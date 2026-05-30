@@ -25,6 +25,8 @@ Inside the TUI:
 > /commit
 ```
 
+Side-effecting commands (`/build`, `/commit`, `/release`, `/checkout`, `/eval`) open an inline confirmation prompt. Press `Enter` or `y` to approve once, and `n` or `Esc` to cancel.
+
 ## KAG
 
 The Python adapter is designed for OpenSPG/KAG `0.8.0`. For local development without OpenSPG running, set `KNOTE_KAG_FAKE=1` to use the adapter's deterministic fixture mode.

@@ -25,6 +25,8 @@ TUI 内可执行：
 > /commit
 ```
 
+带副作用的命令（`/build`、`/commit`、`/release`、`/checkout`、`/eval`）会先打开内嵌确认提示。按 `Enter` 或 `y` 单次确认，按 `n` 或 `Esc` 取消。
+
 真实 KAG 集成面向 OpenSPG/KAG `0.8.0`。本地未启动 OpenSPG 时，可用 `KNOTE_KAG_FAKE=1` 运行确定性开发模式。
 
 如需指定 Python 解释器，设置 `KNOTE_PYTHON=/path/to/python`。

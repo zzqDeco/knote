@@ -114,7 +114,7 @@ func (r *Runtime) handleSlash(ctx context.Context, input string) []protocol.Even
 	arg := strings.TrimSpace(strings.TrimPrefix(input, fields[0]))
 	switch cmd {
 	case "build":
-		return r.build(ctx)
+		return r.confirmRequest("build", input, "Build knowledge artifacts", "Scan sources, call KAG, and write artifacts into artifacts/.")
 	case "status":
 		return r.status(ctx)
 	case "diff":
@@ -124,13 +124,13 @@ func (r *Runtime) handleSlash(ctx context.Context, input string) []protocol.Even
 	case "tasks":
 		return r.taskList()
 	case "commit":
-		return r.commit(ctx, arg)
+		return r.confirmRequest("commit", input, "Commit knowledge version", "Stage knote-tracked knowledge files and create a Git commit.")
 	case "release":
-		return r.release(ctx, arg)
+		return r.confirmRequest("release", input, "Release knowledge version", "Create an annotated Git tag for the current version.")
 	case "checkout":
-		return r.checkout(ctx, arg)
+		return r.confirmRequest("checkout", input, "Checkout knowledge version", "Run git checkout for the requested ref.")
 	case "eval":
-		return r.eval(ctx)
+		return r.confirmRequest("eval", input, "Run evaluation", "Run KAG explain/eval against current artifacts.")
 	case "help":
 		return []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, r.sessionID, helpText, nil)}
 	case "clear", "new", "details", "settings", "model", "resume":
@@ -140,6 +140,47 @@ func (r *Runtime) handleSlash(ctx context.Context, input string) []protocol.Even
 	default:
 		return []protocol.Event{protocol.NewEvent(protocol.EventError, r.sessionID, "unknown command: "+cmd, nil)}
 	}
+}
+
+func (r *Runtime) Confirm(ctx context.Context, req protocol.ConfirmRequest, approved bool) []protocol.Event {
+	if !approved {
+		events := []protocol.Event{
+			protocol.NewEvent(protocol.EventAssistantDone, r.sessionID, "Cancelled: "+req.Action, map[string]string{"request_id": req.RequestID}),
+		}
+		r.persist(events)
+		return events
+	}
+	events := []protocol.Event{protocol.NewEvent(protocol.EventStatusUpdate, r.sessionID, "Confirmed: "+req.Action, map[string]string{"request_id": req.RequestID})}
+	switch req.Action {
+	case "build":
+		events = append(events, r.build(ctx)...)
+	case "commit":
+		events = append(events, r.commit(ctx, slashArg(req.Command))...)
+	case "release":
+		events = append(events, r.release(ctx, slashArg(req.Command))...)
+	case "checkout":
+		events = append(events, r.checkout(ctx, slashArg(req.Command))...)
+	case "eval":
+		events = append(events, r.eval(ctx)...)
+	default:
+		events = append(events, protocol.NewEvent(protocol.EventError, r.sessionID, "unknown confirmed action: "+req.Action, nil))
+	}
+	r.persist(events)
+	return events
+}
+
+func (r *Runtime) confirmRequest(action, command, title, summary string) []protocol.Event {
+	req := protocol.ConfirmRequest{
+		RequestID:   "confirm_" + time.Now().UTC().Format("20060102T150405.000000000"),
+		Action:      action,
+		Command:     command,
+		Title:       title,
+		Summary:     summary,
+		ApproveText: "Approve once",
+		RejectText:  "Cancel",
+		CreatedAt:   time.Now().UTC(),
+	}
+	return []protocol.Event{protocol.NewEvent(protocol.EventConfirmRequest, r.sessionID, title, req)}
 }
 
 func (r *Runtime) build(ctx context.Context) []protocol.Event {
@@ -315,6 +356,14 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func slashArg(input string) string {
+	fields := strings.Fields(input)
+	if len(fields) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(strings.TrimPrefix(input, fields[0]))
 }
 
 const helpText = `Commands:

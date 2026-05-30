@@ -94,6 +94,17 @@ type PermissionRequest struct {
 	CreatedAt time.Time          `json:"created_at"`
 }
 
+type ConfirmRequest struct {
+	RequestID   string    `json:"request_id"`
+	Action      string    `json:"action"`
+	Command     string    `json:"command"`
+	Title       string    `json:"title"`
+	Summary     string    `json:"summary"`
+	ApproveText string    `json:"approve_text"`
+	RejectText  string    `json:"reject_text"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
 type ArtifactManifest struct {
 	Version       int       `json:"version"`
 	Workspace     string    `json:"workspace"`
