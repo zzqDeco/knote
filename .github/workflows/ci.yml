@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+  pull_request:
+    branches:
+      - main
+      - dev
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Go tests
+        run: KNOTE_KAG_FAKE=1 go test ./...
+
+      - name: Python adapter smoke
+        run: python -m unittest discover -s adapters/kag -p '*test*.py'
+
+      - name: Build CLI
+        run: go build -o bin/knote ./cmd/knote

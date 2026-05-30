@@ -1,0 +1,11 @@
+.DS_Store
+bin/
+dist/
+coverage.out
+.knote/cache/
+.knote/checkpoints/
+.knote/kag-runtime/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
