@@ -1,0 +1,68 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        required: true
+        type: string
+        description: Release tag
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+      CGO_ENABLED: "0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Build release archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          commit="$(git rev-parse --short HEAD)"
+          build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          ldflags="-X main.version=${RELEASE_TAG} -X main.commit=${commit} -X main.date=${build_date}"
+          for target in "linux amd64" "linux arm64" "darwin amd64" "darwin arm64" "windows amd64" "windows arm64"; do
+            read -r goos goarch <<< "${target}"
+            name="knote_${RELEASE_TAG}_${goos}_${goarch}"
+            mkdir -p "${name}"
+            bin="${name}/knote"
+            if [[ "${goos}" == "windows" ]]; then bin="${bin}.exe"; fi
+            GOOS="${goos}" GOARCH="${goarch}" go build -trimpath -ldflags "${ldflags}" -o "${bin}" ./cmd/knote
+            cp -R adapters "${name}/"
+            if [[ "${goos}" == "windows" ]]; then
+              (cd "${name}" && zip -q "../dist/${name}.zip" ./*)
+            else
+              tar -czf "dist/${name}.tar.gz" "${name}"
+            fi
+            rm -rf "${name}"
+          done
+          (cd dist && shasum -a 256 * > checksums.txt)
+
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release upload "${RELEASE_TAG}" dist/* --clobber
+          else
+            gh release create "${RELEASE_TAG}" dist/* --title "${RELEASE_TAG}" --generate-notes
+          fi
