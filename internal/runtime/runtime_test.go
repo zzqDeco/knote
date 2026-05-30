@@ -58,6 +58,42 @@ func TestRuntimeRejectsSideEffectConfirmation(t *testing.T) {
 	}
 }
 
+func TestRuntimeRejectsForgedAndReplayedConfirmation(t *testing.T) {
+	workspace := t.TempDir()
+	must(t, os.MkdirAll(filepath.Join(workspace, "sources"), 0o755))
+	must(t, os.WriteFile(filepath.Join(workspace, "sources", "intro.md"), []byte("# Intro\n\nknote is local-first."), 0o644))
+	mustRun(t, workspace, "git", "init")
+
+	t.Setenv("KNOTE_KAG_FAKE", "1")
+	rt, _, err := New(context.Background(), Options{Workspace: workspace})
+	if err != nil {
+		t.Fatal(err)
+	}
+	forged := protocol.ConfirmRequest{
+		RequestID: "forged",
+		Action:    "build",
+		Command:   "/build",
+	}
+	events := rt.Confirm(context.Background(), forged, true)
+	if !hasEvent(events, protocol.EventError) {
+		t.Fatalf("forged confirmation should fail: %+v", events)
+	}
+	if _, err := os.Stat(filepath.Join(workspace, "artifacts", "manifest.json")); !os.IsNotExist(err) {
+		t.Fatalf("forged confirmation wrote artifacts: %v", err)
+	}
+
+	events = rt.Handle(context.Background(), "/build")
+	confirm := firstConfirm(t, events)
+	events = rt.Confirm(context.Background(), confirm, true)
+	if !hasEvent(events, protocol.EventBuildComplete) {
+		t.Fatalf("valid confirmation should build: %+v", events)
+	}
+	events = rt.Confirm(context.Background(), confirm, true)
+	if !hasEvent(events, protocol.EventError) {
+		t.Fatalf("replayed confirmation should fail: %+v", events)
+	}
+}
+
 func hasEvent(events []protocol.Event, eventType protocol.EventType) bool {
 	for _, event := range events {
 		if event.Type == eventType {
