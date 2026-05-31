@@ -77,7 +77,7 @@ def parse_build_summary(output: str) -> dict[str, int] | None:
 
 def ensure_successful_build_summary(summary: dict[str, int] | None) -> None:
     if not summary:
-        return
+        raise RuntimeError("KAG build did not report a parseable success summary")
     if summary["failures"] == 0 and summary["success"] > 0:
         return
     raise RuntimeError(
@@ -136,9 +136,46 @@ def prepare_corpus(workspace: Path, out_dir: Path) -> tuple[Path, list[dict[str,
             }
         )
     out_dir.mkdir(parents=True, exist_ok=True)
+    ensure_runtime_excluded(workspace, out_dir)
     corpus_path = out_dir / "corpus.json"
     atomic_write_text(corpus_path, json.dumps(records, ensure_ascii=False, indent=2) + "\n")
     return corpus_path, records
+
+
+def ensure_runtime_excluded(workspace: Path, out_dir: Path) -> None:
+    try:
+        rel = out_dir.relative_to(workspace).as_posix().rstrip("/")
+    except ValueError:
+        return
+    if not rel:
+        return
+    exclude_path = git_info_exclude(workspace)
+    if exclude_path is None:
+        return
+    pattern = f"/{rel}/"
+    exclude_path.parent.mkdir(parents=True, exist_ok=True)
+    existing = exclude_path.read_text(encoding="utf-8") if exclude_path.exists() else ""
+    if pattern in {line.strip() for line in existing.splitlines()}:
+        return
+    suffix = "" if existing.endswith("\n") or existing == "" else "\n"
+    with exclude_path.open("a", encoding="utf-8") as handle:
+        handle.write(f"{suffix}# knote runtime cache\n{pattern}\n")
+
+
+def git_info_exclude(workspace: Path) -> Path | None:
+    git_path = workspace / ".git"
+    if git_path.is_dir():
+        return git_path / "info" / "exclude"
+    if not git_path.is_file():
+        return None
+    text = git_path.read_text(encoding="utf-8").strip()
+    prefix = "gitdir:"
+    if not text.startswith(prefix):
+        return None
+    git_dir = Path(text[len(prefix) :].strip())
+    if not git_dir.is_absolute():
+        git_dir = workspace / git_dir
+    return git_dir / "info" / "exclude"
 
 
 def atomic_write_text(path: Path, text: str) -> None:
@@ -151,11 +188,13 @@ def atomic_write_text(path: Path, text: str) -> None:
 def select_config(params: dict[str, Any], out_dir: Path) -> Path:
     workspace = workspace_path(params)
     explicit = params.get("config_path")
-    candidates: list[Path] = []
     if explicit:
         path = Path(explicit)
-        candidates.append(path if path.is_absolute() else workspace / path)
-    candidates.extend([workspace / ".knote" / "kag_config.yaml", workspace / "kag_config.yaml"])
+        candidate = path if path.is_absolute() else workspace / path
+        if not candidate.exists():
+            raise FileNotFoundError(f"explicit KAG config not found: {candidate}")
+        return candidate.resolve()
+    candidates = [workspace / ".knote" / "kag_config.yaml", workspace / "kag_config.yaml"]
     for candidate in candidates:
         if candidate.exists():
             return candidate.resolve()

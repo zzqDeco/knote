@@ -51,6 +51,20 @@ class AdapterTest(unittest.TestCase):
             on_disk = json.loads(corpus_path.read_text(encoding="utf-8"))
             self.assertEqual(on_disk, records)
 
+    def test_prepare_corpus_keeps_runtime_cache_out_of_git_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            subprocess.run(["git", "init"], cwd=workspace, text=True, capture_output=True, check=True)
+            (workspace / "sources").mkdir()
+            (workspace / "sources" / "intro.md").write_text("# Intro", encoding="utf-8")
+
+            adapter.prepare_corpus(workspace, workspace / ".knote" / "kag-runtime")
+
+            status = subprocess.run(["git", "status", "--short"], cwd=workspace, text=True, capture_output=True, check=True)
+            self.assertEqual(status.stdout, "?? sources/\n")
+            exclude = workspace / ".git" / "info" / "exclude"
+            self.assertIn("/.knote/kag-runtime/", exclude.read_text(encoding="utf-8"))
+
     def test_generated_config_uses_workspace_runtime_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
@@ -75,6 +89,14 @@ class AdapterTest(unittest.TestCase):
             self.assertIn("executors:\n    - *kag_hybrid_executor_conf", text)
             self.assertIn("type: llm_index_generator", text)
 
+    def test_explicit_config_path_must_exist(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            params = {"workspace": str(workspace), "config_path": "missing.yaml"}
+
+            with self.assertRaisesRegex(FileNotFoundError, "explicit KAG config not found"):
+                adapter.select_config(params, workspace / ".knote" / "kag-runtime")
+
     def test_kag_stdout_is_not_emitted_as_adapter_stdout(self) -> None:
         stdout = StringIO()
         stderr = StringIO()
@@ -97,6 +119,10 @@ class AdapterTest(unittest.TestCase):
     def test_failed_kag_build_summary_raises(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "KAG build failed"):
             adapter.ensure_successful_build_summary({"total": 2, "success": 0, "failures": 2})
+
+    def test_missing_kag_build_summary_raises(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "parseable success summary"):
+            adapter.ensure_successful_build_summary(None)
 
     def test_solver_falls_back_to_async_pipeline(self) -> None:
         class Base:
