@@ -77,6 +77,14 @@ func TestConfigSourcesAndSafeRead(t *testing.T) {
 	if _, err := store.ReadSource(ctx, ".knote/config.yaml"); err == nil {
 		t.Fatal("non-source workspace files should be rejected")
 	}
+	outside := filepath.Join(t.TempDir(), "outside.md")
+	mustWrite(t, outside, "secret\n")
+	if err := os.Symlink(outside, filepath.Join(workspace, "sources", "linked.md")); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	if _, err := store.ReadSource(ctx, "sources/linked.md"); err == nil {
+		t.Fatal("source symlink resolving outside the workspace should be rejected")
+	}
 }
 
 func TestSessionsAppendLoadAndList(t *testing.T) {
@@ -145,7 +153,7 @@ func TestArtifactsEvalAndGate(t *testing.T) {
 
 	if err := store.WriteEval(ctx, repository.EvalReport{
 		Results: []repository.EvalResult{
-			{ID: "smoke", Question: "What is here?", Answer: "stable"},
+			{ID: "smoke", Question: "What is here?", Answer: "stable", KnowledgeHash: "stale-hash"},
 		},
 	}); err != nil {
 		t.Fatal(err)

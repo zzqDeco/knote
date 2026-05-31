@@ -93,7 +93,11 @@ func (s Store) ReadSource(ctx context.Context, path string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return os.ReadFile(fullPath)
+	resolvedPath, err := s.resolveSourcePath(fullPath)
+	if err != nil {
+		return nil, err
+	}
+	return os.ReadFile(resolvedPath)
 }
 
 func (s Store) WriteArtifacts(ctx context.Context, set repository.ArtifactSet) error {
@@ -233,9 +237,7 @@ func (s Store) WriteEval(ctx context.Context, report repository.EvalReport) erro
 		knowledgeHash = hash
 	}
 	for i := range results {
-		if strings.TrimSpace(results[i].KnowledgeHash) == "" {
-			results[i].KnowledgeHash = knowledgeHash
-		}
+		results[i].KnowledgeHash = knowledgeHash
 	}
 	dir := filepath.Join(s.workspace, "evals")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -385,6 +387,29 @@ func (s Store) workspacePath(path string) (string, error) {
 		return "", fmt.Errorf("source path must be under sources/: %s", slashed)
 	}
 	return filepath.Join(s.workspace, path), nil
+}
+
+func (s Store) resolveSourcePath(path string) (string, error) {
+	resolvedWorkspace, err := filepath.EvalSymlinks(s.workspace)
+	if err != nil {
+		return "", err
+	}
+	resolvedPath, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", err
+	}
+	rel, err := filepath.Rel(resolvedWorkspace, resolvedPath)
+	if err != nil {
+		return "", err
+	}
+	if rel == "." || filepath.IsAbs(rel) || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("source path resolves outside workspace: %s", path)
+	}
+	slashed := filepath.ToSlash(rel)
+	if slashed != "sources" && !strings.HasPrefix(slashed, "sources/") {
+		return "", fmt.Errorf("source path resolves outside sources/: %s", slashed)
+	}
+	return resolvedPath, nil
 }
 
 func toRepositoryConfig(cfg config.Config) repository.Config {
