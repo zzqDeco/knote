@@ -70,6 +70,10 @@ class AdapterTest(unittest.TestCase):
             self.assertIn('checkpoint_path: "', text)
             self.assertIn("/.knote/kag-runtime/ckpt", text)
             self.assertIn("scanner:\n    type: json_scanner", text)
+            self.assertIn("kag_solver_pipeline:\n  type: kag_static_pipeline", text)
+            self.assertIn("planner:\n    type: lf_kag_static_planner", text)
+            self.assertIn("executors:\n    - *kag_hybrid_executor_conf", text)
+            self.assertIn("type: llm_index_generator", text)
 
     def test_kag_stdout_is_not_emitted_as_adapter_stdout(self) -> None:
         stdout = StringIO()
@@ -85,6 +89,28 @@ class AdapterTest(unittest.TestCase):
         self.assertEqual(data, {"ok": True})
         self.assertEqual(stdout.getvalue(), "")
         self.assertEqual(stderr.getvalue(), "human KAG progress\n")
+
+    def test_parse_kag_build_summary(self) -> None:
+        output = "\x1b[31mDone process 3 records, with 2 successfully processed and 1 failures encountered.\n"
+        self.assertEqual(adapter.parse_build_summary(output), {"total": 3, "success": 2, "failures": 1})
+
+    def test_failed_kag_build_summary_raises(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "KAG build failed"):
+            adapter.ensure_successful_build_summary({"total": 2, "success": 0, "failures": 2})
+
+    def test_solver_falls_back_to_async_pipeline(self) -> None:
+        class Base:
+            def invoke(self, query: str) -> str:
+                raise NotImplementedError("invoke not implemented yet.")
+
+            async def ainvoke(self, query: str) -> str:
+                raise NotImplementedError("ainvoke not implemented yet.")
+
+        class AsyncOnly(Base):
+            async def ainvoke(self, query: str) -> str:
+                return "async answer: " + query
+
+        self.assertEqual(adapter.run_solver_pipeline(AsyncOnly(), Base, "q"), "async answer: q")
 
     def test_fake_build_writes_corpus_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

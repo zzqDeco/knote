@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 from contextlib import redirect_stdout
@@ -45,7 +46,13 @@ def error(req_id: str, message: str) -> None:
     emit({"id": req_id, "type": "error", "error": message})
 
 
-def run_capturing_stdout(fn: Any, *args: Any, **kwargs: Any) -> Any:
+BUILD_SUMMARY_RE = re.compile(
+    r"Done process\s+(?P<total>\d+)\s+records,\s+with\s+(?P<success>\d+)\s+successfully processed and\s+(?P<failures>\d+)\s+failures? encountered",
+    re.IGNORECASE,
+)
+
+
+def capture_stdout(fn: Any, *args: Any, **kwargs: Any) -> tuple[Any, str]:
     captured = StringIO()
     with redirect_stdout(captured):
         value = fn(*args, **kwargs)
@@ -53,7 +60,31 @@ def run_capturing_stdout(fn: Any, *args: Any, **kwargs: Any) -> Any:
     if output:
         sys.stderr.write(output)
         sys.stderr.flush()
+    return value, output
+
+
+def run_capturing_stdout(fn: Any, *args: Any, **kwargs: Any) -> Any:
+    value, _ = capture_stdout(fn, *args, **kwargs)
     return value
+
+
+def parse_build_summary(output: str) -> dict[str, int] | None:
+    match = BUILD_SUMMARY_RE.search(output)
+    if not match:
+        return None
+    return {key: int(value) for key, value in match.groupdict().items()}
+
+
+def ensure_successful_build_summary(summary: dict[str, int] | None) -> None:
+    if not summary:
+        return
+    if summary["failures"] == 0 and summary["success"] > 0:
+        return
+    raise RuntimeError(
+        "KAG build failed for "
+        f"{summary['failures']} of {summary['total']} records "
+        f"({summary['success']} succeeded)"
+    )
 
 
 def workspace_path(params: dict[str, Any]) -> Path:
@@ -210,56 +241,109 @@ search_api: &search_api
 graph_api: &graph_api
   type: openspg_graph_api
 
-exact_kg_retriever: &exact_kg_retriever
-  type: default_exact_kg_retriever
-  el_num: 5
-  llm_client: *chat_llm
-  search_api: *search_api
-  graph_api: *graph_api
+kg_cs: &kg_cs
+  type: kg_cs_open_spg
+  priority: 0
+  path_select:
+    type: exact_one_hop_select
+    graph_api: *graph_api
+    search_api: *search_api
+  entity_linking:
+    type: entity_linking
+    graph_api: *graph_api
+    search_api: *search_api
+    recognition_threshold: 0.9
+    exclude_types:
+      - Chunk
+      - AtomicQuery
+      - KnowledgeUnit
+      - Summary
+      - Outline
+      - Doc
 
-fuzzy_kg_retriever: &fuzzy_kg_retriever
-  type: default_fuzzy_kg_retriever
-  el_num: 5
+kg_fr: &kg_fr
+  type: kg_fr_knowledge_unit
+  top_k: 20
+  graph_api: *graph_api
+  search_api: *search_api
   vectorize_model: *vectorize_model
-  llm_client: *chat_llm
-  search_api: *search_api
-  graph_api: *graph_api
+  path_select:
+    type: fuzzy_one_hop_select
+    llm_client: *openie_llm
+    graph_api: *graph_api
+    search_api: *search_api
+  ppr_chunk_retriever_tool:
+    type: ppr_chunk_retriever
+    llm_client: *chat_llm
+    graph_api: *graph_api
+    search_api: *search_api
+  entity_linking:
+    type: entity_linking
+    graph_api: *graph_api
+    search_api: *search_api
+    recognition_threshold: 0.8
+    exclude_types:
+      - Chunk
+      - AtomicQuery
+      - KnowledgeUnit
+      - Summary
+      - Outline
+      - Doc
 
-chunk_retriever: &chunk_retriever
-  type: default_chunk_retriever
-  llm_client: *chat_llm
-  recall_num: 10
-  rerank_topk: 10
+rc: &rc
+  type: rc_open_spg
+  vector_chunk_retriever:
+    type: vector_chunk_retriever
+    vectorize_model: *vectorize_model
+    score_threshold: 0.65
+    search_api: *search_api
+  graph_api: *graph_api
+  search_api: *search_api
+  vectorize_model: *vectorize_model
+  top_k: 20
+
+kag_hybrid_executor: &kag_hybrid_executor_conf
+  type: kag_hybrid_retrieval_executor
+  retrievers:
+    - *kg_cs
+    - *kg_fr
+    - *rc
+  merger:
+    type: kag_merger
+  enable_summary: true
+
+kag_output_executor: &kag_output_executor_conf
+  type: kag_output_executor
+  llm_module: *chat_llm
+
+kag_deduce_executor: &kag_deduce_executor_conf
+  type: kag_deduce_executor
+  llm_module: *chat_llm
+
+py_code_based_math_executor: &py_code_based_math_executor_conf
+  type: py_code_based_math_executor
+  llm: *chat_llm
 
 kag_solver_pipeline:
-  memory:
-    type: default_memory
-    llm_client: *chat_llm
-  max_iterations: 3
-  reasoner:
-    type: default_reasoner
-    llm_client: *chat_llm
-    lf_planner:
-      type: default_lf_planner
-      llm_client: *chat_llm
-      vectorize_model: *vectorize_model
-    lf_executor:
-      type: default_lf_executor
-      llm_client: *chat_llm
-      force_chunk_retriever: true
-      exact_kg_retriever: *exact_kg_retriever
-      fuzzy_kg_retriever: *fuzzy_kg_retriever
-      chunk_retriever: *chunk_retriever
-      merger:
-        type: default_lf_sub_query_res_merger
-        vectorize_model: *vectorize_model
-        chunk_retriever: *chunk_retriever
+  type: kag_static_pipeline
+  planner:
+    type: lf_kag_static_planner
+    llm: *chat_llm
+    plan_prompt:
+      type: default_lf_static_planning
+    rewrite_prompt:
+      type: default_rewrite_sub_task_query
+  executors:
+    - *kag_hybrid_executor_conf
+    - *py_code_based_math_executor_conf
+    - *kag_deduce_executor_conf
+    - *kag_output_executor_conf
   generator:
-    type: default_generator
+    type: llm_index_generator
     llm_client: *chat_llm
-  reflector:
-    type: default_reflector
-    llm_client: *chat_llm
+    generated_prompt:
+      type: default_refer_generator_prompt
+    enable_ref: true
 """
     atomic_write_text(path, config)
 
@@ -368,13 +452,16 @@ def run_kag_build(req: dict[str, Any]) -> dict[str, Any]:
     if not pipeline:
         raise RuntimeError(f"kag_builder_pipeline missing in {config_path}")
     runner = BuilderChainRunner.from_config(pipeline)
-    run_capturing_stdout(runner.invoke, str(corpus_path))
+    _, build_output = capture_stdout(runner.invoke, str(corpus_path))
+    build_summary = parse_build_summary(build_output)
+    ensure_successful_build_summary(build_summary)
     return {
         "status": "ok",
         "mode": "real",
         "config_path": str(config_path),
         "corpus_path": str(corpus_path),
         "documents": len(records),
+        "build_summary": build_summary or {},
     }
 
 
@@ -404,6 +491,25 @@ def normalize_trace(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, default=str)[:4000]
 
 
+def method_overridden(instance: Any, base_cls: Any, name: str) -> bool:
+    return getattr(type(instance), name, None) is not getattr(base_cls, name, None)
+
+
+def run_solver_pipeline(pipeline: Any, base_cls: Any, query: str) -> Any:
+    if hasattr(pipeline, "run"):
+        return pipeline.run(query)
+    if method_overridden(pipeline, base_cls, "invoke"):
+        try:
+            return pipeline.invoke(query)
+        except NotImplementedError:
+            pass
+    if method_overridden(pipeline, base_cls, "ainvoke"):
+        import asyncio
+
+        return asyncio.run(pipeline.ainvoke(query))
+    raise RuntimeError("KAG solver pipeline has no concrete run/invoke/ainvoke method")
+
+
 def run_kag_query(req: dict[str, Any], explain: bool = False) -> dict[str, Any]:
     params = req.get("params") or {}
     query = str(params.get("query") or "").strip()
@@ -422,16 +528,7 @@ def run_kag_query(req: dict[str, Any], explain: bool = False) -> dict[str, Any]:
     if not pipeline_conf:
         raise RuntimeError(f"kag_solver_pipeline missing in {config_path}")
     pipeline = SolverPipelineABC.from_config(pipeline_conf)
-    if hasattr(pipeline, "run"):
-        raw = pipeline.run(query)
-    elif hasattr(pipeline, "invoke"):
-        raw = pipeline.invoke(query)
-    elif hasattr(pipeline, "ainvoke"):
-        import asyncio
-
-        raw = asyncio.run(pipeline.ainvoke(query))
-    else:
-        raise RuntimeError("KAG solver pipeline has no run/invoke/ainvoke method")
+    raw = run_solver_pipeline(pipeline, SolverPipelineABC, query)
     answer, trace = normalize_solver_output(raw)
     data = {
         "answer": answer,
