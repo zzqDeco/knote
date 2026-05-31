@@ -94,6 +94,22 @@ func TestTagRequiresCleanWorkspace(t *testing.T) {
 	}
 }
 
+func TestDirtyIgnoresRuntimeSessionFiles(t *testing.T) {
+	workspace := initRepo(t)
+	mustWrite(t, filepath.Join(workspace, ".knote", "config.yaml"), "workspace: test\n")
+	runGit(t, workspace, "add", ".")
+	runGit(t, workspace, "commit", "-m", "initial")
+
+	mustWrite(t, filepath.Join(workspace, ".knote", "sessions", "sess.jsonl"), "{}\n")
+	if (Store{Workspace: workspace}).Dirty(context.Background()) {
+		t.Fatal("runtime session files should not make the knowledge workspace dirty")
+	}
+	mustWrite(t, filepath.Join(workspace, "sources", "intro.md"), "dirty\n")
+	if !(Store{Workspace: workspace}).Dirty(context.Background()) {
+		t.Fatal("knowledge changes should still make the workspace dirty")
+	}
+}
+
 func TestCheckoutDirtyGuard(t *testing.T) {
 	workspace := initRepo(t)
 	mustWrite(t, filepath.Join(workspace, "sources", "intro.md"), "intro\n")

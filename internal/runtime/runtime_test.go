@@ -225,13 +225,12 @@ func TestRuntimeReleaseRequiresEvalGateAndCleanWorkspace(t *testing.T) {
 	mustRun(t, workspace, "git", "init")
 	mustRun(t, workspace, "git", "config", "user.email", "knote@example.com")
 	mustRun(t, workspace, "git", "config", "user.name", "knote")
-	must(t, os.WriteFile(filepath.Join(workspace, ".gitignore"), []byte(".knote/sessions/\n"), 0o644))
 	t.Setenv("KNOTE_KAG_FAKE", "1")
 	rt, _, err := New(context.Background(), Options{Workspace: workspace})
 	if err != nil {
 		t.Fatal(err)
 	}
-	mustRun(t, workspace, "git", "add", ".gitignore", ".knote/config.yaml")
+	mustRun(t, workspace, "git", "add", ".knote/config.yaml")
 	mustRun(t, workspace, "git", "commit", "-m", "initial")
 
 	events := rt.Handle(context.Background(), "/release v0.1.0")
@@ -261,6 +260,39 @@ func TestRuntimeReleaseRequiresEvalGateAndCleanWorkspace(t *testing.T) {
 	}
 	if got := strings.TrimSpace(mustRunOutput(t, workspace, "git", "tag", "--list", "v0.1.0")); got != "v0.1.0" {
 		t.Fatalf("tag missing after release: %q", got)
+	}
+}
+
+func TestRuntimeReleaseRejectsStaleEvalAfterKnowledgeCommit(t *testing.T) {
+	workspace := t.TempDir()
+	mustRun(t, workspace, "git", "init")
+	mustRun(t, workspace, "git", "config", "user.email", "knote@example.com")
+	mustRun(t, workspace, "git", "config", "user.name", "knote")
+	t.Setenv("KNOTE_KAG_FAKE", "1")
+	rt, _, err := New(context.Background(), Options{Workspace: workspace})
+	if err != nil {
+		t.Fatal(err)
+	}
+	must(t, os.MkdirAll(filepath.Join(workspace, "sources"), 0o755))
+	must(t, os.WriteFile(filepath.Join(workspace, "sources", "intro.md"), []byte("before\n"), 0o644))
+	mustRun(t, workspace, "git", "add", ".knote/config.yaml", "sources")
+	mustRun(t, workspace, "git", "commit", "-m", "initial")
+
+	evalEvents := rt.Handle(context.Background(), "/eval")
+	evalConfirm := firstConfirm(t, evalEvents)
+	evalEvents = rt.Confirm(context.Background(), evalConfirm, true)
+	if !hasEvent(evalEvents, protocol.EventAssistantDone) {
+		t.Fatalf("eval failed: %+v", evalEvents)
+	}
+	mustRun(t, workspace, "git", "add", "evals")
+	mustRun(t, workspace, "git", "commit", "-m", "eval")
+	must(t, os.WriteFile(filepath.Join(workspace, "sources", "intro.md"), []byte("after\n"), 0o644))
+	mustRun(t, workspace, "git", "add", "sources")
+	mustRun(t, workspace, "git", "commit", "-m", "knowledge changed")
+
+	events := rt.Handle(context.Background(), "/release v0.1.0")
+	if !hasEvent(events, protocol.EventError) || !strings.Contains(lastError(events), "stale") {
+		t.Fatalf("stale eval should block release: %+v", events)
 	}
 }
 

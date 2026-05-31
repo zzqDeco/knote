@@ -25,6 +25,7 @@ type Version struct {
 }
 
 var knowledgePaths = []string{".knote/config.yaml", "sources", "artifacts", "evals"}
+var runtimeOnlyPaths = []string{".knote/sessions", ".knote/cache", ".knote/checkpoints", ".knote/kag-runtime"}
 
 func (s Store) Branch(ctx context.Context) string {
 	out, err := s.git(ctx, "branch", "--show-current")
@@ -36,7 +37,19 @@ func (s Store) Branch(ctx context.Context) string {
 
 func (s Store) Dirty(ctx context.Context) bool {
 	out, err := s.git(ctx, "status", "--porcelain")
-	return err == nil && strings.TrimSpace(out) != ""
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		if runtimeOnlyStatusLine(line) {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 func (s Store) Status(ctx context.Context) (string, error) {
@@ -210,4 +223,17 @@ func tagsFromDecoration(decoration string) []string {
 		}
 	}
 	return tags
+}
+
+func runtimeOnlyStatusLine(line string) bool {
+	if len(line) < 4 {
+		return false
+	}
+	path := strings.TrimSpace(line[3:])
+	for _, prefix := range runtimeOnlyPaths {
+		if path == prefix || strings.HasPrefix(path, prefix+"/") {
+			return true
+		}
+	}
+	return false
 }

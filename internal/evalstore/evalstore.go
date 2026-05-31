@@ -2,6 +2,8 @@ package evalstore
 
 import (
 	"bufio"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -18,22 +20,26 @@ type Question struct {
 }
 
 type Result struct {
-	ID           string   `json:"id"`
-	Question     string   `json:"question"`
-	Answer       string   `json:"answer"`
-	Evidence     []string `json:"evidence"`
-	Explanation  string   `json:"explanation,omitempty"`
-	Uncertainty  string   `json:"uncertainty,omitempty"`
-	Mode         string   `json:"mode,omitempty"`
-	AdapterError string   `json:"adapter_error,omitempty"`
+	ID            string   `json:"id"`
+	Question      string   `json:"question"`
+	KnowledgeHash string   `json:"knowledge_hash,omitempty"`
+	Answer        string   `json:"answer"`
+	Evidence      []string `json:"evidence"`
+	Explanation   string   `json:"explanation,omitempty"`
+	Uncertainty   string   `json:"uncertainty,omitempty"`
+	Mode          string   `json:"mode,omitempty"`
+	AdapterError  string   `json:"adapter_error,omitempty"`
 }
 
 type Report struct {
 	Results       []Result
 	Total         int
 	AdapterErrors int
+	KnowledgeHash string
 	Path          string
 }
+
+var knowledgeHashPaths = []string{".knote/config.yaml", "sources", "artifacts", "evals/questions.jsonl"}
 
 func LoadQuestions(workspace string) ([]Question, error) {
 	path := filepath.Join(workspace, "evals", "questions.jsonl")
@@ -96,6 +102,13 @@ func ResultFromResponse(question Question, resp kag.Response, err error) Result 
 
 func Write(workspace string, results []Result) (Report, error) {
 	sortResults(results)
+	knowledgeHash, err := KnowledgeHash(workspace)
+	if err != nil {
+		return Report{}, err
+	}
+	for i := range results {
+		results[i].KnowledgeHash = knowledgeHash
+	}
 	dir := filepath.Join(workspace, "evals")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return Report{}, err
@@ -108,6 +121,7 @@ func Write(workspace string, results []Result) (Report, error) {
 		Results:       append([]Result(nil), results...),
 		Total:         len(results),
 		AdapterErrors: countAdapterErrors(results),
+		KnowledgeHash: knowledgeHash,
 		Path:          filepath.Join(dir, "report.md"),
 	}
 	if err := atomicWriteText(report.Path, RenderReport(report)); err != nil {
@@ -131,6 +145,18 @@ func Gate(workspace string) error {
 	}
 	if len(results) == 0 {
 		return fmt.Errorf("release requires at least one eval result")
+	}
+	currentHash, err := KnowledgeHash(workspace)
+	if err != nil {
+		return err
+	}
+	for _, result := range results {
+		if result.KnowledgeHash == "" {
+			return fmt.Errorf("release blocked: eval results are not tied to the current knowledge version")
+		}
+		if result.KnowledgeHash != currentHash {
+			return fmt.Errorf("release blocked: eval results are stale for the current knowledge version")
+		}
 	}
 	if countAdapterErrors(results) > 0 {
 		return fmt.Errorf("release blocked: eval report contains adapter errors")
@@ -174,6 +200,7 @@ func RenderReport(report Report) string {
 	fmt.Fprintf(&b, "# knote eval report\n\n")
 	fmt.Fprintf(&b, "- total: %d\n", report.Total)
 	fmt.Fprintf(&b, "- adapter_errors: %d\n", report.AdapterErrors)
+	fmt.Fprintf(&b, "- knowledge_hash: %s\n", report.KnowledgeHash)
 	status := "pass"
 	if report.AdapterErrors > 0 || report.Total == 0 {
 		status = "fail"
@@ -221,6 +248,58 @@ func writeResults(path string, results []Result) error {
 		return err
 	}
 	return os.Rename(tmp, path)
+}
+
+func KnowledgeHash(workspace string) (string, error) {
+	var files []string
+	for _, rel := range knowledgeHashPaths {
+		path := filepath.Join(workspace, rel)
+		info, err := os.Stat(path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				files = append(files, filepath.ToSlash(rel)+"\x00missing")
+				continue
+			}
+			return "", err
+		}
+		if !info.IsDir() {
+			files = append(files, filepath.ToSlash(rel))
+			continue
+		}
+		if err := filepath.WalkDir(path, func(item string, entry os.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if entry.IsDir() {
+				return nil
+			}
+			relItem, err := filepath.Rel(workspace, item)
+			if err != nil {
+				return err
+			}
+			files = append(files, filepath.ToSlash(relItem))
+			return nil
+		}); err != nil {
+			return "", err
+		}
+	}
+	sort.Strings(files)
+	hash := sha256.New()
+	for _, rel := range files {
+		hash.Write([]byte(rel))
+		hash.Write([]byte{0})
+		if strings.HasSuffix(rel, "\x00missing") {
+			hash.Write([]byte{0})
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(workspace, filepath.FromSlash(rel)))
+		if err != nil {
+			return "", err
+		}
+		hash.Write(data)
+		hash.Write([]byte{0})
+	}
+	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
 func atomicWriteText(path string, text string) error {

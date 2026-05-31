@@ -33,6 +33,7 @@ func TestLoadQuestionsSortsAndAssignsIDs(t *testing.T) {
 
 func TestWriteAndGateStableResults(t *testing.T) {
 	workspace := t.TempDir()
+	mustWrite(t, filepath.Join(workspace, "sources", "intro.md"), "stable\n")
 	results := []Result{
 		{ID: "b", Question: "second", Answer: "B"},
 		{ID: "a", Question: "first", Answer: "A", Evidence: []string{"sources/a.md"}},
@@ -51,8 +52,24 @@ func TestWriteAndGateStableResults(t *testing.T) {
 	if !strings.HasPrefix(string(data), `{"id":"a"`) {
 		t.Fatalf("results were not sorted deterministically:\n%s", data)
 	}
+	if !strings.Contains(string(data), `"knowledge_hash":"`) {
+		t.Fatalf("results did not include knowledge hash:\n%s", data)
+	}
 	if err := Gate(workspace); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestGateRejectsStaleKnowledgeHash(t *testing.T) {
+	workspace := t.TempDir()
+	mustWrite(t, filepath.Join(workspace, "sources", "intro.md"), "before\n")
+	_, err := Write(workspace, []Result{{ID: "smoke", Question: "q", Answer: "answer"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(workspace, "sources", "intro.md"), "after\n")
+	if err := Gate(workspace); err == nil || !strings.Contains(err.Error(), "stale") {
+		t.Fatalf("gate should reject stale eval results, got %v", err)
 	}
 }
 
