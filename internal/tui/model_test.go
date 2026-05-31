@@ -99,6 +99,39 @@ func TestClearProjectsTranscriptWithoutDeletingSession(t *testing.T) {
 	}
 }
 
+func TestResumeDoesNotReviveStaleConfirmation(t *testing.T) {
+	model := newTestModel(t)
+	sessionID := model.runtime.SessionID()
+
+	model.composer.SetValue("/build")
+	updateModel(t, &model, tea.KeyMsg{Type: tea.KeyEnter})
+	if model.pendingConfirm == nil {
+		t.Fatal("/build did not create a pending confirmation")
+	}
+	updateModel(t, &model, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	if model.pendingConfirm != nil {
+		t.Fatal("rejecting /build did not clear pending confirmation")
+	}
+
+	model.composer.SetValue("/new")
+	updateModel(t, &model, tea.KeyMsg{Type: tea.KeyEnter})
+	if model.runtime.SessionID() == sessionID {
+		t.Fatal("/new did not switch sessions")
+	}
+
+	model.composer.SetValue("/resume " + sessionID)
+	updateModel(t, &model, tea.KeyMsg{Type: tea.KeyEnter})
+	if model.pendingConfirm != nil {
+		t.Fatalf("resume revived stale confirmation: %+v", model.pendingConfirm)
+	}
+
+	model.composer.SetValue("/eval")
+	updateModel(t, &model, tea.KeyMsg{Type: tea.KeyEnter})
+	if model.pendingConfirm == nil || model.pendingConfirm.Action != "eval" {
+		t.Fatalf("/eval after resume did not create a fresh confirmation: %+v", model.pendingConfirm)
+	}
+}
+
 func newTestModel(t *testing.T) Model {
 	t.Helper()
 	workspace := t.TempDir()

@@ -15,9 +15,26 @@ The MVP is a single Go CLI/TUI binary with a Python KAG subprocess adapter. Bubb
 - `adapters/kag` prepares sorted corpus JSON, generates a starter `kag_config.yaml`, and invokes real KAG builder/solver APIs when OpenSPG/KAG is installed and reachable.
 - `internal/gitstore` wraps read-only Git status/log/diff plus confirmed commit/tag/checkout.
 
+## PR Progress
+
+- PR #2 `feature/confirm-side-effects`: completed and merged to `dev`.
+- PR #3 `feature/kag-real-adapter`: completed and merged to `dev`.
+- PR #4 `feature/tui-session-ux`: completed and merged to `dev`.
+- PR #5 `feature/version-eval-release-gate`: completed and merged to `dev`.
+- PR #6 `test/mvp-acceptance-docs`: adds repeatable MVP smoke scripts, PTY startup coverage, real KAG manual smoke, docs, and CI wiring.
+
 ## Acceptance
 
-- `go test ./...` passes.
-- `go run ./cmd/knote --workspace tests/fixtures/basic-kb` opens the TUI.
-- `KNOTE_KAG_FAKE=1` enables deterministic KAG build/query/explain without OpenSPG.
-- Real KAG smoke can run with OpenSPG at `127.0.0.1:8887`, `openspg-kag` installed in `KNOTE_PYTHON`, and source files under `sources/`.
+- `KNOTE_KAG_FAKE=1 go test ./...` passes.
+- `python3 -m unittest discover -s adapters/kag -p '*test*.py'` passes.
+- `CGO_ENABLED=0 go build -o bin/knote ./cmd/knote` succeeds.
+- `scripts/smoke_fake_mvp.sh` starts the TUI in a PTY, runs fake build/query/diff/commit/resume/eval, and exits cleanly.
+- `KNOTE_PYTHON=/path/to/python KNOTE_KAG_HOST=http://127.0.0.1:8887 scripts/smoke_real_kag.sh` passes in a local real OpenSPG/KAG environment.
+
+## Release Candidate Checklist
+
+1. Merge PR #6 into `dev` after CI and Codex review are clean enough for MVP.
+2. Create `release/v0.1.0` from `dev`.
+3. Run the acceptance commands above locally, including real KAG smoke.
+4. Promote `release/v0.1.0` to `main` only after explicit confirmation.
+5. Tag `v0.1.0` only after explicit confirmation.
