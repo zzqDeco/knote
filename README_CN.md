@@ -30,3 +30,5 @@ TUI 内可执行：
 真实 KAG 集成面向 OpenSPG/KAG `0.8.0`。本地未启动 OpenSPG 时，可用 `KNOTE_KAG_FAKE=1` 运行确定性开发模式。
 
 如需指定 Python 解释器，设置 `KNOTE_PYTHON=/path/to/python`。
+
+真实 KAG 执行需要本机 OpenSPG 服务运行在 `http://127.0.0.1:8887`，并在 `KNOTE_PYTHON` 指向的 Python 环境中安装 `openspg-kag`。把 Markdown 或 text 源文件放在 `sources/` 下后，adapter 会在 `.knote/kag-runtime/` 写入稳定排序的 JSON corpus 和生成的 starter config；需要自定义模型、namespace 或 project 时，把该 config 复制到 `.knote/kag_config.yaml`。KAG runtime 缓存不会进 Git。
