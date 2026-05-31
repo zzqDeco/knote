@@ -16,16 +16,17 @@ import (
 )
 
 type Model struct {
-	runtime  *runtime.Runtime
-	viewport viewport.Model
-	composer textinput.Model
-	events   []protocol.Event
-	width    int
-	height   int
-	status   string
-	overlay  string
-	ready    bool
-	err      error
+	runtime        *runtime.Runtime
+	viewport       viewport.Model
+	composer       textinput.Model
+	events         []protocol.Event
+	width          int
+	height         int
+	status         string
+	overlay        string
+	pendingConfirm *protocol.ConfirmRequest
+	ready          bool
+	err            error
 }
 
 func New(rt *runtime.Runtime, initial []protocol.Event) Model {
@@ -64,6 +65,26 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.viewport.Height = max(5, msg.Height-6)
 		m.refreshViewport()
 	case tea.KeyMsg:
+		if m.pendingConfirm != nil {
+			switch msg.String() {
+			case "enter", "y", "Y":
+				events := m.runtime.Confirm(context.Background(), *m.pendingConfirm, true)
+				m.pendingConfirm = nil
+				m.events = append(m.events, events...)
+				m.status = m.deriveStatus()
+				m.overlay = overlayFromEvents(events)
+				m.refreshViewport()
+				return m, nil
+			case "esc", "n", "N":
+				events := m.runtime.Confirm(context.Background(), *m.pendingConfirm, false)
+				m.pendingConfirm = nil
+				m.events = append(m.events, events...)
+				m.status = m.deriveStatus()
+				m.overlay = overlayFromEvents(events)
+				m.refreshViewport()
+				return m, nil
+			}
+		}
 		switch msg.String() {
 		case "ctrl+c":
 			return m, tea.Quit
@@ -76,6 +97,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			events := m.runtime.Handle(context.Background(), value)
 			m.events = append(m.events, events...)
 			m.status = m.deriveStatus()
+			m.pendingConfirm = confirmFromEvents(events)
 			m.overlay = overlayFromEvents(events)
 			m.refreshViewport()
 		case "esc":
@@ -178,12 +200,52 @@ func overlayFromEvents(events []protocol.Event) string {
 		case protocol.EventTaskProgress:
 			data, _ := json.MarshalIndent(event.Payload, "", "  ")
 			return "tasks\n" + string(data)
-		case protocol.EventApprovalRequest, protocol.EventConfirmRequest:
+		case protocol.EventConfirmRequest:
+			if req := confirmFromEvent(event); req != nil {
+				return fmt.Sprintf("%s\n\n%s\n\nCommand: %s\n\nEnter/y: %s · n/Esc: %s", req.Title, req.Summary, req.Command, req.ApproveText, req.RejectText)
+			}
+			data, _ := json.MarshalIndent(event.Payload, "", "  ")
+			return "confirm\n" + string(data)
+		case protocol.EventApprovalRequest:
 			data, _ := json.MarshalIndent(event.Payload, "", "  ")
 			return "approval\n" + string(data)
 		}
 	}
 	return ""
+}
+
+func confirmFromEvents(events []protocol.Event) *protocol.ConfirmRequest {
+	for i := len(events) - 1; i >= 0; i-- {
+		if req := confirmFromEvent(events[i]); req != nil {
+			return req
+		}
+	}
+	return nil
+}
+
+func confirmFromEvent(event protocol.Event) *protocol.ConfirmRequest {
+	if event.Type != protocol.EventConfirmRequest {
+		return nil
+	}
+	switch payload := event.Payload.(type) {
+	case protocol.ConfirmRequest:
+		return &payload
+	case *protocol.ConfirmRequest:
+		return payload
+	default:
+		data, err := json.Marshal(payload)
+		if err != nil {
+			return nil
+		}
+		var req protocol.ConfirmRequest
+		if err := json.Unmarshal(data, &req); err != nil {
+			return nil
+		}
+		if req.RequestID == "" {
+			return nil
+		}
+		return &req
+	}
 }
 
 func indent(text string) string {
