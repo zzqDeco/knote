@@ -50,6 +50,9 @@ BUILD_SUMMARY_RE = re.compile(
     r"Done process\s+(?P<total>\d+)\s+records,\s+with\s+(?P<success>\d+)\s+successfully processed and\s+(?P<failures>\d+)\s+failures? encountered",
     re.IGNORECASE,
 )
+CONFIG_TEMPLATE_RE = re.compile(
+    r"\{\{\s*(?P<name>[A-Za-z_][A-Za-z0-9_]*)(?:\s*\|\s*default\(\s*(?P<default>[^)]*)\s*\))?\s*\}\}"
+)
 
 
 def capture_stdout(fn: Any, *args: Any, **kwargs: Any) -> tuple[Any, str]:
@@ -145,14 +148,15 @@ def prepare_corpus(workspace: Path, out_dir: Path) -> tuple[Path, list[dict[str,
 def ensure_runtime_excluded(workspace: Path, out_dir: Path) -> None:
     workspace = workspace.resolve()
     out_dir = out_dir.resolve()
+    repo_info = git_repo_info(workspace)
+    if repo_info is None:
+        return
+    repo_root, exclude_path = repo_info
     try:
-        rel = out_dir.relative_to(workspace).as_posix().rstrip("/")
+        rel = out_dir.relative_to(repo_root).as_posix().rstrip("/")
     except ValueError:
         return
     if not rel:
-        return
-    exclude_path = git_info_exclude(workspace)
-    if exclude_path is None:
         return
     pattern = f"/{rel}/"
     exclude_path.parent.mkdir(parents=True, exist_ok=True)
@@ -164,20 +168,23 @@ def ensure_runtime_excluded(workspace: Path, out_dir: Path) -> None:
         handle.write(f"{suffix}# knote runtime cache\n{pattern}\n")
 
 
-def git_info_exclude(workspace: Path) -> Path | None:
-    git_path = workspace / ".git"
-    if git_path.is_dir():
-        return git_path / "info" / "exclude"
-    if not git_path.is_file():
-        return None
-    text = git_path.read_text(encoding="utf-8").strip()
-    prefix = "gitdir:"
-    if not text.startswith(prefix):
-        return None
-    git_dir = Path(text[len(prefix) :].strip())
-    if not git_dir.is_absolute():
-        git_dir = workspace / git_dir
-    return git_dir / "info" / "exclude"
+def git_repo_info(workspace: Path) -> tuple[Path, Path] | None:
+    current = workspace.resolve()
+    for repo_root in [current, *current.parents]:
+        git_path = repo_root / ".git"
+        if git_path.is_dir():
+            return repo_root, git_path / "info" / "exclude"
+        if not git_path.is_file():
+            continue
+        text = git_path.read_text(encoding="utf-8").strip()
+        prefix = "gitdir:"
+        if not text.startswith(prefix):
+            continue
+        git_dir = Path(text[len(prefix) :].strip())
+        if not git_dir.is_absolute():
+            git_dir = repo_root / git_dir
+        return repo_root, git_dir / "info" / "exclude"
+    return None
 
 
 def atomic_write_text(path: Path, text: str) -> None:
@@ -187,7 +194,7 @@ def atomic_write_text(path: Path, text: str) -> None:
     tmp.replace(path)
 
 
-def select_config(params: dict[str, Any], out_dir: Path) -> Path:
+def select_config(params: dict[str, Any], out_dir: Path, *, generate: bool = True) -> Path:
     workspace = workspace_path(params)
     explicit = params.get("config_path")
     if explicit:
@@ -200,6 +207,8 @@ def select_config(params: dict[str, Any], out_dir: Path) -> Path:
     for candidate in candidates:
         if candidate.exists():
             return candidate.resolve()
+    if not generate:
+        raise FileNotFoundError("KAG config not found; run /build first or provide config_path")
     generated = out_dir / "kag_config.yaml"
     ensure_runtime_excluded(workspace, out_dir)
     generate_kag_config(generated, params)
@@ -222,9 +231,15 @@ def resolve_config_value(value: str) -> str:
     value = value.strip().strip("'\"")
     if value.startswith("!ENV "):
         return os.environ.get(value[5:].strip(), "")
-    match = re.fullmatch(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}", value)
+    match = CONFIG_TEMPLATE_RE.fullmatch(value)
     if match:
-        return os.environ.get(match.group(1), "")
+        env_value = os.environ.get(match.group("name"))
+        if env_value:
+            return env_value
+        default = match.group("default")
+        if default is not None:
+            return default.strip().strip("'\"")
+        return ""
     return value
 
 
@@ -578,7 +593,7 @@ def run_kag_query(req: dict[str, Any], explain: bool = False) -> dict[str, Any]:
     if not query:
         raise RuntimeError("query is required")
     out_dir = runtime_dir(params)
-    config_path = select_config(params, out_dir)
+    config_path = select_config(params, out_dir, generate=False)
     init_kag_config(config_path)
 
     from kag.common.conf import KAG_CONFIG  # type: ignore
@@ -618,7 +633,7 @@ def real_response(req: dict[str, Any]) -> None:
         return
     params = req.get("params") or {}
     try:
-        config_path = select_config(params, runtime_dir(params))
+        config_path = select_config(params, runtime_dir(params), generate=method == "kag.build")
     except Exception as exc:
         error(req_id, str(exc))
         return

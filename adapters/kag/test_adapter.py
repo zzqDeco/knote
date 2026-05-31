@@ -67,6 +67,29 @@ class AdapterTest(unittest.TestCase):
             exclude = workspace / ".git" / "info" / "exclude"
             self.assertIn("/.knote/kag-runtime/", exclude.read_text(encoding="utf-8"))
 
+    def test_prepare_corpus_excludes_runtime_cache_in_parent_git_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            workspace = repo / "tests" / "fixtures" / "basic-kb"
+            subprocess.run(["git", "init"], cwd=repo, text=True, capture_output=True, check=True)
+            (workspace / "sources").mkdir(parents=True)
+            (workspace / "sources" / "intro.md").write_text("# Intro", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=repo, text=True, capture_output=True, check=True)
+            subprocess.run(
+                ["git", "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init"],
+                cwd=repo,
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+
+            adapter.prepare_corpus(workspace, workspace / ".knote" / "kag-runtime")
+
+            status = subprocess.run(["git", "status", "--short"], cwd=repo, text=True, capture_output=True, check=True)
+            self.assertEqual(status.stdout, "")
+            exclude = repo / ".git" / "info" / "exclude"
+            self.assertIn("/tests/fixtures/basic-kb/.knote/kag-runtime/", exclude.read_text(encoding="utf-8"))
+
     def test_generated_config_uses_workspace_runtime_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
@@ -111,6 +134,35 @@ class AdapterTest(unittest.TestCase):
             exclude = workspace / ".git" / "info" / "exclude"
             self.assertIn("/.knote/kag-runtime/", exclude.read_text(encoding="utf-8"))
 
+    def test_select_config_can_require_existing_config_without_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            subprocess.run(["git", "init"], cwd=workspace, text=True, capture_output=True, check=True)
+
+            with self.assertRaisesRegex(FileNotFoundError, "KAG config not found"):
+                adapter.select_config({"workspace": str(workspace)}, workspace / ".knote" / "kag-runtime", generate=False)
+
+            status = subprocess.run(["git", "status", "--short"], cwd=workspace, text=True, capture_output=True, check=True)
+            self.assertEqual(status.stdout, "")
+            self.assertFalse((workspace / ".knote").exists())
+
+    def test_real_query_without_config_is_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            subprocess.run(["git", "init"], cwd=workspace, text=True, capture_output=True, check=True)
+            stdout = StringIO()
+            req = {"id": "q1", "method": "kag.query", "params": {"workspace": str(workspace), "query": "hello"}}
+
+            with redirect_stdout(stdout):
+                adapter.real_response(req)
+
+            line = json.loads(stdout.getvalue().strip())
+            self.assertEqual(line["type"], "error")
+            self.assertIn("KAG config not found", line["error"])
+            status = subprocess.run(["git", "status", "--short"], cwd=workspace, text=True, capture_output=True, check=True)
+            self.assertEqual(status.stdout, "")
+            self.assertFalse((workspace / ".knote").exists())
+
     def test_config_host_reads_literal_and_env_values(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = Path(tmp) / "kag_config.yaml"
@@ -121,6 +173,20 @@ class AdapterTest(unittest.TestCase):
                 config.write_text("project:\n  host_addr: '{{ KAG_PROJECT_HOST_ADDR }}'\n", encoding="utf-8")
                 self.assertEqual(adapter.config_host(config), "http://env-host:8887")
                 config.write_text("project:\n  host_addr: !ENV KAG_PROJECT_HOST_ADDR\n", encoding="utf-8")
+                self.assertEqual(adapter.config_host(config), "http://env-host:8887")
+
+            with patch.dict(os.environ, {}, clear=True):
+                config.write_text(
+                    "project:\n  host_addr: \"{{ KAG_PROJECT_HOST_ADDR | default('http://fallback-host:8887') }}\"\n",
+                    encoding="utf-8",
+                )
+                self.assertEqual(adapter.config_host(config), "http://fallback-host:8887")
+
+            with patch.dict(os.environ, {"KAG_PROJECT_HOST_ADDR": "http://env-host:8887"}):
+                config.write_text(
+                    "project:\n  host_addr: \"{{ KAG_PROJECT_HOST_ADDR | default('http://fallback-host:8887') }}\"\n",
+                    encoding="utf-8",
+                )
                 self.assertEqual(adapter.config_host(config), "http://env-host:8887")
 
     def test_check_real_health_prefers_config_host_override(self) -> None:
