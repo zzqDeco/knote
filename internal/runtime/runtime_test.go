@@ -189,6 +189,96 @@ func TestRuntimeResumeWithoutIDListsRecentSessions(t *testing.T) {
 	}
 }
 
+func TestRuntimeEvalWritesStableReport(t *testing.T) {
+	workspace := t.TempDir()
+	mustRun(t, workspace, "git", "init")
+	t.Setenv("KNOTE_KAG_FAKE", "1")
+	rt, _, err := New(context.Background(), Options{Workspace: workspace})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	events := rt.Handle(context.Background(), "/eval")
+	confirm := firstConfirm(t, events)
+	events = rt.Confirm(context.Background(), confirm, true)
+	if !hasEvent(events, protocol.EventAssistantDone) {
+		t.Fatalf("eval did not report completion: %+v", events)
+	}
+	results, err := os.ReadFile(filepath.Join(workspace, "evals", "results.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(results), `"id":"smoke"`) || !strings.Contains(string(results), "Fake KAG answer") {
+		t.Fatalf("unexpected eval results:\n%s", results)
+	}
+	report, err := os.ReadFile(filepath.Join(workspace, "evals", "report.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(report), "adapter_errors: 0") {
+		t.Fatalf("unexpected eval report:\n%s", report)
+	}
+}
+
+func TestRuntimeReleaseRequiresEvalGateAndCleanWorkspace(t *testing.T) {
+	workspace := t.TempDir()
+	mustRun(t, workspace, "git", "init")
+	mustRun(t, workspace, "git", "config", "user.email", "knote@example.com")
+	mustRun(t, workspace, "git", "config", "user.name", "knote")
+	must(t, os.WriteFile(filepath.Join(workspace, ".gitignore"), []byte(".knote/sessions/\n"), 0o644))
+	t.Setenv("KNOTE_KAG_FAKE", "1")
+	rt, _, err := New(context.Background(), Options{Workspace: workspace})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustRun(t, workspace, "git", "add", ".gitignore", ".knote/config.yaml")
+	mustRun(t, workspace, "git", "commit", "-m", "initial")
+
+	events := rt.Handle(context.Background(), "/release v0.1.0")
+	if !hasEvent(events, protocol.EventError) || hasEvent(events, protocol.EventConfirmRequest) {
+		t.Fatalf("release without eval should fail before confirm: %+v", events)
+	}
+
+	evalEvents := rt.Handle(context.Background(), "/eval")
+	evalConfirm := firstConfirm(t, evalEvents)
+	evalEvents = rt.Confirm(context.Background(), evalConfirm, true)
+	if !hasEvent(evalEvents, protocol.EventAssistantDone) {
+		t.Fatalf("eval failed: %+v", evalEvents)
+	}
+
+	events = rt.Handle(context.Background(), "/release v0.1.0")
+	if !hasEvent(events, protocol.EventError) || !strings.Contains(lastError(events), "clean workspace") {
+		t.Fatalf("release with uncommitted eval outputs should fail clean gate: %+v", events)
+	}
+
+	mustRun(t, workspace, "git", "add", "evals")
+	mustRun(t, workspace, "git", "commit", "-m", "eval")
+	events = rt.Handle(context.Background(), "/release v0.1.0")
+	releaseConfirm := firstConfirm(t, events)
+	events = rt.Confirm(context.Background(), releaseConfirm, true)
+	if !hasEvent(events, protocol.EventVersionChanged) {
+		t.Fatalf("release did not create tag: %+v", events)
+	}
+	if got := strings.TrimSpace(mustRunOutput(t, workspace, "git", "tag", "--list", "v0.1.0")); got != "v0.1.0" {
+		t.Fatalf("tag missing after release: %q", got)
+	}
+}
+
+func TestRuntimeCheckoutRequiresRefBeforeConfirm(t *testing.T) {
+	workspace := t.TempDir()
+	mustRun(t, workspace, "git", "init")
+	t.Setenv("KNOTE_KAG_FAKE", "1")
+	rt, _, err := New(context.Background(), Options{Workspace: workspace})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	events := rt.Handle(context.Background(), "/checkout")
+	if !hasEvent(events, protocol.EventError) || hasEvent(events, protocol.EventConfirmRequest) {
+		t.Fatalf("checkout without ref should fail before confirm: %+v", events)
+	}
+}
+
 func hasEvent(events []protocol.Event, eventType protocol.EventType) bool {
 	for _, event := range events {
 		if event.Type == eventType {
@@ -223,6 +313,15 @@ func lastAssistant(events []protocol.Event) string {
 	return ""
 }
 
+func lastError(events []protocol.Event) string {
+	for i := len(events) - 1; i >= 0; i-- {
+		if events[i].Type == protocol.EventError {
+			return events[i].Message
+		}
+	}
+	return ""
+}
+
 func must(t *testing.T, err error) {
 	t.Helper()
 	if err != nil {
@@ -237,4 +336,15 @@ func mustRun(t *testing.T, dir string, name string, args ...string) {
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("%s %v failed: %v\n%s", name, args, err, out)
 	}
+}
+
+func mustRunOutput(t *testing.T, dir string, name string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command(name, args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("%s %v failed: %v\n%s", name, args, err, out)
+	}
+	return string(out)
 }

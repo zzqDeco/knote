@@ -5,6 +5,7 @@ coverage.out
 .knote/cache/
 .knote/checkpoints/
 .knote/kag-runtime/
+.knote/sessions/
 __pycache__/
 *.pyc
 .pytest_cache/
