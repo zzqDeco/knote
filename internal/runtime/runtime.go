@@ -13,6 +13,7 @@ import (
 
 	"github.com/zzqDeco/knote/internal/artifact"
 	"github.com/zzqDeco/knote/internal/config"
+	"github.com/zzqDeco/knote/internal/evalstore"
 	"github.com/zzqDeco/knote/internal/gitstore"
 	"github.com/zzqDeco/knote/internal/kag"
 	"github.com/zzqDeco/knote/internal/protocol"
@@ -153,11 +154,21 @@ func (r *Runtime) handleSlash(ctx context.Context, input string) []protocol.Even
 	case "tasks":
 		return r.taskList()
 	case "commit":
-		return r.confirmRequest("commit", input, "Commit knowledge version", "Stage knote-tracked knowledge files and create a Git commit.")
+		return r.confirmRequest("commit", input, "Commit knowledge version", "Stage only .knote/config.yaml, sources/, artifacts/, and evals/, then create a Git commit.")
 	case "release":
-		return r.confirmRequest("release", input, "Release knowledge version", "Create an annotated Git tag for the current version.")
+		if err := r.releasePreflight(ctx); err != nil {
+			return []protocol.Event{protocol.NewEvent(protocol.EventError, r.sessionID, err.Error(), nil)}
+		}
+		return r.confirmRequest("release", input, "Release knowledge version", "Create an annotated Git tag after clean-workspace and eval gates pass.")
 	case "checkout":
-		return r.confirmRequest("checkout", input, "Checkout knowledge version", "Run git checkout for the requested ref.")
+		if strings.TrimSpace(arg) == "" {
+			return []protocol.Event{protocol.NewEvent(protocol.EventError, r.sessionID, "ref is required", nil)}
+		}
+		summary := "Run git checkout for the requested ref."
+		if r.git.Dirty(ctx) {
+			summary = "Workspace is dirty. Confirm checkout only if these local changes should remain in the working tree."
+		}
+		return r.confirmRequest("checkout", input, "Checkout knowledge version", summary)
 	case "eval":
 		return r.confirmRequest("eval", input, "Run evaluation", "Run KAG explain/eval against current artifacts.")
 	case "help":
@@ -467,11 +478,27 @@ func (r *Runtime) diff(ctx context.Context, ref string) []protocol.Event {
 }
 
 func (r *Runtime) versions(ctx context.Context) []protocol.Event {
-	out, err := r.git.Log(ctx)
+	versions, err := r.git.Versions(ctx, 20)
 	if err != nil {
-		out = "No versions yet."
+		return []protocol.Event{protocol.NewEvent(protocol.EventVersionChanged, r.sessionID, "No versions yet.", nil)}
 	}
-	return []protocol.Event{protocol.NewEvent(protocol.EventVersionChanged, r.sessionID, strings.TrimSpace(out), nil)}
+	if len(versions) == 0 {
+		return []protocol.Event{protocol.NewEvent(protocol.EventVersionChanged, r.sessionID, "No versions yet.", versions)}
+	}
+	var b strings.Builder
+	b.WriteString("Versions\n")
+	for _, version := range versions {
+		marker := " "
+		if version.Current {
+			marker = "*"
+		}
+		tagText := ""
+		if len(version.Tags) > 0 {
+			tagText = " tags=" + strings.Join(version.Tags, ",")
+		}
+		fmt.Fprintf(&b, "%s %s  %s  %s%s\n", marker, version.ShortHash, version.RelativeTime, version.Subject, tagText)
+	}
+	return []protocol.Event{protocol.NewEvent(protocol.EventVersionChanged, r.sessionID, strings.TrimSpace(b.String()), versions)}
 }
 
 func (r *Runtime) commit(ctx context.Context, message string) []protocol.Event {
@@ -482,34 +509,70 @@ func (r *Runtime) commit(ctx context.Context, message string) []protocol.Event {
 	if err != nil {
 		return []protocol.Event{protocol.NewEvent(protocol.EventError, r.sessionID, err.Error(), nil)}
 	}
-	return []protocol.Event{protocol.NewEvent(protocol.EventVersionChanged, r.sessionID, strings.TrimSpace(out), map[string]string{"message": message})}
+	return []protocol.Event{protocol.NewEvent(protocol.EventVersionChanged, r.sessionID, firstNonEmpty(strings.TrimSpace(out), "Committed knowledge version."), map[string]string{"message": message})}
 }
 
 func (r *Runtime) release(ctx context.Context, tag string) []protocol.Event {
 	if strings.TrimSpace(tag) == "" {
 		tag = "v0.1.0"
 	}
+	if err := r.releasePreflight(ctx); err != nil {
+		return []protocol.Event{protocol.NewEvent(protocol.EventError, r.sessionID, err.Error(), nil)}
+	}
 	out, err := r.git.Tag(ctx, tag)
 	if err != nil {
 		return []protocol.Event{protocol.NewEvent(protocol.EventError, r.sessionID, err.Error(), nil)}
 	}
-	return []protocol.Event{protocol.NewEvent(protocol.EventVersionChanged, r.sessionID, strings.TrimSpace(out), map[string]string{"tag": tag})}
+	return []protocol.Event{protocol.NewEvent(protocol.EventVersionChanged, r.sessionID, firstNonEmpty(strings.TrimSpace(out), "Tagged "+tag), map[string]string{"tag": tag})}
 }
 
 func (r *Runtime) checkout(ctx context.Context, ref string) []protocol.Event {
-	out, err := r.git.Checkout(ctx, ref)
+	out, err := r.git.Checkout(ctx, ref, true)
 	if err != nil {
 		return []protocol.Event{protocol.NewEvent(protocol.EventError, r.sessionID, err.Error(), nil)}
 	}
-	return []protocol.Event{protocol.NewEvent(protocol.EventVersionChanged, r.sessionID, strings.TrimSpace(out), map[string]string{"ref": ref})}
+	return []protocol.Event{protocol.NewEvent(protocol.EventVersionChanged, r.sessionID, firstNonEmpty(strings.TrimSpace(out), "Checked out "+ref), map[string]string{"ref": ref})}
 }
 
 func (r *Runtime) eval(ctx context.Context) []protocol.Event {
-	resp, err := r.kag.Explain(ctx, "Evaluate current knowledge artifacts")
+	questions, err := evalstore.LoadQuestions(r.workspace)
 	if err != nil {
 		return []protocol.Event{protocol.NewEvent(protocol.EventError, r.sessionID, err.Error(), nil)}
 	}
-	return []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, r.sessionID, "Eval complete", resp.Data)}
+	events := []protocol.Event{protocol.NewEvent(protocol.EventToolStart, r.sessionID, "KagExplain eval", map[string]any{"questions": len(questions)})}
+	results := make([]evalstore.Result, 0, len(questions))
+	for _, question := range questions {
+		resp, err := r.kag.Explain(ctx, question.Question)
+		result := evalstore.ResultFromResponse(question, resp, err)
+		results = append(results, result)
+		if err != nil {
+			events = append(events, protocol.NewEvent(protocol.EventToolError, r.sessionID, err.Error(), map[string]string{"question_id": question.ID, "tool": "KagExplain"}))
+			continue
+		}
+		events = append(events, protocol.NewEvent(protocol.EventToolComplete, r.sessionID, "KagExplain complete: "+question.ID, resp.Data))
+	}
+	report, err := evalstore.Write(r.workspace, results)
+	if err != nil {
+		return append(events, protocol.NewEvent(protocol.EventError, r.sessionID, err.Error(), nil))
+	}
+	payload := map[string]any{
+		"total":          report.Total,
+		"adapter_errors": report.AdapterErrors,
+		"report_path":    relDisplay(r.workspace, report.Path),
+	}
+	message := evalstore.RenderReport(report)
+	events = append(events, protocol.NewEvent(protocol.EventAssistantDone, r.sessionID, message, payload))
+	if report.AdapterErrors > 0 {
+		events = append(events, protocol.NewEvent(protocol.EventError, r.sessionID, "eval completed with adapter errors", payload))
+	}
+	return events
+}
+
+func (r *Runtime) releasePreflight(ctx context.Context) error {
+	if r.git.Dirty(ctx) {
+		return fmt.Errorf("release requires a clean workspace")
+	}
+	return evalstore.Gate(r.workspace)
 }
 
 func (r *Runtime) taskList() []protocol.Event {
