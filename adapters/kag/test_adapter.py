@@ -4,6 +4,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
 import importlib.util
 from pathlib import Path
 
@@ -65,7 +67,24 @@ class AdapterTest(unittest.TestCase):
             self.assertIn("host_addr: http://127.0.0.1:8887", text)
             self.assertIn('id: "7"', text)
             self.assertIn("namespace: KnoteTest", text)
+            self.assertIn('checkpoint_path: "', text)
+            self.assertIn("/.knote/kag-runtime/ckpt", text)
             self.assertIn("scanner:\n    type: json_scanner", text)
+
+    def test_kag_stdout_is_not_emitted_as_adapter_stdout(self) -> None:
+        stdout = StringIO()
+        stderr = StringIO()
+
+        def noisy_call() -> dict[str, bool]:
+            print("human KAG progress")
+            return {"ok": True}
+
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            data = adapter.run_capturing_stdout(noisy_call)
+
+        self.assertEqual(data, {"ok": True})
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(stderr.getvalue(), "human KAG progress\n")
 
     def test_fake_build_writes_corpus_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
