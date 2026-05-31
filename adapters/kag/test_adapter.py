@@ -146,6 +146,18 @@ class AdapterTest(unittest.TestCase):
             self.assertEqual(status.stdout, "")
             self.assertFalse((workspace / ".knote").exists())
 
+    def test_select_config_reuses_runtime_generated_config_for_queries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            runtime_dir = workspace / ".knote" / "kag-runtime"
+            runtime_dir.mkdir(parents=True)
+            generated = runtime_dir / "kag_config.yaml"
+            generated.write_text("project:\n  host_addr: http://127.0.0.1:8887\n", encoding="utf-8")
+
+            selected = adapter.select_config({"workspace": str(workspace)}, runtime_dir, generate=False)
+
+            self.assertEqual(selected, generated.resolve())
+
     def test_real_query_without_config_is_read_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)

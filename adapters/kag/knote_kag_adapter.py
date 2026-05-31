@@ -207,9 +207,13 @@ def select_config(params: dict[str, Any], out_dir: Path, *, generate: bool = Tru
     for candidate in candidates:
         if candidate.exists():
             return candidate.resolve()
+    generated = out_dir / "kag_config.yaml"
+    if generated.exists():
+        if generate:
+            ensure_runtime_excluded(workspace, out_dir)
+        return generated.resolve()
     if not generate:
         raise FileNotFoundError("KAG config not found; run /build first or provide config_path")
-    generated = out_dir / "kag_config.yaml"
     ensure_runtime_excluded(workspace, out_dir)
     generate_kag_config(generated, params)
     return generated
