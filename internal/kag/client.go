@@ -19,6 +19,11 @@ type Client struct {
 	Workspace   string
 	Host        string
 	Fake        bool
+	ConfigPath  string
+	ProjectID   string
+	Namespace   string
+	Language    string
+	RuntimeDir  string
 }
 
 type Request struct {
@@ -36,19 +41,35 @@ type Response struct {
 }
 
 func (c Client) Health(ctx context.Context) (Response, error) {
-	return c.call(ctx, "kag.health", map[string]any{"workspace": c.Workspace, "host": c.Host})
+	return c.call(ctx, "kag.health", c.params(nil))
 }
 
 func (c Client) Build(ctx context.Context) (Response, error) {
-	return c.call(ctx, "kag.build", map[string]any{"workspace": c.Workspace, "host": c.Host})
+	return c.call(ctx, "kag.build", c.params(nil))
 }
 
 func (c Client) Query(ctx context.Context, query string) (Response, error) {
-	return c.call(ctx, "kag.query", map[string]any{"workspace": c.Workspace, "host": c.Host, "query": query})
+	return c.call(ctx, "kag.query", c.params(map[string]any{"query": query}))
 }
 
 func (c Client) Explain(ctx context.Context, query string) (Response, error) {
-	return c.call(ctx, "kag.explain", map[string]any{"workspace": c.Workspace, "host": c.Host, "query": query})
+	return c.call(ctx, "kag.explain", c.params(map[string]any{"query": query}))
+}
+
+func (c Client) params(extra map[string]any) map[string]any {
+	params := map[string]any{
+		"workspace":   c.Workspace,
+		"host":        c.Host,
+		"config_path": c.ConfigPath,
+		"project_id":  c.ProjectID,
+		"namespace":   c.Namespace,
+		"language":    c.Language,
+		"runtime_dir": c.RuntimeDir,
+	}
+	for key, value := range extra {
+		params[key] = value
+	}
+	return params
 }
 
 func (c Client) call(ctx context.Context, method string, params map[string]any) (Response, error) {

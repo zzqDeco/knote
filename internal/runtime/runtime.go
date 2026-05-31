@@ -67,6 +67,11 @@ func New(ctx context.Context, opts Options) (*Runtime, []protocol.Event, error) 
 			Workspace:   workspace,
 			Host:        cfg.KAG.Host,
 			Fake:        cfg.KAG.Fake,
+			ConfigPath:  cfg.KAG.ConfigPath,
+			ProjectID:   cfg.KAG.ProjectID,
+			Namespace:   cfg.KAG.Namespace,
+			Language:    cfg.KAG.Language,
+			RuntimeDir:  cfg.KAG.RuntimeDir,
 		},
 		tasks:                map[string]protocol.Task{},
 		pendingConfirmations: map[string]protocol.ConfirmRequest{},
@@ -218,8 +223,11 @@ func (r *Runtime) build(ctx context.Context) []protocol.Event {
 		protocol.NewEvent(protocol.EventBuildStart, r.sessionID, "build started", task),
 		protocol.NewEvent(protocol.EventToolStart, r.sessionID, "KagBuild", map[string]string{"tool": "KagBuild"}),
 	}
-	if _, err := r.kag.Build(ctx); err != nil {
+	kagResp, err := r.kag.Build(ctx)
+	if err != nil {
 		events = append(events, protocol.NewEvent(protocol.EventToolError, r.sessionID, err.Error(), map[string]string{"tool": "KagBuild"}))
+	} else {
+		events = append(events, protocol.NewEvent(protocol.EventToolProgress, r.sessionID, "KagBuild adapter complete", kagResp.Data))
 	}
 	result, err := artifact.Builder{Workspace: r.workspace}.Build()
 	if err != nil {
@@ -234,7 +242,7 @@ func (r *Runtime) build(ctx context.Context) []protocol.Event {
 	}
 	task = r.finishTask(task.ID, protocol.TaskCompleted, "artifacts written")
 	events = append(events,
-		protocol.NewEvent(protocol.EventToolComplete, r.sessionID, "KagBuild complete", result.Manifest),
+		protocol.NewEvent(protocol.EventToolComplete, r.sessionID, "KagBuild complete", map[string]any{"manifest": result.Manifest, "kag": kagResp.Data}),
 		protocol.NewEvent(protocol.EventBuildComplete, r.sessionID, "Build complete", result.Manifest),
 		protocol.NewEvent(protocol.EventTaskComplete, r.sessionID, "build completed", task),
 		protocol.NewEvent(protocol.EventAssistantDone, r.sessionID, result.Report, nil),

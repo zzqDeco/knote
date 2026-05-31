@@ -37,6 +37,8 @@ KNOTE_KAG_FAKE=1 go test ./...
 
 If your preferred Python is not the system interpreter, set `KNOTE_PYTHON=/path/to/python`.
 
+For real KAG execution, start OpenSPG locally at `http://127.0.0.1:8887`, install `openspg-kag` in the Python environment used by `KNOTE_PYTHON`, and put Markdown or text sources under `sources/`. The adapter writes a sorted JSON corpus and generated starter config under `.knote/kag-runtime/`; copy that config to `.knote/kag_config.yaml` when you need custom model, namespace, or project settings. Runtime KAG cache is ignored by Git.
+
 ## Current Scope
 
 MVP scope includes:

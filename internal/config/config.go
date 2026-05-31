@@ -24,6 +24,11 @@ type KAGConfig struct {
 	AdapterPath string `yaml:"adapter_path"`
 	Host        string `yaml:"host"`
 	Fake        bool   `yaml:"fake"`
+	ConfigPath  string `yaml:"config_path,omitempty"`
+	ProjectID   string `yaml:"project_id,omitempty"`
+	Namespace   string `yaml:"namespace,omitempty"`
+	Language    string `yaml:"language,omitempty"`
+	RuntimeDir  string `yaml:"runtime_dir,omitempty"`
 }
 
 type Model struct {
@@ -42,6 +47,10 @@ func Default(workspace string) Config {
 		KAG: KAGConfig{
 			AdapterPath: "adapters/kag/knote_kag_adapter.py",
 			Host:        "http://127.0.0.1:8887",
+			ProjectID:   "1",
+			Namespace:   "KnoteKB",
+			Language:    "en",
+			RuntimeDir:  ".knote/kag-runtime",
 		},
 		Models: map[string]Model{
 			"default": {Provider: "local", Model: "deterministic"},
@@ -70,6 +79,18 @@ func LoadOrDefault(workspace string) (Config, error) {
 	}
 	if cfg.KAG.AdapterPath == "" {
 		cfg.KAG.AdapterPath = "adapters/kag/knote_kag_adapter.py"
+	}
+	if cfg.KAG.ProjectID == "" {
+		cfg.KAG.ProjectID = "1"
+	}
+	if cfg.KAG.Namespace == "" {
+		cfg.KAG.Namespace = "KnoteKB"
+	}
+	if cfg.KAG.Language == "" {
+		cfg.KAG.Language = "en"
+	}
+	if cfg.KAG.RuntimeDir == "" {
+		cfg.KAG.RuntimeDir = ".knote/kag-runtime"
 	}
 	return cfg, nil
 }
