@@ -3,11 +3,13 @@ import os
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 import importlib.util
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -96,6 +98,56 @@ class AdapterTest(unittest.TestCase):
 
             with self.assertRaisesRegex(FileNotFoundError, "explicit KAG config not found"):
                 adapter.select_config(params, workspace / ".knote" / "kag-runtime")
+
+    def test_select_config_excludes_generated_config_from_git_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            subprocess.run(["git", "init"], cwd=workspace, text=True, capture_output=True, check=True)
+
+            adapter.select_config({"workspace": str(workspace)}, workspace / ".knote" / "kag-runtime")
+
+            status = subprocess.run(["git", "status", "--short"], cwd=workspace, text=True, capture_output=True, check=True)
+            self.assertEqual(status.stdout, "")
+            exclude = workspace / ".git" / "info" / "exclude"
+            self.assertIn("/.knote/kag-runtime/", exclude.read_text(encoding="utf-8"))
+
+    def test_config_host_reads_literal_and_env_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "kag_config.yaml"
+            config.write_text("project:\n  host_addr: http://127.0.0.1:9999\n", encoding="utf-8")
+            self.assertEqual(adapter.config_host(config), "http://127.0.0.1:9999")
+
+            with patch.dict(os.environ, {"KAG_PROJECT_HOST_ADDR": "http://env-host:8887"}):
+                config.write_text("project:\n  host_addr: '{{ KAG_PROJECT_HOST_ADDR }}'\n", encoding="utf-8")
+                self.assertEqual(adapter.config_host(config), "http://env-host:8887")
+                config.write_text("project:\n  host_addr: !ENV KAG_PROJECT_HOST_ADDR\n", encoding="utf-8")
+                self.assertEqual(adapter.config_host(config), "http://env-host:8887")
+
+    def test_check_real_health_prefers_config_host_override(self) -> None:
+        seen: dict[str, str] = {}
+
+        class FakeResponse:
+            status = 200
+
+            def __enter__(self) -> "FakeResponse":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+        def fake_urlopen(host: str, timeout: int) -> FakeResponse:
+            seen["host"] = host
+            seen["timeout"] = str(timeout)
+            return FakeResponse()
+
+        fake_kag = types.SimpleNamespace(__version__="0.8.0")
+        req = {"id": "1", "method": "kag.query", "params": {"host": "http://bad-host:8887"}}
+        with patch.dict(sys.modules, {"kag": fake_kag}), patch.object(adapter.urlrequest, "urlopen", fake_urlopen):
+            data, err = adapter.check_real_health(req, "http://config-host:8887")
+
+        self.assertIsNone(err)
+        self.assertEqual(seen["host"], "http://config-host:8887")
+        self.assertEqual(data["host"], "http://config-host:8887")
 
     def test_kag_stdout_is_not_emitted_as_adapter_stdout(self) -> None:
         stdout = StringIO()

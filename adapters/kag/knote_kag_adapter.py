@@ -143,6 +143,8 @@ def prepare_corpus(workspace: Path, out_dir: Path) -> tuple[Path, list[dict[str,
 
 
 def ensure_runtime_excluded(workspace: Path, out_dir: Path) -> None:
+    workspace = workspace.resolve()
+    out_dir = out_dir.resolve()
     try:
         rel = out_dir.relative_to(workspace).as_posix().rstrip("/")
     except ValueError:
@@ -199,8 +201,31 @@ def select_config(params: dict[str, Any], out_dir: Path) -> Path:
         if candidate.exists():
             return candidate.resolve()
     generated = out_dir / "kag_config.yaml"
+    ensure_runtime_excluded(workspace, out_dir)
     generate_kag_config(generated, params)
     return generated
+
+
+def config_host(config_path: Path) -> str:
+    if not config_path.exists():
+        return ""
+    for line in config_path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("host_addr:"):
+            continue
+        value = stripped.split(":", 1)[1].strip()
+        return resolve_config_value(value)
+    return ""
+
+
+def resolve_config_value(value: str) -> str:
+    value = value.strip().strip("'\"")
+    if value.startswith("!ENV "):
+        return os.environ.get(value[5:].strip(), "")
+    match = re.fullmatch(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}", value)
+    if match:
+        return os.environ.get(match.group(1), "")
+    return value
 
 
 def generate_kag_config(path: Path, params: dict[str, Any]) -> None:
@@ -428,9 +453,9 @@ def fake_response(req: dict[str, Any]) -> None:
         error(req_id, f"unknown method: {method}")
 
 
-def check_real_health(req: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+def check_real_health(req: dict[str, Any], host_override: str = "") -> tuple[dict[str, Any] | None, str | None]:
     params = req.get("params") or {}
-    host = (params.get("host") or "http://127.0.0.1:8887").rstrip("/")
+    host = (host_override or params.get("host") or "http://127.0.0.1:8887").rstrip("/")
     try:
         import kag  # type: ignore
 
@@ -466,8 +491,6 @@ def real_health(req: dict[str, Any]) -> None:
 def init_kag_config(config_path: Path) -> Any:
     from kag.common.conf import init_env, KAGConfigAccessor  # type: ignore
 
-    os.environ["KAG_PROJECT_ID"] = ""
-    os.environ["KAG_PROJECT_HOST_ADDR"] = ""
     init_env(config_file=str(config_path))
     return KAGConfigAccessor.get_config()
 
@@ -590,7 +613,16 @@ def real_response(req: dict[str, Any]) -> None:
     if method == "kag.cancel":
         result(req_id, {"status": "cancelled"})
         return
-    health, health_error = check_real_health(req)
+    if method not in {"kag.build", "kag.query", "kag.explain"}:
+        error(req_id, f"unknown method: {method}")
+        return
+    params = req.get("params") or {}
+    try:
+        config_path = select_config(params, runtime_dir(params))
+    except Exception as exc:
+        error(req_id, str(exc))
+        return
+    health, health_error = check_real_health(req, config_host(config_path))
     if health_error:
         error(req_id, health_error)
         return
