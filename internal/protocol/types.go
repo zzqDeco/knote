@@ -25,6 +25,7 @@ const (
 	EventTaskStarted     EventType = "task.started"
 	EventTaskProgress    EventType = "task.progress"
 	EventTaskComplete    EventType = "task.complete"
+	EventViewClear       EventType = "view.clear"
 	EventStatusUpdate    EventType = "status.update"
 	EventUsageUpdate     EventType = "usage.update"
 	EventError           EventType = "error"
@@ -53,6 +54,7 @@ type SessionInfo struct {
 	Workspace string    `json:"workspace"`
 	Branch    string    `json:"branch,omitempty"`
 	Dirty     bool      `json:"dirty"`
+	KAGMode   string    `json:"kag_mode,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
 	Resumed   bool      `json:"resumed"`
 }

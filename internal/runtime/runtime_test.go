@@ -5,9 +5,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/zzqDeco/knote/internal/protocol"
+	"github.com/zzqDeco/knote/internal/session"
 )
 
 func TestRuntimeBuildAndQueryWithFakeKAG(t *testing.T) {
@@ -94,6 +96,99 @@ func TestRuntimeRejectsForgedAndReplayedConfirmation(t *testing.T) {
 	}
 }
 
+func TestRuntimeSessionCommands(t *testing.T) {
+	workspace := t.TempDir()
+	mustRun(t, workspace, "git", "init")
+	t.Setenv("KNOTE_KAG_FAKE", "1")
+	rt, _, err := New(context.Background(), Options{Workspace: workspace})
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldID := rt.SessionID()
+
+	clearEvents := rt.Handle(context.Background(), "/clear")
+	if !hasEvent(clearEvents, protocol.EventViewClear) {
+		t.Fatalf("missing view clear event: %+v", clearEvents)
+	}
+	if _, err := os.Stat(filepath.Join(workspace, ".knote", "sessions", oldID+".jsonl")); err != nil {
+		t.Fatalf("clear should keep session history file: %v", err)
+	}
+
+	newEvents := rt.Handle(context.Background(), "/new")
+	newID := rt.SessionID()
+	if newID == oldID {
+		t.Fatal("/new did not create a new session id")
+	}
+	if !hasEvent(newEvents, protocol.EventSessionInfo) || !hasEvent(newEvents, protocol.EventViewClear) {
+		t.Fatalf("/new did not emit session info and clear events: %+v", newEvents)
+	}
+
+	store := session.NewStore(workspace)
+	beforeResume, err := store.Load(oldID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resumeEvents := rt.Handle(context.Background(), "/resume "+oldID)
+	if rt.SessionID() != oldID {
+		t.Fatalf("/resume did not switch runtime session, got %s", rt.SessionID())
+	}
+	if !hasEvent(resumeEvents, protocol.EventSessionInfo) || !hasEvent(resumeEvents, protocol.EventViewClear) {
+		t.Fatalf("/resume did not emit replay boundary and session info: %+v", resumeEvents)
+	}
+	afterResume, err := store.Load(oldID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(afterResume) != len(beforeResume)+1 {
+		t.Fatalf("/resume should append only fresh session.info to resumed session, before=%d after=%d", len(beforeResume), len(afterResume))
+	}
+}
+
+func TestRuntimeReadOnlyCommands(t *testing.T) {
+	workspace := t.TempDir()
+	mustRun(t, workspace, "git", "init")
+	t.Setenv("KNOTE_KAG_FAKE", "1")
+	rt, _, err := New(context.Background(), Options{Workspace: workspace})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		command string
+		want    string
+	}{
+		{command: "/details", want: "Workspace details"},
+		{command: "/settings", want: "Effective settings"},
+		{command: "/model", want: "Model profiles"},
+	} {
+		events := rt.Handle(context.Background(), tc.command)
+		got := lastAssistant(events)
+		if !strings.Contains(got, tc.want) {
+			t.Fatalf("%s output missing %q:\n%s", tc.command, tc.want, got)
+		}
+		if strings.Contains(got, "stubbed") {
+			t.Fatalf("%s still returned stub output: %s", tc.command, got)
+		}
+	}
+}
+
+func TestRuntimeResumeWithoutIDListsRecentSessions(t *testing.T) {
+	workspace := t.TempDir()
+	mustRun(t, workspace, "git", "init")
+	t.Setenv("KNOTE_KAG_FAKE", "1")
+	rt, _, err := New(context.Background(), Options{Workspace: workspace})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionID := rt.SessionID()
+
+	events := rt.Handle(context.Background(), "/resume")
+	got := lastAssistant(events)
+	if !strings.Contains(got, "Recent sessions") || !strings.Contains(got, sessionID) {
+		t.Fatalf("/resume without id did not list recent sessions:\n%s", got)
+	}
+}
+
 func hasEvent(events []protocol.Event, eventType protocol.EventType) bool {
 	for _, event := range events {
 		if event.Type == eventType {
@@ -117,6 +212,15 @@ func firstConfirm(t *testing.T, events []protocol.Event) protocol.ConfirmRequest
 	}
 	t.Fatalf("no confirm request in %+v", events)
 	return protocol.ConfirmRequest{}
+}
+
+func lastAssistant(events []protocol.Event) string {
+	for i := len(events) - 1; i >= 0; i-- {
+		if events[i].Type == protocol.EventAssistantDone {
+			return events[i].Message
+		}
+	}
+	return ""
 }
 
 func must(t *testing.T, err error) {

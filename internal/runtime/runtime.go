@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -16,6 +17,7 @@ import (
 	"github.com/zzqDeco/knote/internal/kag"
 	"github.com/zzqDeco/knote/internal/protocol"
 	"github.com/zzqDeco/knote/internal/session"
+	"gopkg.in/yaml.v3"
 )
 
 type Runtime struct {
@@ -76,14 +78,11 @@ func New(ctx context.Context, opts Options) (*Runtime, []protocol.Event, error) 
 		tasks:                map[string]protocol.Task{},
 		pendingConfirmations: map[string]protocol.ConfirmRequest{},
 	}
-	info := protocol.SessionInfo{
-		ID:        sessionID,
-		Workspace: workspace,
-		Branch:    r.git.Branch(ctx),
-		Dirty:     r.git.Dirty(ctx),
-		CreatedAt: time.Now().UTC(),
-		Resumed:   resumed,
+	var loaded []protocol.Event
+	if resumed {
+		loaded, _ = r.store.Load(sessionID)
 	}
+	info := r.sessionInfo(ctx, resumed)
 	events := []protocol.Event{
 		protocol.NewEvent(protocol.EventGatewayReady, sessionID, "knote runtime ready", nil),
 		protocol.NewEvent(protocol.EventSessionInfo, sessionID, "session ready", info),
@@ -92,15 +91,29 @@ func New(ctx context.Context, opts Options) (*Runtime, []protocol.Event, error) 
 		_ = r.store.Append(event)
 	}
 	if resumed {
-		if loaded, err := r.store.Load(sessionID); err == nil {
-			events = append(loaded, events...)
-		}
+		events = append(loaded, events...)
 	}
 	return r, events, nil
 }
 
 func (r *Runtime) SessionID() string { return r.sessionID }
 func (r *Runtime) Workspace() string { return r.workspace }
+
+func (r *Runtime) CurrentSessionInfo(ctx context.Context) protocol.SessionInfo {
+	return r.sessionInfo(ctx, false)
+}
+
+func (r *Runtime) sessionInfo(ctx context.Context, resumed bool) protocol.SessionInfo {
+	return protocol.SessionInfo{
+		ID:        r.sessionID,
+		Workspace: r.workspace,
+		Branch:    r.git.Branch(ctx),
+		Dirty:     r.git.Dirty(ctx),
+		KAGMode:   r.kagMode(),
+		CreatedAt: time.Now().UTC(),
+		Resumed:   resumed,
+	}
+}
 
 func (r *Runtime) Handle(ctx context.Context, input string) []protocol.Event {
 	input = strings.TrimSpace(input)
@@ -109,6 +122,15 @@ func (r *Runtime) Handle(ctx context.Context, input string) []protocol.Event {
 	}
 	events := []protocol.Event{protocol.NewEvent(protocol.EventUserMessage, r.sessionID, input, nil)}
 	if strings.HasPrefix(input, "/") {
+		cmd, arg := parseSlash(input)
+		if cmd == "new" {
+			r.persist(events)
+			return append(events, r.newSession(ctx)...)
+		}
+		if cmd == "resume" && strings.TrimSpace(arg) != "" {
+			r.persist(events)
+			return append(events, r.resumeSession(ctx, arg)...)
+		}
 		events = append(events, r.handleSlash(ctx, input)...)
 	} else {
 		events = append(events, r.query(ctx, input)...)
@@ -118,9 +140,7 @@ func (r *Runtime) Handle(ctx context.Context, input string) []protocol.Event {
 }
 
 func (r *Runtime) handleSlash(ctx context.Context, input string) []protocol.Event {
-	fields := strings.Fields(input)
-	cmd := strings.TrimPrefix(fields[0], "/")
-	arg := strings.TrimSpace(strings.TrimPrefix(input, fields[0]))
+	cmd, arg := parseSlash(input)
 	switch cmd {
 	case "build":
 		return r.confirmRequest("build", input, "Build knowledge artifacts", "Scan sources, call KAG, and write artifacts into artifacts/.")
@@ -141,14 +161,160 @@ func (r *Runtime) handleSlash(ctx context.Context, input string) []protocol.Even
 	case "eval":
 		return r.confirmRequest("eval", input, "Run evaluation", "Run KAG explain/eval against current artifacts.")
 	case "help":
-		return []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, r.sessionID, helpText, nil)}
-	case "clear", "new", "details", "settings", "model", "resume":
-		return []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, r.sessionID, "Command accepted: "+cmd, map[string]string{"status": "stubbed for MVP shell"})}
+		return []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, r.sessionID, helpText, map[string]string{"overlay": "help"})}
+	case "clear":
+		return r.clearView()
+	case "resume":
+		return r.sessionList()
+	case "details":
+		return r.details(ctx)
+	case "settings":
+		return r.settings()
+	case "model":
+		return r.modelInfo()
+	case "new":
+		return r.newSession(ctx)
 	case "exit":
 		return []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, r.sessionID, "Use Ctrl+C to exit.", nil)}
 	default:
 		return []protocol.Event{protocol.NewEvent(protocol.EventError, r.sessionID, "unknown command: "+cmd, nil)}
 	}
+}
+
+func (r *Runtime) clearView() []protocol.Event {
+	return []protocol.Event{protocol.NewEvent(protocol.EventViewClear, r.sessionID, "view cleared", nil)}
+}
+
+func (r *Runtime) newSession(ctx context.Context) []protocol.Event {
+	r.clearPendingConfirmations()
+	r.sessionID = session.NewID()
+	info := r.sessionInfo(ctx, false)
+	events := []protocol.Event{
+		protocol.NewEvent(protocol.EventGatewayReady, r.sessionID, "knote runtime ready", nil),
+		protocol.NewEvent(protocol.EventSessionInfo, r.sessionID, "session ready", info),
+		protocol.NewEvent(protocol.EventViewClear, r.sessionID, "new session", nil),
+	}
+	r.persist(events)
+	return events
+}
+
+func (r *Runtime) resumeSession(ctx context.Context, sessionID string) []protocol.Event {
+	sessionID = strings.TrimSpace(sessionID)
+	loaded, err := r.store.Load(sessionID)
+	if err != nil {
+		events := []protocol.Event{protocol.NewEvent(protocol.EventError, r.sessionID, "resume failed: "+err.Error(), nil)}
+		r.persist(events)
+		return events
+	}
+	r.clearPendingConfirmations()
+	r.sessionID = sessionID
+	info := r.sessionInfo(ctx, true)
+	infoEvent := protocol.NewEvent(protocol.EventSessionInfo, r.sessionID, "session resumed", info)
+	r.persist([]protocol.Event{infoEvent})
+	events := make([]protocol.Event, 0, len(loaded)+2)
+	events = append(events, protocol.NewEvent(protocol.EventViewClear, r.sessionID, "resume session", nil))
+	events = append(events, loaded...)
+	events = append(events, infoEvent)
+	return events
+}
+
+func (r *Runtime) sessionList() []protocol.Event {
+	summaries, err := r.store.List(10)
+	if err != nil {
+		return []protocol.Event{protocol.NewEvent(protocol.EventError, r.sessionID, "list sessions failed: "+err.Error(), nil)}
+	}
+	if len(summaries) == 0 {
+		return []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, r.sessionID, "No saved sessions.", map[string]any{"overlay": "details", "sessions": summaries})}
+	}
+	var b strings.Builder
+	b.WriteString("Recent sessions\n")
+	for _, summary := range summaries {
+		when := "no events"
+		if !summary.LastEventAt.IsZero() {
+			when = summary.LastEventAt.Format(time.RFC3339)
+		}
+		fmt.Fprintf(&b, "- %s  events=%d  last=%s\n", summary.ID, summary.EventCount, when)
+	}
+	b.WriteString("\nUse /resume <session-id> to restore one.")
+	return []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, r.sessionID, b.String(), map[string]any{"overlay": "details", "sessions": summaries})}
+}
+
+func (r *Runtime) details(ctx context.Context) []protocol.Event {
+	branch := r.git.Branch(ctx)
+	dirty := r.git.Dirty(ctx)
+	manifestPath := filepath.Join(r.workspace, "artifacts", "manifest.json")
+	manifestStatus := "missing"
+	var manifest protocol.ArtifactManifest
+	if data, err := os.ReadFile(manifestPath); err == nil {
+		if err := json.Unmarshal(data, &manifest); err == nil {
+			manifestStatus = fmt.Sprintf("version=%d documents=%d chunks=%d entities=%d relations=%d claims=%d summaries=%d",
+				manifest.Version,
+				manifest.DocumentCount,
+				manifest.ChunkCount,
+				manifest.EntityCount,
+				manifest.RelationCount,
+				manifest.ClaimCount,
+				manifest.SummaryCount,
+			)
+		} else {
+			manifestStatus = "invalid: " + err.Error()
+		}
+	}
+	text := strings.Join([]string{
+		"Workspace details",
+		"workspace: " + r.workspace,
+		"session: " + r.sessionID,
+		"branch: " + firstNonEmpty(branch, "unknown"),
+		fmt.Sprintf("dirty: %t", dirty),
+		"artifact_manifest: " + relDisplay(r.workspace, manifestPath),
+		"artifact_manifest_status: " + manifestStatus,
+		"kag_mode: " + r.kagMode(),
+		"kag_host: " + firstNonEmpty(r.cfg.KAG.Host, "unset"),
+		"kag_config: " + relDisplay(r.workspace, r.cfg.KAG.ConfigPath),
+		"kag_runtime_dir: " + relDisplay(r.workspace, r.cfg.KAG.RuntimeDir),
+	}, "\n")
+	payload := map[string]any{
+		"overlay":           "details",
+		"workspace":         r.workspace,
+		"session_id":        r.sessionID,
+		"branch":            branch,
+		"dirty":             dirty,
+		"kag_mode":          r.kagMode(),
+		"artifact_manifest": manifest,
+	}
+	return []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, r.sessionID, text, payload)}
+}
+
+func (r *Runtime) settings() []protocol.Event {
+	data, err := yaml.Marshal(r.cfg)
+	if err != nil {
+		return []protocol.Event{protocol.NewEvent(protocol.EventError, r.sessionID, err.Error(), nil)}
+	}
+	text := "Effective settings\n" + redactYAMLSecrets(string(data))
+	return []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, r.sessionID, text, map[string]string{"overlay": "settings"})}
+}
+
+func (r *Runtime) modelInfo() []protocol.Event {
+	names := make([]string, 0, len(r.cfg.Models))
+	for name := range r.cfg.Models {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	var b strings.Builder
+	b.WriteString("Model profiles\n")
+	if len(names) == 0 {
+		b.WriteString("- none configured\n")
+	}
+	for _, name := range names {
+		profile := r.cfg.Models[name]
+		fmt.Fprintf(&b, "- %s: provider=%s model=%s", name, firstNonEmpty(profile.Provider, "unset"), firstNonEmpty(profile.Model, "unset"))
+		if strings.TrimSpace(profile.BaseURL) != "" {
+			fmt.Fprintf(&b, " base_url=%s", profile.BaseURL)
+		}
+		b.WriteByte('\n')
+	}
+	fmt.Fprintf(&b, "\nsource: %s\nkag_mode: %s\nkag_host: %s", relDisplay(r.workspace, filepath.Join(r.workspace, ".knote", "config.yaml")), r.kagMode(), firstNonEmpty(r.cfg.KAG.Host, "unset"))
+	return []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, r.sessionID, b.String(), map[string]string{"overlay": "settings"})}
 }
 
 func (r *Runtime) Confirm(ctx context.Context, req protocol.ConfirmRequest, approved bool) []protocol.Event {
@@ -215,6 +381,12 @@ func (r *Runtime) consumePendingConfirmation(req protocol.ConfirmRequest) (proto
 	}
 	delete(r.pendingConfirmations, req.RequestID)
 	return pending, true
+}
+
+func (r *Runtime) clearPendingConfirmations() {
+	r.confirmMu.Lock()
+	defer r.confirmMu.Unlock()
+	r.pendingConfirmations = map[string]protocol.ConfirmRequest{}
 }
 
 func (r *Runtime) build(ctx context.Context) []protocol.Event {
@@ -395,12 +567,62 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
+func parseSlash(input string) (string, string) {
+	fields := strings.Fields(input)
+	if len(fields) == 0 {
+		return "", ""
+	}
+	cmd := strings.TrimPrefix(fields[0], "/")
+	return cmd, strings.TrimSpace(strings.TrimPrefix(input, fields[0]))
+}
+
 func slashArg(input string) string {
 	fields := strings.Fields(input)
 	if len(fields) == 0 {
 		return ""
 	}
 	return strings.TrimSpace(strings.TrimPrefix(input, fields[0]))
+}
+
+func (r *Runtime) kagMode() string {
+	if r.cfg.KAG.Fake {
+		return "fake"
+	}
+	return "real"
+}
+
+func relDisplay(workspace, path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return "unset"
+	}
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(workspace, path)
+	}
+	rel, err := filepath.Rel(workspace, path)
+	if err != nil || strings.HasPrefix(rel, "..") {
+		return path
+	}
+	return filepath.ToSlash(rel)
+}
+
+func redactYAMLSecrets(text string) string {
+	var lines []string
+	for _, line := range strings.Split(strings.TrimRight(text, "\n"), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if !strings.Contains(trimmed, ":") {
+			lines = append(lines, line)
+			continue
+		}
+		key := strings.ToLower(strings.TrimSpace(strings.SplitN(trimmed, ":", 2)[0]))
+		if strings.Contains(key, "key") || strings.Contains(key, "token") || strings.Contains(key, "secret") || strings.Contains(key, "password") {
+			prefix := line[:strings.Index(line, ":")+1]
+			lines = append(lines, prefix+" REDACTED")
+			continue
+		}
+		lines = append(lines, line)
+	}
+	return strings.Join(lines, "\n")
 }
 
 const helpText = `Commands:
@@ -413,5 +635,12 @@ const helpText = `Commands:
 /eval       run a basic evaluation
 /tasks      show runtime tasks
 /status     show git status
+/clear      clear the current TUI transcript view
+/new        start a new session
+/resume     list recent sessions, or /resume <session-id>
+/details    show workspace/session/KAG details
+/settings   show effective read-only settings
+/model      show read-only model profile details
+/exit       exit from the TUI with Ctrl+C
 /help       show this help
 `

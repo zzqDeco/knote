@@ -1,0 +1,146 @@
+package tui
+
+import (
+	"context"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	tea "github.com/charmbracelet/bubbletea"
+
+	"github.com/zzqDeco/knote/internal/protocol"
+	"github.com/zzqDeco/knote/internal/runtime"
+	"github.com/zzqDeco/knote/internal/session"
+)
+
+func TestInputHistoryCyclesComposerValues(t *testing.T) {
+	model := newTestModel(t)
+
+	model.composer.SetValue("/help")
+	updateModel(t, &model, tea.KeyMsg{Type: tea.KeyEnter})
+	model.composer.SetValue("/status")
+	updateModel(t, &model, tea.KeyMsg{Type: tea.KeyEnter})
+
+	updateModel(t, &model, tea.KeyMsg{Type: tea.KeyUp})
+	if got := model.composer.Value(); got != "/status" {
+		t.Fatalf("first history step = %q, want /status", got)
+	}
+	updateModel(t, &model, tea.KeyMsg{Type: tea.KeyUp})
+	if got := model.composer.Value(); got != "/help" {
+		t.Fatalf("second history step = %q, want /help", got)
+	}
+	updateModel(t, &model, tea.KeyMsg{Type: tea.KeyDown})
+	if got := model.composer.Value(); got != "/status" {
+		t.Fatalf("history down = %q, want /status", got)
+	}
+	updateModel(t, &model, tea.KeyMsg{Type: tea.KeyDown})
+	if got := model.composer.Value(); got != "" {
+		t.Fatalf("history draft restore = %q, want empty", got)
+	}
+}
+
+func TestConfirmRejectClosesOverlayWithoutRunningBuild(t *testing.T) {
+	model := newTestModel(t)
+	workspace := model.runtime.Workspace()
+
+	model.composer.SetValue("/build")
+	updateModel(t, &model, tea.KeyMsg{Type: tea.KeyEnter})
+	if model.pendingConfirm == nil || model.overlayMode != overlayConfirm {
+		t.Fatalf("build did not enter confirm overlay: pending=%v overlay=%s", model.pendingConfirm, model.overlayMode)
+	}
+
+	updateModel(t, &model, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	if model.pendingConfirm != nil {
+		t.Fatalf("reject did not clear pending confirm: %+v", model.pendingConfirm)
+	}
+	if model.overlayMode != overlayNone {
+		t.Fatalf("reject did not close overlay: %s", model.overlayMode)
+	}
+	if _, err := os.Stat(filepath.Join(workspace, "artifacts", "manifest.json")); !os.IsNotExist(err) {
+		t.Fatalf("rejected build wrote artifacts: %v", err)
+	}
+}
+
+func TestOverlaySwitchAndEsc(t *testing.T) {
+	model := newTestModel(t)
+
+	model.composer.SetValue("/tasks")
+	updateModel(t, &model, tea.KeyMsg{Type: tea.KeyEnter})
+	if model.overlayMode != overlayTasks || !strings.Contains(model.overlay, "tasks") {
+		t.Fatalf("/tasks did not show tasks overlay: mode=%s overlay=%q", model.overlayMode, model.overlay)
+	}
+	updateModel(t, &model, tea.KeyMsg{Type: tea.KeyEsc})
+	if model.overlayMode != overlayNone || strings.TrimSpace(model.overlay) != "" {
+		t.Fatalf("esc did not close overlay: mode=%s overlay=%q", model.overlayMode, model.overlay)
+	}
+}
+
+func TestClearProjectsTranscriptWithoutDeletingSession(t *testing.T) {
+	model := newTestModel(t)
+	store := session.NewStore(model.runtime.Workspace())
+	sessionID := model.runtime.SessionID()
+
+	model.composer.SetValue("/help")
+	updateModel(t, &model, tea.KeyMsg{Type: tea.KeyEnter})
+	model.composer.SetValue("/clear")
+	updateModel(t, &model, tea.KeyMsg{Type: tea.KeyEnter})
+
+	if got := strings.TrimSpace(renderTranscript(model.events)); got != "knote ready" {
+		t.Fatalf("clear should project empty transcript, got:\n%s", got)
+	}
+	events, err := store.Load(sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasTUIEvent(events, protocol.EventViewClear) || len(events) == 0 {
+		t.Fatalf("clear did not persist a view event while keeping history: %+v", events)
+	}
+}
+
+func newTestModel(t *testing.T) Model {
+	t.Helper()
+	workspace := t.TempDir()
+	mustRun(t, workspace, "git", "init")
+	t.Setenv("KNOTE_KAG_FAKE", "1")
+	rt, initial, err := runtime.New(context.Background(), runtime.Options{Workspace: workspace})
+	if err != nil {
+		t.Fatal(err)
+	}
+	model := New(rt, initial)
+	model.width = 100
+	model.height = 30
+	model.resize()
+	model.refreshOverlay()
+	model.refreshViewport()
+	return model
+}
+
+func updateModel(t *testing.T, model *Model, msg tea.Msg) {
+	t.Helper()
+	next, _ := model.Update(msg)
+	updated, ok := next.(Model)
+	if !ok {
+		t.Fatalf("unexpected model type %T", next)
+	}
+	*model = updated
+}
+
+func hasTUIEvent(events []protocol.Event, eventType protocol.EventType) bool {
+	for _, event := range events {
+		if event.Type == eventType {
+			return true
+		}
+	}
+	return false
+}
+
+func mustRun(t *testing.T, dir string, name string, args ...string) {
+	t.Helper()
+	cmd := exec.Command(name, args...)
+	cmd.Dir = dir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("%s %v failed: %v\n%s", name, args, err, out)
+	}
+}
