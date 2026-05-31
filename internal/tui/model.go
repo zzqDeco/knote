@@ -462,12 +462,10 @@ func tasksFromEvent(event protocol.Event) []protocol.Task {
 }
 
 func confirmFromEvents(events []protocol.Event) *protocol.ConfirmRequest {
-	for i := len(events) - 1; i >= 0; i-- {
-		if req := confirmFromEvent(events[i]); req != nil {
-			return req
-		}
+	if len(events) == 0 {
+		return nil
 	}
-	return nil
+	return confirmFromEvent(events[len(events)-1])
 }
 
 func confirmFromEvent(event protocol.Event) *protocol.ConfirmRequest {

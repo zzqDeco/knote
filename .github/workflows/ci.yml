@@ -37,4 +37,7 @@ jobs:
         run: python -m unittest discover -s adapters/kag -p '*test*.py'
 
       - name: Build CLI
-        run: go build -o bin/knote ./cmd/knote
+        run: CGO_ENABLED=0 go build -o bin/knote ./cmd/knote
+
+      - name: Fake MVP acceptance smoke
+        run: scripts/smoke_fake_mvp.sh
