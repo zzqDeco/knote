@@ -12,6 +12,7 @@ The MVP is a single Go CLI/TUI binary with a Python KAG subprocess adapter. Bubb
 - Side-effecting slash commands emit `confirm.request` and run only after TUI approval.
 - `internal/knowledge` owns build/query/explain/eval semantics and normalizes stable knote artifacts.
 - `internal/repository/local` writes deterministic JSONL/Markdown artifacts, sessions, evals, config, and Git versions.
+- `internal/repository/remote` is an unwired future adapter skeleton that returns `ErrRemoteNotImplemented`.
 - `internal/knowledge/kag` speaks NDJSON with `adapters/kag/knote_kag_adapter.py`.
 - `adapters/kag` prepares sorted corpus JSON, generates a starter `kag_config.yaml`, and invokes real KAG builder/solver APIs when OpenSPG/KAG is installed and reachable.
 
@@ -27,7 +28,8 @@ The MVP is a single Go CLI/TUI binary with a Python KAG subprocess adapter. Bubb
 - PR #9 `refactor/knowledge-service`: completed and merged to `dev`.
 - PR #10 `refactor/kag-backend`: completed and merged to `dev`.
 - PR #11 `refactor/agent-runtime`: completed and merged to `dev`.
-- PR F `refactor/remove-legacy-shims`: removes compatibility shims and updates docs/tests so new code depends on `agent`, `knowledge`, and `repository` boundaries.
+- PR #12 `refactor/remove-legacy-shims`: completed and merged to `dev`.
+- PR G `refactor/remote-repository-skeleton`: adds the unwired future remote repository model and contract tests.
 
 ## Acceptance
 

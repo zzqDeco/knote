@@ -8,6 +8,7 @@
 4. `internal/knowledge` owns build/query/explain/eval semantics and artifact normalization.
 5. `internal/repository` defines workspace/session/version interfaces; `internal/repository/local` implements them with the local filesystem and Git CLI.
 6. `internal/knowledge/kag` owns the OpenSPG/KAG boundary and Python NDJSON adapter subprocess.
+7. `internal/repository/remote` is a future adapter skeleton for GitHub/Gitea/GitLab-style backends.
 
 The TUI and agent are in the same Go binary. The KAG adapter remains a subprocess because OpenSPG/KAG is Python-native and has heavier environment requirements. The stable artifact contract is owned by knote, not by KAG.
 
@@ -29,6 +30,7 @@ flowchart LR
   Local --> Artifacts["artifacts/*.jsonl"]
   Local --> Evals["evals/*.jsonl"]
   Local --> Git["Git CLI"]
+  RepoIf -. future .-> Remote["internal/repository/remote"]
 ```
 
 `internal/agent` depends only on `internal/knowledge`, `internal/repository`, `internal/protocol`, and the standard library. It does not import the local repository, KAG backend, Git wrapper, or Python adapter. `cmd/knote` is the composition root that creates `local.Store`, `kag.Client`, `knowledge.Service`, and `agent.Agent`.
@@ -85,6 +87,20 @@ The artifact files are:
 - `build_report.md`
 
 JSONL records are sorted by deterministic ids where applicable. Writes use temporary files and rename for atomic replacement. Runtime cache paths under `.knote/cache/`, `.knote/checkpoints/`, `.knote/kag-runtime/`, and `.knote/sessions/` are not knowledge artifacts.
+
+## Remote Repository Skeleton
+
+`internal/repository/remote` is intentionally not wired into `cmd/knote` for v0. It only models the future remote repository boundary and returns `repository.ErrRemoteNotImplemented` for every `Workspace`, `Sessions`, and `Versions` method.
+
+The remote model does not simulate a local dirty working tree. It uses explicit remote concepts:
+
+- base ref
+- draft tree
+- commit proposal
+- pull or merge request
+- tag or release
+
+This keeps `internal/agent` stable: future remote implementations can make `/commit` create a branch commit or PR without changing TUI or agent command handling.
 
 ## Git And Release Gate
 
