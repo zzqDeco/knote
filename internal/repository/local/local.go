@@ -264,6 +264,13 @@ func (s Store) EvalGate(ctx context.Context) error {
 	return evalstore.Gate(s.workspace)
 }
 
+func (s Store) KnowledgeHash(ctx context.Context) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	return evalstore.KnowledgeHash(s.workspace)
+}
+
 func (s Store) Append(ctx context.Context, event protocol.Event) error {
 	if err := ctx.Err(); err != nil {
 		return err
