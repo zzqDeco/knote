@@ -11,8 +11,8 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/zzqDeco/knote/internal/agent"
 	"github.com/zzqDeco/knote/internal/protocol"
-	"github.com/zzqDeco/knote/internal/runtime"
 )
 
 type overlayMode string
@@ -29,7 +29,7 @@ const (
 )
 
 type Model struct {
-	runtime         *runtime.Runtime
+	agent           *agent.Agent
 	viewport        viewport.Model
 	overlayViewport viewport.Model
 	composer        textinput.Model
@@ -47,7 +47,7 @@ type Model struct {
 	err             error
 }
 
-func New(rt *runtime.Runtime, initial []protocol.Event) Model {
+func New(agentRuntime *agent.Agent, initial []protocol.Event) Model {
 	composer := textinput.New()
 	composer.Placeholder = "Ask, /build, /diff, /versions, /tasks, /help"
 	composer.Prompt = "> "
@@ -58,7 +58,7 @@ func New(rt *runtime.Runtime, initial []protocol.Event) Model {
 	vp := viewport.New(80, 20)
 	ov := viewport.New(80, 1)
 	m := Model{
-		runtime:         rt,
+		agent:           agentRuntime,
 		viewport:        vp,
 		overlayViewport: ov,
 		composer:        composer,
@@ -91,12 +91,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.pendingConfirm != nil {
 			switch msg.String() {
 			case "enter", "y", "Y":
-				events := m.runtime.Confirm(context.Background(), *m.pendingConfirm, true)
+				events := m.agent.Confirm(context.Background(), *m.pendingConfirm, true)
 				m.pendingConfirm = nil
 				m.applyEvents(events)
 				return m, nil
 			case "esc", "n", "N":
-				events := m.runtime.Confirm(context.Background(), *m.pendingConfirm, false)
+				events := m.agent.Confirm(context.Background(), *m.pendingConfirm, false)
 				m.pendingConfirm = nil
 				m.applyEvents(events)
 				return m, nil
@@ -147,7 +147,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.composer.SetValue("")
 			m.pushHistory(value)
-			events := m.runtime.Handle(context.Background(), value)
+			events := m.agent.Handle(context.Background(), value)
 			m.applyEvents(events)
 			m.refreshViewport()
 			return m, nil
@@ -307,8 +307,8 @@ func (m Model) deriveStatus() string {
 			activeTasks++
 		}
 	}
-	if m.runtime != nil {
-		info := m.runtime.CurrentSessionInfo(context.Background())
+	if m.agent != nil {
+		info := m.agent.CurrentSessionInfo(context.Background())
 		if info.Branch != "" {
 			branch = info.Branch
 		}
@@ -317,7 +317,7 @@ func (m Model) deriveStatus() string {
 			kagMode = info.KAGMode
 		}
 	}
-	return fmt.Sprintf("session %s · branch %s · dirty %s · tasks %d · kag %s", m.runtime.SessionID(), branch, dirty, activeTasks, kagMode)
+	return fmt.Sprintf("session %s · branch %s · dirty %s · tasks %d · kag %s", m.agent.SessionID(), branch, dirty, activeTasks, kagMode)
 }
 
 func renderTranscript(events []protocol.Event) string {

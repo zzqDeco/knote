@@ -43,7 +43,7 @@ func TestInputHistoryCyclesComposerValues(t *testing.T) {
 
 func TestConfirmRejectClosesOverlayWithoutRunningBuild(t *testing.T) {
 	model := newTestModel(t)
-	workspace := model.runtime.Workspace()
+	workspace := model.agent.Workspace()
 
 	model.composer.SetValue("/build")
 	updateModel(t, &model, tea.KeyMsg{Type: tea.KeyEnter})
@@ -79,8 +79,8 @@ func TestOverlaySwitchAndEsc(t *testing.T) {
 
 func TestClearProjectsTranscriptWithoutDeletingSession(t *testing.T) {
 	model := newTestModel(t)
-	store := session.NewStore(model.runtime.Workspace())
-	sessionID := model.runtime.SessionID()
+	store := session.NewStore(model.agent.Workspace())
+	sessionID := model.agent.SessionID()
 
 	model.composer.SetValue("/help")
 	updateModel(t, &model, tea.KeyMsg{Type: tea.KeyEnter})
@@ -101,7 +101,7 @@ func TestClearProjectsTranscriptWithoutDeletingSession(t *testing.T) {
 
 func TestResumeDoesNotReviveStaleConfirmation(t *testing.T) {
 	model := newTestModel(t)
-	sessionID := model.runtime.SessionID()
+	sessionID := model.agent.SessionID()
 
 	model.composer.SetValue("/build")
 	updateModel(t, &model, tea.KeyMsg{Type: tea.KeyEnter})
@@ -115,7 +115,7 @@ func TestResumeDoesNotReviveStaleConfirmation(t *testing.T) {
 
 	model.composer.SetValue("/new")
 	updateModel(t, &model, tea.KeyMsg{Type: tea.KeyEnter})
-	if model.runtime.SessionID() == sessionID {
+	if model.agent.SessionID() == sessionID {
 		t.Fatal("/new did not switch sessions")
 	}
 
