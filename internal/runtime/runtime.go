@@ -11,12 +11,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/zzqDeco/knote/internal/artifact"
 	"github.com/zzqDeco/knote/internal/config"
-	"github.com/zzqDeco/knote/internal/evalstore"
 	"github.com/zzqDeco/knote/internal/gitstore"
 	"github.com/zzqDeco/knote/internal/kag"
+	"github.com/zzqDeco/knote/internal/knowledge"
 	"github.com/zzqDeco/knote/internal/protocol"
+	"github.com/zzqDeco/knote/internal/repository/local"
 	"github.com/zzqDeco/knote/internal/session"
 	"gopkg.in/yaml.v3"
 )
@@ -28,6 +28,8 @@ type Runtime struct {
 	store                session.Store
 	git                  gitstore.Store
 	kag                  kag.Client
+	repo                 local.Store
+	knowledge            knowledge.Service
 	tasks                map[string]protocol.Task
 	confirmMu            sync.Mutex
 	pendingConfirmations map[string]protocol.ConfirmRequest
@@ -59,23 +61,31 @@ func New(ctx context.Context, opts Options) (*Runtime, []protocol.Event, error) 
 		sessionID = session.NewID()
 		resumed = false
 	}
+	repo := local.New(workspace)
+	kagClient := kag.Client{
+		AdapterPath: cfg.KAG.AdapterPath,
+		Workspace:   workspace,
+		Host:        cfg.KAG.Host,
+		Fake:        cfg.KAG.Fake,
+		ConfigPath:  cfg.KAG.ConfigPath,
+		ProjectID:   cfg.KAG.ProjectID,
+		Namespace:   cfg.KAG.Namespace,
+		Language:    cfg.KAG.Language,
+		RuntimeDir:  cfg.KAG.RuntimeDir,
+	}
+	mode := knowledge.ModeReal
+	if cfg.KAG.Fake {
+		mode = knowledge.ModeFake
+	}
 	r := &Runtime{
-		workspace: workspace,
-		sessionID: sessionID,
-		cfg:       cfg,
-		store:     session.NewStore(workspace),
-		git:       gitstore.Store{Workspace: workspace},
-		kag: kag.Client{
-			AdapterPath: cfg.KAG.AdapterPath,
-			Workspace:   workspace,
-			Host:        cfg.KAG.Host,
-			Fake:        cfg.KAG.Fake,
-			ConfigPath:  cfg.KAG.ConfigPath,
-			ProjectID:   cfg.KAG.ProjectID,
-			Namespace:   cfg.KAG.Namespace,
-			Language:    cfg.KAG.Language,
-			RuntimeDir:  cfg.KAG.RuntimeDir,
-		},
+		workspace:            workspace,
+		sessionID:            sessionID,
+		cfg:                  cfg,
+		store:                session.NewStore(workspace),
+		git:                  gitstore.Store{Workspace: workspace},
+		kag:                  kagClient,
+		repo:                 repo,
+		knowledge:            knowledge.New(knowledge.Options{Workspace: workspace, Repo: repo, Backend: kagClient, Mode: mode}),
 		tasks:                map[string]protocol.Task{},
 		pendingConfirmations: map[string]protocol.ConfirmRequest{},
 	}
@@ -406,26 +416,20 @@ func (r *Runtime) build(ctx context.Context) []protocol.Event {
 		protocol.NewEvent(protocol.EventBuildStart, r.sessionID, "build started", task),
 		protocol.NewEvent(protocol.EventToolStart, r.sessionID, "KagBuild", map[string]string{"tool": "KagBuild"}),
 	}
-	kagResp, err := r.kag.Build(ctx)
+	result, err := r.knowledge.Build(ctx)
 	if err != nil {
-		events = append(events, protocol.NewEvent(protocol.EventToolError, r.sessionID, err.Error(), map[string]string{"tool": "KagBuild"}))
+		task = r.finishTask(task.ID, protocol.TaskFailed, err.Error())
+		events = append(events, protocol.NewEvent(protocol.EventError, r.sessionID, err.Error(), nil), protocol.NewEvent(protocol.EventTaskComplete, r.sessionID, "build failed", task))
+		return events
+	}
+	if strings.TrimSpace(result.AdapterError) != "" {
+		events = append(events, protocol.NewEvent(protocol.EventToolError, r.sessionID, result.AdapterError, map[string]string{"tool": "KagBuild"}))
 	} else {
-		events = append(events, protocol.NewEvent(protocol.EventToolProgress, r.sessionID, "KagBuild adapter complete", kagResp.Data))
-	}
-	result, err := artifact.Builder{Workspace: r.workspace}.Build()
-	if err != nil {
-		task = r.finishTask(task.ID, protocol.TaskFailed, err.Error())
-		events = append(events, protocol.NewEvent(protocol.EventError, r.sessionID, err.Error(), nil), protocol.NewEvent(protocol.EventTaskComplete, r.sessionID, "build failed", task))
-		return events
-	}
-	if err := result.Write(r.workspace); err != nil {
-		task = r.finishTask(task.ID, protocol.TaskFailed, err.Error())
-		events = append(events, protocol.NewEvent(protocol.EventError, r.sessionID, err.Error(), nil), protocol.NewEvent(protocol.EventTaskComplete, r.sessionID, "build failed", task))
-		return events
+		events = append(events, protocol.NewEvent(protocol.EventToolProgress, r.sessionID, "KagBuild adapter complete", result.KAGData))
 	}
 	task = r.finishTask(task.ID, protocol.TaskCompleted, "artifacts written")
 	events = append(events,
-		protocol.NewEvent(protocol.EventToolComplete, r.sessionID, "KagBuild complete", map[string]any{"manifest": result.Manifest, "kag": kagResp.Data}),
+		protocol.NewEvent(protocol.EventToolComplete, r.sessionID, "KagBuild complete", map[string]any{"manifest": result.Manifest, "kag": result.KAGData}),
 		protocol.NewEvent(protocol.EventBuildComplete, r.sessionID, "Build complete", result.Manifest),
 		protocol.NewEvent(protocol.EventTaskComplete, r.sessionID, "build completed", task),
 		protocol.NewEvent(protocol.EventAssistantDone, r.sessionID, result.Report, nil),
@@ -438,22 +442,20 @@ func (r *Runtime) query(ctx context.Context, question string) []protocol.Event {
 		protocol.NewEvent(protocol.EventAssistantStart, r.sessionID, "query started", nil),
 		protocol.NewEvent(protocol.EventToolStart, r.sessionID, "KagQuery", map[string]string{"query": question}),
 	}
-	resp, err := r.kag.Query(ctx, question)
+	answer, err := r.knowledge.Query(ctx, question)
 	if err != nil {
-		answer := localAnswer(r.workspace, question)
+		return append(events, protocol.NewEvent(protocol.EventError, r.sessionID, err.Error(), nil))
+	}
+	if strings.TrimSpace(answer.AdapterError) != "" {
 		events = append(events,
-			protocol.NewEvent(protocol.EventToolError, r.sessionID, err.Error(), map[string]string{"tool": "KagQuery"}),
-			protocol.NewEvent(protocol.EventAssistantDone, r.sessionID, answer, map[string]string{"uncertainty": "KAG unavailable; answered from local artifacts fallback"}),
+			protocol.NewEvent(protocol.EventToolError, r.sessionID, answer.AdapterError, map[string]string{"tool": "KagQuery"}),
+			protocol.NewEvent(protocol.EventAssistantDone, r.sessionID, answer.Answer, map[string]string{"uncertainty": answer.Uncertainty}),
 		)
 		return events
 	}
-	answer := fmt.Sprint(resp.Data["answer"])
-	if strings.TrimSpace(answer) == "" || answer == "<nil>" {
-		answer = localAnswer(r.workspace, question)
-	}
 	events = append(events,
-		protocol.NewEvent(protocol.EventToolComplete, r.sessionID, "KagQuery complete", resp.Data),
-		protocol.NewEvent(protocol.EventAssistantDone, r.sessionID, answer, resp.Data),
+		protocol.NewEvent(protocol.EventToolComplete, r.sessionID, "KagQuery complete", answer.Data),
+		protocol.NewEvent(protocol.EventAssistantDone, r.sessionID, answer.Answer, answer.Data),
 	)
 	return events
 }
@@ -535,32 +537,37 @@ func (r *Runtime) checkout(ctx context.Context, ref string) []protocol.Event {
 }
 
 func (r *Runtime) eval(ctx context.Context) []protocol.Event {
-	questions, err := evalstore.LoadQuestions(r.workspace)
+	questions, err := r.repo.LoadQuestions(ctx)
 	if err != nil {
 		return []protocol.Event{protocol.NewEvent(protocol.EventError, r.sessionID, err.Error(), nil)}
 	}
 	events := []protocol.Event{protocol.NewEvent(protocol.EventToolStart, r.sessionID, "KagExplain eval", map[string]any{"questions": len(questions)})}
-	results := make([]evalstore.Result, 0, len(questions))
-	for _, question := range questions {
-		resp, err := r.kag.Explain(ctx, question.Question)
-		result := evalstore.ResultFromResponse(question, resp, err)
-		results = append(results, result)
-		if err != nil {
-			events = append(events, protocol.NewEvent(protocol.EventToolError, r.sessionID, err.Error(), map[string]string{"question_id": question.ID, "tool": "KagExplain"}))
-			continue
-		}
-		events = append(events, protocol.NewEvent(protocol.EventToolComplete, r.sessionID, "KagExplain complete: "+question.ID, resp.Data))
-	}
-	report, err := evalstore.Write(r.workspace, results)
+	report, err := r.knowledge.Eval(ctx)
 	if err != nil {
 		return append(events, protocol.NewEvent(protocol.EventError, r.sessionID, err.Error(), nil))
+	}
+	for _, result := range report.Results {
+		if result.AdapterError != "" {
+			events = append(events, protocol.NewEvent(protocol.EventToolError, r.sessionID, result.AdapterError, map[string]string{"question_id": result.ID, "tool": "KagExplain"}))
+			continue
+		}
+		events = append(events, protocol.NewEvent(protocol.EventToolComplete, r.sessionID, "KagExplain complete: "+result.ID, map[string]any{
+			"answer":      result.Answer,
+			"evidence":    result.Evidence,
+			"explanation": result.Explanation,
+			"uncertainty": result.Uncertainty,
+			"mode":        result.Mode,
+		}))
 	}
 	payload := map[string]any{
 		"total":          report.Total,
 		"adapter_errors": report.AdapterErrors,
-		"report_path":    relDisplay(r.workspace, report.Path),
+		"report_path":    "evals/report.md",
 	}
-	message := evalstore.RenderReport(report)
+	message := report.ReportMarkdown
+	if strings.TrimSpace(message) == "" {
+		message = knowledge.RenderEvalReport(report)
+	}
 	events = append(events, protocol.NewEvent(protocol.EventAssistantDone, r.sessionID, message, payload))
 	if report.AdapterErrors > 0 {
 		events = append(events, protocol.NewEvent(protocol.EventError, r.sessionID, "eval completed with adapter errors", payload))
@@ -572,7 +579,7 @@ func (r *Runtime) releasePreflight(ctx context.Context) error {
 	if r.git.Dirty(ctx) {
 		return fmt.Errorf("release requires a clean workspace")
 	}
-	return evalstore.Gate(r.workspace)
+	return r.repo.EvalGate(ctx)
 }
 
 func (r *Runtime) taskList() []protocol.Event {
