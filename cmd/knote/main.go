@@ -8,15 +8,12 @@ import (
 	"path/filepath"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"gopkg.in/yaml.v3"
 
 	"github.com/zzqDeco/knote/internal/agent"
-	"github.com/zzqDeco/knote/internal/config"
 	"github.com/zzqDeco/knote/internal/knowledge"
 	"github.com/zzqDeco/knote/internal/knowledge/kag"
 	"github.com/zzqDeco/knote/internal/protocol"
 	"github.com/zzqDeco/knote/internal/repository/local"
-	"github.com/zzqDeco/knote/internal/session"
 	"github.com/zzqDeco/knote/internal/tui"
 )
 
@@ -55,23 +52,16 @@ func newAgent(ctx context.Context, workspacePath string, resumeID string) (*agen
 	if err != nil {
 		return nil, nil, err
 	}
-	cfg, err := config.LoadOrDefault(workspace)
+	repo := local.New(workspace)
+	repoCfg, err := repo.Config(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
 	if os.Getenv("KNOTE_KAG_FAKE") == "1" {
-		cfg.KAG.Fake = true
+		repoCfg.KAG.Fake = true
 	}
-	if err := config.Ensure(workspace, cfg); err != nil {
-		return nil, nil, err
-	}
-	settings, err := yaml.Marshal(cfg)
-	if err != nil {
-		return nil, nil, err
-	}
-	repo := local.New(workspace)
-	repoCfg, err := repo.Config(ctx)
-	if err != nil {
+	repoCfg.Workspace = workspace
+	if err := repo.SaveConfig(ctx, repoCfg); err != nil {
 		return nil, nil, err
 	}
 	mode := knowledge.ModeReal
@@ -93,11 +83,10 @@ func newAgent(ctx context.Context, workspacePath string, resumeID string) (*agen
 		Workspace:     workspace,
 		ResumeID:      resumeID,
 		Config:        repoCfg,
-		SettingsYAML:  string(settings),
 		Sessions:      repo,
 		Versions:      repo,
 		WorkspaceRepo: repo,
 		Knowledge:     knowledge.New(knowledge.Options{Workspace: workspace, Repo: repo, Backend: kagClient, Mode: mode}),
-		NewSessionID:  session.NewID,
+		NewSessionID:  local.NewSessionID,
 	})
 }

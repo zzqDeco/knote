@@ -109,6 +109,9 @@ func TestSessionsAppendLoadAndList(t *testing.T) {
 	if len(summaries) != 1 || summaries[0].ID != "sess_one" || summaries[0].EventCount != 1 {
 		t.Fatalf("unexpected session summaries: %+v", summaries)
 	}
+	if err := store.Append(ctx, protocol.NewEvent(protocol.EventUserMessage, "../escape", "bad", nil)); err == nil {
+		t.Fatal("session ids with path traversal should be rejected")
+	}
 }
 
 func TestArtifactsEvalAndGate(t *testing.T) {
@@ -167,6 +170,31 @@ func TestArtifactsEvalAndGate(t *testing.T) {
 	}
 }
 
+func TestEvalQuestionsFallbackAndSorting(t *testing.T) {
+	ctx := context.Background()
+	workspace := t.TempDir()
+	store := New(workspace)
+
+	questions, err := store.LoadQuestions(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(questions) != 1 || questions[0].ID != "smoke" || questions[0].Question == "" {
+		t.Fatalf("unexpected smoke question: %+v", questions)
+	}
+
+	mustWrite(t, filepath.Join(workspace, "evals", "questions.jsonl"), `{"id":"b","question":"second"}
+{"question":"first"}
+`)
+	questions, err = store.LoadQuestions(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := questions[0].ID + ":" + questions[1].ID; got != "b:q002" {
+		t.Fatalf("questions not sorted or assigned as expected: %+v", questions)
+	}
+}
+
 func TestVersionsContract(t *testing.T) {
 	ctx := context.Background()
 	workspace := initRepo(t)
@@ -208,12 +236,75 @@ func TestVersionsContract(t *testing.T) {
 	if err := store.Tag(ctx, "v0.0.1"); err != nil {
 		t.Fatal(err)
 	}
+	versions, err = store.Versions(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(versions[0].Tags) != 1 || versions[0].Tags[0] != "v0.0.1" {
+		t.Fatalf("tag was not parsed from decorations: %+v", versions[0])
+	}
 	if err := store.Checkout(ctx, "HEAD", repository.CheckoutOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	mustWrite(t, filepath.Join(workspace, "sources", "intro.md"), "dirty\n")
 	if err := store.Checkout(ctx, "HEAD", repository.CheckoutOptions{}); err == nil || !strings.Contains(err.Error(), "dirty") {
 		t.Fatalf("dirty checkout should require confirmation, got %v", err)
+	}
+}
+
+func TestCommitOnlyIncludesKnowledgePaths(t *testing.T) {
+	ctx := context.Background()
+	workspace := initRepo(t)
+	store := New(workspace)
+	mustWrite(t, filepath.Join(workspace, ".knote", "config.yaml"), "workspace: test\n")
+	mustWrite(t, filepath.Join(workspace, "sources", "intro.md"), "intro\n")
+	runGit(t, workspace, "add", ".")
+	runGit(t, workspace, "commit", "-m", "initial")
+
+	mustWrite(t, filepath.Join(workspace, ".knote", "config.yaml"), "workspace: changed\n")
+	mustWrite(t, filepath.Join(workspace, "evals", "results.jsonl"), "{}\n")
+	mustWrite(t, filepath.Join(workspace, "unrelated.txt"), "do not commit\n")
+	runGit(t, workspace, "add", "unrelated.txt")
+
+	if _, err := store.Commit(ctx, "knowledge update"); err != nil {
+		t.Fatal(err)
+	}
+	show := runGit(t, workspace, "show", "--name-only", "--format=", "HEAD")
+	if !strings.Contains(show, ".knote/config.yaml") || !strings.Contains(show, "evals/results.jsonl") {
+		t.Fatalf("commit did not include knowledge paths:\n%s", show)
+	}
+	if strings.Contains(show, "unrelated.txt") {
+		t.Fatalf("commit included unrelated staged file:\n%s", show)
+	}
+	cached := runGit(t, workspace, "diff", "--cached", "--name-only")
+	if strings.TrimSpace(cached) != "unrelated.txt" {
+		t.Fatalf("unrelated staged file should remain staged, got %q", cached)
+	}
+}
+
+func TestStatusDirtyIgnoresRuntimeSessionFiles(t *testing.T) {
+	ctx := context.Background()
+	workspace := initRepo(t)
+	store := New(workspace)
+	mustWrite(t, filepath.Join(workspace, ".knote", "config.yaml"), "workspace: test\n")
+	runGit(t, workspace, "add", ".")
+	runGit(t, workspace, "commit", "-m", "initial")
+
+	mustWrite(t, filepath.Join(workspace, ".knote", "sessions", "sess.jsonl"), "{}\n")
+	status, err := store.Status(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Dirty {
+		t.Fatal("runtime session files should not make the knowledge workspace dirty")
+	}
+	mustWrite(t, filepath.Join(workspace, "sources", "intro.md"), "dirty\n")
+	status, err = store.Status(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !status.Dirty {
+		t.Fatal("knowledge changes should still make the workspace dirty")
 	}
 }
 

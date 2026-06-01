@@ -10,12 +10,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/zzqDeco/knote/internal/config"
-	"github.com/zzqDeco/knote/internal/evalstore"
-	"github.com/zzqDeco/knote/internal/gitstore"
 	"github.com/zzqDeco/knote/internal/protocol"
 	"github.com/zzqDeco/knote/internal/repository"
-	"github.com/zzqDeco/knote/internal/session"
 )
 
 type Store struct {
@@ -30,18 +26,14 @@ func (s Store) Config(ctx context.Context) (repository.Config, error) {
 	if err := ctx.Err(); err != nil {
 		return repository.Config{}, err
 	}
-	cfg, err := config.LoadOrDefault(s.workspace)
-	if err != nil {
-		return repository.Config{}, err
-	}
-	return toRepositoryConfig(cfg), nil
+	return loadConfigOrDefault(s.workspace)
 }
 
 func (s Store) SaveConfig(ctx context.Context, cfg repository.Config) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return config.Ensure(s.workspace, toConfig(cfg, s.workspace))
+	return ensureConfig(s.workspace, cfg)
 }
 
 func (s Store) ListSources(ctx context.Context) ([]repository.Source, error) {
@@ -190,27 +182,16 @@ func (s Store) LoadQuestions(ctx context.Context) ([]repository.EvalQuestion, er
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	questions, err := evalstore.LoadQuestions(s.workspace)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]repository.EvalQuestion, 0, len(questions))
-	for _, question := range questions {
-		out = append(out, repository.EvalQuestion{
-			ID:       question.ID,
-			Question: question.Question,
-		})
-	}
-	return out, nil
+	return loadEvalQuestions(s.workspace)
 }
 
 func (s Store) WriteEval(ctx context.Context, report repository.EvalReport) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	results := make([]evalstore.Result, 0, len(report.Results))
+	results := make([]repository.EvalResult, 0, len(report.Results))
 	for _, result := range report.Results {
-		results = append(results, evalstore.Result{
+		results = append(results, repository.EvalResult{
 			ID:            result.ID,
 			Question:      result.Question,
 			KnowledgeHash: result.KnowledgeHash,
@@ -228,16 +209,16 @@ func (s Store) WriteEval(ctx context.Context, report repository.EvalReport) erro
 		}
 		return results[i].Question < results[j].Question
 	})
-	knowledgeHash := strings.TrimSpace(report.KnowledgeHash)
-	if knowledgeHash == "" {
-		hash, err := evalstore.KnowledgeHash(s.workspace)
+	currentKnowledgeHash := strings.TrimSpace(report.KnowledgeHash)
+	if currentKnowledgeHash == "" {
+		hash, err := knowledgeHash(s.workspace)
 		if err != nil {
 			return err
 		}
-		knowledgeHash = hash
+		currentKnowledgeHash = hash
 	}
 	for i := range results {
-		results[i].KnowledgeHash = knowledgeHash
+		results[i].KnowledgeHash = currentKnowledgeHash
 	}
 	dir := filepath.Join(s.workspace, "evals")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -246,70 +227,59 @@ func (s Store) WriteEval(ctx context.Context, report repository.EvalReport) erro
 	if err := writeJSONL(filepath.Join(dir, "results.jsonl"), results); err != nil {
 		return err
 	}
-	evalReport := evalstore.Report{
+	evalReport := repository.EvalReport{
 		Results:       results,
 		Total:         firstPositive(report.Total, len(results)),
 		AdapterErrors: firstPositive(report.AdapterErrors, countAdapterErrors(results)),
-		KnowledgeHash: knowledgeHash,
-		Path:          filepath.Join(dir, "report.md"),
+		KnowledgeHash: currentKnowledgeHash,
 	}
-	markdown := firstNonEmpty(report.ReportMarkdown, evalstore.RenderReport(evalReport))
-	return atomicWriteText(evalReport.Path, markdown)
+	markdown := renderEvalReport(evalReport)
+	if strings.TrimSpace(report.ReportMarkdown) != "" && strings.TrimSpace(report.KnowledgeHash) == currentKnowledgeHash {
+		markdown = report.ReportMarkdown
+	}
+	return atomicWriteText(filepath.Join(dir, "report.md"), markdown)
 }
 
 func (s Store) EvalGate(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return evalstore.Gate(s.workspace)
+	return evalGate(s.workspace)
 }
 
 func (s Store) KnowledgeHash(ctx context.Context) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	return evalstore.KnowledgeHash(s.workspace)
+	return knowledgeHash(s.workspace)
 }
 
 func (s Store) Append(ctx context.Context, event protocol.Event) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return session.NewStore(s.workspace).Append(event)
+	return appendSessionEvent(s.workspace, event)
 }
 
 func (s Store) Load(ctx context.Context, sessionID string) ([]protocol.Event, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	return session.NewStore(s.workspace).Load(sessionID)
+	return loadSessionEvents(s.workspace, sessionID)
 }
 
 func (s Store) List(ctx context.Context, limit int) ([]repository.SessionSummary, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	summaries, err := session.NewStore(s.workspace).List(limit)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]repository.SessionSummary, 0, len(summaries))
-	for _, summary := range summaries {
-		out = append(out, repository.SessionSummary{
-			ID:          summary.ID,
-			EventCount:  summary.EventCount,
-			LastEventAt: summary.LastEventAt,
-			UpdatedAt:   summary.UpdatedAt,
-		})
-	}
-	return out, nil
+	return listSessions(s.workspace, limit)
 }
 
 func (s Store) Status(ctx context.Context) (repository.Status, error) {
 	if err := ctx.Err(); err != nil {
 		return repository.Status{}, err
 	}
-	store := gitstore.Store{Workspace: s.workspace}
+	store := gitClient{workspace: s.workspace}
 	raw, err := store.Status(ctx)
 	if err != nil {
 		return repository.Status{}, err
@@ -325,36 +295,21 @@ func (s Store) Diff(ctx context.Context, ref string) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	return (gitstore.Store{Workspace: s.workspace}).Diff(ctx, ref)
+	return (gitClient{workspace: s.workspace}).Diff(ctx, ref)
 }
 
 func (s Store) Versions(ctx context.Context, limit int) ([]repository.Version, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	versions, err := (gitstore.Store{Workspace: s.workspace}).Versions(ctx, limit)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]repository.Version, 0, len(versions))
-	for _, version := range versions {
-		out = append(out, repository.Version{
-			Hash:         version.Hash,
-			ShortHash:    version.ShortHash,
-			Subject:      version.Subject,
-			RelativeTime: version.RelativeTime,
-			Tags:         append([]string(nil), version.Tags...),
-			Current:      version.Current,
-		})
-	}
-	return out, nil
+	return (gitClient{workspace: s.workspace}).Versions(ctx, limit)
 }
 
 func (s Store) Commit(ctx context.Context, message string) (repository.CommitResult, error) {
 	if err := ctx.Err(); err != nil {
 		return repository.CommitResult{}, err
 	}
-	output, err := (gitstore.Store{Workspace: s.workspace}).Commit(ctx, message)
+	output, err := (gitClient{workspace: s.workspace}).Commit(ctx, message)
 	if err != nil {
 		return repository.CommitResult{}, err
 	}
@@ -372,7 +327,7 @@ func (s Store) Tag(ctx context.Context, tag string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	_, err := (gitstore.Store{Workspace: s.workspace}).Tag(ctx, tag)
+	err := (gitClient{workspace: s.workspace}).Tag(ctx, tag)
 	return err
 }
 
@@ -380,7 +335,7 @@ func (s Store) Checkout(ctx context.Context, ref string, opts repository.Checkou
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	_, err := (gitstore.Store{Workspace: s.workspace}).Checkout(ctx, ref, opts.AllowDirty)
+	err := (gitClient{workspace: s.workspace}).Checkout(ctx, ref, opts.AllowDirty)
 	return err
 }
 
@@ -417,65 +372,6 @@ func (s Store) resolveSourcePath(path string) (string, error) {
 		return "", fmt.Errorf("source path resolves outside sources/: %s", slashed)
 	}
 	return resolvedPath, nil
-}
-
-func toRepositoryConfig(cfg config.Config) repository.Config {
-	models := make(map[string]repository.ModelProfile, len(cfg.Models))
-	for name, model := range cfg.Models {
-		models[name] = repository.ModelProfile{
-			Provider: model.Provider,
-			Model:    model.Model,
-			BaseURL:  model.BaseURL,
-		}
-	}
-	return repository.Config{
-		Workspace: cfg.Workspace,
-		Permissions: repository.PermissionConfig{
-			BuildDefault: cfg.Permissions.BuildDefault,
-			GitDefault:   cfg.Permissions.GitDefault,
-		},
-		KAG: repository.KAGConfig{
-			AdapterPath: cfg.KAG.AdapterPath,
-			Host:        cfg.KAG.Host,
-			Fake:        cfg.KAG.Fake,
-			ConfigPath:  cfg.KAG.ConfigPath,
-			ProjectID:   cfg.KAG.ProjectID,
-			Namespace:   cfg.KAG.Namespace,
-			Language:    cfg.KAG.Language,
-			RuntimeDir:  cfg.KAG.RuntimeDir,
-		},
-		Models: models,
-	}
-}
-
-func toConfig(cfg repository.Config, workspace string) config.Config {
-	models := make(map[string]config.Model, len(cfg.Models))
-	for name, model := range cfg.Models {
-		models[name] = config.Model{
-			Provider: model.Provider,
-			Model:    model.Model,
-			BaseURL:  model.BaseURL,
-		}
-	}
-	out := config.Config{
-		Workspace: firstNonEmpty(cfg.Workspace, workspace),
-		Permissions: config.PermissionConfig{
-			BuildDefault: cfg.Permissions.BuildDefault,
-			GitDefault:   cfg.Permissions.GitDefault,
-		},
-		KAG: config.KAGConfig{
-			AdapterPath: cfg.KAG.AdapterPath,
-			Host:        cfg.KAG.Host,
-			Fake:        cfg.KAG.Fake,
-			ConfigPath:  cfg.KAG.ConfigPath,
-			ProjectID:   cfg.KAG.ProjectID,
-			Namespace:   cfg.KAG.Namespace,
-			Language:    cfg.KAG.Language,
-			RuntimeDir:  cfg.KAG.RuntimeDir,
-		},
-		Models: models,
-	}
-	return out
 }
 
 func writeJSON(path string, value any) error {
@@ -541,7 +437,7 @@ func writeJSONL(path string, value any) error {
 				return err
 			}
 		}
-	case []evalstore.Result:
+	case []repository.EvalResult:
 		for _, item := range items {
 			if err := enc.Encode(item); err != nil {
 				_ = file.Close()
@@ -588,7 +484,7 @@ func atomicWriteText(path string, text string) error {
 	return os.Rename(tmp, path)
 }
 
-func countAdapterErrors(results []evalstore.Result) int {
+func countAdapterErrors(results []repository.EvalResult) int {
 	count := 0
 	for _, result := range results {
 		if strings.TrimSpace(result.AdapterError) != "" {
