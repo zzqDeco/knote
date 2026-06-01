@@ -13,8 +13,8 @@ import (
 
 	"github.com/zzqDeco/knote/internal/config"
 	"github.com/zzqDeco/knote/internal/gitstore"
-	"github.com/zzqDeco/knote/internal/kag"
 	"github.com/zzqDeco/knote/internal/knowledge"
+	"github.com/zzqDeco/knote/internal/knowledge/kag"
 	"github.com/zzqDeco/knote/internal/protocol"
 	"github.com/zzqDeco/knote/internal/repository/local"
 	"github.com/zzqDeco/knote/internal/session"

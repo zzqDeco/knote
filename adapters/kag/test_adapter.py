@@ -295,6 +295,44 @@ class AdapterTest(unittest.TestCase):
             self.assertEqual(lines[-1]["data"]["documents"], 1)
             self.assertTrue(Path(lines[-1]["data"]["corpus_path"]).exists())
 
+    def test_fake_build_accepts_explicit_corpus(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            runtime_dir = workspace / ".knote" / "kag-runtime"
+            env = os.environ.copy()
+            env["KNOTE_KAG_FAKE"] = "1"
+            req = {
+                "id": "2",
+                "method": "kag.build",
+                "params": {
+                    "workspace": str(workspace),
+                    "runtime_dir": str(runtime_dir),
+                    "corpus": [
+                        {
+                            "id": "remote-1",
+                            "name": "Remote note",
+                            "content": "# Remote\n\ncontent from repository facade",
+                            "source_path": "remote/source.md",
+                        }
+                    ],
+                },
+            }
+            proc = subprocess.run(
+                [sys.executable, str(ADAPTER_PATH)],
+                input=json.dumps(req) + "\n",
+                text=True,
+                capture_output=True,
+                cwd=ROOT,
+                env=env,
+                check=True,
+            )
+            lines = [json.loads(line) for line in proc.stdout.splitlines()]
+            self.assertEqual(lines[-1]["type"], "result")
+            self.assertEqual(lines[-1]["data"]["documents"], 1)
+            corpus = json.loads(Path(lines[-1]["data"]["corpus_path"]).read_text(encoding="utf-8"))
+            self.assertEqual(corpus[0]["id"], "remote-1")
+            self.assertEqual(corpus[0]["source_path"], "remote/source.md")
+
 
 if __name__ == "__main__":
     unittest.main()
