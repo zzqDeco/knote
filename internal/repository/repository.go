@@ -42,32 +42,32 @@ type Versions interface {
 }
 
 type Config struct {
-	Workspace   string
-	Permissions PermissionConfig
-	KAG         KAGConfig
-	Models      map[string]ModelProfile
+	Workspace   string                  `yaml:"workspace"`
+	Permissions PermissionConfig        `yaml:"permissions"`
+	KAG         KAGConfig               `yaml:"kag"`
+	Models      map[string]ModelProfile `yaml:"models"`
 }
 
 type PermissionConfig struct {
-	BuildDefault string
-	GitDefault   string
+	BuildDefault string `yaml:"build_default"`
+	GitDefault   string `yaml:"git_default"`
 }
 
 type KAGConfig struct {
-	AdapterPath string
-	Host        string
-	Fake        bool
-	ConfigPath  string
-	ProjectID   string
-	Namespace   string
-	Language    string
-	RuntimeDir  string
+	AdapterPath string `yaml:"adapter_path"`
+	Host        string `yaml:"host"`
+	Fake        bool   `yaml:"fake"`
+	ConfigPath  string `yaml:"config_path,omitempty"`
+	ProjectID   string `yaml:"project_id,omitempty"`
+	Namespace   string `yaml:"namespace,omitempty"`
+	Language    string `yaml:"language,omitempty"`
+	RuntimeDir  string `yaml:"runtime_dir,omitempty"`
 }
 
 type ModelProfile struct {
-	Provider string
-	Model    string
-	BaseURL  string
+	Provider string `yaml:"provider"`
+	Model    string `yaml:"model"`
+	BaseURL  string `yaml:"base_url,omitempty"`
 }
 
 type Source struct {
@@ -89,20 +89,20 @@ type ArtifactSet struct {
 }
 
 type EvalQuestion struct {
-	ID       string
-	Question string
+	ID       string `json:"id"`
+	Question string `json:"question"`
 }
 
 type EvalResult struct {
-	ID            string
-	Question      string
-	KnowledgeHash string
-	Answer        string
-	Evidence      []string
-	Explanation   string
-	Uncertainty   string
-	Mode          string
-	AdapterError  string
+	ID            string   `json:"id"`
+	Question      string   `json:"question"`
+	KnowledgeHash string   `json:"knowledge_hash,omitempty"`
+	Answer        string   `json:"answer"`
+	Evidence      []string `json:"evidence"`
+	Explanation   string   `json:"explanation,omitempty"`
+	Uncertainty   string   `json:"uncertainty,omitempty"`
+	Mode          string   `json:"mode,omitempty"`
+	AdapterError  string   `json:"adapter_error,omitempty"`
 }
 
 type EvalReport struct {

@@ -1,7 +1,6 @@
-package session
+package local
 
 import (
-	"bufio"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -11,36 +10,18 @@ import (
 	"time"
 
 	"github.com/zzqDeco/knote/internal/protocol"
+	"github.com/zzqDeco/knote/internal/repository"
 )
 
-type Store struct {
-	workspace string
-}
-
-type Summary struct {
-	ID          string    `json:"id"`
-	EventCount  int       `json:"event_count"`
-	LastEventAt time.Time `json:"last_event_at,omitempty"`
-	UpdatedAt   time.Time `json:"updated_at"`
-}
-
-func NewStore(workspace string) Store {
-	return Store{workspace: workspace}
-}
-
-func NewID() string {
+func NewSessionID() string {
 	return "sess_" + time.Now().UTC().Format("20060102T150405.000000000")
 }
 
-func (s Store) path(sessionID string) string {
-	return filepath.Join(s.workspace, ".knote", "sessions", sessionID+".jsonl")
-}
-
-func (s Store) Append(event protocol.Event) error {
-	if err := validateID(event.SessionID); err != nil {
+func appendSessionEvent(workspace string, event protocol.Event) error {
+	if err := validateSessionID(event.SessionID); err != nil {
 		return err
 	}
-	path := s.path(event.SessionID)
+	path := sessionPath(workspace, event.SessionID)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
@@ -49,19 +30,27 @@ func (s Store) Append(event protocol.Event) error {
 		return err
 	}
 	defer file.Close()
-	enc := json.NewEncoder(file)
-	return enc.Encode(event)
+	return json.NewEncoder(file).Encode(event)
 }
 
-func (s Store) Load(sessionID string) ([]protocol.Event, error) {
-	if err := validateID(sessionID); err != nil {
+func loadSessionEvents(workspace string, sessionID string) ([]protocol.Event, error) {
+	if err := validateSessionID(sessionID); err != nil {
 		return nil, err
 	}
-	return loadEvents(s.path(sessionID))
+	var events []protocol.Event
+	err := readJSONL(sessionPath(workspace, sessionID), func(data []byte) error {
+		var event protocol.Event
+		if err := json.Unmarshal(data, &event); err != nil {
+			return err
+		}
+		events = append(events, event)
+		return nil
+	})
+	return events, err
 }
 
-func (s Store) List(limit int) ([]Summary, error) {
-	dir := filepath.Join(s.workspace, ".knote", "sessions")
+func listSessions(workspace string, limit int) ([]repository.SessionSummary, error) {
+	dir := filepath.Join(workspace, ".knote", "sessions")
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -69,22 +58,21 @@ func (s Store) List(limit int) ([]Summary, error) {
 		}
 		return nil, err
 	}
-	summaries := make([]Summary, 0, len(entries))
+	summaries := make([]repository.SessionSummary, 0, len(entries))
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
 			continue
 		}
 		id := strings.TrimSuffix(entry.Name(), ".jsonl")
-		path := filepath.Join(dir, entry.Name())
 		info, err := entry.Info()
 		if err != nil {
 			return nil, err
 		}
-		events, err := loadEvents(path)
+		events, err := loadSessionEvents(workspace, id)
 		if err != nil {
 			return nil, err
 		}
-		summary := Summary{
+		summary := repository.SessionSummary{
 			ID:         id,
 			EventCount: len(events),
 			UpdatedAt:  info.ModTime().UTC(),
@@ -109,26 +97,11 @@ func (s Store) List(limit int) ([]Summary, error) {
 	return summaries, nil
 }
 
-func loadEvents(path string) ([]protocol.Event, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-	var events []protocol.Event
-	scanner := bufio.NewScanner(file)
-	scanner.Buffer(make([]byte, 64*1024), 8*1024*1024)
-	for scanner.Scan() {
-		var event protocol.Event
-		if err := json.Unmarshal(scanner.Bytes(), &event); err != nil {
-			return nil, err
-		}
-		events = append(events, event)
-	}
-	return events, scanner.Err()
+func sessionPath(workspace string, sessionID string) string {
+	return filepath.Join(workspace, ".knote", "sessions", sessionID+".jsonl")
 }
 
-func validateID(sessionID string) error {
+func validateSessionID(sessionID string) error {
 	if strings.TrimSpace(sessionID) == "" {
 		return fmt.Errorf("session id is required")
 	}

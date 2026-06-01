@@ -83,7 +83,6 @@ func TestKnowledgePackageImportBoundary(t *testing.T) {
 	}
 	for _, forbidden := range []string{
 		"/internal/tui",
-		"/internal/runtime",
 		"/internal/repository/local",
 	} {
 		if strings.Contains(string(out), forbidden) {

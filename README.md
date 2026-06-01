@@ -6,7 +6,10 @@ This MVP is Go-first:
 
 - `cmd/knote`: single CLI/TUI binary
 - `internal/tui`: Bubble Tea transcript, composer, overlays, pickers, and status line
-- `internal/runtime`: session, tools, permissions, task state, Git versioning, and KAG orchestration
+- `internal/agent`: turn handling, slash commands, confirmations, tasks, and session events
+- `internal/knowledge`: build/query/explain/eval semantics and artifact normalization
+- `internal/repository/local`: local config, sessions, artifacts, evals, and Git versions
+- `internal/knowledge/kag`: Go boundary for fake/real OpenSPG/KAG backends
 - `adapters/kag`: Python NDJSON adapter for OpenSPG/KAG
 
 ## Quick Start

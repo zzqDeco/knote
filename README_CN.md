@@ -6,7 +6,10 @@
 
 - `cmd/knote`：单一 CLI/TUI binary
 - `internal/tui`：Bubble Tea 实现 transcript、composer、overlay、picker、pager、status line
-- `internal/runtime`：会话、工具、权限、任务、Git 版本和 KAG 编排
+- `internal/agent`：turn、slash command、确认、任务和 session event
+- `internal/knowledge`：build/query/explain/eval 业务语义和 artifact 归一化
+- `internal/repository/local`：本地 config、session、artifact、eval 和 Git version 实现
+- `internal/knowledge/kag`：fake/real OpenSPG/KAG backend 的 Go 边界
 - `adapters/kag`：OpenSPG/KAG Python NDJSON adapter
 
 ## 快速开始

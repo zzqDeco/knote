@@ -1,4 +1,4 @@
-package runtime
+package agenttest
 
 import (
 	"context"
@@ -8,8 +8,11 @@ import (
 	"strings"
 	"testing"
 
+	agentpkg "github.com/zzqDeco/knote/internal/agent"
+	"github.com/zzqDeco/knote/internal/knowledge"
+	"github.com/zzqDeco/knote/internal/knowledge/kag"
 	"github.com/zzqDeco/knote/internal/protocol"
-	"github.com/zzqDeco/knote/internal/session"
+	"github.com/zzqDeco/knote/internal/repository/local"
 )
 
 func TestAgentBuildAndQueryWithFakeKAG(t *testing.T) {
@@ -19,7 +22,7 @@ func TestAgentBuildAndQueryWithFakeKAG(t *testing.T) {
 	mustRun(t, workspace, "git", "init")
 
 	t.Setenv("KNOTE_KAG_FAKE", "1")
-	agent, _, err := New(context.Background(), Options{Workspace: workspace})
+	agent, _, err := newTestAgent(t, workspace)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,7 +48,7 @@ func TestAgentRejectsSideEffectConfirmation(t *testing.T) {
 	mustRun(t, workspace, "git", "init")
 
 	t.Setenv("KNOTE_KAG_FAKE", "1")
-	agent, _, err := New(context.Background(), Options{Workspace: workspace})
+	agent, _, err := newTestAgent(t, workspace)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,7 +70,7 @@ func TestAgentRejectsForgedAndReplayedConfirmation(t *testing.T) {
 	mustRun(t, workspace, "git", "init")
 
 	t.Setenv("KNOTE_KAG_FAKE", "1")
-	agent, _, err := New(context.Background(), Options{Workspace: workspace})
+	agent, _, err := newTestAgent(t, workspace)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -100,7 +103,7 @@ func TestAgentSessionCommands(t *testing.T) {
 	workspace := t.TempDir()
 	mustRun(t, workspace, "git", "init")
 	t.Setenv("KNOTE_KAG_FAKE", "1")
-	agent, _, err := New(context.Background(), Options{Workspace: workspace})
+	agent, _, err := newTestAgent(t, workspace)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -123,8 +126,8 @@ func TestAgentSessionCommands(t *testing.T) {
 		t.Fatalf("/new did not emit session info and clear events: %+v", newEvents)
 	}
 
-	store := session.NewStore(workspace)
-	beforeResume, err := store.Load(oldID)
+	store := local.New(workspace)
+	beforeResume, err := store.Load(context.Background(), oldID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -135,7 +138,7 @@ func TestAgentSessionCommands(t *testing.T) {
 	if !hasEvent(resumeEvents, protocol.EventSessionInfo) || !hasEvent(resumeEvents, protocol.EventViewClear) {
 		t.Fatalf("/resume did not emit replay boundary and session info: %+v", resumeEvents)
 	}
-	afterResume, err := store.Load(oldID)
+	afterResume, err := store.Load(context.Background(), oldID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,7 +151,7 @@ func TestAgentReadOnlyCommands(t *testing.T) {
 	workspace := t.TempDir()
 	mustRun(t, workspace, "git", "init")
 	t.Setenv("KNOTE_KAG_FAKE", "1")
-	agent, _, err := New(context.Background(), Options{Workspace: workspace})
+	agent, _, err := newTestAgent(t, workspace)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -176,7 +179,7 @@ func TestAgentResumeWithoutIDListsRecentSessions(t *testing.T) {
 	workspace := t.TempDir()
 	mustRun(t, workspace, "git", "init")
 	t.Setenv("KNOTE_KAG_FAKE", "1")
-	agent, _, err := New(context.Background(), Options{Workspace: workspace})
+	agent, _, err := newTestAgent(t, workspace)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -193,7 +196,7 @@ func TestAgentEvalWritesStableReport(t *testing.T) {
 	workspace := t.TempDir()
 	mustRun(t, workspace, "git", "init")
 	t.Setenv("KNOTE_KAG_FAKE", "1")
-	agent, _, err := New(context.Background(), Options{Workspace: workspace})
+	agent, _, err := newTestAgent(t, workspace)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -226,7 +229,7 @@ func TestAgentReleaseRequiresEvalGateAndCleanWorkspace(t *testing.T) {
 	mustRun(t, workspace, "git", "config", "user.email", "knote@example.com")
 	mustRun(t, workspace, "git", "config", "user.name", "knote")
 	t.Setenv("KNOTE_KAG_FAKE", "1")
-	agent, _, err := New(context.Background(), Options{Workspace: workspace})
+	agent, _, err := newTestAgent(t, workspace)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -269,7 +272,7 @@ func TestAgentReleaseRejectsStaleEvalAfterKnowledgeCommit(t *testing.T) {
 	mustRun(t, workspace, "git", "config", "user.email", "knote@example.com")
 	mustRun(t, workspace, "git", "config", "user.name", "knote")
 	t.Setenv("KNOTE_KAG_FAKE", "1")
-	agent, _, err := New(context.Background(), Options{Workspace: workspace})
+	agent, _, err := newTestAgent(t, workspace)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -300,7 +303,7 @@ func TestAgentCheckoutRequiresRefBeforeConfirm(t *testing.T) {
 	workspace := t.TempDir()
 	mustRun(t, workspace, "git", "init")
 	t.Setenv("KNOTE_KAG_FAKE", "1")
-	agent, _, err := New(context.Background(), Options{Workspace: workspace})
+	agent, _, err := newTestAgent(t, workspace)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -318,6 +321,41 @@ func hasEvent(events []protocol.Event, eventType protocol.EventType) bool {
 		}
 	}
 	return false
+}
+
+func newTestAgent(t *testing.T, workspace string) (*agentpkg.Agent, []protocol.Event, error) {
+	t.Helper()
+	ctx := context.Background()
+	repo := local.New(workspace)
+	cfg, err := repo.Config(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	cfg.KAG.Fake = true
+	cfg.Workspace = workspace
+	if err := repo.SaveConfig(ctx, cfg); err != nil {
+		return nil, nil, err
+	}
+	kagClient := kag.Client{
+		AdapterPath: cfg.KAG.AdapterPath,
+		Workspace:   workspace,
+		Host:        cfg.KAG.Host,
+		Fake:        cfg.KAG.Fake,
+		ConfigPath:  cfg.KAG.ConfigPath,
+		ProjectID:   cfg.KAG.ProjectID,
+		Namespace:   cfg.KAG.Namespace,
+		Language:    cfg.KAG.Language,
+		RuntimeDir:  cfg.KAG.RuntimeDir,
+	}
+	return agentpkg.New(ctx, agentpkg.Dependencies{
+		Workspace:     workspace,
+		Config:        cfg,
+		Sessions:      repo,
+		Versions:      repo,
+		WorkspaceRepo: repo,
+		Knowledge:     knowledge.New(knowledge.Options{Workspace: workspace, Repo: repo, Backend: kagClient, Mode: knowledge.ModeFake}),
+		NewSessionID:  local.NewSessionID,
+	})
 }
 
 func firstConfirm(t *testing.T, events []protocol.Event) protocol.ConfirmRequest {

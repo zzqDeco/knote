@@ -8,12 +8,12 @@ The MVP is a single Go CLI/TUI binary with a Python KAG subprocess adapter. Bubb
 
 - `cmd/knote` parses `--workspace`, `--resume`, `--version`, and starts the TUI.
 - `internal/tui` renders transcript, composer, permission overlay, tasks, versions, diff pager, and status line.
-- `internal/runtime` maps user messages and slash commands to build/query/explain/status/version/eval actions.
+- `internal/agent` maps user messages and slash commands to build/query/explain/status/version/eval actions.
 - Side-effecting slash commands emit `confirm.request` and run only after TUI approval.
-- `internal/artifact` writes deterministic JSONL and Markdown artifacts.
-- `internal/kag` speaks NDJSON with `adapters/kag/knote_kag_adapter.py`.
+- `internal/knowledge` owns build/query/explain/eval semantics and normalizes stable knote artifacts.
+- `internal/repository/local` writes deterministic JSONL/Markdown artifacts, sessions, evals, config, and Git versions.
+- `internal/knowledge/kag` speaks NDJSON with `adapters/kag/knote_kag_adapter.py`.
 - `adapters/kag` prepares sorted corpus JSON, generates a starter `kag_config.yaml`, and invokes real KAG builder/solver APIs when OpenSPG/KAG is installed and reachable.
-- `internal/gitstore` wraps read-only Git status/log/diff plus confirmed commit/tag/checkout.
 
 ## PR Progress
 
@@ -21,7 +21,13 @@ The MVP is a single Go CLI/TUI binary with a Python KAG subprocess adapter. Bubb
 - PR #3 `feature/kag-real-adapter`: completed and merged to `dev`.
 - PR #4 `feature/tui-session-ux`: completed and merged to `dev`.
 - PR #5 `feature/version-eval-release-gate`: completed and merged to `dev`.
-- PR #6 `test/mvp-acceptance-docs`: adds repeatable MVP smoke scripts, PTY startup coverage, real KAG manual smoke, docs, and CI wiring.
+- PR #6 `test/mvp-acceptance-docs`: completed and merged to `dev`.
+- PR #7 `refactor/repository-interfaces`: completed and merged to `dev`.
+- PR #8 `refactor/local-repository`: completed and merged to `dev`.
+- PR #9 `refactor/knowledge-service`: completed and merged to `dev`.
+- PR #10 `refactor/kag-backend`: completed and merged to `dev`.
+- PR #11 `refactor/agent-runtime`: completed and merged to `dev`.
+- PR F `refactor/remove-legacy-shims`: removes compatibility shims and updates docs/tests so new code depends on `agent`, `knowledge`, and `repository` boundaries.
 
 ## Acceptance
 
