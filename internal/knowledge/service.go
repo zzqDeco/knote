@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/zzqDeco/knote/internal/kag"
+	"github.com/zzqDeco/knote/internal/knowledge/kag"
 	"github.com/zzqDeco/knote/internal/protocol"
 	"github.com/zzqDeco/knote/internal/repository"
 )
