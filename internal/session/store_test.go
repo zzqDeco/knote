@@ -45,6 +45,25 @@ func TestStoreListSummariesNewestFirst(t *testing.T) {
 	}
 }
 
+func TestStoreRejectsUnsafeSessionIDs(t *testing.T) {
+	workspace := t.TempDir()
+	store := NewStore(workspace)
+	for _, sessionID := range []string{"../../outside", "..", ".", "nested/session", `nested\session`, " sess"} {
+		t.Run(sessionID, func(t *testing.T) {
+			event := protocol.NewEvent(protocol.EventAssistantDone, sessionID, "unsafe", nil)
+			if err := store.Append(event); err == nil {
+				t.Fatalf("Append should reject unsafe session id %q", sessionID)
+			}
+			if _, err := store.Load(sessionID); err == nil {
+				t.Fatalf("Load should reject unsafe session id %q", sessionID)
+			}
+		})
+	}
+	if _, err := os.Stat(filepath.Join(workspace, "outside.jsonl")); err == nil {
+		t.Fatal("unsafe session id escaped the sessions directory")
+	}
+}
+
 func mustAppend(t *testing.T, store Store, sessionID, message string) {
 	t.Helper()
 	event := protocol.NewEvent(protocol.EventAssistantDone, sessionID, message, nil)

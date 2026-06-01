@@ -37,8 +37,8 @@ func (s Store) path(sessionID string) string {
 }
 
 func (s Store) Append(event protocol.Event) error {
-	if strings.TrimSpace(event.SessionID) == "" {
-		return fmt.Errorf("session event missing session id")
+	if err := validateID(event.SessionID); err != nil {
+		return err
 	}
 	path := s.path(event.SessionID)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -54,6 +54,9 @@ func (s Store) Append(event protocol.Event) error {
 }
 
 func (s Store) Load(sessionID string) ([]protocol.Event, error) {
+	if err := validateID(sessionID); err != nil {
+		return nil, err
+	}
 	return loadEvents(s.path(sessionID))
 }
 
@@ -123,4 +126,23 @@ func loadEvents(path string) ([]protocol.Event, error) {
 		events = append(events, event)
 	}
 	return events, scanner.Err()
+}
+
+func validateID(sessionID string) error {
+	if strings.TrimSpace(sessionID) == "" {
+		return fmt.Errorf("session id is required")
+	}
+	if strings.TrimSpace(sessionID) != sessionID {
+		return fmt.Errorf("session id contains leading or trailing whitespace")
+	}
+	if sessionID == "." || sessionID == ".." {
+		return fmt.Errorf("session id cannot be a path segment: %s", sessionID)
+	}
+	if strings.ContainsAny(sessionID, `/\`) {
+		return fmt.Errorf("session id cannot contain path separators: %s", sessionID)
+	}
+	if filepath.Clean(sessionID) != sessionID {
+		return fmt.Errorf("session id is not normalized: %s", sessionID)
+	}
+	return nil
 }
