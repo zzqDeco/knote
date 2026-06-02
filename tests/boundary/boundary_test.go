@@ -30,6 +30,25 @@ func TestAgentPackageImportBoundary(t *testing.T) {
 	}
 }
 
+func TestVersionedKnowledgePackageImportBoundary(t *testing.T) {
+	cmd := exec.Command("go", "list", "-f", "{{join .Imports \"\\n\"}}", "./internal/knowledge/versioned")
+	cmd.Dir = repoRoot()
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("go list versioned knowledge imports: %v", err)
+	}
+	for _, forbidden := range []string{
+		"/internal/agent",
+		"/internal/runtime",
+		"/internal/tui",
+		"/internal/repository/" + "local",
+	} {
+		if strings.Contains(string(out), forbidden) {
+			t.Fatalf("versioned knowledge imports forbidden package %s:\n%s", forbidden, out)
+		}
+	}
+}
+
 func TestAgentProductionCodeHasNoFilesystemOrProcessSideEffects(t *testing.T) {
 	files, err := filepath.Glob(filepath.Join(repoRoot(), "internal", "agent", "*.go"))
 	if err != nil {

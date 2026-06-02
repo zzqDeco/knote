@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/zzqDeco/knote/internal/knowledge"
+	"github.com/zzqDeco/knote/internal/knowledge/versioned"
 	"github.com/zzqDeco/knote/internal/protocol"
 	"github.com/zzqDeco/knote/internal/repository"
 )
@@ -22,7 +22,7 @@ type Agent struct {
 	sessions             repository.Sessions
 	versionStore         repository.Versions
 	workspaceRepo        repository.Workspace
-	knowledge            knowledge.Service
+	knowledge            versioned.Service
 	newSessionID         func() string
 	tasks                map[string]protocol.Task
 	confirmMu            sync.Mutex
@@ -37,7 +37,7 @@ type Dependencies struct {
 	Sessions      repository.Sessions
 	Versions      repository.Versions
 	WorkspaceRepo repository.Workspace
-	Knowledge     knowledge.Service
+	Knowledge     versioned.Service
 	NewSessionID  func() string
 }
 
@@ -448,7 +448,7 @@ func (r *Agent) query(ctx context.Context, question string) []protocol.Event {
 }
 
 func (r *Agent) status(ctx context.Context) []protocol.Event {
-	status, err := r.versionStore.Status(ctx)
+	status, err := r.knowledge.Status(ctx)
 	if err != nil {
 		return []protocol.Event{protocol.NewEvent(protocol.EventError, r.sessionID, err.Error(), nil)}
 	}
@@ -456,7 +456,7 @@ func (r *Agent) status(ctx context.Context) []protocol.Event {
 }
 
 func (r *Agent) diff(ctx context.Context, ref string) []protocol.Event {
-	out, err := r.versionStore.Diff(ctx, ref)
+	out, err := r.knowledge.Diff(ctx, ref)
 	if err != nil {
 		return []protocol.Event{protocol.NewEvent(protocol.EventError, r.sessionID, err.Error(), nil)}
 	}
@@ -467,7 +467,7 @@ func (r *Agent) diff(ctx context.Context, ref string) []protocol.Event {
 }
 
 func (r *Agent) versions(ctx context.Context) []protocol.Event {
-	versions, err := r.versionStore.Versions(ctx, 20)
+	versions, err := r.knowledge.Versions(ctx, 20)
 	if err != nil {
 		return []protocol.Event{protocol.NewEvent(protocol.EventVersionChanged, r.sessionID, "No versions yet.", nil)}
 	}
@@ -494,7 +494,7 @@ func (r *Agent) commit(ctx context.Context, message string) []protocol.Event {
 	if strings.TrimSpace(message) == "" {
 		message = "knowledge: build " + time.Now().UTC().Format("20060102T150405Z")
 	}
-	result, err := r.versionStore.Commit(ctx, message)
+	result, err := r.knowledge.Commit(ctx, message)
 	if err != nil {
 		return []protocol.Event{protocol.NewEvent(protocol.EventError, r.sessionID, err.Error(), nil)}
 	}
@@ -505,19 +505,14 @@ func (r *Agent) release(ctx context.Context, tag string) []protocol.Event {
 	if strings.TrimSpace(tag) == "" {
 		tag = "v0.1.0"
 	}
-	if err := r.releasePreflight(ctx); err != nil {
-		return []protocol.Event{protocol.NewEvent(protocol.EventError, r.sessionID, err.Error(), nil)}
-	}
-	err := r.versionStore.Tag(ctx, tag)
-	if err != nil {
+	if err := r.knowledge.Release(ctx, tag); err != nil {
 		return []protocol.Event{protocol.NewEvent(protocol.EventError, r.sessionID, err.Error(), nil)}
 	}
 	return []protocol.Event{protocol.NewEvent(protocol.EventVersionChanged, r.sessionID, "Tagged "+tag, map[string]string{"tag": tag})}
 }
 
 func (r *Agent) checkout(ctx context.Context, ref string) []protocol.Event {
-	err := r.versionStore.Checkout(ctx, ref, repository.CheckoutOptions{AllowDirty: true})
-	if err != nil {
+	if err := r.knowledge.Checkout(ctx, ref, repository.CheckoutOptions{AllowDirty: true}); err != nil {
 		return []protocol.Event{protocol.NewEvent(protocol.EventError, r.sessionID, err.Error(), nil)}
 	}
 	return []protocol.Event{protocol.NewEvent(protocol.EventVersionChanged, r.sessionID, "Checked out "+ref, map[string]string{"ref": ref})}
@@ -553,7 +548,7 @@ func (r *Agent) eval(ctx context.Context) []protocol.Event {
 	}
 	message := report.ReportMarkdown
 	if strings.TrimSpace(message) == "" {
-		message = knowledge.RenderEvalReport(report)
+		message = versioned.RenderEvalReport(report)
 	}
 	events = append(events, protocol.NewEvent(protocol.EventAssistantDone, r.sessionID, message, payload))
 	if report.AdapterErrors > 0 {
