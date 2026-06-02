@@ -9,8 +9,8 @@ import (
 	"testing"
 
 	agentpkg "github.com/zzqDeco/knote/internal/agent"
-	"github.com/zzqDeco/knote/internal/knowledge"
 	"github.com/zzqDeco/knote/internal/knowledge/kag"
+	"github.com/zzqDeco/knote/internal/knowledge/versioned"
 	"github.com/zzqDeco/knote/internal/protocol"
 	"github.com/zzqDeco/knote/internal/repository/local"
 )
@@ -62,7 +62,7 @@ func TestAgentBuildFailureDoesNotEmitSuccessOrWriteArtifacts(t *testing.T) {
 		Sessions:      repo,
 		Versions:      repo,
 		WorkspaceRepo: repo,
-		Knowledge:     knowledge.New(knowledge.Options{Workspace: workspace, Repo: repo, Backend: buildFailingBackend{}, Mode: knowledge.ModeReal}),
+		Knowledge:     versioned.New(versioned.Options{Workspace: workspace, Repo: repo, Versions: repo, Backend: buildFailingBackend{}, Mode: versioned.ModeReal}),
 		NewSessionID:  local.NewSessionID,
 	})
 	if err != nil {
@@ -415,7 +415,7 @@ func newTestAgent(t *testing.T, workspace string) (*agentpkg.Agent, []protocol.E
 		Sessions:      repo,
 		Versions:      repo,
 		WorkspaceRepo: repo,
-		Knowledge:     knowledge.New(knowledge.Options{Workspace: workspace, Repo: repo, Backend: kagClient, Mode: knowledge.ModeFake}),
+		Knowledge:     versioned.New(versioned.Options{Workspace: workspace, Repo: repo, Versions: repo, Backend: kagClient, Mode: versioned.ModeFake}),
 		NewSessionID:  local.NewSessionID,
 	})
 }

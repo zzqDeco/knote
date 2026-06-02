@@ -10,8 +10,8 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/zzqDeco/knote/internal/agent"
-	"github.com/zzqDeco/knote/internal/knowledge"
 	"github.com/zzqDeco/knote/internal/knowledge/kag"
+	"github.com/zzqDeco/knote/internal/knowledge/versioned"
 	"github.com/zzqDeco/knote/internal/protocol"
 	"github.com/zzqDeco/knote/internal/repository/local"
 	"github.com/zzqDeco/knote/internal/tui"
@@ -64,9 +64,9 @@ func newAgent(ctx context.Context, workspacePath string, resumeID string) (*agen
 	if err := repo.SaveConfig(ctx, repoCfg); err != nil {
 		return nil, nil, err
 	}
-	mode := knowledge.ModeReal
+	mode := versioned.ModeReal
 	if repoCfg.KAG.Fake {
-		mode = knowledge.ModeFake
+		mode = versioned.ModeFake
 	}
 	kagClient := kag.Client{
 		AdapterPath: repoCfg.KAG.AdapterPath,
@@ -86,7 +86,7 @@ func newAgent(ctx context.Context, workspacePath string, resumeID string) (*agen
 		Sessions:      repo,
 		Versions:      repo,
 		WorkspaceRepo: repo,
-		Knowledge:     knowledge.New(knowledge.Options{Workspace: workspace, Repo: repo, Backend: kagClient, Mode: mode}),
+		Knowledge:     versioned.New(versioned.Options{Workspace: workspace, Repo: repo, Versions: repo, Backend: kagClient, Mode: mode}),
 		NewSessionID:  local.NewSessionID,
 	})
 }
