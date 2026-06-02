@@ -27,23 +27,45 @@ const (
 	NameCheckout = "knote_checkout"
 )
 
+type SideEffectRequest struct {
+	ToolName        string `json:"tool_name"`
+	Action          string `json:"action"`
+	ArgumentsInJSON string `json:"arguments_in_json"`
+	Summary         string `json:"summary"`
+}
+
+type SideEffectGate func(ctx context.Context, req SideEffectRequest) error
+
+type Options struct {
+	Service        versioned.Service
+	SideEffectGate SideEffectGate
+}
+
 func New(svc versioned.Service) []einotool.InvokableTool {
+	return NewWithOptions(Options{Service: svc})
+}
+
+func NewWithOptions(opts Options) []einotool.InvokableTool {
 	return []einotool.InvokableTool{
-		buildTool(svc),
-		queryTool(svc),
-		explainTool(svc),
-		evalTool(svc),
-		diffTool(svc),
-		versionsTool(svc),
-		commitTool(svc),
-		releaseTool(svc),
-		checkoutTool(svc),
+		buildTool(opts),
+		queryTool(opts.Service),
+		explainTool(opts.Service),
+		evalTool(opts),
+		diffTool(opts.Service),
+		versionsTool(opts.Service),
+		commitTool(opts),
+		releaseTool(opts),
+		checkoutTool(opts),
 	}
 }
 
 func ByName(svc versioned.Service) map[string]einotool.InvokableTool {
+	return ByNameWithOptions(Options{Service: svc})
+}
+
+func ByNameWithOptions(opts Options) map[string]einotool.InvokableTool {
 	out := make(map[string]einotool.InvokableTool)
-	for _, candidate := range New(svc) {
+	for _, candidate := range NewWithOptions(opts) {
 		info, err := candidate.Info(context.Background())
 		if err != nil {
 			continue
@@ -78,14 +100,17 @@ func (t *invokable) InvokableRun(ctx context.Context, argumentsInJSON string, _ 
 	return string(data), nil
 }
 
-func buildTool(svc versioned.Service) einotool.InvokableTool {
+func buildTool(opts Options) einotool.InvokableTool {
 	return &invokable{
 		info: toolInfo(NameBuild, "Build the current knote knowledge artifacts by calling the configured KAG backend.", nil),
 		run: func(ctx context.Context, args string) (any, error) {
 			if err := decodeArgs(args, nil); err != nil {
 				return nil, err
 			}
-			result, err := svc.Build(ctx)
+			if err := requireSideEffectGate(ctx, opts, NameBuild, "build", args, "Build knowledge artifacts."); err != nil {
+				return nil, err
+			}
+			result, err := opts.Service.Build(ctx)
 			if err != nil {
 				return nil, err
 			}
@@ -143,14 +168,17 @@ func explainTool(svc versioned.Service) einotool.InvokableTool {
 	}
 }
 
-func evalTool(svc versioned.Service) einotool.InvokableTool {
+func evalTool(opts Options) einotool.InvokableTool {
 	return &invokable{
 		info: toolInfo(NameEval, "Run knote eval questions against the current knowledge version.", nil),
 		run: func(ctx context.Context, args string) (any, error) {
 			if err := decodeArgs(args, nil); err != nil {
 				return nil, err
 			}
-			report, err := svc.Eval(ctx)
+			if err := requireSideEffectGate(ctx, opts, NameEval, "eval", args, "Run evaluation and write eval outputs."); err != nil {
+				return nil, err
+			}
+			report, err := opts.Service.Eval(ctx)
 			if err != nil {
 				return nil, err
 			}
@@ -201,7 +229,7 @@ func versionsTool(svc versioned.Service) einotool.InvokableTool {
 	}
 }
 
-func commitTool(svc versioned.Service) einotool.InvokableTool {
+func commitTool(opts Options) einotool.InvokableTool {
 	return &invokable{
 		info: toolInfo(NameCommit, "Commit the current knote knowledge version.", params(map[string]*schema.ParameterInfo{
 			"message": stringParam("Git commit message.", false),
@@ -211,7 +239,10 @@ func commitTool(svc versioned.Service) einotool.InvokableTool {
 			if err := decodeArgs(args, &req); err != nil {
 				return nil, err
 			}
-			result, err := svc.Commit(ctx, req.Message)
+			if err := requireSideEffectGate(ctx, opts, NameCommit, "commit", args, "Commit the current knowledge version."); err != nil {
+				return nil, err
+			}
+			result, err := opts.Service.Commit(ctx, req.Message)
 			if err != nil {
 				return nil, err
 			}
@@ -224,7 +255,7 @@ func commitTool(svc versioned.Service) einotool.InvokableTool {
 	}
 }
 
-func releaseTool(svc versioned.Service) einotool.InvokableTool {
+func releaseTool(opts Options) einotool.InvokableTool {
 	return &invokable{
 		info: toolInfo(NameRelease, "Create a release tag for the current knote knowledge version.", params(map[string]*schema.ParameterInfo{
 			"tag": stringParam("Release tag to create.", true),
@@ -237,7 +268,10 @@ func releaseTool(svc versioned.Service) einotool.InvokableTool {
 			if strings.TrimSpace(req.Tag) == "" {
 				return nil, fmt.Errorf("tag is required")
 			}
-			if err := svc.Release(ctx, req.Tag); err != nil {
+			if err := requireSideEffectGate(ctx, opts, NameRelease, "release", args, "Create a release tag."); err != nil {
+				return nil, err
+			}
+			if err := opts.Service.Release(ctx, req.Tag); err != nil {
 				return nil, err
 			}
 			return map[string]string{"tag": req.Tag}, nil
@@ -245,7 +279,7 @@ func releaseTool(svc versioned.Service) einotool.InvokableTool {
 	}
 }
 
-func checkoutTool(svc versioned.Service) einotool.InvokableTool {
+func checkoutTool(opts Options) einotool.InvokableTool {
 	return &invokable{
 		info: toolInfo(NameCheckout, "Checkout a Git ref for the knote knowledge workspace.", params(map[string]*schema.ParameterInfo{
 			"ref":         stringParam("Git ref to checkout.", true),
@@ -259,13 +293,28 @@ func checkoutTool(svc versioned.Service) einotool.InvokableTool {
 			if strings.TrimSpace(req.Ref) == "" {
 				return nil, fmt.Errorf("ref is required")
 			}
-			opts := repository.CheckoutOptions{AllowDirty: req.AllowDirty}
-			if err := svc.Checkout(ctx, req.Ref, opts); err != nil {
+			checkoutOpts := repository.CheckoutOptions{AllowDirty: req.AllowDirty}
+			if err := requireSideEffectGate(ctx, opts, NameCheckout, "checkout", args, "Checkout a knowledge version."); err != nil {
 				return nil, err
 			}
-			return map[string]any{"ref": req.Ref, "allow_dirty": opts.AllowDirty}, nil
+			if err := opts.Service.Checkout(ctx, req.Ref, checkoutOpts); err != nil {
+				return nil, err
+			}
+			return map[string]any{"ref": req.Ref, "allow_dirty": checkoutOpts.AllowDirty}, nil
 		},
 	}
+}
+
+func requireSideEffectGate(ctx context.Context, opts Options, toolName string, action string, args string, summary string) error {
+	if opts.SideEffectGate == nil {
+		return fmt.Errorf("%s requires runtime confirmation before side effects", toolName)
+	}
+	return opts.SideEffectGate(ctx, SideEffectRequest{
+		ToolName:        toolName,
+		Action:          action,
+		ArgumentsInJSON: strings.TrimSpace(args),
+		Summary:         summary,
+	})
 }
 
 func toolInfo(name string, desc string, paramsOneOf *schema.ParamsOneOf) *schema.ToolInfo {

@@ -44,7 +44,14 @@ func TestNewExposesExpectedInvokableTools(t *testing.T) {
 
 func TestToolsCallVersionedServiceAndReturnJSON(t *testing.T) {
 	svc := &fakeService{}
-	registry := ByName(svc)
+	var gated []SideEffectRequest
+	registry := ByNameWithOptions(Options{
+		Service: svc,
+		SideEffectGate: func(_ context.Context, req SideEffectRequest) error {
+			gated = append(gated, req)
+			return nil
+		},
+	})
 
 	runJSON(t, registry[NameBuild], `{}`)
 	if !svc.buildCalled {
@@ -95,6 +102,14 @@ func TestToolsCallVersionedServiceAndReturnJSON(t *testing.T) {
 	if checkout["ref"] != "dev" || checkout["allow_dirty"] != true || svc.checkoutRef != "dev" || !svc.checkoutOpts.AllowDirty {
 		t.Fatalf("unexpected checkout result=%+v ref=%q opts=%+v", checkout, svc.checkoutRef, svc.checkoutOpts)
 	}
+	if got, want := len(gated), 5; got != want {
+		t.Fatalf("side-effect gate calls = %d, want %d: %+v", got, want, gated)
+	}
+	for _, action := range []string{"build", "eval", "commit", "release", "checkout"} {
+		if !hasGateAction(gated, action) {
+			t.Fatalf("missing side-effect gate action %s in %+v", action, gated)
+		}
+	}
 }
 
 func TestToolsRejectMalformedUnknownAndMissingArguments(t *testing.T) {
@@ -113,6 +128,29 @@ func TestToolsRejectMalformedUnknownAndMissingArguments(t *testing.T) {
 		if _, err := registry[tc.name].InvokableRun(context.Background(), tc.args); err == nil {
 			t.Fatalf("%s accepted invalid args %s", tc.name, tc.args)
 		}
+	}
+}
+
+func TestMutatingToolsRequireSideEffectGate(t *testing.T) {
+	svc := &fakeService{}
+	registry := ByName(svc)
+	for _, tc := range []struct {
+		name string
+		args string
+	}{
+		{name: NameBuild, args: `{}`},
+		{name: NameEval, args: `{}`},
+		{name: NameCommit, args: `{"message":"knowledge update"}`},
+		{name: NameRelease, args: `{"tag":"v0.1.1"}`},
+		{name: NameCheckout, args: `{"ref":"dev","allow_dirty":true}`},
+	} {
+		_, err := registry[tc.name].InvokableRun(context.Background(), tc.args)
+		if err == nil || !strings.Contains(err.Error(), "requires runtime confirmation") {
+			t.Fatalf("%s did not require side-effect gate, err=%v", tc.name, err)
+		}
+	}
+	if svc.buildCalled || svc.evalCalled || svc.commitMessage != "" || svc.releaseTag != "" || svc.checkoutRef != "" {
+		t.Fatalf("mutating tool called service without gate: %+v", svc)
 	}
 }
 
@@ -145,6 +183,15 @@ func runJSON(t *testing.T, tool einotool.InvokableTool, args string) map[string]
 		t.Fatalf("tool returned invalid JSON %q: %v", out, err)
 	}
 	return decoded
+}
+
+func hasGateAction(requests []SideEffectRequest, action string) bool {
+	for _, req := range requests {
+		if req.Action == action {
+			return true
+		}
+	}
+	return false
 }
 
 type fakeService struct {
