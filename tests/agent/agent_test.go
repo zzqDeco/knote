@@ -41,6 +41,48 @@ func TestAgentBuildAndQueryWithFakeKAG(t *testing.T) {
 	}
 }
 
+func TestAgentBuildFailureDoesNotEmitSuccessOrWriteArtifacts(t *testing.T) {
+	workspace := t.TempDir()
+	must(t, os.MkdirAll(filepath.Join(workspace, "sources"), 0o755))
+	must(t, os.WriteFile(filepath.Join(workspace, "sources", "intro.md"), []byte("# Intro\n\nknote is local-first."), 0o644))
+	mustRun(t, workspace, "git", "init")
+
+	repo := local.New(workspace)
+	cfg, err := repo.Config(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Workspace = workspace
+	if err := repo.SaveConfig(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	agent, _, err := agentpkg.New(context.Background(), agentpkg.Dependencies{
+		Workspace:     workspace,
+		Config:        cfg,
+		Sessions:      repo,
+		Versions:      repo,
+		WorkspaceRepo: repo,
+		Knowledge:     knowledge.New(knowledge.Options{Workspace: workspace, Repo: repo, Backend: buildFailingBackend{}, Mode: knowledge.ModeReal}),
+		NewSessionID:  local.NewSessionID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	events := agent.Handle(context.Background(), "/build")
+	confirm := firstConfirm(t, events)
+	events = agent.Confirm(context.Background(), confirm, true)
+	if !hasEvent(events, protocol.EventError) || !hasEvent(events, protocol.EventTaskComplete) {
+		t.Fatalf("failed build did not emit error and task completion: %+v", events)
+	}
+	if hasEvent(events, protocol.EventBuildComplete) || hasEvent(events, protocol.EventToolComplete) {
+		t.Fatalf("failed build emitted success events: %+v", events)
+	}
+	if _, err := os.Stat(filepath.Join(workspace, "artifacts", "manifest.json")); !os.IsNotExist(err) {
+		t.Fatalf("failed build wrote artifacts: %v", err)
+	}
+}
+
 func TestAgentRejectsSideEffectConfirmation(t *testing.T) {
 	workspace := t.TempDir()
 	must(t, os.MkdirAll(filepath.Join(workspace, "sources"), 0o755))
@@ -61,6 +103,26 @@ func TestAgentRejectsSideEffectConfirmation(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(workspace, "artifacts", "manifest.json")); !os.IsNotExist(err) {
 		t.Fatalf("rejected build wrote artifacts: %v", err)
 	}
+}
+
+type buildFailingBackend struct{}
+
+func (buildFailingBackend) Build(context.Context) (kag.Response, error) {
+	return kag.Response{}, fakeBackendError("adapter unavailable")
+}
+
+func (buildFailingBackend) Query(context.Context, string) (kag.Response, error) {
+	return kag.Response{}, fakeBackendError("adapter unavailable")
+}
+
+func (buildFailingBackend) Explain(context.Context, string) (kag.Response, error) {
+	return kag.Response{}, fakeBackendError("adapter unavailable")
+}
+
+type fakeBackendError string
+
+func (e fakeBackendError) Error() string {
+	return string(e)
 }
 
 func TestAgentRejectsForgedAndReplayedConfirmation(t *testing.T) {
