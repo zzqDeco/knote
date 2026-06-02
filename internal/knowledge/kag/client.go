@@ -14,6 +14,8 @@ import (
 	"time"
 )
 
+const maxNDJSONLineBytes = 16 * 1024 * 1024
+
 type Client struct {
 	AdapterPath string
 	Workspace   string
@@ -111,6 +113,7 @@ func (c Client) call(ctx context.Context, method string, params map[string]any) 
 	var last Response
 	var mu sync.Mutex
 	scanner := bufio.NewScanner(out)
+	scanner.Buffer(make([]byte, 64*1024), maxNDJSONLineBytes)
 	for scanner.Scan() {
 		var resp Response
 		if err := json.Unmarshal(scanner.Bytes(), &resp); err != nil {
@@ -152,23 +155,36 @@ func pythonBin() string {
 }
 
 func (c Client) resolveAdapterPath() string {
-	if filepath.IsAbs(c.AdapterPath) {
-		return c.AdapterPath
-	}
-	if _, err := os.Stat(filepath.Join(c.Workspace, c.AdapterPath)); err == nil {
-		return filepath.Join(c.Workspace, c.AdapterPath)
-	}
-	return filepath.Join(projectRootFallback(c.Workspace, c.AdapterPath), c.AdapterPath)
+	executable, _ := os.Executable()
+	wd, _ := os.Getwd()
+	return resolveAdapterPath(c.AdapterPath, c.Workspace, wd, executable)
 }
 
-func projectRootFallback(workspace, rel string) string {
-	dir, err := os.Getwd()
-	if err != nil {
-		return workspace
+func resolveAdapterPath(adapterPath, workspace, wd, executable string) string {
+	if filepath.IsAbs(adapterPath) {
+		return adapterPath
 	}
+	if candidate := filepath.Join(workspace, adapterPath); fileExists(candidate) {
+		return candidate
+	}
+	if executable != "" {
+		if found, ok := findInParents(filepath.Dir(executable), adapterPath); ok {
+			return found
+		}
+	}
+	if wd != "" {
+		if found, ok := findInParents(wd, adapterPath); ok {
+			return found
+		}
+	}
+	return filepath.Join(workspace, adapterPath)
+}
+
+func findInParents(dir, rel string) (string, bool) {
 	for {
-		if _, err := os.Stat(filepath.Join(dir, rel)); err == nil {
-			return dir
+		candidate := filepath.Join(dir, rel)
+		if fileExists(candidate) {
+			return candidate, true
 		}
 		next := filepath.Dir(dir)
 		if next == dir {
@@ -176,5 +192,10 @@ func projectRootFallback(workspace, rel string) string {
 		}
 		dir = next
 	}
-	return workspace
+	return "", false
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }

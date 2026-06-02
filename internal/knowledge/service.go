@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/zzqDeco/knote/internal/knowledge/kag"
 	"github.com/zzqDeco/knote/internal/protocol"
@@ -90,6 +91,7 @@ func (s service) Build(ctx context.Context) (BuildResult, error) {
 		resp, err := s.backend.Build(ctx)
 		if err != nil {
 			out.AdapterError = err.Error()
+			return out, fmt.Errorf("KAG build failed: %w", err)
 		} else {
 			out.KAGData = cloneMap(resp.Data)
 		}
@@ -213,6 +215,7 @@ func (s service) buildArtifacts(ctx context.Context) (repository.ArtifactSet, er
 	sort.Slice(sources, func(i, j int) bool { return sources[i].Path < sources[j].Path })
 
 	var set repository.ArtifactSet
+	generatedAt := stableGeneratedAt(sources)
 	for _, source := range sources {
 		data, err := s.repo.ReadSource(ctx, source.Path)
 		if err != nil {
@@ -227,6 +230,7 @@ func (s service) buildArtifacts(ctx context.Context) (repository.ArtifactSet, er
 			Mtime:       source.ModTime.UTC(),
 		}
 		set.Documents = append(set.Documents, doc)
+		var evidenceChunkIDs []string
 		for _, chunk := range splitChunks(string(data), 1000) {
 			chunkHash := hashString(chunk.text)
 			item := protocol.Chunk{
@@ -237,13 +241,7 @@ func (s service) buildArtifacts(ctx context.Context) (repository.ArtifactSet, er
 				Hash:       chunkHash,
 			}
 			set.Chunks = append(set.Chunks, item)
-			set.Entities = append(set.Entities, protocol.Entity{
-				EntityID:         hashString("document:" + doc.Title),
-				Name:             firstNonEmpty(doc.Title, doc.Path),
-				Type:             "Document",
-				Aliases:          []string{doc.Path},
-				EvidenceChunkIDs: []string{item.ChunkID},
-			})
+			evidenceChunkIDs = append(evidenceChunkIDs, item.ChunkID)
 			set.Claims = append(set.Claims, protocol.Claim{
 				ClaimID:          hashString("claim:" + item.ChunkID),
 				Text:             compactClaim(item.Text),
@@ -251,6 +249,14 @@ func (s service) buildArtifacts(ctx context.Context) (repository.ArtifactSet, er
 				EvidenceChunkIDs: []string{item.ChunkID},
 			})
 		}
+		sort.Strings(evidenceChunkIDs)
+		set.Entities = append(set.Entities, protocol.Entity{
+			EntityID:         hashString("document:" + doc.DocumentID),
+			Name:             firstNonEmpty(doc.Title, doc.Path),
+			Type:             "Document",
+			Aliases:          []string{doc.Path},
+			EvidenceChunkIDs: evidenceChunkIDs,
+		})
 	}
 	sort.Slice(set.Entities, func(i, j int) bool { return set.Entities[i].EntityID < set.Entities[j].EntityID })
 	sort.Slice(set.Claims, func(i, j int) bool { return set.Claims[i].ClaimID < set.Claims[j].ClaimID })
@@ -262,7 +268,7 @@ func (s service) buildArtifacts(ctx context.Context) (repository.ArtifactSet, er
 	set.Manifest = protocol.ArtifactManifest{
 		Version:       1,
 		Workspace:     s.workspace,
-		GeneratedAt:   time.Now().UTC(),
+		GeneratedAt:   generatedAt,
 		SourceCount:   len(sources),
 		DocumentCount: len(set.Documents),
 		ChunkCount:    len(set.Chunks),
@@ -372,13 +378,32 @@ func splitChunks(text string, limit int) []chunk {
 	start := 0
 	for start < len(text) {
 		end := start + limit
-		if end > len(text) {
+		if end >= len(text) {
 			end = len(text)
+		} else {
+			for end > start && !utf8.RuneStart(text[end]) {
+				end--
+			}
+			if end == start {
+				_, size := utf8.DecodeRuneInString(text[start:])
+				end = start + size
+			}
 		}
-		chunks = append(chunks, chunk{span: [2]int{start, end}, text: strings.TrimSpace(text[start:end])})
+		chunks = append(chunks, chunk{span: [2]int{start, end}, text: text[start:end]})
 		start = end
 	}
 	return chunks
+}
+
+func stableGeneratedAt(sources []repository.Source) time.Time {
+	generatedAt := time.Unix(0, 0).UTC()
+	for _, source := range sources {
+		modTime := source.ModTime.UTC()
+		if modTime.After(generatedAt) {
+			generatedAt = modTime
+		}
+	}
+	return generatedAt
 }
 
 func hashString(value string) string {
@@ -398,8 +423,9 @@ func titleFromContent(text string) string {
 
 func compactClaim(text string) string {
 	text = strings.Join(strings.Fields(text), " ")
-	if len(text) > 180 {
-		return text[:180] + "..."
+	runes := []rune(text)
+	if len(runes) > 180 {
+		return string(runes[:180]) + "..."
 	}
 	return text
 }
