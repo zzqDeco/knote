@@ -49,6 +49,43 @@ func TestVersionedKnowledgePackageImportBoundary(t *testing.T) {
 	}
 }
 
+func TestRuntimePackageImportBoundary(t *testing.T) {
+	cmd := exec.Command("go", "list", "-f", "{{join .Imports \"\\n\"}}", "./internal/runtime")
+	cmd.Dir = repoRoot()
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("go list runtime imports: %v", err)
+	}
+	for _, forbidden := range []string{
+		"/internal/tui",
+		"/internal/knowledge/" + "kag",
+		"/internal/repository/" + "local",
+		"/internal/" + "kag",
+	} {
+		if strings.Contains(string(out), forbidden) {
+			t.Fatalf("runtime imports forbidden package %s:\n%s", forbidden, out)
+		}
+	}
+}
+
+func TestTUIPackageImportBoundary(t *testing.T) {
+	cmd := exec.Command("go", "list", "-f", "{{join .Imports \"\\n\"}}", "./internal/tui")
+	cmd.Dir = repoRoot()
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("go list tui imports: %v", err)
+	}
+	for _, forbidden := range []string{
+		"/internal/agent",
+		"/internal/knowledge",
+		"/internal/repository",
+	} {
+		if strings.Contains(string(out), forbidden) {
+			t.Fatalf("tui imports forbidden package %s:\n%s", forbidden, out)
+		}
+	}
+}
+
 func TestAgentProductionCodeHasNoFilesystemOrProcessSideEffects(t *testing.T) {
 	files, err := filepath.Glob(filepath.Join(repoRoot(), "internal", "agent", "*.go"))
 	if err != nil {
