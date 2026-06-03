@@ -6,7 +6,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/zzqDeco/knote/internal/knowledge/kag"
@@ -104,16 +103,33 @@ func TestRuntimeRunnerInfoIncludesEinoInventory(t *testing.T) {
 	}
 }
 
-func TestRuntimeEinoModeIsExplicitSkeleton(t *testing.T) {
+func TestRuntimeEinoModeStartsAndSendsThroughBridge(t *testing.T) {
+	workspace := t.TempDir()
+	store := local.New(workspace)
 	rt := New(Dependencies{
-		Workspace:    "/tmp/knote-test",
+		Workspace:    workspace,
+		Sessions:     store,
 		RunnerMode:   RunnerModeEino,
-		EinoRunner:   fakeEinoRunner{},
-		NewSessionID: local.NewSessionID,
+		EinoRunner:   fakeEinoRunner{events: []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, "", "hello from eino", nil)}},
+		NewSessionID: func() string { return "sess_eino" },
 	})
-	_, err := rt.Start(context.Background(), StartOptions{})
-	if err == nil || !strings.Contains(err.Error(), "scaffolded") {
-		t.Fatalf("expected explicit Eino skeleton error, got %v", err)
+	initial, err := rt.Start(context.Background(), StartOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasEvent(initial, protocol.EventSessionInfo) || rt.SessionID() != "sess_eino" {
+		t.Fatalf("runtime did not start Eino session: events=%+v session=%q", initial, rt.SessionID())
+	}
+	events := rt.SendMessage(context.Background(), "hello")
+	if !hasEvent(events, protocol.EventUserMessage) || !hasEvent(events, protocol.EventAssistantDone) {
+		t.Fatalf("runtime did not bridge Eino events: %+v", events)
+	}
+	loaded, err := store.Load(context.Background(), "sess_eino")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasEvent(loaded, protocol.EventUserMessage) || !hasEvent(loaded, protocol.EventAssistantDone) {
+		t.Fatalf("Eino events were not persisted: %+v", loaded)
 	}
 	info, err := rt.RunnerInfo(context.Background())
 	if err != nil {
@@ -185,15 +201,24 @@ func hasEvent(events []protocol.Event, eventType protocol.EventType) bool {
 }
 
 type fakeEinoRunner struct {
-	tools []RunnerToolInfo
+	tools  []RunnerToolInfo
+	events []protocol.Event
 }
 
 func (r fakeEinoRunner) ToolInventory(context.Context) ([]RunnerToolInfo, error) {
 	return append([]RunnerToolInfo(nil), r.tools...), nil
 }
 
-func (fakeEinoRunner) Run(context.Context, EinoRunInput) ([]protocol.Event, error) {
-	return nil, fmt.Errorf("fake Eino runner does not execute")
+func (r fakeEinoRunner) Run(_ context.Context, input EinoRunInput) ([]protocol.Event, error) {
+	if len(r.events) == 0 {
+		return nil, fmt.Errorf("fake Eino runner does not execute")
+	}
+	events := make([]protocol.Event, 0, len(r.events))
+	for _, event := range r.events {
+		event.SessionID = input.SessionID
+		events = append(events, event)
+	}
+	return events, nil
 }
 
 func must(t *testing.T, err error) {

@@ -3,9 +3,11 @@ package eino
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/cloudwego/eino/adk"
 	einotool "github.com/cloudwego/eino/components/tool"
+	"github.com/cloudwego/eino/schema"
 
 	"github.com/zzqDeco/knote/internal/protocol"
 	"github.com/zzqDeco/knote/internal/runtime"
@@ -13,14 +15,22 @@ import (
 
 type Options struct {
 	Tools           []einotool.InvokableTool
+	Agent           adk.Agent
+	Executor        QueryExecutor
 	EnableStreaming bool
 	CheckPointStore adk.CheckPointStore
 }
 
 type Runner struct {
 	tools           []einotool.InvokableTool
+	agent           adk.Agent
+	executor        QueryExecutor
 	enableStreaming bool
 	checkPointStore adk.CheckPointStore
+}
+
+type QueryExecutor interface {
+	Query(ctx context.Context, input string) ([]*adk.AgentEvent, error)
 }
 
 var _ runtime.EinoRunner = (*Runner)(nil)
@@ -28,6 +38,8 @@ var _ runtime.EinoRunner = (*Runner)(nil)
 func NewRunner(opts Options) *Runner {
 	return &Runner{
 		tools:           append([]einotool.InvokableTool(nil), opts.Tools...),
+		agent:           opts.Agent,
+		executor:        opts.Executor,
 		enableStreaming: opts.EnableStreaming,
 		checkPointStore: opts.CheckPointStore,
 	}
@@ -51,8 +63,30 @@ func (r *Runner) ToolInventory(ctx context.Context) ([]runtime.RunnerToolInfo, e
 	return out, nil
 }
 
-func (r *Runner) Run(context.Context, runtime.EinoRunInput) ([]protocol.Event, error) {
-	return nil, fmt.Errorf("eino runner skeleton is not connected to a chat model")
+func (r *Runner) Run(ctx context.Context, input runtime.EinoRunInput) ([]protocol.Event, error) {
+	text := strings.TrimSpace(input.Message)
+	if text == "" {
+		return nil, nil
+	}
+	executor := r.executor
+	if executor == nil {
+		if r.agent == nil {
+			return nil, fmt.Errorf("eino runner is not configured with an ADK agent")
+		}
+		executor = adkQueryExecutor{runner: r.NewADKRunner(ctx, r.agent)}
+	}
+	agentEvents, err := executor.Query(ctx, text)
+	if err != nil {
+		return nil, err
+	}
+	events := []protocol.Event{protocol.NewEvent(protocol.EventAssistantStart, input.SessionID, "eino runner started", nil)}
+	for _, event := range agentEvents {
+		events = append(events, projectEvent(input.SessionID, event)...)
+	}
+	if len(events) == 1 {
+		events = append(events, protocol.NewEvent(protocol.EventAssistantDone, input.SessionID, "Eino runner completed without response.", nil))
+	}
+	return events, nil
 }
 
 func (r *Runner) RunnerConfig(agent adk.Agent) adk.RunnerConfig {
@@ -65,4 +99,85 @@ func (r *Runner) RunnerConfig(agent adk.Agent) adk.RunnerConfig {
 
 func (r *Runner) NewADKRunner(ctx context.Context, agent adk.Agent) *adk.Runner {
 	return adk.NewRunner(ctx, r.RunnerConfig(agent))
+}
+
+type adkQueryExecutor struct {
+	runner *adk.Runner
+}
+
+func (e adkQueryExecutor) Query(ctx context.Context, input string) ([]*adk.AgentEvent, error) {
+	if e.runner == nil {
+		return nil, fmt.Errorf("eino ADK runner is not configured")
+	}
+	iter := e.runner.Query(ctx, input)
+	var events []*adk.AgentEvent
+	for {
+		event, ok := iter.Next()
+		if !ok {
+			break
+		}
+		if event == nil {
+			continue
+		}
+		if event.Err != nil {
+			return events, event.Err
+		}
+		events = append(events, event)
+	}
+	return events, nil
+}
+
+func projectEvent(sessionID string, event *adk.AgentEvent) []protocol.Event {
+	if event == nil {
+		return nil
+	}
+	if event.Err != nil {
+		return []protocol.Event{protocol.NewEvent(protocol.EventError, sessionID, event.Err.Error(), nil)}
+	}
+	if event.Output == nil || event.Output.MessageOutput == nil {
+		return nil
+	}
+	output := event.Output.MessageOutput
+	message := output.Message
+	content := strings.TrimSpace(messageContent(message))
+	switch output.Role {
+	case schema.Tool:
+		toolName := strings.TrimSpace(output.ToolName)
+		if toolName == "" && message != nil {
+			toolName = strings.TrimSpace(message.ToolName)
+		}
+		if toolName == "" {
+			toolName = "eino_tool"
+		}
+		return []protocol.Event{protocol.NewEvent(protocol.EventToolComplete, sessionID, firstNonEmpty(content, toolName+" complete"), map[string]string{"tool": toolName})}
+	case schema.Assistant:
+		if content == "" {
+			return nil
+		}
+		return []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, sessionID, content, map[string]string{"agent": event.AgentName})}
+	default:
+		if message != nil && message.Role == schema.Assistant && content != "" {
+			return []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, sessionID, content, map[string]string{"agent": event.AgentName})}
+		}
+		if content != "" {
+			return []protocol.Event{protocol.NewEvent(protocol.EventStatusUpdate, sessionID, content, map[string]string{"agent": event.AgentName})}
+		}
+	}
+	return nil
+}
+
+func messageContent(message *schema.Message) string {
+	if message == nil {
+		return ""
+	}
+	return message.Content
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }

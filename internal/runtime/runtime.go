@@ -3,7 +3,9 @@ package runtime
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/zzqDeco/knote/internal/agent"
 	"github.com/zzqDeco/knote/internal/knowledge/versioned"
@@ -78,6 +80,7 @@ type Manager struct {
 	mu          sync.Mutex
 	deps        Dependencies
 	agent       *agent.Agent
+	einoSession protocol.SessionInfo
 	subscribers map[int]EventSubscriber
 	nextSubID   int
 }
@@ -103,12 +106,31 @@ func (m *Manager) Start(ctx context.Context, opts StartOptions) ([]protocol.Even
 		m.emit(events)
 		return events, nil
 	}
-	if m.deps.RunnerMode == RunnerModeEino {
+	if m.einoSession.ID != "" {
+		sessionID := m.einoSession.ID
 		m.mu.Unlock()
+		events := []protocol.Event{protocol.NewEvent(protocol.EventStatusUpdate, sessionID, "runtime already started", nil)}
+		m.emit(events)
+		return events, nil
+	}
+	if m.deps.RunnerMode == RunnerModeEino {
 		if m.deps.EinoRunner == nil {
+			m.mu.Unlock()
 			return nil, fmt.Errorf("eino runner mode requires an Eino runner")
 		}
-		return nil, fmt.Errorf("eino runner mode is scaffolded but not enabled for production turns")
+		info, loaded := m.newEinoSessionLocked(ctx, opts.ResumeID)
+		m.einoSession = info
+		m.mu.Unlock()
+		events := []protocol.Event{
+			protocol.NewEvent(protocol.EventGatewayReady, info.ID, "knote runtime ready", nil),
+			protocol.NewEvent(protocol.EventSessionInfo, info.ID, "session ready", info),
+		}
+		m.persist(events)
+		if info.Resumed {
+			events = append(loaded, events...)
+		}
+		m.emit(events)
+		return events, nil
 	}
 	deps := agent.Dependencies{
 		Workspace:     m.deps.Workspace,
@@ -133,11 +155,31 @@ func (m *Manager) Start(ctx context.Context, opts StartOptions) ([]protocol.Even
 }
 
 func (m *Manager) SendMessage(ctx context.Context, input string) []protocol.Event {
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return nil
+	}
 	m.mu.Lock()
 	runner := m.agent
+	einoSession := m.einoSession
+	einoRunner := m.deps.EinoRunner
 	m.mu.Unlock()
 	if runner == nil {
-		return m.emitAndReturn(m.runtimeError("runtime has not started"))
+		if einoSession.ID == "" {
+			return m.emitAndReturn(m.runtimeError("runtime has not started"))
+		}
+		events := []protocol.Event{protocol.NewEvent(protocol.EventUserMessage, einoSession.ID, input, nil)}
+		if strings.HasPrefix(input, "/") {
+			events = append(events, protocol.NewEvent(protocol.EventError, einoSession.ID, "slash commands are not available in Eino runner mode yet", nil))
+			return m.persistEmitAndReturn(events)
+		}
+		runnerEvents, err := einoRunner.Run(ctx, EinoRunInput{SessionID: einoSession.ID, Message: input})
+		if err != nil {
+			events = append(events, protocol.NewEvent(protocol.EventError, einoSession.ID, err.Error(), nil))
+			return m.persistEmitAndReturn(events)
+		}
+		events = append(events, runnerEvents...)
+		return m.persistEmitAndReturn(events)
 	}
 	return m.emitAndReturn(runner.Handle(ctx, input))
 }
@@ -145,20 +187,36 @@ func (m *Manager) SendMessage(ctx context.Context, input string) []protocol.Even
 func (m *Manager) Confirm(ctx context.Context, req protocol.ConfirmRequest, approved bool) []protocol.Event {
 	m.mu.Lock()
 	runner := m.agent
+	einoSessionID := m.einoSession.ID
 	m.mu.Unlock()
 	if runner == nil {
+		if einoSessionID != "" {
+			return m.persistEmitAndReturn([]protocol.Event{protocol.NewEvent(protocol.EventError, einoSessionID, "confirm is not available in Eino runner mode yet", nil)})
+		}
 		return m.emitAndReturn(m.runtimeError("runtime has not started"))
 	}
 	return m.emitAndReturn(runner.Confirm(ctx, req, approved))
 }
 
 func (m *Manager) Interrupt(context.Context) []protocol.Event {
+	m.mu.Lock()
+	einoSessionID := m.einoSession.ID
+	m.mu.Unlock()
+	if einoSessionID != "" {
+		return m.persistEmitAndReturn([]protocol.Event{protocol.NewEvent(protocol.EventStatusUpdate, einoSessionID, "interrupt requested; Eino runner has no active streaming controller yet", nil)})
+	}
 	return m.emitAndReturn(m.currentStatus("interrupt requested; direct runner has no active streaming turn"))
 }
 
 func (m *Manager) StopTask(_ context.Context, taskID string) []protocol.Event {
 	if taskID == "" {
 		return m.emitAndReturn(m.runtimeError("task id is required"))
+	}
+	m.mu.Lock()
+	einoSessionID := m.einoSession.ID
+	m.mu.Unlock()
+	if einoSessionID != "" {
+		return m.persistEmitAndReturn([]protocol.Event{protocol.NewEvent(protocol.EventStatusUpdate, einoSessionID, fmt.Sprintf("task stop requested for %s; Eino runner has no background task controller yet", taskID), nil)})
 	}
 	return m.emitAndReturn(m.currentStatus(fmt.Sprintf("task stop requested for %s; direct runner has no background task controller", taskID)))
 }
@@ -175,7 +233,7 @@ func (m *Manager) RunnerInfo(ctx context.Context) (RunnerInfo, error) {
 	configured := m.deps.RunnerMode
 	active := RunnerModeDirect
 	einoRunner := m.deps.EinoRunner
-	if m.agent == nil && configured == RunnerModeEino {
+	if m.agent == nil && (configured == RunnerModeEino || m.einoSession.ID != "") {
 		active = RunnerModeEino
 	}
 	m.mu.Unlock()
@@ -194,6 +252,39 @@ func (m *Manager) RunnerInfo(ctx context.Context) (RunnerInfo, error) {
 	}
 	info.Tools = tools
 	return info, nil
+}
+
+func (m *Manager) newEinoSessionLocked(ctx context.Context, resumeID string) (protocol.SessionInfo, []protocol.Event) {
+	sessionID := strings.TrimSpace(resumeID)
+	resumed := true
+	var loaded []protocol.Event
+	if sessionID == "" {
+		if m.deps.NewSessionID != nil {
+			sessionID = m.deps.NewSessionID()
+		} else {
+			sessionID = "sess_" + time.Now().UTC().Format("20060102T150405.000000000")
+		}
+		resumed = false
+	} else if m.deps.Sessions != nil {
+		loaded, _ = m.deps.Sessions.Load(ctx, sessionID)
+	}
+	status := repository.Status{}
+	if m.deps.Versions != nil {
+		status, _ = m.deps.Versions.Status(ctx)
+	}
+	kagMode := ""
+	if m.deps.Knowledge != nil {
+		kagMode = string(m.deps.Knowledge.Mode())
+	}
+	return protocol.SessionInfo{
+		ID:        sessionID,
+		Workspace: m.deps.Workspace,
+		Branch:    status.Branch,
+		Dirty:     status.Dirty,
+		KAGMode:   kagMode,
+		CreatedAt: time.Now().UTC(),
+		Resumed:   resumed,
+	}, loaded
 }
 
 func (m *Manager) Subscribe(fn EventSubscriber) func() {
@@ -216,6 +307,9 @@ func (m *Manager) SessionID() string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.agent == nil {
+		if m.einoSession.ID != "" {
+			return m.einoSession.ID
+		}
 		return ""
 	}
 	return m.agent.SessionID()
@@ -233,11 +327,30 @@ func (m *Manager) Workspace() string {
 func (m *Manager) CurrentSessionInfo(ctx context.Context) protocol.SessionInfo {
 	m.mu.Lock()
 	runner := m.agent
+	einoSession := m.einoSession
 	m.mu.Unlock()
 	if runner == nil {
+		if einoSession.ID != "" {
+			return einoSession
+		}
 		return protocol.SessionInfo{Workspace: m.deps.Workspace}
 	}
 	return runner.CurrentSessionInfo(ctx)
+}
+
+func (m *Manager) persistEmitAndReturn(events []protocol.Event) []protocol.Event {
+	m.persist(events)
+	m.emit(events)
+	return events
+}
+
+func (m *Manager) persist(events []protocol.Event) {
+	if m.deps.Sessions == nil {
+		return
+	}
+	for _, event := range events {
+		_ = m.deps.Sessions.Append(context.Background(), event)
+	}
 }
 
 func (m *Manager) emitAndReturn(events []protocol.Event) []protocol.Event {
