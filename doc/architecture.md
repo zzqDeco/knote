@@ -1,14 +1,17 @@
 # Architecture
 
-`knote` is a local-first TUI application with a small composition root and clear runtime boundaries:
+`knote` is a local-first TUI application with a small composition root and layered runtime boundaries:
 
 1. `cmd/knote` parses CLI flags and wires concrete implementations.
 2. `internal/tui` owns Bubble Tea projection and keyboard interaction.
-3. `internal/agent` owns turns, slash commands, confirmations, tasks, and event persistence.
-4. `internal/knowledge` owns build/query/explain/eval semantics and artifact normalization.
-5. `internal/repository` defines workspace/session/version interfaces; `internal/repository/local` implements them with the local filesystem and Git CLI.
-6. `internal/knowledge/kag` owns the OpenSPG/KAG boundary and Python NDJSON adapter subprocess.
-7. `internal/repository/remote` is a future adapter skeleton for GitHub/Gitea/GitLab-style backends.
+3. `internal/runtime` owns session/thread lifecycle, event dispatch, task controls, confirm routing, and runner selection.
+4. `internal/agent` owns the current direct turn handler: natural-language turns, slash commands, confirmations, tasks, and event persistence.
+5. `internal/knowledge/versioned` owns versioned knowledge operations: build/query/explain/eval/diff/commit/release/checkout/status.
+6. `internal/eino/tools` exposes the versioned knowledge service as shallow Eino `InvokableTool` adapters.
+7. `internal/runtime/eino` is the Eino runner skeleton and tool inventory bridge. It is wired for inspection and future runner activation, but production turns still use the direct agent.
+8. `internal/repository` defines workspace/session/version interfaces; `internal/repository/local` implements them with the local filesystem and Git CLI.
+9. `internal/knowledge/kag` owns the OpenSPG/KAG boundary and Python NDJSON adapter subprocess.
+10. `internal/repository/remote` is a future adapter skeleton for GitHub/Gitea/GitLab-style backends.
 
 The TUI and agent are in the same Go binary. The KAG adapter remains a subprocess because OpenSPG/KAG is Python-native and has heavier environment requirements. The stable artifact contract is owned by knote, not by KAG.
 
@@ -17,11 +20,16 @@ The TUI and agent are in the same Go binary. The KAG adapter remains a subproces
 ```mermaid
 flowchart LR
   User["User input"] --> TUI["internal/tui"]
-  TUI --> Agent["internal/agent"]
-  Agent --> RepoIf["internal/repository interfaces"]
-  Agent --> Knowledge["internal/knowledge"]
-  Knowledge --> RepoIf
-  Knowledge --> Kag["internal/knowledge/kag"]
+  TUI --> Runtime["internal/runtime"]
+  Runtime --> Agent["internal/agent direct runner"]
+  Runtime --> EinoRunner["internal/runtime/eino skeleton"]
+  Runtime --> EinoTools["internal/eino/tools"]
+  Runtime --> RepoIf["internal/repository interfaces"]
+  Agent --> RepoIf
+  Agent --> Versioned["internal/knowledge/versioned"]
+  EinoTools --> Versioned
+  Versioned --> RepoIf
+  Versioned --> Kag["internal/knowledge/kag"]
   Kag --> Adapter["adapters/kag/knote_kag_adapter.py"]
   Adapter --> OpenSPG["OpenSPG/KAG"]
   RepoIf -. implemented by .-> Local["internal/repository/local"]
@@ -33,13 +41,23 @@ flowchart LR
   RepoIf -. future .-> Remote["internal/repository/remote"]
 ```
 
-`internal/agent` depends only on `internal/knowledge`, `internal/repository`, `internal/protocol`, and the standard library. It does not import the local repository, KAG backend, Git wrapper, or Python adapter. `cmd/knote` is the composition root that creates `local.Store`, `kag.Client`, `knowledge.Service`, and `agent.Agent`.
+`internal/agent` depends only on `internal/knowledge/versioned`, `internal/repository`, `internal/protocol`, and the standard library. It does not import the local repository, KAG backend, Git wrapper, Python adapter, Eino tools, or TUI. `cmd/knote` is the composition root that creates `local.Store`, `kag.Client`, `versioned.Service`, Eino tools, the Eino runner skeleton, and `runtime.Manager`.
+
+## Runtime Layers
+
+`internal/runtime` is the interaction boundary for TUI now and Web later. It exposes start, message, confirm, interrupt, task stop, status, subscription, and runner info methods. Runtime owns the active session/thread state and fans emitted events to subscribers.
+
+The default runner mode is `direct`. In this mode runtime delegates turns to `internal/agent`, preserving the current TUI behavior. `KNOTE_RUNTIME_MODE=eino` is an explicit development guard for the Eino skeleton; startup fails with a clear scaffolded-mode error until production turn execution is implemented.
+
+`internal/runtime/eino` holds the Eino-facing runner skeleton. It can inventory registered tools and produce an ADK runner config from a future ADK agent. It does not own knowledge semantics and does not execute production turns yet.
+
+`internal/eino/tools` is intentionally shallow. Each tool parses JSON arguments, calls `internal/knowledge/versioned`, and returns JSON. Mutating tools require a side-effect gate so they cannot bypass runtime confirmation.
 
 ## Agent And TUI
 
-`internal/tui` owns screen projection only. It keeps the transcript, composer history, overlay state, and status line, then calls agent methods for every user intent. It does not execute Git, artifact, or KAG side effects directly.
+`internal/tui` owns screen projection only. It keeps the transcript, composer history, overlay state, and status line, then calls runtime methods for every user intent. It does not execute Git, artifact, KAG, Eino, or repository side effects directly.
 
-`internal/agent` owns the event stream. User messages become `message.user`; read-only commands return status, details, settings, versions, or diff events; side-effecting commands first emit `confirm.request`. Confirmed actions are validated against agent-owned pending confirmation state before they can run.
+`internal/agent` owns the direct-runner event stream. User messages become `message.user`; read-only commands return status, details, settings, versions, or diff events; side-effecting commands first emit `confirm.request`. Confirmed actions are validated against agent-owned pending confirmation state before they can run.
 
 ## Session Data
 
@@ -47,11 +65,14 @@ Each session is a JSONL event log under `.knote/sessions/<session-id>.jsonl`. `/
 
 ## Knowledge And KAG
 
-`internal/knowledge` implements knote's knowledge semantics:
+`internal/knowledge/versioned` implements knote's versioned knowledge semantics:
 
 - `/build` reads sources through `repository.Workspace`, calls `kag.Backend.Build`, normalizes results into knote artifact records, and writes an `ArtifactSet` through the repository.
 - Natural-language query and explain prefer KAG, then fall back to stable local summaries when KAG is unavailable or empty.
 - `/eval` reads questions through the repository, calls explain, writes stable eval results/report, and updates the knowledge hash used by the release gate.
+- Version commands delegate to `repository.Versions`, so Git-backed local versions and future remote-backed versions share the same semantic facade.
+
+`internal/knowledge` remains a compatibility shim over `internal/knowledge/versioned` while old imports are being removed.
 
 `internal/knowledge/kag` talks to `adapters/kag/knote_kag_adapter.py` over newline-delimited JSON on stdio. Public methods are:
 
