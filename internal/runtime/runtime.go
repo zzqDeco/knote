@@ -18,6 +18,7 @@ type Runtime interface {
 	Interrupt(ctx context.Context) []protocol.Event
 	StopTask(ctx context.Context, taskID string) []protocol.Event
 	WorkspaceStatus(ctx context.Context) (repository.Status, error)
+	RunnerInfo(ctx context.Context) (RunnerInfo, error)
 	Subscribe(fn EventSubscriber) func()
 
 	SessionID() string
@@ -33,11 +34,42 @@ type Dependencies struct {
 	Versions      repository.Versions
 	WorkspaceRepo repository.Workspace
 	Knowledge     versioned.Service
+	RunnerMode    RunnerMode
+	EinoRunner    EinoRunner
 	NewSessionID  func() string
 }
 
 type StartOptions struct {
 	ResumeID string
+}
+
+type RunnerMode string
+
+const (
+	RunnerModeDirect RunnerMode = "direct"
+	RunnerModeEino   RunnerMode = "eino"
+)
+
+type EinoRunner interface {
+	ToolInventory(ctx context.Context) ([]RunnerToolInfo, error)
+	Run(ctx context.Context, input EinoRunInput) ([]protocol.Event, error)
+}
+
+type EinoRunInput struct {
+	SessionID string
+	Message   string
+}
+
+type RunnerInfo struct {
+	ConfiguredMode RunnerMode       `json:"configured_mode"`
+	ActiveMode     RunnerMode       `json:"active_mode"`
+	EinoAvailable  bool             `json:"eino_available"`
+	Tools          []RunnerToolInfo `json:"tools,omitempty"`
+}
+
+type RunnerToolInfo struct {
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
 }
 
 type EventSubscriber func([]protocol.Event)
@@ -53,6 +85,9 @@ type Manager struct {
 var _ Runtime = (*Manager)(nil)
 
 func New(deps Dependencies) *Manager {
+	if deps.RunnerMode == "" {
+		deps.RunnerMode = RunnerModeDirect
+	}
 	return &Manager{
 		deps:        deps,
 		subscribers: map[int]EventSubscriber{},
@@ -67,6 +102,13 @@ func (m *Manager) Start(ctx context.Context, opts StartOptions) ([]protocol.Even
 		events := []protocol.Event{protocol.NewEvent(protocol.EventStatusUpdate, sessionID, "runtime already started", nil)}
 		m.emit(events)
 		return events, nil
+	}
+	if m.deps.RunnerMode == RunnerModeEino {
+		m.mu.Unlock()
+		if m.deps.EinoRunner == nil {
+			return nil, fmt.Errorf("eino runner mode requires an Eino runner")
+		}
+		return nil, fmt.Errorf("eino runner mode is scaffolded but not enabled for production turns")
 	}
 	deps := agent.Dependencies{
 		Workspace:     m.deps.Workspace,
@@ -126,6 +168,32 @@ func (m *Manager) WorkspaceStatus(ctx context.Context) (repository.Status, error
 		return repository.Status{}, fmt.Errorf("runtime versions repository is not configured")
 	}
 	return m.deps.Versions.Status(ctx)
+}
+
+func (m *Manager) RunnerInfo(ctx context.Context) (RunnerInfo, error) {
+	m.mu.Lock()
+	configured := m.deps.RunnerMode
+	active := RunnerModeDirect
+	einoRunner := m.deps.EinoRunner
+	if m.agent == nil && configured == RunnerModeEino {
+		active = RunnerModeEino
+	}
+	m.mu.Unlock()
+
+	info := RunnerInfo{
+		ConfiguredMode: configured,
+		ActiveMode:     active,
+		EinoAvailable:  einoRunner != nil,
+	}
+	if einoRunner == nil {
+		return info, nil
+	}
+	tools, err := einoRunner.ToolInventory(ctx)
+	if err != nil {
+		return RunnerInfo{}, err
+	}
+	info.Tools = tools
+	return info, nil
 }
 
 func (m *Manager) Subscribe(fn EventSubscriber) func() {
