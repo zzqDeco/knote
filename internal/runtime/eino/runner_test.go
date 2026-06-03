@@ -28,23 +28,40 @@ func TestRunnerInventoryAndSkeletonRun(t *testing.T) {
 	if len(tools) != 2 || tools[0].Name != "knote_query" || tools[1].Name != "knote_diff" {
 		t.Fatalf("unexpected tool inventory: %+v", tools)
 	}
+	if err := runner.Ready(context.Background()); err == nil || !strings.Contains(err.Error(), "requires a configured") {
+		t.Fatalf("expected skeleton runner to be not ready, got %v", err)
+	}
 	if _, err := runner.Run(context.Background(), runtime.EinoRunInput{SessionID: "s1", Message: "hello"}); err == nil || !strings.Contains(err.Error(), "not configured") {
 		t.Fatalf("expected skeleton run error, got %v", err)
 	}
 }
 
 func TestRunnerProjectsExecutorEvents(t *testing.T) {
+	executor := &fakeExecutor{
+		events: []*adk.AgentEvent{
+			adk.EventFromMessage(schema.ToolMessage("tool output", "call_1", schema.WithToolName("knote_query")), nil, schema.Tool, "knote_query"),
+			adk.EventFromMessage(schema.AssistantMessage("assistant answer", nil), nil, schema.Assistant, ""),
+		},
+	}
 	runner := NewRunner(Options{
-		Executor: fakeExecutor{
-			events: []*adk.AgentEvent{
-				adk.EventFromMessage(schema.ToolMessage("tool output", "call_1", schema.WithToolName("knote_query")), nil, schema.Tool, "knote_query"),
-				adk.EventFromMessage(schema.AssistantMessage("assistant answer", nil), nil, schema.Assistant, ""),
-			},
+		Executor: executor,
+	})
+	if err := runner.Ready(context.Background()); err != nil {
+		t.Fatalf("runner should be ready: %v", err)
+	}
+	events, err := runner.Run(context.Background(), runtime.EinoRunInput{
+		SessionID: "s1",
+		Message:   "question",
+		History: []protocol.Event{
+			protocol.NewEvent(protocol.EventUserMessage, "s1", "earlier question", nil),
+			protocol.NewEvent(protocol.EventAssistantDone, "s1", "earlier answer", nil),
 		},
 	})
-	events, err := runner.Run(context.Background(), runtime.EinoRunInput{SessionID: "s1", Message: "question"})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if got := messageContents(executor.messages); strings.Join(got, "|") != "earlier question|earlier answer|question" {
+		t.Fatalf("runner did not preserve transcript history: %+v", got)
 	}
 	if !hasEvent(events, protocol.EventAssistantStart) {
 		t.Fatalf("missing assistant start: %+v", events)
@@ -54,6 +71,36 @@ func TestRunnerProjectsExecutorEvents(t *testing.T) {
 	}
 	if got := lastMessage(events, protocol.EventAssistantDone); got != "assistant answer" {
 		t.Fatalf("unexpected assistant answer %q in %+v", got, events)
+	}
+}
+
+func TestRunnerProjectsStreamingAndInterruptEvents(t *testing.T) {
+	stream := schema.StreamReaderFromArray([]*schema.Message{schema.AssistantMessage("streamed answer", nil)})
+	runner := NewRunner(Options{
+		Executor: &fakeExecutor{
+			events: []*adk.AgentEvent{
+				adk.EventFromMessage(nil, stream, schema.Assistant, ""),
+				{
+					Action: &adk.AgentAction{
+						Interrupted: &adk.InterruptInfo{
+							InterruptContexts: []*adk.InterruptCtx{
+								{ID: "agent:test", Info: "approval needed", IsRootCause: true},
+							},
+						},
+					},
+				},
+			},
+		},
+	})
+	events, err := runner.Run(context.Background(), runtime.EinoRunInput{SessionID: "s1", Message: "question"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := lastMessage(events, protocol.EventAssistantDone); got != "streamed answer" {
+		t.Fatalf("streaming assistant output was not projected: %q in %+v", got, events)
+	}
+	if got := lastMessage(events, protocol.EventApprovalRequest); got != "approval needed" {
+		t.Fatalf("interrupt was not surfaced: %q in %+v", got, events)
 	}
 }
 
@@ -85,11 +132,13 @@ func (fakeTool) InvokableRun(context.Context, string, ...einotool.Option) (strin
 }
 
 type fakeExecutor struct {
-	events []*adk.AgentEvent
-	err    error
+	events   []*adk.AgentEvent
+	messages []*schema.Message
+	err      error
 }
 
-func (e fakeExecutor) Query(context.Context, string) ([]*adk.AgentEvent, error) {
+func (e *fakeExecutor) Run(_ context.Context, messages []*schema.Message) ([]*adk.AgentEvent, error) {
+	e.messages = append([]*schema.Message(nil), messages...)
 	return append([]*adk.AgentEvent(nil), e.events...), e.err
 }
 
@@ -109,4 +158,14 @@ func lastMessage(events []protocol.Event, eventType protocol.EventType) string {
 		}
 	}
 	return ""
+}
+
+func messageContents(messages []*schema.Message) []string {
+	var out []string
+	for _, message := range messages {
+		if message != nil {
+			out = append(out, message.Content)
+		}
+	}
+	return out
 }

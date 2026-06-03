@@ -53,6 +53,7 @@ const (
 )
 
 type EinoRunner interface {
+	Ready(ctx context.Context) error
 	ToolInventory(ctx context.Context) ([]RunnerToolInfo, error)
 	Run(ctx context.Context, input EinoRunInput) ([]protocol.Event, error)
 }
@@ -60,6 +61,7 @@ type EinoRunner interface {
 type EinoRunInput struct {
 	SessionID string
 	Message   string
+	History   []protocol.Event
 }
 
 type RunnerInfo struct {
@@ -118,6 +120,10 @@ func (m *Manager) Start(ctx context.Context, opts StartOptions) ([]protocol.Even
 			m.mu.Unlock()
 			return nil, fmt.Errorf("eino runner mode requires an Eino runner")
 		}
+		if err := m.deps.EinoRunner.Ready(ctx); err != nil {
+			m.mu.Unlock()
+			return nil, err
+		}
 		info, loaded := m.newEinoSessionLocked(ctx, opts.ResumeID)
 		m.einoSession = info
 		m.mu.Unlock()
@@ -173,7 +179,8 @@ func (m *Manager) SendMessage(ctx context.Context, input string) []protocol.Even
 			events = append(events, protocol.NewEvent(protocol.EventError, einoSession.ID, "slash commands are not available in Eino runner mode yet", nil))
 			return m.persistEmitAndReturn(events)
 		}
-		runnerEvents, err := einoRunner.Run(ctx, EinoRunInput{SessionID: einoSession.ID, Message: input})
+		history := m.loadHistory(ctx, einoSession.ID)
+		runnerEvents, err := einoRunner.Run(ctx, EinoRunInput{SessionID: einoSession.ID, Message: input, History: history})
 		if err != nil {
 			events = append(events, protocol.NewEvent(protocol.EventError, einoSession.ID, err.Error(), nil))
 			return m.persistEmitAndReturn(events)
@@ -351,6 +358,17 @@ func (m *Manager) persist(events []protocol.Event) {
 	for _, event := range events {
 		_ = m.deps.Sessions.Append(context.Background(), event)
 	}
+}
+
+func (m *Manager) loadHistory(ctx context.Context, sessionID string) []protocol.Event {
+	if m.deps.Sessions == nil || sessionID == "" {
+		return nil
+	}
+	events, err := m.deps.Sessions.Load(ctx, sessionID)
+	if err != nil {
+		return nil
+	}
+	return events
 }
 
 func (m *Manager) emitAndReturn(events []protocol.Event) []protocol.Event {

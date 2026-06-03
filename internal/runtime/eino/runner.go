@@ -30,7 +30,7 @@ type Runner struct {
 }
 
 type QueryExecutor interface {
-	Query(ctx context.Context, input string) ([]*adk.AgentEvent, error)
+	Run(ctx context.Context, messages []*schema.Message) ([]*adk.AgentEvent, error)
 }
 
 var _ runtime.EinoRunner = (*Runner)(nil)
@@ -43,6 +43,13 @@ func NewRunner(opts Options) *Runner {
 		enableStreaming: opts.EnableStreaming,
 		checkPointStore: opts.CheckPointStore,
 	}
+}
+
+func (r *Runner) Ready(context.Context) error {
+	if r.executor != nil || r.agent != nil {
+		return nil
+	}
+	return fmt.Errorf("eino runner mode requires a configured ADK agent or executor")
 }
 
 func (r *Runner) ToolInventory(ctx context.Context) ([]runtime.RunnerToolInfo, error) {
@@ -75,7 +82,9 @@ func (r *Runner) Run(ctx context.Context, input runtime.EinoRunInput) ([]protoco
 		}
 		executor = adkQueryExecutor{runner: r.NewADKRunner(ctx, r.agent)}
 	}
-	agentEvents, err := executor.Query(ctx, text)
+	messages := transcriptMessages(input.History)
+	messages = append(messages, schema.UserMessage(text))
+	agentEvents, err := executor.Run(ctx, messages)
 	if err != nil {
 		return nil, err
 	}
@@ -105,11 +114,11 @@ type adkQueryExecutor struct {
 	runner *adk.Runner
 }
 
-func (e adkQueryExecutor) Query(ctx context.Context, input string) ([]*adk.AgentEvent, error) {
+func (e adkQueryExecutor) Run(ctx context.Context, messages []*schema.Message) ([]*adk.AgentEvent, error) {
 	if e.runner == nil {
 		return nil, fmt.Errorf("eino ADK runner is not configured")
 	}
-	iter := e.runner.Query(ctx, input)
+	iter := e.runner.Run(ctx, messages)
 	var events []*adk.AgentEvent
 	for {
 		event, ok := iter.Next()
@@ -134,11 +143,17 @@ func projectEvent(sessionID string, event *adk.AgentEvent) []protocol.Event {
 	if event.Err != nil {
 		return []protocol.Event{protocol.NewEvent(protocol.EventError, sessionID, event.Err.Error(), nil)}
 	}
+	if event.Action != nil && event.Action.Interrupted != nil {
+		return []protocol.Event{projectInterrupt(sessionID, event)}
+	}
 	if event.Output == nil || event.Output.MessageOutput == nil {
 		return nil
 	}
 	output := event.Output.MessageOutput
-	message := output.Message
+	message, _, err := adk.GetMessage(event)
+	if err != nil {
+		return []protocol.Event{protocol.NewEvent(protocol.EventError, sessionID, "read Eino message: "+err.Error(), nil)}
+	}
 	content := strings.TrimSpace(messageContent(message))
 	switch output.Role {
 	case schema.Tool:
@@ -164,6 +179,53 @@ func projectEvent(sessionID string, event *adk.AgentEvent) []protocol.Event {
 		}
 	}
 	return nil
+}
+
+func projectInterrupt(sessionID string, event *adk.AgentEvent) protocol.Event {
+	payload := map[string]any{
+		"agent":     event.AgentName,
+		"resumable": false,
+	}
+	var contexts []map[string]any
+	for _, interruptContext := range event.Action.Interrupted.InterruptContexts {
+		if interruptContext == nil {
+			continue
+		}
+		contexts = append(contexts, map[string]any{
+			"id":            interruptContext.ID,
+			"info":          interruptContext.Info,
+			"is_root_cause": interruptContext.IsRootCause,
+			"address":       interruptContext.Address.String(),
+		})
+	}
+	if len(contexts) > 0 {
+		payload["contexts"] = contexts
+	}
+	message := "Eino runner interrupted; resume bridge is not enabled yet."
+	for _, interruptContext := range contexts {
+		if info := strings.TrimSpace(fmt.Sprint(interruptContext["info"])); info != "" {
+			message = info
+			break
+		}
+	}
+	return protocol.NewEvent(protocol.EventApprovalRequest, sessionID, message, payload)
+}
+
+func transcriptMessages(history []protocol.Event) []*schema.Message {
+	var messages []*schema.Message
+	for _, event := range history {
+		text := strings.TrimSpace(event.Message)
+		if text == "" {
+			continue
+		}
+		switch event.Type {
+		case protocol.EventUserMessage:
+			messages = append(messages, schema.UserMessage(text))
+		case protocol.EventAssistantDone:
+			messages = append(messages, schema.AssistantMessage(text, nil))
+		}
+	}
+	return messages
 }
 
 func messageContent(message *schema.Message) string {
