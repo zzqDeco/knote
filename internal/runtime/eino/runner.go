@@ -84,16 +84,16 @@ func (r *Runner) Run(ctx context.Context, input runtime.EinoRunInput) ([]protoco
 	}
 	messages := transcriptMessages(input.History)
 	messages = append(messages, schema.UserMessage(text))
-	agentEvents, err := executor.Run(ctx, messages)
-	if err != nil {
-		return nil, err
-	}
 	events := []protocol.Event{protocol.NewEvent(protocol.EventAssistantStart, input.SessionID, "eino runner started", nil)}
+	agentEvents, err := executor.Run(ctx, messages)
 	for _, event := range agentEvents {
 		events = append(events, projectEvent(input.SessionID, event)...)
 	}
+	if err != nil {
+		return events, err
+	}
 	if len(events) == 1 {
-		events = append(events, protocol.NewEvent(protocol.EventAssistantDone, input.SessionID, "Eino runner completed without response.", nil))
+		events = append(events, protocol.NewEvent(protocol.EventStatusUpdate, input.SessionID, "Eino runner completed without response.", nil))
 	}
 	return events, nil
 }
@@ -220,6 +220,9 @@ func transcriptMessages(history []protocol.Event) []*schema.Message {
 		}
 		switch event.Type {
 		case protocol.EventUserMessage:
+			if strings.HasPrefix(text, "/") {
+				continue
+			}
 			messages = append(messages, schema.UserMessage(text))
 		case protocol.EventAssistantDone:
 			messages = append(messages, schema.AssistantMessage(text, nil))

@@ -2,6 +2,7 @@ package eino
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -101,6 +102,50 @@ func TestRunnerProjectsStreamingAndInterruptEvents(t *testing.T) {
 	}
 	if got := lastMessage(events, protocol.EventApprovalRequest); got != "approval needed" {
 		t.Fatalf("interrupt was not surfaced: %q in %+v", got, events)
+	}
+}
+
+func TestRunnerKeepsPartialEventsOnExecutorError(t *testing.T) {
+	runner := NewRunner(Options{
+		Executor: &fakeExecutor{
+			events: []*adk.AgentEvent{
+				adk.EventFromMessage(schema.AssistantMessage("partial answer", nil), nil, schema.Assistant, ""),
+			},
+			err: errors.New("runner failed"),
+		},
+	})
+	events, err := runner.Run(context.Background(), runtime.EinoRunInput{SessionID: "s1", Message: "question"})
+	if err == nil || !strings.Contains(err.Error(), "runner failed") {
+		t.Fatalf("expected executor error, got %v", err)
+	}
+	if got := lastMessage(events, protocol.EventAssistantDone); got != "partial answer" {
+		t.Fatalf("partial assistant output was not preserved: %q in %+v", got, events)
+	}
+}
+
+func TestRunnerUsesStatusForNoResponseAndFiltersSlashHistory(t *testing.T) {
+	executor := &fakeExecutor{}
+	runner := NewRunner(Options{Executor: executor})
+	events, err := runner.Run(context.Background(), runtime.EinoRunInput{
+		SessionID: "s1",
+		Message:   "question",
+		History: []protocol.Event{
+			protocol.NewEvent(protocol.EventUserMessage, "s1", "/build", nil),
+			protocol.NewEvent(protocol.EventStatusUpdate, "s1", "Eino runner completed without response.", nil),
+			protocol.NewEvent(protocol.EventAssistantDone, "s1", "real assistant answer", nil),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasEvent(events, protocol.EventAssistantDone) {
+		t.Fatalf("no-response fallback must not be persisted as assistant output: %+v", events)
+	}
+	if got := lastMessage(events, protocol.EventStatusUpdate); got != "Eino runner completed without response." {
+		t.Fatalf("missing no-response status event: %q in %+v", got, events)
+	}
+	if got := messageContents(executor.messages); strings.Join(got, "|") != "real assistant answer|question" {
+		t.Fatalf("slash or status history leaked into ADK messages: %+v", got)
 	}
 }
 

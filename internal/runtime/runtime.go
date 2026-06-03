@@ -120,6 +120,10 @@ func (m *Manager) Start(ctx context.Context, opts StartOptions) ([]protocol.Even
 			m.mu.Unlock()
 			return nil, fmt.Errorf("eino runner mode requires an Eino runner")
 		}
+		if m.deps.Sessions == nil {
+			m.mu.Unlock()
+			return nil, fmt.Errorf("eino runner mode requires session storage")
+		}
 		if err := m.deps.EinoRunner.Ready(ctx); err != nil {
 			m.mu.Unlock()
 			return nil, err
@@ -181,11 +185,11 @@ func (m *Manager) SendMessage(ctx context.Context, input string) []protocol.Even
 		}
 		history := m.loadHistory(ctx, einoSession.ID)
 		runnerEvents, err := einoRunner.Run(ctx, EinoRunInput{SessionID: einoSession.ID, Message: input, History: history})
+		events = append(events, runnerEvents...)
 		if err != nil {
 			events = append(events, protocol.NewEvent(protocol.EventError, einoSession.ID, err.Error(), nil))
 			return m.persistEmitAndReturn(events)
 		}
-		events = append(events, runnerEvents...)
 		return m.persistEmitAndReturn(events)
 	}
 	return m.emitAndReturn(runner.Handle(ctx, input))

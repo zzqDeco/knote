@@ -149,15 +149,55 @@ func TestRuntimeEinoModeStartsAndSendsThroughBridge(t *testing.T) {
 	}
 }
 
-func TestRuntimeEinoModeRequiresReadyRunner(t *testing.T) {
+func TestRuntimeEinoModePersistsPartialEventsOnRunnerError(t *testing.T) {
+	workspace := t.TempDir()
+	store := local.New(workspace)
 	rt := New(Dependencies{
-		Workspace:    t.TempDir(),
+		Workspace:    workspace,
+		Sessions:     store,
+		RunnerMode:   RunnerModeEino,
+		EinoRunner:   &fakeEinoRunner{events: []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, "", "partial answer", nil)}, err: fmt.Errorf("runner failed")},
+		NewSessionID: func() string { return "sess_eino" },
+	})
+	if _, err := rt.Start(context.Background(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	events := rt.SendMessage(context.Background(), "hello")
+	if !hasMessage(events, protocol.EventAssistantDone, "partial answer") || !hasEvent(events, protocol.EventError) {
+		t.Fatalf("runtime did not keep partial runner events before error: %+v", events)
+	}
+	loaded, err := store.Load(context.Background(), "sess_eino")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasMessage(loaded, protocol.EventAssistantDone, "partial answer") || !hasEvent(loaded, protocol.EventError) {
+		t.Fatalf("partial runner events were not persisted: %+v", loaded)
+	}
+}
+
+func TestRuntimeEinoModeRequiresReadyRunner(t *testing.T) {
+	workspace := t.TempDir()
+	rt := New(Dependencies{
+		Workspace:    workspace,
+		Sessions:     local.New(workspace),
 		RunnerMode:   RunnerModeEino,
 		EinoRunner:   &fakeEinoRunner{},
 		NewSessionID: func() string { return "sess_eino" },
 	})
 	if _, err := rt.Start(context.Background(), StartOptions{}); err == nil {
 		t.Fatal("expected Eino mode startup to fail when runner is not ready")
+	}
+}
+
+func TestRuntimeEinoModeRequiresSessionStorage(t *testing.T) {
+	rt := New(Dependencies{
+		Workspace:    t.TempDir(),
+		RunnerMode:   RunnerModeEino,
+		EinoRunner:   &fakeEinoRunner{events: []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, "", "hello from eino", nil)}},
+		NewSessionID: func() string { return "sess_eino" },
+	})
+	if _, err := rt.Start(context.Background(), StartOptions{}); err == nil {
+		t.Fatal("expected Eino mode startup to fail without session storage")
 	}
 }
 
@@ -234,6 +274,7 @@ type fakeEinoRunner struct {
 	tools       []RunnerToolInfo
 	events      []protocol.Event
 	lastHistory []protocol.Event
+	err         error
 }
 
 func (r *fakeEinoRunner) Ready(context.Context) error {
@@ -257,7 +298,7 @@ func (r *fakeEinoRunner) Run(_ context.Context, input EinoRunInput) ([]protocol.
 		event.SessionID = input.SessionID
 		events = append(events, event)
 	}
-	return events, nil
+	return events, r.err
 }
 
 func must(t *testing.T, err error) {
