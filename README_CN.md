@@ -10,7 +10,7 @@
 - `internal/agent`：direct runner 的 turn、slash command、确认、任务和 session event
 - `internal/knowledge/versioned`：带版本语义的 build/query/explain/eval/diff/commit/release/checkout/status facade
 - `internal/eino/tools`：基于 versioned knowledge facade 的浅层 Eino `InvokableTool` adapter
-- `internal/runtime/eino`：Eino runner skeleton 和 tool inventory bridge；默认仍使用 direct runner
+- `internal/runtime/eino`：OpenAI-compatible Eino ChatModelAgent runner bridge；默认仍使用 direct runner
 - `internal/repository/local`：本地 config、session、artifact、eval 和 Git version 实现
 - `internal/knowledge/kag`：fake/real OpenSPG/KAG backend 的 Go 边界
 - `adapters/kag`：OpenSPG/KAG Python NDJSON adapter
@@ -72,7 +72,18 @@ adapter 会在 `.knote/kag-runtime/` 写入稳定排序的 JSON corpus 和生成
 
 ## Runtime 分层
 
-TUI 只调用 `internal/runtime`，不直接接触 KAG、Git、repository 或 Eino。当前生产路径仍使用 direct agent runner。Eino 路径目前作为内部 skeleton 支持 tool inventory 和 ADK runner config 测试。`KNOTE_RUNTIME_MODE=eino` 是开发保护开关，会在启动时报出明确的 “scaffolded but not enabled” 错误，直到生产 turn 执行接入完成。
+TUI 只调用 `internal/runtime`，不直接接触 KAG、Git、repository 或 Eino。默认生产路径仍使用 direct agent runner。设置 `KNOTE_RUNTIME_MODE=eino` 后，会启动基于 OpenAI-compatible chat model 的 Eino ADK ChatModelAgent 路径：
+
+```bash
+KNOTE_RUNTIME_MODE=eino \
+KNOTE_EINO_PROVIDER=openai-compatible \
+KNOTE_EINO_MODEL=gpt-4o-mini \
+KNOTE_EINO_API_KEY=your-api-key \
+KNOTE_EINO_BASE_URL=https://api.openai.com/v1 \
+./bin/knote --workspace tests/fixtures/basic-kb
+```
+
+`KNOTE_EINO_MODEL_PROFILE` 用于选择 `.knote/config.yaml` 中的模型 profile，默认是 `default`。环境变量会覆盖被选中的 profile。`KNOTE_EINO_REASONING_EFFORT` 支持 `low`、`medium`、`high`。
 
 带副作用的 Eino tools 必须经过 runtime side-effect gate，这和 TUI 中 `/build`、`/commit`、`/release`、`/checkout`、`/eval` 的确认规则保持一致。
 
