@@ -2,9 +2,11 @@ package runtime
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/zzqDeco/knote/internal/knowledge/kag"
@@ -80,6 +82,48 @@ func TestRuntimeWorkspaceStatusAndDirectModeControls(t *testing.T) {
 	}
 }
 
+func TestRuntimeRunnerInfoIncludesEinoInventory(t *testing.T) {
+	rt := New(Dependencies{
+		Workspace:    "/tmp/knote-test",
+		RunnerMode:   RunnerModeDirect,
+		EinoRunner:   fakeEinoRunner{tools: []RunnerToolInfo{{Name: "knote_query", Description: "query knowledge"}}},
+		NewSessionID: local.NewSessionID,
+	})
+	info, err := rt.RunnerInfo(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.ConfiguredMode != RunnerModeDirect || info.ActiveMode != RunnerModeDirect {
+		t.Fatalf("unexpected runner modes: %+v", info)
+	}
+	if !info.EinoAvailable {
+		t.Fatalf("expected Eino runner to be available: %+v", info)
+	}
+	if len(info.Tools) != 1 || info.Tools[0].Name != "knote_query" {
+		t.Fatalf("unexpected tool inventory: %+v", info.Tools)
+	}
+}
+
+func TestRuntimeEinoModeIsExplicitSkeleton(t *testing.T) {
+	rt := New(Dependencies{
+		Workspace:    "/tmp/knote-test",
+		RunnerMode:   RunnerModeEino,
+		EinoRunner:   fakeEinoRunner{},
+		NewSessionID: local.NewSessionID,
+	})
+	_, err := rt.Start(context.Background(), StartOptions{})
+	if err == nil || !strings.Contains(err.Error(), "scaffolded") {
+		t.Fatalf("expected explicit Eino skeleton error, got %v", err)
+	}
+	info, err := rt.RunnerInfo(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.ConfiguredMode != RunnerModeEino || info.ActiveMode != RunnerModeEino {
+		t.Fatalf("unexpected Eino runner info: %+v", info)
+	}
+}
+
 func newTestRuntime(t *testing.T, workspace string) (*Manager, error) {
 	t.Helper()
 	ctx := context.Background()
@@ -138,6 +182,18 @@ func hasEvent(events []protocol.Event, eventType protocol.EventType) bool {
 		}
 	}
 	return false
+}
+
+type fakeEinoRunner struct {
+	tools []RunnerToolInfo
+}
+
+func (r fakeEinoRunner) ToolInventory(context.Context) ([]RunnerToolInfo, error) {
+	return append([]RunnerToolInfo(nil), r.tools...), nil
+}
+
+func (fakeEinoRunner) Run(context.Context, EinoRunInput) ([]protocol.Event, error) {
+	return nil, fmt.Errorf("fake Eino runner does not execute")
 }
 
 func must(t *testing.T, err error) {

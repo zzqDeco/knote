@@ -68,6 +68,25 @@ func TestRuntimePackageImportBoundary(t *testing.T) {
 	}
 }
 
+func TestRuntimeEinoPackageImportBoundary(t *testing.T) {
+	cmd := exec.Command("go", "list", "-f", "{{join .Imports \"\\n\"}}", "./internal/runtime/eino")
+	cmd.Dir = repoRoot()
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("go list runtime/eino imports: %v", err)
+	}
+	for _, forbidden := range []string{
+		"/internal/tui",
+		"/internal/agent",
+		"/internal/knowledge/" + "kag",
+		"/internal/repository/" + "local",
+	} {
+		if strings.Contains(string(out), forbidden) {
+			t.Fatalf("runtime/eino imports forbidden package %s:\n%s", forbidden, out)
+		}
+	}
+}
+
 func TestTUIPackageImportBoundary(t *testing.T) {
 	cmd := exec.Command("go", "list", "-f", "{{join .Imports \"\\n\"}}", "./internal/tui")
 	cmd.Dir = repoRoot()
