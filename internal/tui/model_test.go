@@ -10,11 +10,11 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	agentpkg "github.com/zzqDeco/knote/internal/agent"
 	"github.com/zzqDeco/knote/internal/knowledge/kag"
 	"github.com/zzqDeco/knote/internal/knowledge/versioned"
 	"github.com/zzqDeco/knote/internal/protocol"
 	"github.com/zzqDeco/knote/internal/repository/local"
+	"github.com/zzqDeco/knote/internal/runtime"
 )
 
 func TestInputHistoryCyclesComposerValues(t *testing.T) {
@@ -45,7 +45,7 @@ func TestInputHistoryCyclesComposerValues(t *testing.T) {
 
 func TestConfirmRejectClosesOverlayWithoutRunningBuild(t *testing.T) {
 	model := newTestModel(t)
-	workspace := model.agent.Workspace()
+	workspace := model.runtime.Workspace()
 
 	model.composer.SetValue("/build")
 	updateModel(t, &model, tea.KeyMsg{Type: tea.KeyEnter})
@@ -81,8 +81,8 @@ func TestOverlaySwitchAndEsc(t *testing.T) {
 
 func TestClearProjectsTranscriptWithoutDeletingSession(t *testing.T) {
 	model := newTestModel(t)
-	store := local.New(model.agent.Workspace())
-	sessionID := model.agent.SessionID()
+	store := local.New(model.runtime.Workspace())
+	sessionID := model.runtime.SessionID()
 
 	model.composer.SetValue("/help")
 	updateModel(t, &model, tea.KeyMsg{Type: tea.KeyEnter})
@@ -103,7 +103,7 @@ func TestClearProjectsTranscriptWithoutDeletingSession(t *testing.T) {
 
 func TestResumeDoesNotReviveStaleConfirmation(t *testing.T) {
 	model := newTestModel(t)
-	sessionID := model.agent.SessionID()
+	sessionID := model.runtime.SessionID()
 
 	model.composer.SetValue("/build")
 	updateModel(t, &model, tea.KeyMsg{Type: tea.KeyEnter})
@@ -117,7 +117,7 @@ func TestResumeDoesNotReviveStaleConfirmation(t *testing.T) {
 
 	model.composer.SetValue("/new")
 	updateModel(t, &model, tea.KeyMsg{Type: tea.KeyEnter})
-	if model.agent.SessionID() == sessionID {
+	if model.runtime.SessionID() == sessionID {
 		t.Fatal("/new did not switch sessions")
 	}
 
@@ -152,7 +152,7 @@ func newTestModel(t *testing.T) Model {
 	return model
 }
 
-func newTestAgent(t *testing.T, workspace string) (*agentpkg.Agent, []protocol.Event, error) {
+func newTestAgent(t *testing.T, workspace string) (runtime.Runtime, []protocol.Event, error) {
 	t.Helper()
 	ctx := context.Background()
 	repo := local.New(workspace)
@@ -176,7 +176,7 @@ func newTestAgent(t *testing.T, workspace string) (*agentpkg.Agent, []protocol.E
 		Language:    cfg.KAG.Language,
 		RuntimeDir:  cfg.KAG.RuntimeDir,
 	}
-	return agentpkg.New(ctx, agentpkg.Dependencies{
+	rt := runtime.New(runtime.Dependencies{
 		Workspace:     workspace,
 		Config:        cfg,
 		Sessions:      repo,
@@ -185,6 +185,8 @@ func newTestAgent(t *testing.T, workspace string) (*agentpkg.Agent, []protocol.E
 		Knowledge:     versioned.New(versioned.Options{Workspace: workspace, Repo: repo, Versions: repo, Backend: kagClient, Mode: versioned.ModeFake}),
 		NewSessionID:  local.NewSessionID,
 	})
+	initial, err := rt.Start(ctx, runtime.StartOptions{})
+	return rt, initial, err
 }
 
 func updateModel(t *testing.T, model *Model, msg tea.Msg) {

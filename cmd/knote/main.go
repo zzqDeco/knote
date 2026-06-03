@@ -9,11 +9,11 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/zzqDeco/knote/internal/agent"
 	"github.com/zzqDeco/knote/internal/knowledge/kag"
 	"github.com/zzqDeco/knote/internal/knowledge/versioned"
 	"github.com/zzqDeco/knote/internal/protocol"
 	"github.com/zzqDeco/knote/internal/repository/local"
+	"github.com/zzqDeco/knote/internal/runtime"
 	"github.com/zzqDeco/knote/internal/tui"
 )
 
@@ -34,20 +34,20 @@ func main() {
 		return
 	}
 
-	agentRuntime, events, err := newAgent(context.Background(), *workspace, *resume)
+	rt, events, err := newRuntime(context.Background(), *workspace, *resume)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 
-	program := tea.NewProgram(tui.New(agentRuntime, events), tea.WithAltScreen())
+	program := tea.NewProgram(tui.New(rt, events), tea.WithAltScreen())
 	if _, err := program.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 }
 
-func newAgent(ctx context.Context, workspacePath string, resumeID string) (*agent.Agent, []protocol.Event, error) {
+func newRuntime(ctx context.Context, workspacePath string, resumeID string) (runtime.Runtime, []protocol.Event, error) {
 	workspace, err := filepath.Abs(workspacePath)
 	if err != nil {
 		return nil, nil, err
@@ -79,9 +79,8 @@ func newAgent(ctx context.Context, workspacePath string, resumeID string) (*agen
 		Language:    repoCfg.KAG.Language,
 		RuntimeDir:  repoCfg.KAG.RuntimeDir,
 	}
-	return agent.New(ctx, agent.Dependencies{
+	rt := runtime.New(runtime.Dependencies{
 		Workspace:     workspace,
-		ResumeID:      resumeID,
 		Config:        repoCfg,
 		Sessions:      repo,
 		Versions:      repo,
@@ -89,4 +88,6 @@ func newAgent(ctx context.Context, workspacePath string, resumeID string) (*agen
 		Knowledge:     versioned.New(versioned.Options{Workspace: workspace, Repo: repo, Versions: repo, Backend: kagClient, Mode: mode}),
 		NewSessionID:  local.NewSessionID,
 	})
+	events, err := rt.Start(ctx, runtime.StartOptions{ResumeID: resumeID})
+	return rt, events, err
 }
