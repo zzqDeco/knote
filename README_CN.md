@@ -6,8 +6,11 @@
 
 - `cmd/knote`：单一 CLI/TUI binary
 - `internal/tui`：Bubble Tea 实现 transcript、composer、overlay、picker、pager、status line
-- `internal/agent`：turn、slash command、确认、任务和 session event
-- `internal/knowledge`：build/query/explain/eval 业务语义和 artifact 归一化
+- `internal/runtime`：session/thread 生命周期、event dispatch、task control、confirm routing 和 runner 选择
+- `internal/agent`：direct runner 的 turn、slash command、确认、任务和 session event
+- `internal/knowledge/versioned`：带版本语义的 build/query/explain/eval/diff/commit/release/checkout/status facade
+- `internal/eino/tools`：基于 versioned knowledge facade 的浅层 Eino `InvokableTool` adapter
+- `internal/runtime/eino`：Eino runner skeleton 和 tool inventory bridge；默认仍使用 direct runner
 - `internal/repository/local`：本地 config、session、artifact、eval 和 Git version 实现
 - `internal/knowledge/kag`：fake/real OpenSPG/KAG backend 的 Go 边界
 - `adapters/kag`：OpenSPG/KAG Python NDJSON adapter
@@ -66,6 +69,12 @@ adapter 会在 `.knote/kag-runtime/` 写入稳定排序的 JSON corpus 和生成
 ## 会话
 
 会话以 JSONL event log 保存在 `.knote/sessions/`。`/clear` 只清空当前 TUI 投影视图，不删除历史；`/new` 创建新 session；`/resume` 列出最近 session；`/resume <session-id>` 在 TUI 中恢复历史。
+
+## Runtime 分层
+
+TUI 只调用 `internal/runtime`，不直接接触 KAG、Git、repository 或 Eino。当前生产路径仍使用 direct agent runner。Eino 路径目前作为内部 skeleton 支持 tool inventory 和 ADK runner config 测试。`KNOTE_RUNTIME_MODE=eino` 是开发保护开关，会在启动时报出明确的 “scaffolded but not enabled” 错误，直到生产 turn 执行接入完成。
+
+带副作用的 Eino tools 必须经过 runtime side-effect gate，这和 TUI 中 `/build`、`/commit`、`/release`、`/checkout`、`/eval` 的确认规则保持一致。
 
 ## 版本和评估
 

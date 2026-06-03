@@ -6,8 +6,11 @@ This MVP is Go-first:
 
 - `cmd/knote`: single CLI/TUI binary
 - `internal/tui`: Bubble Tea transcript, composer, overlays, pickers, and status line
-- `internal/agent`: turn handling, slash commands, confirmations, tasks, and session events
-- `internal/knowledge`: build/query/explain/eval semantics and artifact normalization
+- `internal/runtime`: session/thread lifecycle, event dispatch, task controls, confirm routing, and runner selection
+- `internal/agent`: direct-runner turn handling, slash commands, confirmations, tasks, and session events
+- `internal/knowledge/versioned`: versioned build/query/explain/eval/diff/commit/release/checkout/status facade
+- `internal/eino/tools`: shallow Eino `InvokableTool` adapters over the versioned knowledge facade
+- `internal/runtime/eino`: Eino runner skeleton and tool inventory bridge; direct runner remains the default
 - `internal/repository/local`: local config, sessions, artifacts, evals, and Git versions
 - `internal/knowledge/kag`: Go boundary for fake/real OpenSPG/KAG backends
 - `adapters/kag`: Python NDJSON adapter for OpenSPG/KAG
@@ -67,6 +70,12 @@ The adapter writes a sorted JSON corpus and generated starter config under `.kno
 
 Sessions are JSONL event logs under `.knote/sessions/`. `/clear` only clears the current TUI projection; it does not delete session history. `/new` creates a fresh session. `/resume` lists recent sessions, and `/resume <session-id>` replays one in the TUI.
 
+## Runtime Layers
+
+The TUI talks to `internal/runtime`, not directly to KAG, Git, repositories, or Eino. Runtime currently uses the direct agent runner for production turns. The Eino path is scaffolded internally for tool inventory and ADK runner configuration tests. `KNOTE_RUNTIME_MODE=eino` is a development guard that fails startup with an explicit "scaffolded but not enabled" error until production turn execution is implemented.
+
+Mutating Eino tools require a runtime side-effect gate, matching the TUI confirmation rule for `/build`, `/commit`, `/release`, `/checkout`, and `/eval`.
+
 ## Versions And Eval
 
 `knote` treats Git commits as knowledge versions, Git tags as release versions, and branches as candidate experiments.
@@ -105,6 +114,8 @@ MVP scope includes:
 - KAG adapter health/build/query/explain bridge
 - session JSONL persistence
 - task and permission state
+- runtime manager boundary for future TUI/Web reuse
+- Eino tool adapters and runner skeleton
 - Git diff/log/commit/tag wrappers
 - release-oriented CI skeleton
 
