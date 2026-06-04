@@ -50,6 +50,11 @@ func executeEinoToolOnce(approvedTools map[string]einotool.InvokableTool) runtim
 		}
 		decoded := decodeEinoToolResult(out)
 		payload := map[string]any{"tool": toolName, "result": decoded}
+		if failure := adapterFailureMessage(toolName, decoded); failure != "" {
+			events = append(events, protocol.NewEvent(protocol.EventToolError, sessionID, failure, payload))
+			events = append(events, protocol.NewEvent(protocol.EventError, sessionID, failure, payload))
+			return events, fmt.Errorf("%s", failure)
+		}
 		events = append(events, protocol.NewEvent(protocol.EventToolComplete, sessionID, toolName+" complete", payload))
 		events = append(events, versionEventsForEinoTool(sessionID, toolName, decoded)...)
 		if toolName == einotools.NameBuild {
@@ -85,6 +90,38 @@ func prettyEinoToolResult(decoded any) string {
 func decodedMap(decoded any) map[string]any {
 	value, _ := decoded.(map[string]any)
 	return value
+}
+
+func adapterFailureMessage(toolName string, decoded any) string {
+	fields := decodedMap(decoded)
+	if len(fields) == 0 {
+		return ""
+	}
+	if message := strings.TrimSpace(stringField(fields, "adapter_error")); message != "" {
+		return message
+	}
+	if count := intField(fields, "adapter_errors"); count > 0 {
+		return fmt.Sprintf("%s completed with %d adapter error(s)", toolName, count)
+	}
+	return ""
+}
+
+func stringField(fields map[string]any, key string) string {
+	value, _ := fields[key].(string)
+	return value
+}
+
+func intField(fields map[string]any, key string) int {
+	switch value := fields[key].(type) {
+	case int:
+		return value
+	case int64:
+		return int(value)
+	case float64:
+		return int(value)
+	default:
+		return 0
+	}
 }
 
 func versionEventsForEinoTool(sessionID string, toolName string, decoded any) []protocol.Event {

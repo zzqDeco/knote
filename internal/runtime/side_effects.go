@@ -25,8 +25,10 @@ type SideEffectRequest struct {
 }
 
 type SideEffectBridge struct {
-	mu      sync.Mutex
-	pending map[string]pendingSideEffect
+	mu            sync.Mutex
+	nextRequestID uint64
+	queue         []string
+	pending       map[string]pendingSideEffect
 }
 
 type pendingSideEffect struct {
@@ -64,18 +66,22 @@ func (b *SideEffectBridge) Request(ctx context.Context, req SideEffectRequest) e
 	req.Action = strings.TrimSpace(req.Action)
 	req.ArgumentsInJSON = strings.TrimSpace(req.ArgumentsInJSON)
 	req.Summary = strings.TrimSpace(req.Summary)
+	createdAt := time.Now().UTC()
+	b.mu.Lock()
+	b.nextRequestID++
+	requestID := fmt.Sprintf("eino_confirm_%s_%06d", createdAt.Format("20060102T150405.000000000"), b.nextRequestID)
 	confirm := protocol.ConfirmRequest{
-		RequestID:   "eino_confirm_" + time.Now().UTC().Format("20060102T150405.000000000"),
+		RequestID:   requestID,
 		Action:      req.Action,
 		Command:     sideEffectCommand(req),
 		Title:       "Confirm Eino tool: " + req.ToolName,
 		Summary:     sideEffectSummary(req),
 		ApproveText: "Run tool once",
 		RejectText:  "Cancel",
-		CreatedAt:   time.Now().UTC(),
+		CreatedAt:   createdAt,
 	}
-	b.mu.Lock()
 	b.pending[confirm.RequestID] = pendingSideEffect{request: req, confirm: confirm}
+	b.queue = append(b.queue, confirm.RequestID)
 	b.mu.Unlock()
 	return ErrSideEffectPending
 }
@@ -87,16 +93,21 @@ func (b *SideEffectBridge) PendingEvents(sessionID string) []protocol.Event {
 	sessionID = strings.TrimSpace(sessionID)
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	var events []protocol.Event
-	for id, pending := range b.pending {
-		if pending.emitted || pending.request.SessionID != sessionID {
+	for _, pending := range b.pending {
+		if pending.emitted && pending.request.SessionID == sessionID {
+			return nil
+		}
+	}
+	for _, id := range b.queue {
+		pending, ok := b.pending[id]
+		if !ok || pending.request.SessionID != sessionID {
 			continue
 		}
 		pending.emitted = true
 		b.pending[id] = pending
-		events = append(events, protocol.NewEvent(protocol.EventConfirmRequest, sessionID, pending.confirm.Title, pending.confirm))
+		return []protocol.Event{protocol.NewEvent(protocol.EventConfirmRequest, sessionID, pending.confirm.Title, pending.confirm)}
 	}
-	return events
+	return nil
 }
 
 func (b *SideEffectBridge) Confirm(ctx context.Context, sessionID string, req protocol.ConfirmRequest, approved bool) []protocol.Event {
@@ -110,9 +121,11 @@ func (b *SideEffectBridge) Confirm(ctx context.Context, sessionID string, req pr
 		}
 	}
 	if !approved {
-		return []protocol.Event{
+		events := []protocol.Event{
 			protocol.NewEvent(protocol.EventAssistantDone, sessionID, "Cancelled: "+pending.confirm.Action, map[string]string{"request_id": pending.confirm.RequestID}),
 		}
+		events = append(events, b.PendingEvents(sessionID)...)
+		return events
 	}
 	events := []protocol.Event{
 		protocol.NewEvent(protocol.EventStatusUpdate, sessionID, "Confirmed: "+pending.confirm.Action, map[string]string{"request_id": pending.confirm.RequestID}),
@@ -125,6 +138,7 @@ func (b *SideEffectBridge) Confirm(ctx context.Context, sessionID string, req pr
 			"tool":       pending.request.ToolName,
 		}))
 	}
+	events = append(events, b.PendingEvents(sessionID)...)
 	return events
 }
 
@@ -139,7 +153,19 @@ func (b *SideEffectBridge) consume(sessionID string, req protocol.ConfirmRequest
 		return pendingSideEffect{}, false
 	}
 	delete(b.pending, req.RequestID)
+	b.removeQueuedLocked(req.RequestID)
 	return pending, true
+}
+
+func (b *SideEffectBridge) removeQueuedLocked(requestID string) {
+	for i, id := range b.queue {
+		if id != requestID {
+			continue
+		}
+		copy(b.queue[i:], b.queue[i+1:])
+		b.queue = b.queue[:len(b.queue)-1]
+		return
+	}
 }
 
 type sideEffectSessionKey struct{}
