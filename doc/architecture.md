@@ -53,6 +53,10 @@ The default runner mode is `direct`. In this mode runtime delegates turns to `in
 
 `internal/eino/tools` is intentionally shallow. Each tool parses JSON arguments, calls `internal/knowledge/versioned`, and returns JSON. Mutating tools require a side-effect gate so they cannot bypass runtime confirmation.
 
+Eino side effects are bridged back through runtime confirmation instead of executing directly. In Eino mode, mutating tools call a `SideEffectGate`; runtime stores the pending request, emits one `confirm.request` at a time, and only executes the approved tool once after TUI approval. Queued confirmations are FIFO, request ids include a monotonic suffix, and adapter failures returned by approved build/eval tools are projected as `tool.error`/`error` rather than `tool.complete`.
+
+The local OpenAI-compatible path is validated manually with `scripts/smoke_eino_local_proxy.sh`. That script probes `/v1/models`, starts `KNOTE_RUNTIME_MODE=eino`, sends a PTY prompt, and waits for the model to return `knote-eino-ok`. The smoke is intentionally manual because it depends on a local proxy and API key.
+
 ## Agent And TUI
 
 `internal/tui` owns screen projection only. It keeps the transcript, composer history, overlay state, and status line, then calls runtime methods for every user intent. It does not execute Git, artifact, KAG, Eino, or repository side effects directly.

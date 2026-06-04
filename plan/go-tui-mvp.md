@@ -40,7 +40,9 @@ The MVP is a single Go CLI/TUI binary with a Python KAG subprocess adapter. Bubb
 - PR #18 `refactor/runtime-eino-runner-skeleton`: completed and merged to `dev`.
 - PR #19 `docs/architecture-runtime-layers`: documents the current layered runtime architecture and validation gates.
 - PR #20 `feature/eino-direct-runner-bridge`: completed and merged to `dev`.
-- PR #21 `feature/eino-chatmodel-agent`: in progress.
+- PR #21 `feature/eino-chatmodel-agent`: completed and merged to `dev`.
+- PR #22 `feature/eino-confirmation-bridge`: completed and merged to `dev`.
+- PR #23 `test/eino-runtime-acceptance-docs`: adds repeatable Eino local proxy smoke coverage and updates runtime acceptance docs.
 
 ## Acceptance
 
@@ -48,6 +50,7 @@ The MVP is a single Go CLI/TUI binary with a Python KAG subprocess adapter. Bubb
 - `/usr/bin/python3 -m unittest discover -s adapters/kag -p '*test*.py'` passes.
 - `CGO_ENABLED=0 go build -o bin/knote ./cmd/knote` succeeds.
 - `PYTHON=/usr/bin/python3 KNOTE_SMOKE_FORCE_BIN=1 bash scripts/smoke_fake_mvp.sh` starts the TUI in a PTY, runs fake build/query/diff/commit/resume/eval, and exits cleanly.
+- `KNOTE_EINO_BASE_URL=http://127.0.0.1:8317/v1 KNOTE_EINO_MODEL=gpt-5.3-codex-spark KNOTE_EINO_REASONING_EFFORT=low bash scripts/smoke_eino_local_proxy.sh` manually validates the OpenAI-compatible Eino runner path when a local proxy and API key are available.
 - `KNOTE_PYTHON=/path/to/python KNOTE_KAG_HOST=http://127.0.0.1:8887 scripts/smoke_real_kag.sh` passes in a local real OpenSPG/KAG environment.
 
 ## Release Candidate Checklist
