@@ -149,6 +149,68 @@ func TestRuntimeEinoModeStartsAndSendsThroughBridge(t *testing.T) {
 	}
 }
 
+func TestRuntimeEinoModeConfirmsSideEffectTool(t *testing.T) {
+	workspace := t.TempDir()
+	store := local.New(workspace)
+	bridge := NewSideEffectBridge()
+	einoRunner := &sideEffectEinoRunner{bridge: bridge}
+	rt := New(Dependencies{
+		Workspace:    workspace,
+		Sessions:     store,
+		RunnerMode:   RunnerModeEino,
+		EinoRunner:   einoRunner,
+		SideEffects:  bridge,
+		NewSessionID: func() string { return "sess_eino" },
+	})
+	if _, err := rt.Start(context.Background(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	events := rt.SendMessage(context.Background(), "build knowledge")
+	if hasEvent(events, protocol.EventError) || !hasEvent(events, protocol.EventConfirmRequest) {
+		t.Fatalf("side-effect request should surface as confirm without error: %+v", events)
+	}
+	confirm := firstConfirm(t, events)
+	events = rt.Confirm(context.Background(), confirm, true)
+	if !hasEvent(events, protocol.EventStatusUpdate) || !hasEvent(events, protocol.EventToolComplete) {
+		t.Fatalf("approved side-effect did not execute: %+v", events)
+	}
+	if einoRunner.executions != 1 {
+		t.Fatalf("approved side-effect executions = %d, want 1", einoRunner.executions)
+	}
+	loaded, err := store.Load(context.Background(), "sess_eino")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasEvent(loaded, protocol.EventConfirmRequest) || !hasEvent(loaded, protocol.EventToolComplete) {
+		t.Fatalf("side-effect confirm/execution events were not persisted: %+v", loaded)
+	}
+}
+
+func TestRuntimeEinoModeRejectsSideEffectTool(t *testing.T) {
+	workspace := t.TempDir()
+	bridge := NewSideEffectBridge()
+	einoRunner := &sideEffectEinoRunner{bridge: bridge}
+	rt := New(Dependencies{
+		Workspace:    workspace,
+		Sessions:     local.New(workspace),
+		RunnerMode:   RunnerModeEino,
+		EinoRunner:   einoRunner,
+		SideEffects:  bridge,
+		NewSessionID: func() string { return "sess_eino" },
+	})
+	if _, err := rt.Start(context.Background(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	confirm := firstConfirm(t, rt.SendMessage(context.Background(), "build knowledge"))
+	events := rt.Confirm(context.Background(), confirm, false)
+	if !hasMessage(events, protocol.EventAssistantDone, "Cancelled: build") {
+		t.Fatalf("rejected side-effect should be cancelled: %+v", events)
+	}
+	if einoRunner.executions != 0 {
+		t.Fatalf("rejected side-effect executed %d times", einoRunner.executions)
+	}
+}
+
 func TestRuntimeEinoModePersistsPartialEventsOnRunnerError(t *testing.T) {
 	workspace := t.TempDir()
 	store := local.New(workspace)
@@ -275,6 +337,34 @@ type fakeEinoRunner struct {
 	events      []protocol.Event
 	lastHistory []protocol.Event
 	err         error
+}
+
+type sideEffectEinoRunner struct {
+	bridge     *SideEffectBridge
+	executions int
+}
+
+func (r *sideEffectEinoRunner) Ready(context.Context) error {
+	return nil
+}
+
+func (r *sideEffectEinoRunner) ToolInventory(context.Context) ([]RunnerToolInfo, error) {
+	return []RunnerToolInfo{{Name: "knote_build", Description: "build knowledge"}}, nil
+}
+
+func (r *sideEffectEinoRunner) Run(ctx context.Context, input EinoRunInput) ([]protocol.Event, error) {
+	return nil, r.bridge.Request(ctx, SideEffectRequest{
+		ToolName:        "knote_build",
+		Action:          "build",
+		ArgumentsInJSON: "{}",
+		Summary:         "Build knowledge artifacts.",
+		Execute: func(context.Context, SideEffectRequest) ([]protocol.Event, error) {
+			r.executions++
+			return []protocol.Event{
+				protocol.NewEvent(protocol.EventToolComplete, input.SessionID, "knote_build complete", map[string]string{"tool": "knote_build"}),
+			}, nil
+		},
+	})
 }
 
 func (r *fakeEinoRunner) Ready(context.Context) error {

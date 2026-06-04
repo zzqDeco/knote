@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -38,6 +39,7 @@ type Dependencies struct {
 	Knowledge     versioned.Service
 	RunnerMode    RunnerMode
 	EinoRunner    EinoRunner
+	SideEffects   *SideEffectBridge
 	NewSessionID  func() string
 }
 
@@ -184,9 +186,19 @@ func (m *Manager) SendMessage(ctx context.Context, input string) []protocol.Even
 			return m.persistEmitAndReturn(events)
 		}
 		history := m.loadHistory(ctx, einoSession.ID)
-		runnerEvents, err := einoRunner.Run(ctx, EinoRunInput{SessionID: einoSession.ID, Message: input, History: history})
+		runCtx := ctx
+		if m.deps.SideEffects != nil {
+			runCtx = withSideEffectSession(ctx, einoSession.ID)
+		}
+		runnerEvents, err := einoRunner.Run(runCtx, EinoRunInput{SessionID: einoSession.ID, Message: input, History: history})
 		events = append(events, runnerEvents...)
+		if m.deps.SideEffects != nil {
+			events = append(events, m.deps.SideEffects.PendingEvents(einoSession.ID)...)
+		}
 		if err != nil {
+			if errors.Is(err, ErrSideEffectPending) {
+				return m.persistEmitAndReturn(events)
+			}
 			events = append(events, protocol.NewEvent(protocol.EventError, einoSession.ID, err.Error(), nil))
 			return m.persistEmitAndReturn(events)
 		}
@@ -202,6 +214,9 @@ func (m *Manager) Confirm(ctx context.Context, req protocol.ConfirmRequest, appr
 	m.mu.Unlock()
 	if runner == nil {
 		if einoSessionID != "" {
+			if m.deps.SideEffects != nil {
+				return m.persistEmitAndReturn(m.deps.SideEffects.Confirm(ctx, einoSessionID, req, approved))
+			}
 			return m.persistEmitAndReturn([]protocol.Event{protocol.NewEvent(protocol.EventError, einoSessionID, "confirm is not available in Eino runner mode yet", nil)})
 		}
 		return m.emitAndReturn(m.runtimeError("runtime has not started"))
