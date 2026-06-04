@@ -85,11 +85,14 @@ func newRuntime(ctx context.Context, workspacePath string, resumeID string) (run
 		RuntimeDir:  repoCfg.KAG.RuntimeDir,
 	}
 	knowledgeService := versioned.New(versioned.Options{Workspace: workspace, Repo: repo, Versions: repo, Backend: kagClient, Mode: knowledgeMode})
+	sideEffects := runtime.NewSideEffectBridge()
+	approvedEinoTools := einotools.ByNameWithOptions(einotools.Options{
+		Service:        knowledgeService,
+		SideEffectGate: func(context.Context, einotools.SideEffectRequest) error { return nil },
+	})
 	einoTools := einotools.NewWithOptions(einotools.Options{
-		Service: knowledgeService,
-		SideEffectGate: func(_ context.Context, req einotools.SideEffectRequest) error {
-			return fmt.Errorf("%s requires runtime confirmation; Eino runner confirmation bridge is not enabled", req.ToolName)
-		},
+		Service:        knowledgeService,
+		SideEffectGate: newEinoSideEffectGate(sideEffects, approvedEinoTools),
 	})
 	einoRunner, err := newEinoRunner(ctx, runnerMode, repoCfg, einoTools)
 	if err != nil {
@@ -104,6 +107,7 @@ func newRuntime(ctx context.Context, workspacePath string, resumeID string) (run
 		Knowledge:     knowledgeService,
 		RunnerMode:    runnerMode,
 		EinoRunner:    einoRunner,
+		SideEffects:   sideEffects,
 		NewSessionID:  local.NewSessionID,
 	})
 	events, err := rt.Start(ctx, runtime.StartOptions{ResumeID: resumeID})
