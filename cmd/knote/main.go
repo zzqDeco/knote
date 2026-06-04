@@ -15,7 +15,6 @@ import (
 	"github.com/zzqDeco/knote/internal/protocol"
 	"github.com/zzqDeco/knote/internal/repository/local"
 	"github.com/zzqDeco/knote/internal/runtime"
-	runtimeeino "github.com/zzqDeco/knote/internal/runtime/eino"
 	"github.com/zzqDeco/knote/internal/tui"
 )
 
@@ -92,6 +91,10 @@ func newRuntime(ctx context.Context, workspacePath string, resumeID string) (run
 			return fmt.Errorf("%s requires runtime confirmation; Eino runner confirmation bridge is not enabled", req.ToolName)
 		},
 	})
+	einoRunner, err := newEinoRunner(ctx, runnerMode, repoCfg, einoTools)
+	if err != nil {
+		return nil, nil, err
+	}
 	rt := runtime.New(runtime.Dependencies{
 		Workspace:     workspace,
 		Config:        repoCfg,
@@ -100,7 +103,7 @@ func newRuntime(ctx context.Context, workspacePath string, resumeID string) (run
 		WorkspaceRepo: repo,
 		Knowledge:     knowledgeService,
 		RunnerMode:    runnerMode,
-		EinoRunner:    runtimeeino.NewRunner(runtimeeino.Options{Tools: einoTools}),
+		EinoRunner:    einoRunner,
 		NewSessionID:  local.NewSessionID,
 	})
 	events, err := rt.Start(ctx, runtime.StartOptions{ResumeID: resumeID})

@@ -10,7 +10,7 @@ This MVP is Go-first:
 - `internal/agent`: direct-runner turn handling, slash commands, confirmations, tasks, and session events
 - `internal/knowledge/versioned`: versioned build/query/explain/eval/diff/commit/release/checkout/status facade
 - `internal/eino/tools`: shallow Eino `InvokableTool` adapters over the versioned knowledge facade
-- `internal/runtime/eino`: Eino runner skeleton and tool inventory bridge; direct runner remains the default
+- `internal/runtime/eino`: OpenAI-compatible Eino ChatModelAgent runner bridge; direct runner remains the default
 - `internal/repository/local`: local config, sessions, artifacts, evals, and Git versions
 - `internal/knowledge/kag`: Go boundary for fake/real OpenSPG/KAG backends
 - `adapters/kag`: Python NDJSON adapter for OpenSPG/KAG
@@ -72,7 +72,18 @@ Sessions are JSONL event logs under `.knote/sessions/`. `/clear` only clears the
 
 ## Runtime Layers
 
-The TUI talks to `internal/runtime`, not directly to KAG, Git, repositories, or Eino. Runtime currently uses the direct agent runner for production turns. The Eino path is scaffolded internally for tool inventory and ADK runner configuration tests. `KNOTE_RUNTIME_MODE=eino` is a development guard that fails startup with an explicit "scaffolded but not enabled" error until production turn execution is implemented.
+The TUI talks to `internal/runtime`, not directly to KAG, Git, repositories, or Eino. Runtime uses the direct agent runner by default. Set `KNOTE_RUNTIME_MODE=eino` to start the Eino ADK ChatModelAgent path with an OpenAI-compatible chat model:
+
+```bash
+KNOTE_RUNTIME_MODE=eino \
+KNOTE_EINO_PROVIDER=openai-compatible \
+KNOTE_EINO_MODEL=gpt-4o-mini \
+KNOTE_EINO_API_KEY=your-api-key \
+KNOTE_EINO_BASE_URL=https://api.openai.com/v1 \
+./bin/knote --workspace tests/fixtures/basic-kb
+```
+
+`KNOTE_EINO_MODEL_PROFILE` selects a profile from `.knote/config.yaml` and defaults to `default`. Environment variables override the selected profile. `KNOTE_EINO_REASONING_EFFORT` accepts `low`, `medium`, or `high`.
 
 Mutating Eino tools require a runtime side-effect gate, matching the TUI confirmation rule for `/build`, `/commit`, `/release`, `/checkout`, and `/eval`.
 
@@ -115,7 +126,7 @@ MVP scope includes:
 - session JSONL persistence
 - task and permission state
 - runtime manager boundary for future TUI/Web reuse
-- Eino tool adapters and runner skeleton
+- Eino tool adapters and OpenAI-compatible ADK runner bridge
 - Git diff/log/commit/tag wrappers
 - release-oriented CI skeleton
 

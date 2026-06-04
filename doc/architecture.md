@@ -8,7 +8,7 @@
 4. `internal/agent` owns the current direct turn handler: natural-language turns, slash commands, confirmations, tasks, and event persistence.
 5. `internal/knowledge/versioned` owns versioned knowledge operations: build/query/explain/eval/diff/commit/release/checkout/status.
 6. `internal/eino/tools` exposes the versioned knowledge service as shallow Eino `InvokableTool` adapters.
-7. `internal/runtime/eino` is the Eino runner skeleton and tool inventory bridge. It is wired for inspection and future runner activation, but production turns still use the direct agent.
+7. `internal/runtime/eino` is the Eino ADK runner bridge. It can construct an OpenAI-compatible `ChatModelAgent`, inventory knote tools, and project ADK events back to knote events.
 8. `internal/repository` defines workspace/session/version interfaces; `internal/repository/local` implements them with the local filesystem and Git CLI.
 9. `internal/knowledge/kag` owns the OpenSPG/KAG boundary and Python NDJSON adapter subprocess.
 10. `internal/repository/remote` is a future adapter skeleton for GitHub/Gitea/GitLab-style backends.
@@ -22,7 +22,7 @@ flowchart LR
   User["User input"] --> TUI["internal/tui"]
   TUI --> Runtime["internal/runtime"]
   Runtime --> Agent["internal/agent direct runner"]
-  Runtime --> EinoRunner["internal/runtime/eino skeleton"]
+  Runtime --> EinoRunner["internal/runtime/eino ADK runner"]
   Runtime --> EinoTools["internal/eino/tools"]
   Runtime --> RepoIf["internal/repository interfaces"]
   Agent --> RepoIf
@@ -41,15 +41,15 @@ flowchart LR
   RepoIf -. future .-> Remote["internal/repository/remote"]
 ```
 
-`internal/agent` depends only on `internal/knowledge/versioned`, `internal/repository`, `internal/protocol`, and the standard library. It does not import the local repository, KAG backend, Git wrapper, Python adapter, Eino tools, or TUI. `cmd/knote` is the composition root that creates `local.Store`, `kag.Client`, `versioned.Service`, Eino tools, the Eino runner skeleton, and `runtime.Manager`.
+`internal/agent` depends only on `internal/knowledge/versioned`, `internal/repository`, `internal/protocol`, and the standard library. It does not import the local repository, KAG backend, Git wrapper, Python adapter, Eino tools, or TUI. `cmd/knote` is the composition root that creates `local.Store`, `kag.Client`, `versioned.Service`, Eino tools, the Eino runner, and `runtime.Manager`.
 
 ## Runtime Layers
 
 `internal/runtime` is the interaction boundary for TUI now and Web later. It exposes start, message, confirm, interrupt, task stop, status, subscription, and runner info methods. Runtime owns the active session/thread state and fans emitted events to subscribers.
 
-The default runner mode is `direct`. In this mode runtime delegates turns to `internal/agent`, preserving the current TUI behavior. `KNOTE_RUNTIME_MODE=eino` is an explicit development guard for the Eino skeleton; startup fails with a clear scaffolded-mode error until production turn execution is implemented.
+The default runner mode is `direct`. In this mode runtime delegates turns to `internal/agent`, preserving the current TUI behavior. `KNOTE_RUNTIME_MODE=eino` switches runtime to the Eino ADK `ChatModelAgent` path. Eino mode requires an OpenAI-compatible profile and API key from `.knote/config.yaml` plus environment overrides such as `KNOTE_EINO_PROVIDER`, `KNOTE_EINO_MODEL`, `KNOTE_EINO_API_KEY`, `KNOTE_EINO_BASE_URL`, and `KNOTE_EINO_REASONING_EFFORT`.
 
-`internal/runtime/eino` holds the Eino-facing runner skeleton. It can inventory registered tools and produce an ADK runner config from a future ADK agent. It does not own knowledge semantics and does not execute production turns yet.
+`internal/runtime/eino` holds the Eino-facing runner. It converts knote `InvokableTool` adapters into Eino base tools, constructs the OpenAI-compatible chat model, builds the ADK agent, executes turns through `adk.Runner`, and projects ADK tool/assistant/interrupt events into knote protocol events. It does not own knowledge semantics.
 
 `internal/eino/tools` is intentionally shallow. Each tool parses JSON arguments, calls `internal/knowledge/versioned`, and returns JSON. Mutating tools require a side-effect gate so they cannot bypass runtime confirmation.
 

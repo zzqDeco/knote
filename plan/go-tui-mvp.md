@@ -13,7 +13,7 @@ The MVP is a single Go CLI/TUI binary with a Python KAG subprocess adapter. Bubb
 - Side-effecting slash commands emit `confirm.request` and run only after TUI approval.
 - `internal/knowledge/versioned` owns versioned build/query/explain/eval/version semantics and normalizes stable knote artifacts.
 - `internal/eino/tools` exposes versioned knowledge as shallow Eino tools.
-- `internal/runtime/eino` is an unwired Eino runner skeleton for tool inventory and future ADK runner activation.
+- `internal/runtime/eino` is the Eino ADK runner bridge for OpenAI-compatible ChatModelAgent execution and tool inventory.
 - `internal/repository/local` writes deterministic JSONL/Markdown artifacts, sessions, evals, config, and Git versions.
 - `internal/repository/remote` is an unwired future adapter skeleton that returns `ErrRemoteNotImplemented`.
 - `internal/knowledge/kag` speaks NDJSON with `adapters/kag/knote_kag_adapter.py`.
@@ -39,6 +39,8 @@ The MVP is a single Go CLI/TUI binary with a Python KAG subprocess adapter. Bubb
 - PR #17 `refactor/runtime-manager`: completed and merged to `dev`.
 - PR #18 `refactor/runtime-eino-runner-skeleton`: completed and merged to `dev`.
 - PR #19 `docs/architecture-runtime-layers`: documents the current layered runtime architecture and validation gates.
+- PR #20 `feature/eino-direct-runner-bridge`: completed and merged to `dev`.
+- PR #21 `feature/eino-chatmodel-agent`: in progress.
 
 ## Acceptance
 
