@@ -87,6 +87,17 @@ KNOTE_EINO_BASE_URL=https://api.openai.com/v1 \
 
 Mutating Eino tools require a runtime side-effect gate, matching the TUI confirmation rule for `/build`, `/commit`, `/release`, `/checkout`, and `/eval`.
 
+For a local CLIProxyAPI/OpenAI-compatible smoke, keep the proxy running and use:
+
+```bash
+KNOTE_EINO_BASE_URL=http://127.0.0.1:8317/v1 \
+KNOTE_EINO_MODEL=gpt-5.3-codex-spark \
+KNOTE_EINO_REASONING_EFFORT=low \
+scripts/smoke_eino_local_proxy.sh
+```
+
+The script probes `/v1/models`, starts `KNOTE_RUNTIME_MODE=eino`, sends a fixed PTY prompt, and waits for `knote-eino-ok`. Set `KNOTE_EINO_API_KEY` explicitly, or let the script read the first `api-keys` entry from `KNOTE_CLIPROXY_CONFIG` when that config is available locally.
+
 ## Versions And Eval
 
 `knote` treats Git commits as knowledge versions, Git tags as release versions, and branches as candidate experiments.
@@ -107,6 +118,15 @@ KNOTE_KAG_FAKE=1 go test ./...
 python3 -m unittest discover -s adapters/kag -p '*test*.py'
 CGO_ENABLED=0 go build -o bin/knote ./cmd/knote
 scripts/smoke_fake_mvp.sh
+```
+
+Manual Eino/OpenAI-compatible validation:
+
+```bash
+KNOTE_EINO_BASE_URL=http://127.0.0.1:8317/v1 \
+KNOTE_EINO_MODEL=gpt-5.3-codex-spark \
+KNOTE_EINO_REASONING_EFFORT=low \
+scripts/smoke_eino_local_proxy.sh
 ```
 
 Manual real KAG validation:

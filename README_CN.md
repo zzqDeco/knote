@@ -87,6 +87,17 @@ KNOTE_EINO_BASE_URL=https://api.openai.com/v1 \
 
 带副作用的 Eino tools 必须经过 runtime side-effect gate，这和 TUI 中 `/build`、`/commit`、`/release`、`/checkout`、`/eval` 的确认规则保持一致。
 
+本地 CLIProxyAPI/OpenAI-compatible smoke 可保持 proxy 运行后执行：
+
+```bash
+KNOTE_EINO_BASE_URL=http://127.0.0.1:8317/v1 \
+KNOTE_EINO_MODEL=gpt-5.3-codex-spark \
+KNOTE_EINO_REASONING_EFFORT=low \
+scripts/smoke_eino_local_proxy.sh
+```
+
+脚本会先探测 `/v1/models`，再以 `KNOTE_RUNTIME_MODE=eino` 启动 TUI，通过 PTY 发送固定 prompt，并等待返回 `knote-eino-ok`。可以显式设置 `KNOTE_EINO_API_KEY`；如果本机有 `KNOTE_CLIPROXY_CONFIG` 指向的 CLIProxyAPI config，脚本会尝试读取第一条 `api-keys`，但不会打印 key。
+
 ## 版本和评估
 
 `knote` 使用 Git commit 表示知识版本，Git tag 表示发布版本，branch 表示候选实验版本。
@@ -107,6 +118,15 @@ KNOTE_KAG_FAKE=1 go test ./...
 python3 -m unittest discover -s adapters/kag -p '*test*.py'
 CGO_ENABLED=0 go build -o bin/knote ./cmd/knote
 scripts/smoke_fake_mvp.sh
+```
+
+手动 Eino/OpenAI-compatible 验收：
+
+```bash
+KNOTE_EINO_BASE_URL=http://127.0.0.1:8317/v1 \
+KNOTE_EINO_MODEL=gpt-5.3-codex-spark \
+KNOTE_EINO_REASONING_EFFORT=low \
+scripts/smoke_eino_local_proxy.sh
 ```
 
 真实 KAG 手动验收：
