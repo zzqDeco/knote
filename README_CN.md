@@ -2,6 +2,10 @@
 
 `knote` 是一个面向本地目录知识工作区的 agentic TUI 工具。启动后进入 transcript-first 终端界面，用自然语言和少量 slash command 完成知识库构建、查询、解释、版本化和基础评估。
 
+## 版本状态
+
+`v0.1.0` 是已发布的 MVP 基线。下一个候选版本是 `v0.1.1`，默认仍使用 direct runner，并新增 opt-in 的 Eino ChatModel runner 路径、带副作用 Eino tools 的 runtime confirmation bridge、本地 CLIProxyAPI/OpenAI-compatible smoke，以及更可移植的本地 proxy smoke。
+
 当前 MVP 调整为 Go-first：
 
 - `cmd/knote`：单一 CLI/TUI binary
@@ -134,3 +138,5 @@ scripts/smoke_eino_local_proxy.sh
 ```bash
 KNOTE_PYTHON=/path/to/python KNOTE_KAG_HOST=http://127.0.0.1:8887 scripts/smoke_real_kag.sh
 ```
+
+`v0.1.1` 不包含：把默认 runner 从 direct mode 切走、绕过 release PR 推进 main、或未获明确确认就自动创建 tag。

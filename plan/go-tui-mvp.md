@@ -43,6 +43,8 @@ The MVP is a single Go CLI/TUI binary with a Python KAG subprocess adapter. Bubb
 - PR #21 `feature/eino-chatmodel-agent`: completed and merged to `dev`.
 - PR #22 `feature/eino-confirmation-bridge`: completed and merged to `dev`.
 - PR #23 `test/eino-runtime-acceptance-docs`: adds repeatable Eino local proxy smoke coverage and updates runtime acceptance docs.
+- PR #24 `fix/eino-smoke-portability`: completed and merged to `dev`.
+- PR #25 `docs/release-v0.1.1-readiness`: prepares `v0.1.1` release-candidate documentation.
 
 ## Acceptance
 
@@ -59,3 +61,18 @@ The MVP is a single Go CLI/TUI binary with a Python KAG subprocess adapter. Bubb
 2. Run the acceptance commands above locally, including real KAG smoke for release candidates.
 3. Promote release branches to `main` only after explicit confirmation.
 4. Create release tags only after explicit confirmation.
+
+## v0.1.1 Release Candidate
+
+`v0.1.1` is the post-`v0.1.0` runtime/Eino release candidate. It keeps `direct` as the default runner while adding the opt-in Eino ChatModel path, Eino mutating-tool confirmation bridge, local CLIProxyAPI/OpenAI-compatible smoke, and hardened smoke portability.
+
+Candidate validation must pass on `dev` and again on `release/v0.1.1`:
+
+- `KNOTE_KAG_FAKE=1 go test ./...`
+- `/usr/bin/python3 -m unittest discover -s adapters/kag -p '*test*.py'`
+- `CGO_ENABLED=0 go build -o bin/knote ./cmd/knote`
+- `PYTHON=/usr/bin/python3 KNOTE_SMOKE_FORCE_BIN=1 bash scripts/smoke_fake_mvp.sh`
+- `KNOTE_EINO_BASE_URL=http://127.0.0.1:8317/v1 KNOTE_EINO_MODEL=gpt-5.3-codex-spark KNOTE_EINO_REASONING_EFFORT=low bash scripts/smoke_eino_local_proxy.sh`
+- `KNOTE_PYTHON=/path/to/kag-venv/python KNOTE_KAG_HOST=http://127.0.0.1:8887 bash scripts/smoke_real_kag.sh`
+
+After these pass, create `release/v0.1.1` from `dev`, open `release/v0.1.1 -> main`, and trigger `@codex review`. Merging to `main`, creating `v0.1.1`, and publishing release assets require separate explicit confirmation.

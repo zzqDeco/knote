@@ -2,6 +2,10 @@
 
 `knote` is a local knowledge-workspace agentic TUI. It opens a transcript-first terminal interface in the current directory and helps build, query, version, and evaluate a local knowledge base.
 
+## Version Status
+
+`v0.1.0` is the published MVP baseline. The next release candidate is `v0.1.1`, which keeps the direct runner as the default and adds the opt-in Eino ChatModel runner path, runtime confirmation bridging for mutating Eino tools, local CLIProxyAPI/OpenAI-compatible smoke coverage, and hardened local proxy smoke portability.
+
 This MVP is Go-first:
 
 - `cmd/knote`: single CLI/TUI binary
@@ -151,3 +155,5 @@ MVP scope includes:
 - release-oriented CI skeleton
 
 Not in v0.1.0: web UI, desktop app, cloud sync, multi-user collaboration, independent version database, graph-database versioning, or MCP dependency.
+
+Not in v0.1.1: changing the default runner away from direct mode, main-branch promotion without a release PR, or automatic tag creation without explicit confirmation.
