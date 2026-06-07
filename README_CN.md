@@ -96,7 +96,7 @@ KNOTE_EINO_REASONING_EFFORT=low \
 scripts/smoke_eino_local_proxy.sh
 ```
 
-脚本会先探测 `/v1/models`，再以 `KNOTE_RUNTIME_MODE=eino` 启动 TUI，通过 PTY 发送固定 prompt，并等待返回 `knote-eino-ok`。可以显式设置 `KNOTE_EINO_API_KEY`；如果本机有 `KNOTE_CLIPROXY_CONFIG` 指向的 CLIProxyAPI config，脚本会尝试读取第一条 `api-keys`，但不会打印 key。
+脚本会先探测 `/v1/models`，再以 `KNOTE_RUNTIME_MODE=eino` 启动 TUI，通过 PTY 发送固定 prompt，并等待返回 `knote-eino-ok`。可以显式设置 `KNOTE_EINO_API_KEY`，设置 `KNOTE_CLIPROXY_CONFIG`，或让脚本尝试 `~/.cli-proxy-api/config.yaml`、Homebrew `etc/cliproxyapi.conf` 等 CLIProxyAPI 默认配置路径。
 
 ## 版本和评估
 
