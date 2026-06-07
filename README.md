@@ -96,7 +96,7 @@ KNOTE_EINO_REASONING_EFFORT=low \
 scripts/smoke_eino_local_proxy.sh
 ```
 
-The script probes `/v1/models`, starts `KNOTE_RUNTIME_MODE=eino`, sends a fixed PTY prompt, and waits for `knote-eino-ok`. Set `KNOTE_EINO_API_KEY` explicitly, or let the script read the first `api-keys` entry from `KNOTE_CLIPROXY_CONFIG` when that config is available locally.
+The script probes `/v1/models`, starts `KNOTE_RUNTIME_MODE=eino`, sends a fixed PTY prompt, and waits for `knote-eino-ok`. Set `KNOTE_EINO_API_KEY` explicitly, set `KNOTE_CLIPROXY_CONFIG`, or let the script try documented CLIProxyAPI default config paths such as `~/.cli-proxy-api/config.yaml` and Homebrew `etc/cliproxyapi.conf`.
 
 ## Versions And Eval
 
