@@ -171,7 +171,7 @@ def run_fake_mvp(driver: PTYDriver, workspace: Path) -> None:
 
 def run_eino_local_proxy(driver: PTYDriver) -> None:
     run_startup(driver)
-    driver.send("Return exactly: knote-eino-ok\r")
+    driver.send("Do not use tools. Reply only with the phrase made from the words knote, eino, ok using hyphens.\r")
     driver.expect("knote-eino-ok", timeout=60)
 
 
