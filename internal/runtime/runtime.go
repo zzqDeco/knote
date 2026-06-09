@@ -357,11 +357,24 @@ func (m *Manager) CurrentSessionInfo(ctx context.Context) protocol.SessionInfo {
 	m.mu.Unlock()
 	if runner == nil {
 		if einoSession.ID != "" {
-			return einoSession
+			return m.refreshEinoSessionInfo(ctx, einoSession)
 		}
 		return protocol.SessionInfo{Workspace: m.deps.Workspace}
 	}
 	return runner.CurrentSessionInfo(ctx)
+}
+
+func (m *Manager) refreshEinoSessionInfo(ctx context.Context, info protocol.SessionInfo) protocol.SessionInfo {
+	if m.deps.Versions == nil {
+		return info
+	}
+	status, err := m.deps.Versions.Status(ctx)
+	if err != nil {
+		return info
+	}
+	info.Branch = status.Branch
+	info.Dirty = status.Dirty
+	return info
 }
 
 func (m *Manager) persistEmitAndReturn(events []protocol.Event) []protocol.Event {

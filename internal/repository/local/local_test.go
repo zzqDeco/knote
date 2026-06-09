@@ -282,6 +282,43 @@ func TestCommitOnlyIncludesKnowledgePaths(t *testing.T) {
 	}
 }
 
+func TestCommitIncludesDeletedKnowledgePaths(t *testing.T) {
+	ctx := context.Background()
+	workspace := initRepo(t)
+	store := New(workspace)
+	mustWrite(t, filepath.Join(workspace, ".knote", "config.yaml"), "workspace: test\n")
+	mustWrite(t, filepath.Join(workspace, "sources", "intro.md"), "intro\n")
+	mustWrite(t, filepath.Join(workspace, "artifacts", "manifest.json"), "{}\n")
+	runGit(t, workspace, "add", ".knote/config.yaml", "sources", "artifacts")
+	runGit(t, workspace, "commit", "-m", "initial")
+
+	if err := os.Remove(filepath.Join(workspace, ".knote", "config.yaml")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(filepath.Join(workspace, "artifacts")); err != nil {
+		t.Fatal(err)
+	}
+	diff, err := store.Diff(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(diff, ".knote/config.yaml") || !strings.Contains(diff, "artifacts/manifest.json") {
+		t.Fatalf("diff should include deleted knowledge paths:\n%s", diff)
+	}
+
+	if _, err := store.Commit(ctx, "remove knowledge paths"); err != nil {
+		t.Fatal(err)
+	}
+	show := runGit(t, workspace, "show", "--name-status", "--format=", "HEAD")
+	if !strings.Contains(show, "D\t.knote/config.yaml") || !strings.Contains(show, "D\tartifacts/manifest.json") {
+		t.Fatalf("commit did not include deleted knowledge paths:\n%s", show)
+	}
+	status := runGit(t, workspace, "status", "--short")
+	if strings.Contains(status, ".knote/config.yaml") || strings.Contains(status, "artifacts/manifest.json") {
+		t.Fatalf("deleted knowledge paths should be clean after commit:\n%s", status)
+	}
+}
+
 func TestStatusDirtyIgnoresRuntimeSessionFiles(t *testing.T) {
 	ctx := context.Background()
 	workspace := initRepo(t)
