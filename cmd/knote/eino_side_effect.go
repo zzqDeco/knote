@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -12,6 +13,29 @@ import (
 	"github.com/zzqDeco/knote/internal/protocol"
 	"github.com/zzqDeco/knote/internal/runtime"
 )
+
+type einoToolExecutor struct {
+	tools map[string]einotool.InvokableTool
+}
+
+func newEinoToolExecutor(tools []einotool.InvokableTool) einoToolExecutor {
+	out := map[string]einotool.InvokableTool{}
+	for _, candidate := range tools {
+		if candidate == nil {
+			continue
+		}
+		info, err := candidate.Info(context.Background())
+		if err != nil || info == nil {
+			continue
+		}
+		out[info.Name] = candidate
+	}
+	return einoToolExecutor{tools: out}
+}
+
+func (e einoToolExecutor) Invoke(ctx context.Context, sessionID string, toolName string, argumentsInJSON string) ([]protocol.Event, error) {
+	return invokeEinoTool(ctx, e.tools, sessionID, toolName, argumentsInJSON)
+}
 
 func newEinoSideEffectGate(bridge *runtime.SideEffectBridge, approvedTools map[string]einotool.InvokableTool) einotools.SideEffectGate {
 	execute := executeEinoToolOnce(approvedTools)
@@ -31,40 +55,47 @@ func newEinoSideEffectGate(bridge *runtime.SideEffectBridge, approvedTools map[s
 
 func executeEinoToolOnce(approvedTools map[string]einotool.InvokableTool) runtime.SideEffectExecutor {
 	return func(ctx context.Context, req runtime.SideEffectRequest) ([]protocol.Event, error) {
-		sessionID := strings.TrimSpace(req.SessionID)
-		toolName := strings.TrimSpace(req.ToolName)
-		tool, ok := approvedTools[toolName]
-		if !ok || tool == nil {
-			err := fmt.Errorf("approved Eino tool %q is not registered", toolName)
-			return []protocol.Event{protocol.NewEvent(protocol.EventError, sessionID, err.Error(), map[string]string{"tool": toolName})}, err
-		}
-		args := strings.TrimSpace(req.ArgumentsInJSON)
-		if args == "" {
-			args = "{}"
-		}
-		events := []protocol.Event{protocol.NewEvent(protocol.EventToolStart, sessionID, toolName, map[string]string{"tool": toolName})}
-		out, err := tool.InvokableRun(ctx, args)
-		if err != nil {
-			events = append(events, protocol.NewEvent(protocol.EventToolError, sessionID, err.Error(), map[string]string{"tool": toolName}))
-			return events, err
-		}
-		decoded := decodeEinoToolResult(out)
-		payload := map[string]any{"tool": toolName, "result": decoded}
-		if failure := adapterFailureMessage(toolName, decoded); failure != "" {
-			events = append(events, protocol.NewEvent(protocol.EventToolError, sessionID, failure, payload))
-			events = append(events, protocol.NewEvent(protocol.EventError, sessionID, failure, payload))
-			return events, fmt.Errorf("%s", failure)
-		}
-		events = append(events, protocol.NewEvent(protocol.EventToolComplete, sessionID, toolName+" complete", payload))
-		events = append(events, versionEventsForEinoTool(sessionID, toolName, decoded)...)
-		if toolName == einotools.NameBuild {
-			if manifest, ok := decodedMap(decoded)["manifest"]; ok {
-				events = append(events, protocol.NewEvent(protocol.EventBuildComplete, sessionID, "Build complete", manifest))
-			}
-		}
-		events = append(events, protocol.NewEvent(protocol.EventAssistantDone, sessionID, "Eino tool result\n"+prettyEinoToolResult(decoded), map[string]string{"tool": toolName}))
-		return events, nil
+		return invokeEinoTool(ctx, approvedTools, req.SessionID, req.ToolName, req.ArgumentsInJSON)
 	}
+}
+
+func invokeEinoTool(ctx context.Context, tools map[string]einotool.InvokableTool, sessionID string, toolName string, argumentsInJSON string) ([]protocol.Event, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	toolName = strings.TrimSpace(toolName)
+	tool, ok := tools[toolName]
+	if !ok || tool == nil {
+		err := fmt.Errorf("Eino tool %q is not registered", toolName)
+		return []protocol.Event{protocol.NewEvent(protocol.EventError, sessionID, err.Error(), map[string]string{"tool": toolName})}, err
+	}
+	args := strings.TrimSpace(argumentsInJSON)
+	if args == "" {
+		args = "{}"
+	}
+	events := []protocol.Event{protocol.NewEvent(protocol.EventToolStart, sessionID, toolName, map[string]string{"tool": toolName})}
+	out, err := tool.InvokableRun(ctx, args)
+	if errors.Is(err, runtime.ErrSideEffectPending) {
+		return nil, err
+	}
+	if err != nil {
+		events = append(events, protocol.NewEvent(protocol.EventToolError, sessionID, err.Error(), map[string]string{"tool": toolName}))
+		return events, err
+	}
+	decoded := decodeEinoToolResult(out)
+	payload := map[string]any{"tool": toolName, "result": decoded}
+	if failure := adapterFailureMessage(toolName, decoded); failure != "" {
+		events = append(events, protocol.NewEvent(protocol.EventToolError, sessionID, failure, payload))
+		events = append(events, protocol.NewEvent(protocol.EventError, sessionID, failure, payload))
+		return events, fmt.Errorf("%s", failure)
+	}
+	events = append(events, protocol.NewEvent(protocol.EventToolComplete, sessionID, toolName+" complete", payload))
+	events = append(events, versionEventsForEinoTool(sessionID, toolName, decoded)...)
+	if toolName == einotools.NameBuild {
+		if manifest, ok := decodedMap(decoded)["manifest"]; ok {
+			events = append(events, protocol.NewEvent(protocol.EventBuildComplete, sessionID, "Build complete", manifest))
+		}
+	}
+	events = append(events, protocol.NewEvent(protocol.EventAssistantDone, sessionID, "Eino tool result\n"+prettyEinoToolResult(decoded), map[string]string{"tool": toolName}))
+	return events, nil
 }
 
 func decodeEinoToolResult(out string) any {
@@ -126,6 +157,15 @@ func intField(fields map[string]any, key string) int {
 
 func versionEventsForEinoTool(sessionID string, toolName string, decoded any) []protocol.Event {
 	switch toolName {
+	case einotools.NameDiff:
+		if diff, ok := decodedMap(decoded)["diff"].(string); ok {
+			if strings.TrimSpace(diff) == "" {
+				diff = "No diff."
+			}
+			return []protocol.Event{protocol.NewEvent(protocol.EventVersionDiff, sessionID, diff, decoded)}
+		}
+	case einotools.NameVersions:
+		return []protocol.Event{protocol.NewEvent(protocol.EventVersionChanged, sessionID, "Versions", decoded)}
 	case einotools.NameCommit:
 		return []protocol.Event{protocol.NewEvent(protocol.EventVersionChanged, sessionID, "Commit complete", decoded)}
 	case einotools.NameRelease:
@@ -135,4 +175,5 @@ func versionEventsForEinoTool(sessionID string, toolName string, decoded any) []
 	default:
 		return nil
 	}
+	return nil
 }

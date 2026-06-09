@@ -170,6 +170,10 @@ func (b *SideEffectBridge) removeQueuedLocked(requestID string) {
 
 type sideEffectSessionKey struct{}
 
+func WithSideEffectSession(ctx context.Context, sessionID string) context.Context {
+	return withSideEffectSession(ctx, sessionID)
+}
+
 func withSideEffectSession(ctx context.Context, sessionID string) context.Context {
 	return context.WithValue(ctx, sideEffectSessionKey{}, strings.TrimSpace(sessionID))
 }

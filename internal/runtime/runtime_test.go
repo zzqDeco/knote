@@ -220,6 +220,77 @@ func TestRuntimeEinoModeConfirmsSideEffectTool(t *testing.T) {
 	}
 }
 
+func TestRuntimeEinoSlashReadOnlyToolUsesExecutor(t *testing.T) {
+	workspace := t.TempDir()
+	store := local.New(workspace)
+	einoRunner := &fakeEinoRunner{events: []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, "", "natural answer", nil)}}
+	toolExecutor := &fakeToolExecutor{
+		events: []protocol.Event{protocol.NewEvent(protocol.EventVersionDiff, "", "No diff.", nil)},
+	}
+	rt := New(Dependencies{
+		Workspace:    workspace,
+		Sessions:     store,
+		RunnerMode:   RunnerModeEino,
+		EinoRunner:   einoRunner,
+		ToolExecutor: toolExecutor,
+		NewSessionID: func() string { return "sess_eino" },
+	})
+	if _, err := rt.Start(context.Background(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	events := rt.SendMessage(context.Background(), "/diff HEAD")
+	if !hasEvent(events, protocol.EventUserMessage) || !hasEvent(events, protocol.EventVersionDiff) {
+		t.Fatalf("slash diff did not use tool executor: %+v", events)
+	}
+	if toolExecutor.calls != 1 || toolExecutor.lastTool != "knote_diff" || toolExecutor.lastArgs != `{"ref":"HEAD"}` {
+		t.Fatalf("unexpected tool executor call: calls=%d tool=%q args=%q", toolExecutor.calls, toolExecutor.lastTool, toolExecutor.lastArgs)
+	}
+	if len(einoRunner.lastHistory) != 0 {
+		t.Fatalf("slash command should not be sent to Eino runner history: %+v", einoRunner.lastHistory)
+	}
+}
+
+func TestRuntimeEinoSlashMutatingToolRequiresConfirmation(t *testing.T) {
+	workspace := t.TempDir()
+	bridge := NewSideEffectBridge()
+	toolExecutor := &fakeToolExecutor{}
+	toolExecutor.onInvoke = func(ctx context.Context, sessionID string, toolName string, args string) ([]protocol.Event, error) {
+		return nil, bridge.Request(ctx, SideEffectRequest{
+			ToolName:        toolName,
+			Action:          "build",
+			ArgumentsInJSON: args,
+			Summary:         "Build knowledge artifacts.",
+			Execute: func(context.Context, SideEffectRequest) ([]protocol.Event, error) {
+				toolExecutor.executions++
+				return []protocol.Event{protocol.NewEvent(protocol.EventToolComplete, sessionID, toolName+" complete", nil)}, nil
+			},
+		})
+	}
+	rt := New(Dependencies{
+		Workspace:    workspace,
+		Sessions:     local.New(workspace),
+		RunnerMode:   RunnerModeEino,
+		EinoRunner:   &fakeEinoRunner{events: []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, "", "natural answer", nil)}},
+		SideEffects:  bridge,
+		ToolExecutor: toolExecutor,
+		NewSessionID: func() string { return "sess_eino" },
+	})
+	if _, err := rt.Start(context.Background(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	events := rt.SendMessage(context.Background(), "/build")
+	if !hasEvent(events, protocol.EventConfirmRequest) || hasEvent(events, protocol.EventToolComplete) {
+		t.Fatalf("slash build should request confirmation before execution: %+v", events)
+	}
+	if toolExecutor.executions != 0 {
+		t.Fatalf("slash build executed before confirmation: %d", toolExecutor.executions)
+	}
+	events = rt.Confirm(context.Background(), firstConfirm(t, events), true)
+	if !hasEvent(events, protocol.EventToolComplete) || toolExecutor.executions != 1 {
+		t.Fatalf("approved slash build did not execute once: executions=%d events=%+v", toolExecutor.executions, events)
+	}
+}
+
 func TestRuntimeEinoModeRejectsSideEffectTool(t *testing.T) {
 	workspace := t.TempDir()
 	bridge := NewSideEffectBridge()
@@ -429,6 +500,31 @@ type fakeEinoRunner struct {
 	events      []protocol.Event
 	lastHistory []protocol.Event
 	err         error
+}
+
+type fakeToolExecutor struct {
+	events     []protocol.Event
+	err        error
+	onInvoke   func(context.Context, string, string, string) ([]protocol.Event, error)
+	calls      int
+	executions int
+	lastTool   string
+	lastArgs   string
+}
+
+func (e *fakeToolExecutor) Invoke(ctx context.Context, sessionID string, toolName string, argumentsInJSON string) ([]protocol.Event, error) {
+	e.calls++
+	e.lastTool = toolName
+	e.lastArgs = argumentsInJSON
+	if e.onInvoke != nil {
+		return e.onInvoke(ctx, sessionID, toolName, argumentsInJSON)
+	}
+	events := make([]protocol.Event, 0, len(e.events))
+	for _, event := range e.events {
+		event.SessionID = sessionID
+		events = append(events, event)
+	}
+	return events, e.err
 }
 
 type sideEffectEinoRunner struct {

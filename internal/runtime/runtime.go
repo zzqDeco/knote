@@ -40,6 +40,7 @@ type Dependencies struct {
 	RunnerMode    RunnerMode
 	EinoRunner    EinoRunner
 	SideEffects   *SideEffectBridge
+	ToolExecutor  ToolExecutor
 	NewSessionID  func() string
 }
 
@@ -76,6 +77,10 @@ type RunnerInfo struct {
 type RunnerToolInfo struct {
 	Name        string `json:"name"`
 	Description string `json:"description,omitempty"`
+}
+
+type ToolExecutor interface {
+	Invoke(ctx context.Context, sessionID string, toolName string, argumentsInJSON string) ([]protocol.Event, error)
 }
 
 type EventSubscriber func([]protocol.Event)
@@ -182,8 +187,7 @@ func (m *Manager) SendMessage(ctx context.Context, input string) []protocol.Even
 		}
 		events := []protocol.Event{protocol.NewEvent(protocol.EventUserMessage, einoSession.ID, input, nil)}
 		if strings.HasPrefix(input, "/") {
-			events = append(events, protocol.NewEvent(protocol.EventError, einoSession.ID, "slash commands are not available in Eino runner mode yet", nil))
-			return m.persistEmitAndReturn(events)
+			return m.handleSlash(ctx, einoSession.ID, input)
 		}
 		history := m.loadHistory(ctx, einoSession.ID)
 		runCtx := ctx

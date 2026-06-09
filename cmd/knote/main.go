@@ -94,6 +94,7 @@ func newRuntime(ctx context.Context, workspacePath string, resumeID string) (run
 		Service:        knowledgeService,
 		SideEffectGate: newEinoSideEffectGate(sideEffects, approvedEinoTools),
 	})
+	toolExecutor := newEinoToolExecutor(einoTools)
 	einoRunner, err := newEinoRunner(ctx, runnerMode, repoCfg, einoTools)
 	if err != nil {
 		return nil, nil, err
@@ -108,6 +109,7 @@ func newRuntime(ctx context.Context, workspacePath string, resumeID string) (run
 		RunnerMode:    runnerMode,
 		EinoRunner:    einoRunner,
 		SideEffects:   sideEffects,
+		ToolExecutor:  toolExecutor,
 		NewSessionID:  local.NewSessionID,
 	})
 	events, err := rt.Start(ctx, runtime.StartOptions{ResumeID: resumeID})
