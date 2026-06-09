@@ -149,6 +149,40 @@ func TestRuntimeEinoModeStartsAndSendsThroughBridge(t *testing.T) {
 	}
 }
 
+func TestRuntimeEinoCurrentSessionInfoRefreshesWorkspaceStatus(t *testing.T) {
+	workspace := t.TempDir()
+	mustRun(t, workspace, "git", "init")
+	mustRun(t, workspace, "git", "config", "user.email", "knote@example.com")
+	mustRun(t, workspace, "git", "config", "user.name", "knote")
+	must(t, os.WriteFile(filepath.Join(workspace, ".gitignore"), []byte(".knote/sessions/\n"), 0o644))
+	mustRun(t, workspace, "git", "add", ".gitignore")
+	mustRun(t, workspace, "git", "commit", "-m", "initial")
+	store := local.New(workspace)
+	einoRunner := &fakeEinoRunner{events: []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, "", "hello from eino", nil)}}
+	rt := New(Dependencies{
+		Workspace:    workspace,
+		Sessions:     store,
+		Versions:     store,
+		RunnerMode:   RunnerModeEino,
+		EinoRunner:   einoRunner,
+		NewSessionID: func() string { return "sess_eino" },
+	})
+	if _, err := rt.Start(context.Background(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	info := rt.CurrentSessionInfo(context.Background())
+	if info.ID != "sess_eino" || info.Branch == "" || info.Dirty {
+		t.Fatalf("unexpected initial Eino session info: %+v", info)
+	}
+
+	must(t, os.MkdirAll(filepath.Join(workspace, "sources"), 0o755))
+	must(t, os.WriteFile(filepath.Join(workspace, "sources", "intro.md"), []byte("dirty\n"), 0o644))
+	info = rt.CurrentSessionInfo(context.Background())
+	if info.ID != "sess_eino" || info.Branch == "" || !info.Dirty {
+		t.Fatalf("Eino session info did not refresh workspace status: %+v", info)
+	}
+}
+
 func TestRuntimeEinoModeConfirmsSideEffectTool(t *testing.T) {
 	workspace := t.TempDir()
 	store := local.New(workspace)

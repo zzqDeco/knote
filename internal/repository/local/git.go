@@ -53,7 +53,10 @@ func (c gitClient) Diff(ctx context.Context, ref string) (string, error) {
 	if strings.TrimSpace(ref) == "" {
 		return c.workspaceDiff(ctx)
 	}
-	paths := existingKnowledgePaths(c.workspace)
+	paths, err := c.committableKnowledgePaths(ctx)
+	if err != nil {
+		return "", err
+	}
 	if len(paths) == 0 {
 		return "", nil
 	}
@@ -98,17 +101,20 @@ func (c gitClient) Commit(ctx context.Context, message string) (string, error) {
 	if strings.TrimSpace(message) == "" {
 		message = "knowledge: build " + time.Now().UTC().Format("20060102T150405Z")
 	}
-	existing := existingKnowledgePaths(c.workspace)
-	if len(existing) == 0 {
-		return "", fmt.Errorf("nothing to commit")
-	}
-	if _, err := c.git(ctx, append([]string{"add"}, existing...)...); err != nil {
+	paths, err := c.committableKnowledgePaths(ctx)
+	if err != nil {
 		return "", err
 	}
-	if _, err := c.git(ctx, append([]string{"diff", "--cached", "--quiet", "--"}, existing...)...); err == nil {
+	if len(paths) == 0 {
 		return "", fmt.Errorf("nothing to commit")
 	}
-	args := append([]string{"commit", "-m", message, "--"}, existing...)
+	if _, err := c.git(ctx, append([]string{"add", "--"}, paths...)...); err != nil {
+		return "", err
+	}
+	if _, err := c.git(ctx, append([]string{"diff", "--cached", "--quiet", "--"}, paths...)...); err == nil {
+		return "", fmt.Errorf("nothing to commit")
+	}
+	args := append([]string{"commit", "-m", message, "--"}, paths...)
 	return c.git(ctx, args...)
 }
 
@@ -147,7 +153,10 @@ func (c gitClient) git(ctx context.Context, args ...string) (string, error) {
 }
 
 func (c gitClient) workspaceDiff(ctx context.Context) (string, error) {
-	paths := existingKnowledgePaths(c.workspace)
+	paths, err := c.committableKnowledgePaths(ctx)
+	if err != nil {
+		return "", err
+	}
 	if len(paths) == 0 {
 		return "", nil
 	}
@@ -202,6 +211,27 @@ func existingKnowledgePaths(workspace string) []string {
 		}
 	}
 	return existing
+}
+
+func (c gitClient) committableKnowledgePaths(ctx context.Context) ([]string, error) {
+	var paths []string
+	for _, path := range knowledgePaths {
+		if _, err := os.Stat(filepath.Join(c.workspace, path)); err == nil {
+			paths = append(paths, path)
+			continue
+		} else if !os.IsNotExist(err) {
+			return nil, err
+		}
+		if c.trackedPath(ctx, path) {
+			paths = append(paths, path)
+		}
+	}
+	return paths, nil
+}
+
+func (c gitClient) trackedPath(ctx context.Context, path string) bool {
+	_, err := c.git(ctx, "ls-files", "--error-unmatch", "--", path)
+	return err == nil
 }
 
 func tagsFromDecoration(decoration string) []string {
