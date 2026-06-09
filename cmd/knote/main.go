@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -54,6 +55,9 @@ func newRuntime(ctx context.Context, workspacePath string, resumeID string) (run
 	if err != nil {
 		return nil, nil, err
 	}
+	if err := validateRuntimeMode(); err != nil {
+		return nil, nil, err
+	}
 	repo := local.New(workspace)
 	repoCfg, err := repo.Config(ctx)
 	if err != nil {
@@ -69,10 +73,6 @@ func newRuntime(ctx context.Context, workspacePath string, resumeID string) (run
 	knowledgeMode := versioned.ModeReal
 	if repoCfg.KAG.Fake {
 		knowledgeMode = versioned.ModeFake
-	}
-	runnerMode := runtime.RunnerModeDirect
-	if os.Getenv("KNOTE_RUNTIME_MODE") == string(runtime.RunnerModeEino) {
-		runnerMode = runtime.RunnerModeEino
 	}
 	kagClient := kag.Client{
 		AdapterPath: repoCfg.KAG.AdapterPath,
@@ -96,7 +96,7 @@ func newRuntime(ctx context.Context, workspacePath string, resumeID string) (run
 		SideEffectGate: newEinoSideEffectGate(sideEffects, approvedEinoTools),
 	})
 	toolExecutor := runtimeeino.NewToolExecutor(einoTools)
-	einoRunner, err := newEinoRunner(ctx, runnerMode, repoCfg, einoTools)
+	einoRunner, err := newEinoRunner(ctx, repoCfg, einoTools)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -107,7 +107,7 @@ func newRuntime(ctx context.Context, workspacePath string, resumeID string) (run
 		Versions:      repo,
 		WorkspaceRepo: repo,
 		Knowledge:     knowledgeService,
-		RunnerMode:    runnerMode,
+		RunnerMode:    runtime.RunnerModeEino,
 		EinoRunner:    einoRunner,
 		SideEffects:   sideEffects,
 		ToolExecutor:  toolExecutor,
@@ -115,4 +115,12 @@ func newRuntime(ctx context.Context, workspacePath string, resumeID string) (run
 	})
 	events, err := rt.Start(ctx, runtime.StartOptions{ResumeID: resumeID})
 	return rt, events, err
+}
+
+func validateRuntimeMode() error {
+	mode := strings.TrimSpace(os.Getenv("KNOTE_RUNTIME_MODE"))
+	if mode == "" || mode == string(runtime.RunnerModeEino) {
+		return nil
+	}
+	return fmt.Errorf("KNOTE_RUNTIME_MODE=%q is not supported; knote uses the Eino runtime only", mode)
 }

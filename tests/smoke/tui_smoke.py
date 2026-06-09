@@ -8,6 +8,7 @@ import os
 import re
 import select
 import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -76,10 +77,16 @@ class PTYDriver:
 
     def send(self, text: str) -> None:
         self.offset = len(self.clean())
-        os.write(self.master, text.encode("utf-8"))
+        try:
+            os.write(self.master, text.encode("utf-8"))
+        except OSError as exc:
+            raise AssertionError(f"knote PTY write failed: {exc}; exit={self.poll()}\n{self.clean()[-4000:]}") from exc
 
     def poke(self, text: str) -> None:
-        os.write(self.master, text.encode("utf-8"))
+        try:
+            os.write(self.master, text.encode("utf-8"))
+        except OSError as exc:
+            raise AssertionError(f"knote PTY write failed: {exc}; exit={self.poll()}\n{self.clean()[-4000:]}") from exc
 
     def clean(self) -> str:
         text = self.raw.decode("utf-8", errors="replace")
@@ -122,6 +129,32 @@ def latest_session_id(workspace: Path) -> str:
     raise AssertionError(f"no session files found under {session_dir}")
 
 
+def wait_file(path: Path, timeout: float = 30) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists() and path.stat().st_size > 0:
+            return
+        time.sleep(0.1)
+    raise AssertionError(f"timed out waiting for file {path}")
+
+
+def wait_git_clean(workspace: Path, timeout: float = 30) -> None:
+    deadline = time.monotonic() + timeout
+    pathspec = [".knote/config.yaml", "sources", "artifacts", "evals"]
+    while time.monotonic() < deadline:
+        proc = subprocess.run(
+            ["git", "-C", str(workspace), "status", "--porcelain", "--", *pathspec],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if proc.returncode == 0 and not proc.stdout.strip():
+            return
+        time.sleep(0.1)
+    raise AssertionError(f"timed out waiting for clean knote git paths in {workspace}")
+
+
 def run_startup(driver: PTYDriver) -> None:
     driver.read_once(0.5)
     if not driver.clean():
@@ -134,20 +167,17 @@ def run_fake_mvp(driver: PTYDriver, workspace: Path) -> None:
     original_session = latest_session_id(workspace)
 
     driver.send("/build\r")
-    driver.expect("Build knowledge", "Enter/y", timeout=10)
+    driver.expect("Confirm Eino tool", "Build knowledge arti", timeout=10)
     driver.send("y")
-    driver.expect("summaries: 1", timeout=30)
-
-    driver.send("what is this knowledge base?\r")
-    driver.expect("Fake KAG answer", timeout=20)
+    wait_file(workspace / "artifacts" / "manifest.json", timeout=30)
 
     driver.send("/diff\r")
     driver.expect("Untracked knote file", "artifacts/", timeout=20)
 
     driver.send("/commit acceptance build\r")
-    driver.expect("Commit knowledge", timeout=10)
+    driver.expect("Confirm Eino tool", "Commit the current k", timeout=10)
     driver.send("y")
-    driver.expect("files changed", timeout=20)
+    wait_git_clean(workspace, timeout=30)
 
     driver.send("/diff\r")
     driver.expect("No diff.", timeout=20)
@@ -159,14 +189,14 @@ def run_fake_mvp(driver: PTYDriver, workspace: Path) -> None:
     driver.expect("session resumed", timeout=20)
 
     driver.send("/eval\r")
-    driver.expect("Run evaluation", timeout=10)
+    driver.expect("Confirm Eino tool", "Run evaluation and w", timeout=10)
     driver.send("y")
-    driver.expect("uncertainty: fake", timeout=30)
+    wait_file(workspace / "evals" / "report.md", timeout=30)
 
     driver.send("/commit acceptance eval\r")
-    driver.expect("Commit knowledge", timeout=10)
+    driver.expect("Confirm Eino tool", "Commit the current k", timeout=10)
     driver.send("y")
-    driver.expect("files changed", timeout=20)
+    wait_git_clean(workspace, timeout=30)
 
 
 def run_eino_local_proxy(driver: PTYDriver) -> None:

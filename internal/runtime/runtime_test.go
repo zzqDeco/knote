@@ -8,8 +8,6 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/zzqDeco/knote/internal/knowledge/kag"
-	"github.com/zzqDeco/knote/internal/knowledge/versioned"
 	"github.com/zzqDeco/knote/internal/protocol"
 	"github.com/zzqDeco/knote/internal/repository/local"
 )
@@ -53,7 +51,7 @@ func TestRuntimeStartSendConfirmAndSubscribe(t *testing.T) {
 	}
 }
 
-func TestRuntimeWorkspaceStatusAndDirectModeControls(t *testing.T) {
+func TestRuntimeWorkspaceStatusAndEinoControls(t *testing.T) {
 	workspace := t.TempDir()
 	mustRun(t, workspace, "git", "init")
 	rt, err := newTestRuntime(t, workspace)
@@ -71,10 +69,10 @@ func TestRuntimeWorkspaceStatusAndDirectModeControls(t *testing.T) {
 		t.Fatalf("workspace status did not include branch: %+v", status)
 	}
 	if !hasEvent(rt.Interrupt(context.Background()), protocol.EventStatusUpdate) {
-		t.Fatal("interrupt should emit a status event in direct mode")
+		t.Fatal("interrupt should emit a status event in Eino-only runtime")
 	}
 	if !hasEvent(rt.StopTask(context.Background(), "task_1"), protocol.EventStatusUpdate) {
-		t.Fatal("stop task should emit a status event in direct mode")
+		t.Fatal("stop task should emit a status event in Eino-only runtime")
 	}
 	if !hasEvent(rt.StopTask(context.Background(), ""), protocol.EventError) {
 		t.Fatal("stop task without id should emit an error")
@@ -84,7 +82,6 @@ func TestRuntimeWorkspaceStatusAndDirectModeControls(t *testing.T) {
 func TestRuntimeRunnerInfoIncludesEinoInventory(t *testing.T) {
 	rt := New(Dependencies{
 		Workspace:    "/tmp/knote-test",
-		RunnerMode:   RunnerModeDirect,
 		EinoRunner:   &fakeEinoRunner{tools: []RunnerToolInfo{{Name: "knote_query", Description: "query knowledge"}}},
 		NewSessionID: local.NewSessionID,
 	})
@@ -92,7 +89,7 @@ func TestRuntimeRunnerInfoIncludesEinoInventory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.ConfiguredMode != RunnerModeDirect || info.ActiveMode != RunnerModeDirect {
+	if info.ConfiguredMode != RunnerModeEino || info.ActiveMode != RunnerModeEino {
 		t.Fatalf("unexpected runner modes: %+v", info)
 	}
 	if !info.EinoAvailable {
@@ -110,7 +107,6 @@ func TestRuntimeEinoModeStartsAndSendsThroughBridge(t *testing.T) {
 	rt := New(Dependencies{
 		Workspace:    workspace,
 		Sessions:     store,
-		RunnerMode:   RunnerModeEino,
 		EinoRunner:   einoRunner,
 		NewSessionID: func() string { return "sess_eino" },
 	})
@@ -163,7 +159,6 @@ func TestRuntimeEinoCurrentSessionInfoRefreshesWorkspaceStatus(t *testing.T) {
 		Workspace:    workspace,
 		Sessions:     store,
 		Versions:     store,
-		RunnerMode:   RunnerModeEino,
 		EinoRunner:   einoRunner,
 		NewSessionID: func() string { return "sess_eino" },
 	})
@@ -191,7 +186,6 @@ func TestRuntimeEinoModeConfirmsSideEffectTool(t *testing.T) {
 	rt := New(Dependencies{
 		Workspace:    workspace,
 		Sessions:     store,
-		RunnerMode:   RunnerModeEino,
 		EinoRunner:   einoRunner,
 		SideEffects:  bridge,
 		NewSessionID: func() string { return "sess_eino" },
@@ -230,7 +224,6 @@ func TestRuntimeEinoSlashReadOnlyToolUsesExecutor(t *testing.T) {
 	rt := New(Dependencies{
 		Workspace:    workspace,
 		Sessions:     store,
-		RunnerMode:   RunnerModeEino,
 		EinoRunner:   einoRunner,
 		ToolExecutor: toolExecutor,
 		NewSessionID: func() string { return "sess_eino" },
@@ -269,7 +262,6 @@ func TestRuntimeEinoSlashMutatingToolRequiresConfirmation(t *testing.T) {
 	rt := New(Dependencies{
 		Workspace:    workspace,
 		Sessions:     local.New(workspace),
-		RunnerMode:   RunnerModeEino,
 		EinoRunner:   &fakeEinoRunner{events: []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, "", "natural answer", nil)}},
 		SideEffects:  bridge,
 		ToolExecutor: toolExecutor,
@@ -298,7 +290,6 @@ func TestRuntimeEinoModeRejectsSideEffectTool(t *testing.T) {
 	rt := New(Dependencies{
 		Workspace:    workspace,
 		Sessions:     local.New(workspace),
-		RunnerMode:   RunnerModeEino,
 		EinoRunner:   einoRunner,
 		SideEffects:  bridge,
 		NewSessionID: func() string { return "sess_eino" },
@@ -370,7 +361,6 @@ func TestRuntimeEinoModePersistsPartialEventsOnRunnerError(t *testing.T) {
 	rt := New(Dependencies{
 		Workspace:    workspace,
 		Sessions:     store,
-		RunnerMode:   RunnerModeEino,
 		EinoRunner:   &fakeEinoRunner{events: []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, "", "partial answer", nil)}, err: fmt.Errorf("runner failed")},
 		NewSessionID: func() string { return "sess_eino" },
 	})
@@ -395,7 +385,6 @@ func TestRuntimeEinoModeRequiresReadyRunner(t *testing.T) {
 	rt := New(Dependencies{
 		Workspace:    workspace,
 		Sessions:     local.New(workspace),
-		RunnerMode:   RunnerModeEino,
 		EinoRunner:   &fakeEinoRunner{},
 		NewSessionID: func() string { return "sess_eino" },
 	})
@@ -407,7 +396,6 @@ func TestRuntimeEinoModeRequiresReadyRunner(t *testing.T) {
 func TestRuntimeEinoModeRequiresSessionStorage(t *testing.T) {
 	rt := New(Dependencies{
 		Workspace:    t.TempDir(),
-		RunnerMode:   RunnerModeEino,
 		EinoRunner:   &fakeEinoRunner{events: []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, "", "hello from eino", nil)}},
 		NewSessionID: func() string { return "sess_eino" },
 	})
@@ -429,16 +417,22 @@ func newTestRuntime(t *testing.T, workspace string) (*Manager, error) {
 	if err := repo.SaveConfig(ctx, cfg); err != nil {
 		return nil, err
 	}
-	kagClient := kag.Client{
-		AdapterPath: cfg.KAG.AdapterPath,
-		Workspace:   workspace,
-		Host:        cfg.KAG.Host,
-		Fake:        cfg.KAG.Fake,
-		ConfigPath:  cfg.KAG.ConfigPath,
-		ProjectID:   cfg.KAG.ProjectID,
-		Namespace:   cfg.KAG.Namespace,
-		Language:    cfg.KAG.Language,
-		RuntimeDir:  cfg.KAG.RuntimeDir,
+	bridge := NewSideEffectBridge()
+	toolExecutor := &fakeToolExecutor{}
+	toolExecutor.onInvoke = func(ctx context.Context, sessionID string, toolName string, args string) ([]protocol.Event, error) {
+		return nil, bridge.Request(ctx, SideEffectRequest{
+			ToolName:        toolName,
+			Action:          "build",
+			ArgumentsInJSON: args,
+			Summary:         "Build knowledge artifacts.",
+			Execute: func(context.Context, SideEffectRequest) ([]protocol.Event, error) {
+				toolExecutor.executions++
+				return []protocol.Event{
+					protocol.NewEvent(protocol.EventToolComplete, sessionID, toolName+" complete", nil),
+					protocol.NewEvent(protocol.EventBuildComplete, sessionID, "Build complete", nil),
+				}, nil
+			},
+		})
 	}
 	return New(Dependencies{
 		Workspace:     workspace,
@@ -446,7 +440,9 @@ func newTestRuntime(t *testing.T, workspace string) (*Manager, error) {
 		Sessions:      repo,
 		Versions:      repo,
 		WorkspaceRepo: repo,
-		Knowledge:     versioned.New(versioned.Options{Workspace: workspace, Repo: repo, Versions: repo, Backend: kagClient, Mode: versioned.ModeFake}),
+		EinoRunner:    &fakeEinoRunner{events: []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, "", "hello from eino", nil)}},
+		SideEffects:   bridge,
+		ToolExecutor:  toolExecutor,
 		NewSessionID:  local.NewSessionID,
 	}), nil
 }
