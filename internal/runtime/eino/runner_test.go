@@ -131,6 +131,7 @@ func TestRunnerUsesStatusForNoResponseAndFiltersSlashHistory(t *testing.T) {
 		Message:   "question",
 		History: []protocol.Event{
 			protocol.NewEvent(protocol.EventUserMessage, "s1", "/build", nil),
+			protocol.NewEvent(protocol.EventAssistantDone, "s1", "slash output", map[string]string{"source": "slash"}),
 			protocol.NewEvent(protocol.EventStatusUpdate, "s1", "Eino runner completed without response.", nil),
 			protocol.NewEvent(protocol.EventAssistantDone, "s1", "real assistant answer", nil),
 		},

@@ -94,6 +94,9 @@ func invokeEinoTool(ctx context.Context, tools map[string]einotool.InvokableTool
 			events = append(events, protocol.NewEvent(protocol.EventBuildComplete, sessionID, "Build complete", manifest))
 		}
 	}
+	if toolName == einotools.NameEval {
+		return events, nil
+	}
 	events = append(events, protocol.NewEvent(protocol.EventAssistantDone, sessionID, "Eino tool result\n"+prettyEinoToolResult(decoded), map[string]string{"tool": toolName}))
 	return events, nil
 }
@@ -131,6 +134,9 @@ func adapterFailureMessage(toolName string, decoded any) string {
 	if message := strings.TrimSpace(stringField(fields, "adapter_error")); message != "" {
 		return message
 	}
+	if toolName == einotools.NameEval {
+		return ""
+	}
 	if count := intField(fields, "adapter_errors"); count > 0 {
 		return fmt.Sprintf("%s completed with %d adapter error(s)", toolName, count)
 	}
@@ -165,7 +171,13 @@ func versionEventsForEinoTool(sessionID string, toolName string, decoded any) []
 			return []protocol.Event{protocol.NewEvent(protocol.EventVersionDiff, sessionID, diff, decoded)}
 		}
 	case einotools.NameVersions:
-		return []protocol.Event{protocol.NewEvent(protocol.EventVersionChanged, sessionID, "Versions", decoded)}
+		return []protocol.Event{protocol.NewEvent(protocol.EventVersionChanged, sessionID, formatVersions(decoded), decoded)}
+	case einotools.NameEval:
+		events := []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, sessionID, formatEvalReport(decoded), decoded)}
+		if count := intField(decodedMap(decoded), "adapter_errors"); count > 0 {
+			events = append(events, protocol.NewEvent(protocol.EventError, sessionID, fmt.Sprintf("eval completed with %d adapter error(s)", count), decoded))
+		}
+		return events
 	case einotools.NameCommit:
 		return []protocol.Event{protocol.NewEvent(protocol.EventVersionChanged, sessionID, "Commit complete", decoded)}
 	case einotools.NameRelease:
@@ -176,4 +188,78 @@ func versionEventsForEinoTool(sessionID string, toolName string, decoded any) []
 		return nil
 	}
 	return nil
+}
+
+func formatVersions(decoded any) string {
+	fields := decodedMap(decoded)
+	items, _ := fields["versions"].([]any)
+	if len(items) == 0 {
+		return "No versions yet."
+	}
+	var b strings.Builder
+	b.WriteString("Versions\n")
+	for _, item := range items {
+		version, _ := item.(map[string]any)
+		if len(version) == 0 {
+			continue
+		}
+		marker := " "
+		if boolField(version, "current") {
+			marker = "*"
+		}
+		tagText := ""
+		if tags := stringSliceField(version, "tags"); len(tags) > 0 {
+			tagText = " tags=" + strings.Join(tags, ",")
+		}
+		fmt.Fprintf(&b, "%s %s  %s  %s%s\n",
+			marker,
+			firstNonEmpty(stringField(version, "short_hash"), stringField(version, "hash")),
+			stringField(version, "relative_time"),
+			stringField(version, "subject"),
+			tagText,
+		)
+	}
+	text := strings.TrimSpace(b.String())
+	if text == "Versions" || text == "" {
+		return "No versions yet."
+	}
+	return text
+}
+
+func formatEvalReport(decoded any) string {
+	fields := decodedMap(decoded)
+	if report := strings.TrimSpace(stringField(fields, "report_markdown")); report != "" {
+		return report
+	}
+	data, err := json.MarshalIndent(decoded, "", "  ")
+	if err != nil {
+		return strings.TrimSpace(fmt.Sprint(decoded))
+	}
+	return string(data)
+}
+
+func boolField(fields map[string]any, key string) bool {
+	value, _ := fields[key].(bool)
+	return value
+}
+
+func stringSliceField(fields map[string]any, key string) []string {
+	values, _ := fields[key].([]any)
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		text := strings.TrimSpace(fmt.Sprint(value))
+		if text != "" {
+			out = append(out, text)
+		}
+	}
+	return out
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }

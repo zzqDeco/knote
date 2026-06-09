@@ -30,7 +30,7 @@ func (m *Manager) handleSlash(ctx context.Context, sessionID string, input strin
 		m.emit(events)
 		return events
 	default:
-		events := append([]protocol.Event{userEvent}, m.routeSlash(ctx, sessionID, cmd, arg)...)
+		events := append([]protocol.Event{userEvent}, markSlashEvents(m.routeSlash(ctx, sessionID, cmd, arg))...)
 		return m.persistEmitAndReturn(events)
 	}
 }
@@ -299,6 +299,38 @@ func jsonArgs(values map[string]any) string {
 		return "{}"
 	}
 	return string(data)
+}
+
+func markSlashEvents(events []protocol.Event) []protocol.Event {
+	for i := range events {
+		if events[i].Type == protocol.EventAssistantDone {
+			events[i].Payload = payloadWithSource(events[i].Payload, "slash")
+		}
+	}
+	return events
+}
+
+func payloadWithSource(payload any, source string) any {
+	switch value := payload.(type) {
+	case nil:
+		return map[string]string{"source": source}
+	case map[string]string:
+		out := make(map[string]string, len(value)+1)
+		for key, item := range value {
+			out[key] = item
+		}
+		out["source"] = source
+		return out
+	case map[string]any:
+		out := make(map[string]any, len(value)+1)
+		for key, item := range value {
+			out[key] = item
+		}
+		out["source"] = source
+		return out
+	default:
+		return map[string]any{"source": source, "value": payload}
+	}
 }
 
 func firstNonEmpty(values ...string) string {

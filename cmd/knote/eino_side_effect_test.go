@@ -26,12 +26,6 @@ func TestExecuteEinoToolOnceSurfacesAdapterFailures(t *testing.T) {
 			resultJSON: `{"adapter_error":"KAG build failed","manifest":{"version":1}}`,
 			want:       "KAG build failed",
 		},
-		{
-			name:       "eval adapter error count",
-			toolName:   einotools.NameEval,
-			resultJSON: `{"total":2,"adapter_errors":1}`,
-			want:       "knote_eval completed with 1 adapter error(s)",
-		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			exec := executeEinoToolOnce(map[string]einotool.InvokableTool{
@@ -55,6 +49,26 @@ func TestExecuteEinoToolOnceSurfacesAdapterFailures(t *testing.T) {
 	}
 }
 
+func TestExecuteEinoToolOncePreservesEvalReportWithAdapterErrors(t *testing.T) {
+	exec := executeEinoToolOnce(map[string]einotool.InvokableTool{
+		einotools.NameEval: staticTool{name: einotools.NameEval, out: `{"total":2,"adapter_errors":1,"report_markdown":"# Eval\n\npartial results"}`},
+	})
+	events, err := exec(context.Background(), runtime.SideEffectRequest{
+		SessionID:       "sess_eino",
+		ToolName:        einotools.NameEval,
+		ArgumentsInJSON: "{}",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasCmdMessage(events, protocol.EventAssistantDone, "# Eval\n\npartial results") {
+		t.Fatalf("eval report should be shown before adapter error: %+v", events)
+	}
+	if !hasCmdEvent(events, protocol.EventToolComplete) || !hasCmdEvent(events, protocol.EventError) {
+		t.Fatalf("eval with adapter errors should complete and append error: %+v", events)
+	}
+}
+
 func TestExecuteEinoToolOnceReportsSuccessfulBuildCompletion(t *testing.T) {
 	exec := executeEinoToolOnce(map[string]einotool.InvokableTool{
 		einotools.NameBuild: staticTool{name: einotools.NameBuild, out: `{"manifest":{"version":1}}`},
@@ -69,6 +83,23 @@ func TestExecuteEinoToolOnceReportsSuccessfulBuildCompletion(t *testing.T) {
 	}
 	if !hasCmdEvent(events, protocol.EventToolComplete) || !hasCmdEvent(events, protocol.EventBuildComplete) {
 		t.Fatalf("successful build should report completion: %+v", events)
+	}
+}
+
+func TestExecuteEinoToolOnceRendersVersionsMessage(t *testing.T) {
+	exec := executeEinoToolOnce(map[string]einotool.InvokableTool{
+		einotools.NameVersions: staticTool{name: einotools.NameVersions, out: `{"versions":[{"short_hash":"abc1234","relative_time":"now","subject":"initial","tags":["v0"],"current":true}]}`},
+	})
+	events, err := exec(context.Background(), runtime.SideEffectRequest{
+		SessionID:       "sess_eino",
+		ToolName:        einotools.NameVersions,
+		ArgumentsInJSON: "{}",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasCmdMessageContaining(events, protocol.EventVersionChanged, "* abc1234  now  initial tags=v0") {
+		t.Fatalf("versions event should include rendered entries: %+v", events)
 	}
 }
 
@@ -88,6 +119,24 @@ func (t staticTool) InvokableRun(context.Context, string, ...einotool.Option) (s
 func hasCmdEvent(events []protocol.Event, eventType protocol.EventType) bool {
 	for _, event := range events {
 		if event.Type == eventType {
+			return true
+		}
+	}
+	return false
+}
+
+func hasCmdMessage(events []protocol.Event, eventType protocol.EventType, message string) bool {
+	for _, event := range events {
+		if event.Type == eventType && event.Message == message {
+			return true
+		}
+	}
+	return false
+}
+
+func hasCmdMessageContaining(events []protocol.Event, eventType protocol.EventType, message string) bool {
+	for _, event := range events {
+		if event.Type == eventType && strings.Contains(event.Message, message) {
 			return true
 		}
 	}

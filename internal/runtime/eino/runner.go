@@ -225,10 +225,25 @@ func transcriptMessages(history []protocol.Event) []*schema.Message {
 			}
 			messages = append(messages, schema.UserMessage(text))
 		case protocol.EventAssistantDone:
+			if eventSource(event.Payload) == "slash" {
+				continue
+			}
 			messages = append(messages, schema.AssistantMessage(text, nil))
 		}
 	}
 	return messages
+}
+
+func eventSource(payload any) string {
+	switch value := payload.(type) {
+	case map[string]string:
+		return strings.TrimSpace(value["source"])
+	case map[string]any:
+		source, _ := value["source"].(string)
+		return strings.TrimSpace(source)
+	default:
+		return ""
+	}
 }
 
 func messageContent(message *schema.Message) string {
