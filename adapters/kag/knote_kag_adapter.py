@@ -124,20 +124,50 @@ def title_from_content(content: str, fallback: str) -> str:
     return fallback
 
 
-def prepare_corpus(workspace: Path, out_dir: Path) -> tuple[Path, list[dict[str, Any]]]:
-    files = source_files(workspace)
+def explicit_corpus_records(params: dict[str, Any]) -> list[dict[str, Any]] | None:
+    corpus = params.get("corpus")
+    if corpus is None:
+        return None
+    if not isinstance(corpus, list):
+        raise RuntimeError("corpus must be a list of records")
     records: list[dict[str, Any]] = []
-    for path in files:
-        rel = path.relative_to(workspace).as_posix()
-        content = path.read_text(encoding="utf-8")
+    for index, item in enumerate(corpus):
+        if not isinstance(item, dict):
+            raise RuntimeError(f"corpus[{index}] must be an object")
+        content = str(item.get("content") or "")
+        if not content.strip():
+            raise RuntimeError(f"corpus[{index}].content is required")
+        source_path = str(item.get("source_path") or item.get("path") or f"corpus/{index + 1}.txt")
         records.append(
             {
-                "id": rel,
-                "name": title_from_content(content, rel),
+                "id": str(item.get("id") or source_path),
+                "name": str(item.get("name") or title_from_content(content, source_path)),
                 "content": content,
-                "source_path": rel,
+                "source_path": source_path,
             }
         )
+    return records
+
+
+def prepare_corpus(workspace: Path, out_dir: Path, params: dict[str, Any] | None = None) -> tuple[Path, list[dict[str, Any]]]:
+    params = params or {}
+    explicit = explicit_corpus_records(params)
+    records: list[dict[str, Any]] = []
+    if explicit is not None:
+        records = explicit
+    else:
+        files = source_files(workspace)
+        for path in files:
+            rel = path.relative_to(workspace).as_posix()
+            content = path.read_text(encoding="utf-8")
+            records.append(
+                {
+                    "id": rel,
+                    "name": title_from_content(content, rel),
+                    "content": content,
+                    "source_path": rel,
+                }
+            )
     out_dir.mkdir(parents=True, exist_ok=True)
     ensure_runtime_excluded(workspace, out_dir)
     corpus_path = out_dir / "corpus.json"
@@ -441,7 +471,7 @@ def fake_response(req: dict[str, Any]) -> None:
         result(req_id, {"status": "ok", "mode": "fake", "version": "0.8.0"})
     elif method == "kag.build":
         out_dir = runtime_dir(params)
-        corpus_path, records = prepare_corpus(workspace, out_dir)
+        corpus_path, records = prepare_corpus(workspace, out_dir, params)
         progress(req_id, "scanning sources", 1, 3)
         progress(req_id, "extracting graph", 2, 3)
         result(
@@ -518,7 +548,7 @@ def run_kag_build(req: dict[str, Any]) -> dict[str, Any]:
     params = req.get("params") or {}
     workspace = workspace_path(params)
     out_dir = runtime_dir(params)
-    corpus_path, records = prepare_corpus(workspace, out_dir)
+    corpus_path, records = prepare_corpus(workspace, out_dir, params)
     if not records:
         raise RuntimeError(f"no Markdown or text sources found under {workspace / 'sources'}")
     config_path = select_config(params, out_dir)

@@ -29,7 +29,7 @@ const (
 )
 
 type Model struct {
-	runtime         *runtime.Runtime
+	runtime         runtime.Runtime
 	viewport        viewport.Model
 	overlayViewport viewport.Model
 	composer        textinput.Model
@@ -47,7 +47,7 @@ type Model struct {
 	err             error
 }
 
-func New(rt *runtime.Runtime, initial []protocol.Event) Model {
+func New(rt runtime.Runtime, initial []protocol.Event) Model {
 	composer := textinput.New()
 	composer.Placeholder = "Ask, /build, /diff, /versions, /tasks, /help"
 	composer.Prompt = "> "
@@ -147,7 +147,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.composer.SetValue("")
 			m.pushHistory(value)
-			events := m.runtime.Handle(context.Background(), value)
+			events := m.runtime.SendMessage(context.Background(), value)
 			m.applyEvents(events)
 			m.refreshViewport()
 			return m, nil
@@ -317,7 +317,11 @@ func (m Model) deriveStatus() string {
 			kagMode = info.KAGMode
 		}
 	}
-	return fmt.Sprintf("session %s · branch %s · dirty %s · tasks %d · kag %s", m.runtime.SessionID(), branch, dirty, activeTasks, kagMode)
+	sessionID := ""
+	if m.runtime != nil {
+		sessionID = m.runtime.SessionID()
+	}
+	return fmt.Sprintf("session %s · branch %s · dirty %s · tasks %d · kag %s", sessionID, branch, dirty, activeTasks, kagMode)
 }
 
 func renderTranscript(events []protocol.Event) string {

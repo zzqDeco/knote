@@ -2,322 +2,382 @@ package runtime
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"testing"
 
+	"github.com/zzqDeco/knote/internal/knowledge/kag"
+	"github.com/zzqDeco/knote/internal/knowledge/versioned"
 	"github.com/zzqDeco/knote/internal/protocol"
-	"github.com/zzqDeco/knote/internal/session"
+	"github.com/zzqDeco/knote/internal/repository/local"
 )
 
-func TestRuntimeBuildAndQueryWithFakeKAG(t *testing.T) {
+func TestRuntimeStartSendConfirmAndSubscribe(t *testing.T) {
 	workspace := t.TempDir()
 	must(t, os.MkdirAll(filepath.Join(workspace, "sources"), 0o755))
 	must(t, os.WriteFile(filepath.Join(workspace, "sources", "intro.md"), []byte("# Intro\n\nknote is local-first."), 0o644))
 	mustRun(t, workspace, "git", "init")
 
-	t.Setenv("KNOTE_KAG_FAKE", "1")
-	rt, _, err := New(context.Background(), Options{Workspace: workspace})
+	rt, err := newTestRuntime(t, workspace)
 	if err != nil {
 		t.Fatal(err)
 	}
-	buildEvents := rt.Handle(context.Background(), "/build")
-	if !hasEvent(buildEvents, protocol.EventConfirmRequest) {
-		t.Fatalf("missing build confirmation: %+v", buildEvents)
+	var emitted []protocol.Event
+	unsubscribe := rt.Subscribe(func(events []protocol.Event) {
+		emitted = append(emitted, events...)
+	})
+	initial, err := rt.Start(context.Background(), StartOptions{})
+	if err != nil {
+		t.Fatal(err)
 	}
+	if !hasEvent(initial, protocol.EventSessionInfo) || rt.SessionID() == "" {
+		t.Fatalf("runtime did not start session: events=%+v session=%q", initial, rt.SessionID())
+	}
+
+	buildEvents := rt.SendMessage(context.Background(), "/build")
 	confirm := firstConfirm(t, buildEvents)
 	buildEvents = rt.Confirm(context.Background(), confirm, true)
 	if !hasEvent(buildEvents, protocol.EventBuildComplete) {
-		t.Fatalf("missing build complete: %+v", buildEvents)
+		t.Fatalf("runtime build did not complete: %+v", buildEvents)
 	}
-	queryEvents := rt.Handle(context.Background(), "what is knote?")
-	if !hasEvent(queryEvents, protocol.EventAssistantDone) {
-		t.Fatalf("missing assistant answer: %+v", queryEvents)
+	if len(emitted) == 0 {
+		t.Fatal("runtime subscriber did not receive events")
 	}
-}
-
-func TestRuntimeRejectsSideEffectConfirmation(t *testing.T) {
-	workspace := t.TempDir()
-	must(t, os.MkdirAll(filepath.Join(workspace, "sources"), 0o755))
-	must(t, os.WriteFile(filepath.Join(workspace, "sources", "intro.md"), []byte("# Intro\n\nknote is local-first."), 0o644))
-	mustRun(t, workspace, "git", "init")
-
-	t.Setenv("KNOTE_KAG_FAKE", "1")
-	rt, _, err := New(context.Background(), Options{Workspace: workspace})
-	if err != nil {
-		t.Fatal(err)
-	}
-	events := rt.Handle(context.Background(), "/build")
-	confirm := firstConfirm(t, events)
-	events = rt.Confirm(context.Background(), confirm, false)
-	if hasEvent(events, protocol.EventBuildComplete) {
-		t.Fatalf("rejected build should not run: %+v", events)
-	}
-	if _, err := os.Stat(filepath.Join(workspace, "artifacts", "manifest.json")); !os.IsNotExist(err) {
-		t.Fatalf("rejected build wrote artifacts: %v", err)
+	unsubscribe()
+	before := len(emitted)
+	_ = rt.SendMessage(context.Background(), "/status")
+	if len(emitted) != before {
+		t.Fatal("runtime subscriber received events after unsubscribe")
 	}
 }
 
-func TestRuntimeRejectsForgedAndReplayedConfirmation(t *testing.T) {
+func TestRuntimeWorkspaceStatusAndDirectModeControls(t *testing.T) {
 	workspace := t.TempDir()
-	must(t, os.MkdirAll(filepath.Join(workspace, "sources"), 0o755))
-	must(t, os.WriteFile(filepath.Join(workspace, "sources", "intro.md"), []byte("# Intro\n\nknote is local-first."), 0o644))
 	mustRun(t, workspace, "git", "init")
-
-	t.Setenv("KNOTE_KAG_FAKE", "1")
-	rt, _, err := New(context.Background(), Options{Workspace: workspace})
+	rt, err := newTestRuntime(t, workspace)
 	if err != nil {
 		t.Fatal(err)
 	}
-	forged := protocol.ConfirmRequest{
-		RequestID: "forged",
-		Action:    "build",
-		Command:   "/build",
+	if _, err := rt.Start(context.Background(), StartOptions{}); err != nil {
+		t.Fatal(err)
 	}
-	events := rt.Confirm(context.Background(), forged, true)
-	if !hasEvent(events, protocol.EventError) {
-		t.Fatalf("forged confirmation should fail: %+v", events)
+	status, err := rt.WorkspaceStatus(context.Background())
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Join(workspace, "artifacts", "manifest.json")); !os.IsNotExist(err) {
-		t.Fatalf("forged confirmation wrote artifacts: %v", err)
+	if status.Branch == "" {
+		t.Fatalf("workspace status did not include branch: %+v", status)
 	}
-
-	events = rt.Handle(context.Background(), "/build")
-	confirm := firstConfirm(t, events)
-	events = rt.Confirm(context.Background(), confirm, true)
-	if !hasEvent(events, protocol.EventBuildComplete) {
-		t.Fatalf("valid confirmation should build: %+v", events)
+	if !hasEvent(rt.Interrupt(context.Background()), protocol.EventStatusUpdate) {
+		t.Fatal("interrupt should emit a status event in direct mode")
 	}
-	events = rt.Confirm(context.Background(), confirm, true)
-	if !hasEvent(events, protocol.EventError) {
-		t.Fatalf("replayed confirmation should fail: %+v", events)
+	if !hasEvent(rt.StopTask(context.Background(), "task_1"), protocol.EventStatusUpdate) {
+		t.Fatal("stop task should emit a status event in direct mode")
+	}
+	if !hasEvent(rt.StopTask(context.Background(), ""), protocol.EventError) {
+		t.Fatal("stop task without id should emit an error")
 	}
 }
 
-func TestRuntimeSessionCommands(t *testing.T) {
-	workspace := t.TempDir()
-	mustRun(t, workspace, "git", "init")
-	t.Setenv("KNOTE_KAG_FAKE", "1")
-	rt, _, err := New(context.Background(), Options{Workspace: workspace})
+func TestRuntimeRunnerInfoIncludesEinoInventory(t *testing.T) {
+	rt := New(Dependencies{
+		Workspace:    "/tmp/knote-test",
+		RunnerMode:   RunnerModeDirect,
+		EinoRunner:   &fakeEinoRunner{tools: []RunnerToolInfo{{Name: "knote_query", Description: "query knowledge"}}},
+		NewSessionID: local.NewSessionID,
+	})
+	info, err := rt.RunnerInfo(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	oldID := rt.SessionID()
-
-	clearEvents := rt.Handle(context.Background(), "/clear")
-	if !hasEvent(clearEvents, protocol.EventViewClear) {
-		t.Fatalf("missing view clear event: %+v", clearEvents)
+	if info.ConfiguredMode != RunnerModeDirect || info.ActiveMode != RunnerModeDirect {
+		t.Fatalf("unexpected runner modes: %+v", info)
 	}
-	if _, err := os.Stat(filepath.Join(workspace, ".knote", "sessions", oldID+".jsonl")); err != nil {
-		t.Fatalf("clear should keep session history file: %v", err)
+	if !info.EinoAvailable {
+		t.Fatalf("expected Eino runner to be available: %+v", info)
 	}
-
-	newEvents := rt.Handle(context.Background(), "/new")
-	newID := rt.SessionID()
-	if newID == oldID {
-		t.Fatal("/new did not create a new session id")
-	}
-	if !hasEvent(newEvents, protocol.EventSessionInfo) || !hasEvent(newEvents, protocol.EventViewClear) {
-		t.Fatalf("/new did not emit session info and clear events: %+v", newEvents)
-	}
-
-	store := session.NewStore(workspace)
-	beforeResume, err := store.Load(oldID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resumeEvents := rt.Handle(context.Background(), "/resume "+oldID)
-	if rt.SessionID() != oldID {
-		t.Fatalf("/resume did not switch runtime session, got %s", rt.SessionID())
-	}
-	if !hasEvent(resumeEvents, protocol.EventSessionInfo) || !hasEvent(resumeEvents, protocol.EventViewClear) {
-		t.Fatalf("/resume did not emit replay boundary and session info: %+v", resumeEvents)
-	}
-	afterResume, err := store.Load(oldID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(afterResume) != len(beforeResume)+1 {
-		t.Fatalf("/resume should append only fresh session.info to resumed session, before=%d after=%d", len(beforeResume), len(afterResume))
+	if len(info.Tools) != 1 || info.Tools[0].Name != "knote_query" {
+		t.Fatalf("unexpected tool inventory: %+v", info.Tools)
 	}
 }
 
-func TestRuntimeReadOnlyCommands(t *testing.T) {
+func TestRuntimeEinoModeStartsAndSendsThroughBridge(t *testing.T) {
 	workspace := t.TempDir()
-	mustRun(t, workspace, "git", "init")
-	t.Setenv("KNOTE_KAG_FAKE", "1")
-	rt, _, err := New(context.Background(), Options{Workspace: workspace})
+	store := local.New(workspace)
+	einoRunner := &fakeEinoRunner{events: []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, "", "hello from eino", nil)}}
+	rt := New(Dependencies{
+		Workspace:    workspace,
+		Sessions:     store,
+		RunnerMode:   RunnerModeEino,
+		EinoRunner:   einoRunner,
+		NewSessionID: func() string { return "sess_eino" },
+	})
+	initial, err := rt.Start(context.Background(), StartOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	for _, tc := range []struct {
-		command string
-		want    string
-	}{
-		{command: "/details", want: "Workspace details"},
-		{command: "/settings", want: "Effective settings"},
-		{command: "/model", want: "Model profiles"},
-	} {
-		events := rt.Handle(context.Background(), tc.command)
-		got := lastAssistant(events)
-		if !strings.Contains(got, tc.want) {
-			t.Fatalf("%s output missing %q:\n%s", tc.command, tc.want, got)
-		}
-		if strings.Contains(got, "stubbed") {
-			t.Fatalf("%s still returned stub output: %s", tc.command, got)
-		}
+	if !hasEvent(initial, protocol.EventSessionInfo) || rt.SessionID() != "sess_eino" {
+		t.Fatalf("runtime did not start Eino session: events=%+v session=%q", initial, rt.SessionID())
 	}
-}
-
-func TestRuntimeResumeWithoutIDListsRecentSessions(t *testing.T) {
-	workspace := t.TempDir()
-	mustRun(t, workspace, "git", "init")
-	t.Setenv("KNOTE_KAG_FAKE", "1")
-	rt, _, err := New(context.Background(), Options{Workspace: workspace})
-	if err != nil {
-		t.Fatal(err)
+	events := rt.SendMessage(context.Background(), "hello")
+	if !hasEvent(events, protocol.EventUserMessage) || !hasEvent(events, protocol.EventAssistantDone) {
+		t.Fatalf("runtime did not bridge Eino events: %+v", events)
 	}
-	sessionID := rt.SessionID()
-
-	events := rt.Handle(context.Background(), "/resume")
-	got := lastAssistant(events)
-	if !strings.Contains(got, "Recent sessions") || !strings.Contains(got, sessionID) {
-		t.Fatalf("/resume without id did not list recent sessions:\n%s", got)
-	}
-}
-
-func TestRuntimeEvalWritesStableReport(t *testing.T) {
-	workspace := t.TempDir()
-	mustRun(t, workspace, "git", "init")
-	t.Setenv("KNOTE_KAG_FAKE", "1")
-	rt, _, err := New(context.Background(), Options{Workspace: workspace})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	events := rt.Handle(context.Background(), "/eval")
-	confirm := firstConfirm(t, events)
-	events = rt.Confirm(context.Background(), confirm, true)
+	events = rt.SendMessage(context.Background(), "follow up")
 	if !hasEvent(events, protocol.EventAssistantDone) {
-		t.Fatalf("eval did not report completion: %+v", events)
+		t.Fatalf("runtime did not bridge follow-up Eino events: %+v", events)
 	}
-	results, err := os.ReadFile(filepath.Join(workspace, "evals", "results.jsonl"))
+	if !hasMessage(einoRunner.lastHistory, protocol.EventUserMessage, "hello") ||
+		!hasMessage(einoRunner.lastHistory, protocol.EventAssistantDone, "hello from eino") {
+		t.Fatalf("runtime did not forward prior session history: %+v", einoRunner.lastHistory)
+	}
+	loaded, err := store.Load(context.Background(), "sess_eino")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(results), `"id":"smoke"`) || !strings.Contains(string(results), "Fake KAG answer") {
-		t.Fatalf("unexpected eval results:\n%s", results)
+	if !hasEvent(loaded, protocol.EventUserMessage) || !hasEvent(loaded, protocol.EventAssistantDone) {
+		t.Fatalf("Eino events were not persisted: %+v", loaded)
 	}
-	report, err := os.ReadFile(filepath.Join(workspace, "evals", "report.md"))
+	info, err := rt.RunnerInfo(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(report), "adapter_errors: 0") {
-		t.Fatalf("unexpected eval report:\n%s", report)
+	if info.ConfiguredMode != RunnerModeEino || info.ActiveMode != RunnerModeEino {
+		t.Fatalf("unexpected Eino runner info: %+v", info)
 	}
 }
 
-func TestRuntimeReleaseRequiresEvalGateAndCleanWorkspace(t *testing.T) {
+func TestRuntimeEinoCurrentSessionInfoRefreshesWorkspaceStatus(t *testing.T) {
 	workspace := t.TempDir()
 	mustRun(t, workspace, "git", "init")
 	mustRun(t, workspace, "git", "config", "user.email", "knote@example.com")
 	mustRun(t, workspace, "git", "config", "user.name", "knote")
-	t.Setenv("KNOTE_KAG_FAKE", "1")
-	rt, _, err := New(context.Background(), Options{Workspace: workspace})
-	if err != nil {
-		t.Fatal(err)
-	}
-	mustRun(t, workspace, "git", "add", ".knote/config.yaml")
+	must(t, os.WriteFile(filepath.Join(workspace, ".gitignore"), []byte(".knote/sessions/\n"), 0o644))
+	mustRun(t, workspace, "git", "add", ".gitignore")
 	mustRun(t, workspace, "git", "commit", "-m", "initial")
-
-	events := rt.Handle(context.Background(), "/release v0.1.0")
-	if !hasEvent(events, protocol.EventError) || hasEvent(events, protocol.EventConfirmRequest) {
-		t.Fatalf("release without eval should fail before confirm: %+v", events)
-	}
-
-	evalEvents := rt.Handle(context.Background(), "/eval")
-	evalConfirm := firstConfirm(t, evalEvents)
-	evalEvents = rt.Confirm(context.Background(), evalConfirm, true)
-	if !hasEvent(evalEvents, protocol.EventAssistantDone) {
-		t.Fatalf("eval failed: %+v", evalEvents)
-	}
-
-	events = rt.Handle(context.Background(), "/release v0.1.0")
-	if !hasEvent(events, protocol.EventError) || !strings.Contains(lastError(events), "clean workspace") {
-		t.Fatalf("release with uncommitted eval outputs should fail clean gate: %+v", events)
-	}
-
-	mustRun(t, workspace, "git", "add", "evals")
-	mustRun(t, workspace, "git", "commit", "-m", "eval")
-	events = rt.Handle(context.Background(), "/release v0.1.0")
-	releaseConfirm := firstConfirm(t, events)
-	events = rt.Confirm(context.Background(), releaseConfirm, true)
-	if !hasEvent(events, protocol.EventVersionChanged) {
-		t.Fatalf("release did not create tag: %+v", events)
-	}
-	if got := strings.TrimSpace(mustRunOutput(t, workspace, "git", "tag", "--list", "v0.1.0")); got != "v0.1.0" {
-		t.Fatalf("tag missing after release: %q", got)
-	}
-}
-
-func TestRuntimeReleaseRejectsStaleEvalAfterKnowledgeCommit(t *testing.T) {
-	workspace := t.TempDir()
-	mustRun(t, workspace, "git", "init")
-	mustRun(t, workspace, "git", "config", "user.email", "knote@example.com")
-	mustRun(t, workspace, "git", "config", "user.name", "knote")
-	t.Setenv("KNOTE_KAG_FAKE", "1")
-	rt, _, err := New(context.Background(), Options{Workspace: workspace})
-	if err != nil {
+	store := local.New(workspace)
+	einoRunner := &fakeEinoRunner{events: []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, "", "hello from eino", nil)}}
+	rt := New(Dependencies{
+		Workspace:    workspace,
+		Sessions:     store,
+		Versions:     store,
+		RunnerMode:   RunnerModeEino,
+		EinoRunner:   einoRunner,
+		NewSessionID: func() string { return "sess_eino" },
+	})
+	if _, err := rt.Start(context.Background(), StartOptions{}); err != nil {
 		t.Fatal(err)
 	}
+	info := rt.CurrentSessionInfo(context.Background())
+	if info.ID != "sess_eino" || info.Branch == "" || info.Dirty {
+		t.Fatalf("unexpected initial Eino session info: %+v", info)
+	}
+
 	must(t, os.MkdirAll(filepath.Join(workspace, "sources"), 0o755))
-	must(t, os.WriteFile(filepath.Join(workspace, "sources", "intro.md"), []byte("before\n"), 0o644))
-	mustRun(t, workspace, "git", "add", ".knote/config.yaml", "sources")
-	mustRun(t, workspace, "git", "commit", "-m", "initial")
-
-	evalEvents := rt.Handle(context.Background(), "/eval")
-	evalConfirm := firstConfirm(t, evalEvents)
-	evalEvents = rt.Confirm(context.Background(), evalConfirm, true)
-	if !hasEvent(evalEvents, protocol.EventAssistantDone) {
-		t.Fatalf("eval failed: %+v", evalEvents)
-	}
-	mustRun(t, workspace, "git", "add", "evals")
-	mustRun(t, workspace, "git", "commit", "-m", "eval")
-	must(t, os.WriteFile(filepath.Join(workspace, "sources", "intro.md"), []byte("after\n"), 0o644))
-	mustRun(t, workspace, "git", "add", "sources")
-	mustRun(t, workspace, "git", "commit", "-m", "knowledge changed")
-
-	events := rt.Handle(context.Background(), "/release v0.1.0")
-	if !hasEvent(events, protocol.EventError) || !strings.Contains(lastError(events), "stale") {
-		t.Fatalf("stale eval should block release: %+v", events)
+	must(t, os.WriteFile(filepath.Join(workspace, "sources", "intro.md"), []byte("dirty\n"), 0o644))
+	info = rt.CurrentSessionInfo(context.Background())
+	if info.ID != "sess_eino" || info.Branch == "" || !info.Dirty {
+		t.Fatalf("Eino session info did not refresh workspace status: %+v", info)
 	}
 }
 
-func TestRuntimeCheckoutRequiresRefBeforeConfirm(t *testing.T) {
+func TestRuntimeEinoModeConfirmsSideEffectTool(t *testing.T) {
 	workspace := t.TempDir()
-	mustRun(t, workspace, "git", "init")
-	t.Setenv("KNOTE_KAG_FAKE", "1")
-	rt, _, err := New(context.Background(), Options{Workspace: workspace})
+	store := local.New(workspace)
+	bridge := NewSideEffectBridge()
+	einoRunner := &sideEffectEinoRunner{bridge: bridge}
+	rt := New(Dependencies{
+		Workspace:    workspace,
+		Sessions:     store,
+		RunnerMode:   RunnerModeEino,
+		EinoRunner:   einoRunner,
+		SideEffects:  bridge,
+		NewSessionID: func() string { return "sess_eino" },
+	})
+	if _, err := rt.Start(context.Background(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	events := rt.SendMessage(context.Background(), "build knowledge")
+	if hasEvent(events, protocol.EventError) || !hasEvent(events, protocol.EventConfirmRequest) {
+		t.Fatalf("side-effect request should surface as confirm without error: %+v", events)
+	}
+	confirm := firstConfirm(t, events)
+	events = rt.Confirm(context.Background(), confirm, true)
+	if !hasEvent(events, protocol.EventStatusUpdate) || !hasEvent(events, protocol.EventToolComplete) {
+		t.Fatalf("approved side-effect did not execute: %+v", events)
+	}
+	if einoRunner.executions != 1 {
+		t.Fatalf("approved side-effect executions = %d, want 1", einoRunner.executions)
+	}
+	loaded, err := store.Load(context.Background(), "sess_eino")
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	events := rt.Handle(context.Background(), "/checkout")
-	if !hasEvent(events, protocol.EventError) || hasEvent(events, protocol.EventConfirmRequest) {
-		t.Fatalf("checkout without ref should fail before confirm: %+v", events)
+	if !hasEvent(loaded, protocol.EventConfirmRequest) || !hasEvent(loaded, protocol.EventToolComplete) {
+		t.Fatalf("side-effect confirm/execution events were not persisted: %+v", loaded)
 	}
 }
 
-func hasEvent(events []protocol.Event, eventType protocol.EventType) bool {
-	for _, event := range events {
-		if event.Type == eventType {
-			return true
+func TestRuntimeEinoModeRejectsSideEffectTool(t *testing.T) {
+	workspace := t.TempDir()
+	bridge := NewSideEffectBridge()
+	einoRunner := &sideEffectEinoRunner{bridge: bridge}
+	rt := New(Dependencies{
+		Workspace:    workspace,
+		Sessions:     local.New(workspace),
+		RunnerMode:   RunnerModeEino,
+		EinoRunner:   einoRunner,
+		SideEffects:  bridge,
+		NewSessionID: func() string { return "sess_eino" },
+	})
+	if _, err := rt.Start(context.Background(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	confirm := firstConfirm(t, rt.SendMessage(context.Background(), "build knowledge"))
+	events := rt.Confirm(context.Background(), confirm, false)
+	if !hasMessage(events, protocol.EventAssistantDone, "Cancelled: build") {
+		t.Fatalf("rejected side-effect should be cancelled: %+v", events)
+	}
+	if einoRunner.executions != 0 {
+		t.Fatalf("rejected side-effect executed %d times", einoRunner.executions)
+	}
+}
+
+func TestSideEffectBridgeQueuesOneConfirmationAtATime(t *testing.T) {
+	bridge := NewSideEffectBridge()
+	ctx := withSideEffectSession(context.Background(), "sess_eino")
+	executed := make([]string, 0, 2)
+	for _, action := range []string{"build", "eval"} {
+		err := bridge.Request(ctx, SideEffectRequest{
+			ToolName:        "knote_" + action,
+			Action:          action,
+			ArgumentsInJSON: "{}",
+			Summary:         action,
+			Execute: func(_ context.Context, req SideEffectRequest) ([]protocol.Event, error) {
+				executed = append(executed, req.Action)
+				return []protocol.Event{protocol.NewEvent(protocol.EventToolComplete, req.SessionID, req.ToolName+" complete", nil)}, nil
+			},
+		})
+		if err != ErrSideEffectPending {
+			t.Fatalf("request %s returned %v", action, err)
 		}
 	}
-	return false
+	firstBatch := bridge.PendingEvents("sess_eino")
+	if got := countEvents(firstBatch, protocol.EventConfirmRequest); got != 1 {
+		t.Fatalf("first pending batch confirm count = %d, want 1: %+v", got, firstBatch)
+	}
+	first := firstConfirm(t, firstBatch)
+	secondBatch := bridge.PendingEvents("sess_eino")
+	if countEvents(secondBatch, protocol.EventConfirmRequest) != 0 {
+		t.Fatalf("bridge showed another confirmation while first is active: %+v", secondBatch)
+	}
+	events := bridge.Confirm(context.Background(), "sess_eino", first, true)
+	if executed[0] != "build" {
+		t.Fatalf("bridge did not execute FIFO first request: %+v", executed)
+	}
+	if got := countEvents(events, protocol.EventConfirmRequest); got != 1 {
+		t.Fatalf("confirm should surface next queued request, got %d confirm events: %+v", got, events)
+	}
+	second := firstConfirm(t, events)
+	if first.RequestID == second.RequestID {
+		t.Fatalf("queued confirmations reused request id %q", first.RequestID)
+	}
+	events = bridge.Confirm(context.Background(), "sess_eino", second, false)
+	if !hasMessage(events, protocol.EventAssistantDone, "Cancelled: eval") {
+		t.Fatalf("rejecting second queued request did not cancel eval: %+v", events)
+	}
+	if len(executed) != 1 {
+		t.Fatalf("rejected queued request executed unexpectedly: %+v", executed)
+	}
+}
+
+func TestRuntimeEinoModePersistsPartialEventsOnRunnerError(t *testing.T) {
+	workspace := t.TempDir()
+	store := local.New(workspace)
+	rt := New(Dependencies{
+		Workspace:    workspace,
+		Sessions:     store,
+		RunnerMode:   RunnerModeEino,
+		EinoRunner:   &fakeEinoRunner{events: []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, "", "partial answer", nil)}, err: fmt.Errorf("runner failed")},
+		NewSessionID: func() string { return "sess_eino" },
+	})
+	if _, err := rt.Start(context.Background(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	events := rt.SendMessage(context.Background(), "hello")
+	if !hasMessage(events, protocol.EventAssistantDone, "partial answer") || !hasEvent(events, protocol.EventError) {
+		t.Fatalf("runtime did not keep partial runner events before error: %+v", events)
+	}
+	loaded, err := store.Load(context.Background(), "sess_eino")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasMessage(loaded, protocol.EventAssistantDone, "partial answer") || !hasEvent(loaded, protocol.EventError) {
+		t.Fatalf("partial runner events were not persisted: %+v", loaded)
+	}
+}
+
+func TestRuntimeEinoModeRequiresReadyRunner(t *testing.T) {
+	workspace := t.TempDir()
+	rt := New(Dependencies{
+		Workspace:    workspace,
+		Sessions:     local.New(workspace),
+		RunnerMode:   RunnerModeEino,
+		EinoRunner:   &fakeEinoRunner{},
+		NewSessionID: func() string { return "sess_eino" },
+	})
+	if _, err := rt.Start(context.Background(), StartOptions{}); err == nil {
+		t.Fatal("expected Eino mode startup to fail when runner is not ready")
+	}
+}
+
+func TestRuntimeEinoModeRequiresSessionStorage(t *testing.T) {
+	rt := New(Dependencies{
+		Workspace:    t.TempDir(),
+		RunnerMode:   RunnerModeEino,
+		EinoRunner:   &fakeEinoRunner{events: []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, "", "hello from eino", nil)}},
+		NewSessionID: func() string { return "sess_eino" },
+	})
+	if _, err := rt.Start(context.Background(), StartOptions{}); err == nil {
+		t.Fatal("expected Eino mode startup to fail without session storage")
+	}
+}
+
+func newTestRuntime(t *testing.T, workspace string) (*Manager, error) {
+	t.Helper()
+	ctx := context.Background()
+	repo := local.New(workspace)
+	cfg, err := repo.Config(ctx)
+	if err != nil {
+		return nil, err
+	}
+	cfg.KAG.Fake = true
+	cfg.Workspace = workspace
+	if err := repo.SaveConfig(ctx, cfg); err != nil {
+		return nil, err
+	}
+	kagClient := kag.Client{
+		AdapterPath: cfg.KAG.AdapterPath,
+		Workspace:   workspace,
+		Host:        cfg.KAG.Host,
+		Fake:        cfg.KAG.Fake,
+		ConfigPath:  cfg.KAG.ConfigPath,
+		ProjectID:   cfg.KAG.ProjectID,
+		Namespace:   cfg.KAG.Namespace,
+		Language:    cfg.KAG.Language,
+		RuntimeDir:  cfg.KAG.RuntimeDir,
+	}
+	return New(Dependencies{
+		Workspace:     workspace,
+		Config:        cfg,
+		Sessions:      repo,
+		Versions:      repo,
+		WorkspaceRepo: repo,
+		Knowledge:     versioned.New(versioned.Options{Workspace: workspace, Repo: repo, Versions: repo, Backend: kagClient, Mode: versioned.ModeFake}),
+		NewSessionID:  local.NewSessionID,
+	}), nil
 }
 
 func firstConfirm(t *testing.T, events []protocol.Event) protocol.ConfirmRequest {
@@ -336,22 +396,91 @@ func firstConfirm(t *testing.T, events []protocol.Event) protocol.ConfirmRequest
 	return protocol.ConfirmRequest{}
 }
 
-func lastAssistant(events []protocol.Event) string {
-	for i := len(events) - 1; i >= 0; i-- {
-		if events[i].Type == protocol.EventAssistantDone {
-			return events[i].Message
+func hasEvent(events []protocol.Event, eventType protocol.EventType) bool {
+	for _, event := range events {
+		if event.Type == eventType {
+			return true
 		}
 	}
-	return ""
+	return false
 }
 
-func lastError(events []protocol.Event) string {
-	for i := len(events) - 1; i >= 0; i-- {
-		if events[i].Type == protocol.EventError {
-			return events[i].Message
+func countEvents(events []protocol.Event, eventType protocol.EventType) int {
+	var count int
+	for _, event := range events {
+		if event.Type == eventType {
+			count++
 		}
 	}
-	return ""
+	return count
+}
+
+func hasMessage(events []protocol.Event, eventType protocol.EventType, message string) bool {
+	for _, event := range events {
+		if event.Type == eventType && event.Message == message {
+			return true
+		}
+	}
+	return false
+}
+
+type fakeEinoRunner struct {
+	tools       []RunnerToolInfo
+	events      []protocol.Event
+	lastHistory []protocol.Event
+	err         error
+}
+
+type sideEffectEinoRunner struct {
+	bridge     *SideEffectBridge
+	executions int
+}
+
+func (r *sideEffectEinoRunner) Ready(context.Context) error {
+	return nil
+}
+
+func (r *sideEffectEinoRunner) ToolInventory(context.Context) ([]RunnerToolInfo, error) {
+	return []RunnerToolInfo{{Name: "knote_build", Description: "build knowledge"}}, nil
+}
+
+func (r *sideEffectEinoRunner) Run(ctx context.Context, input EinoRunInput) ([]protocol.Event, error) {
+	return nil, r.bridge.Request(ctx, SideEffectRequest{
+		ToolName:        "knote_build",
+		Action:          "build",
+		ArgumentsInJSON: "{}",
+		Summary:         "Build knowledge artifacts.",
+		Execute: func(context.Context, SideEffectRequest) ([]protocol.Event, error) {
+			r.executions++
+			return []protocol.Event{
+				protocol.NewEvent(protocol.EventToolComplete, input.SessionID, "knote_build complete", map[string]string{"tool": "knote_build"}),
+			}, nil
+		},
+	})
+}
+
+func (r *fakeEinoRunner) Ready(context.Context) error {
+	if len(r.events) == 0 {
+		return fmt.Errorf("fake Eino runner is not ready")
+	}
+	return nil
+}
+
+func (r *fakeEinoRunner) ToolInventory(context.Context) ([]RunnerToolInfo, error) {
+	return append([]RunnerToolInfo(nil), r.tools...), nil
+}
+
+func (r *fakeEinoRunner) Run(_ context.Context, input EinoRunInput) ([]protocol.Event, error) {
+	if len(r.events) == 0 {
+		return nil, fmt.Errorf("fake Eino runner does not execute")
+	}
+	r.lastHistory = append([]protocol.Event(nil), input.History...)
+	events := make([]protocol.Event, 0, len(r.events))
+	for _, event := range r.events {
+		event.SessionID = input.SessionID
+		events = append(events, event)
+	}
+	return events, r.err
 }
 
 func must(t *testing.T, err error) {
@@ -368,15 +497,4 @@ func mustRun(t *testing.T, dir string, name string, args ...string) {
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("%s %v failed: %v\n%s", name, args, err, out)
 	}
-}
-
-func mustRunOutput(t *testing.T, dir string, name string, args ...string) string {
-	t.Helper()
-	cmd := exec.Command(name, args...)
-	cmd.Dir = dir
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("%s %v failed: %v\n%s", name, args, err, out)
-	}
-	return string(out)
 }

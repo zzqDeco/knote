@@ -1,4 +1,4 @@
-package gitstore
+package local
 
 import (
 	"bytes"
@@ -9,34 +9,27 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/zzqDeco/knote/internal/repository"
 )
 
-type Store struct {
-	Workspace string
-}
-
-type Version struct {
-	Hash         string   `json:"hash"`
-	ShortHash    string   `json:"short_hash"`
-	Subject      string   `json:"subject"`
-	RelativeTime string   `json:"relative_time"`
-	Tags         []string `json:"tags,omitempty"`
-	Current      bool     `json:"current"`
+type gitClient struct {
+	workspace string
 }
 
 var knowledgePaths = []string{".knote/config.yaml", "sources", "artifacts", "evals"}
 var runtimeOnlyPaths = []string{".knote/sessions", ".knote/cache", ".knote/checkpoints", ".knote/kag-runtime"}
 
-func (s Store) Branch(ctx context.Context) string {
-	out, err := s.git(ctx, "branch", "--show-current")
+func (c gitClient) Branch(ctx context.Context) string {
+	out, err := c.git(ctx, "branch", "--show-current")
 	if err != nil {
 		return ""
 	}
 	return strings.TrimSpace(out)
 }
 
-func (s Store) Dirty(ctx context.Context) bool {
-	out, err := s.git(ctx, "status", "--porcelain")
+func (c gitClient) Dirty(ctx context.Context) bool {
+	out, err := c.git(ctx, "status", "--porcelain")
 	if err != nil {
 		return false
 	}
@@ -52,39 +45,38 @@ func (s Store) Dirty(ctx context.Context) bool {
 	return false
 }
 
-func (s Store) Status(ctx context.Context) (string, error) {
-	return s.git(ctx, "status", "--short", "--branch")
+func (c gitClient) Status(ctx context.Context) (string, error) {
+	return c.git(ctx, "status", "--short", "--branch")
 }
 
-func (s Store) Diff(ctx context.Context, ref string) (string, error) {
+func (c gitClient) Diff(ctx context.Context, ref string) (string, error) {
 	if strings.TrimSpace(ref) == "" {
-		return s.workspaceDiff(ctx)
+		return c.workspaceDiff(ctx)
 	}
-	paths := existingKnowledgePaths(s.Workspace)
+	paths, err := c.committableKnowledgePaths(ctx)
+	if err != nil {
+		return "", err
+	}
 	if len(paths) == 0 {
 		return "", nil
 	}
-	return s.git(ctx, append([]string{"diff", ref, "--"}, paths...)...)
+	return c.git(ctx, append([]string{"diff", ref, "--"}, paths...)...)
 }
 
-func (s Store) Log(ctx context.Context) (string, error) {
-	return s.git(ctx, "log", "--oneline", "--decorate", "-n", "20")
-}
-
-func (s Store) Versions(ctx context.Context, limit int) ([]Version, error) {
+func (c gitClient) Versions(ctx context.Context, limit int) ([]repository.Version, error) {
 	if limit <= 0 {
 		limit = 20
 	}
-	head, err := s.git(ctx, "rev-parse", "HEAD")
+	head, err := c.git(ctx, "rev-parse", "HEAD")
 	if err != nil {
 		return nil, err
 	}
-	out, err := s.git(ctx, "log", fmt.Sprintf("-n%d", limit), "--format=%H%x1f%h%x1f%s%x1f%cr%x1f%D")
+	out, err := c.git(ctx, "log", fmt.Sprintf("-n%d", limit), "--format=%H%x1f%h%x1f%s%x1f%cr%x1f%D")
 	if err != nil {
 		return nil, err
 	}
 	head = strings.TrimSpace(head)
-	var versions []Version
+	var versions []repository.Version
 	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
 		if strings.TrimSpace(line) == "" {
 			continue
@@ -93,60 +85,64 @@ func (s Store) Versions(ctx context.Context, limit int) ([]Version, error) {
 		if len(parts) < 5 {
 			continue
 		}
-		version := Version{
+		versions = append(versions, repository.Version{
 			Hash:         parts[0],
 			ShortHash:    parts[1],
 			Subject:      parts[2],
 			RelativeTime: parts[3],
 			Tags:         tagsFromDecoration(parts[4]),
 			Current:      parts[0] == head,
-		}
-		versions = append(versions, version)
+		})
 	}
 	return versions, nil
 }
 
-func (s Store) Commit(ctx context.Context, message string) (string, error) {
+func (c gitClient) Commit(ctx context.Context, message string) (string, error) {
 	if strings.TrimSpace(message) == "" {
 		message = "knowledge: build " + time.Now().UTC().Format("20060102T150405Z")
 	}
-	existing := existingKnowledgePaths(s.Workspace)
-	if len(existing) == 0 {
-		return "", fmt.Errorf("nothing to commit")
-	}
-	if _, err := s.git(ctx, append([]string{"add"}, existing...)...); err != nil {
+	paths, err := c.committableKnowledgePaths(ctx)
+	if err != nil {
 		return "", err
 	}
-	if _, err := s.git(ctx, append([]string{"diff", "--cached", "--quiet", "--"}, existing...)...); err == nil {
+	if len(paths) == 0 {
 		return "", fmt.Errorf("nothing to commit")
 	}
-	args := append([]string{"commit", "-m", message, "--"}, existing...)
-	return s.git(ctx, args...)
+	if _, err := c.git(ctx, append([]string{"add", "--"}, paths...)...); err != nil {
+		return "", err
+	}
+	if _, err := c.git(ctx, append([]string{"diff", "--cached", "--quiet", "--"}, paths...)...); err == nil {
+		return "", fmt.Errorf("nothing to commit")
+	}
+	args := append([]string{"commit", "-m", message, "--"}, paths...)
+	return c.git(ctx, args...)
 }
 
-func (s Store) Tag(ctx context.Context, tag string) (string, error) {
+func (c gitClient) Tag(ctx context.Context, tag string) error {
 	if strings.TrimSpace(tag) == "" {
-		return "", fmt.Errorf("tag is required")
+		return fmt.Errorf("tag is required")
 	}
-	if s.Dirty(ctx) {
-		return "", fmt.Errorf("release requires a clean workspace")
+	if c.Dirty(ctx) {
+		return fmt.Errorf("release requires a clean workspace")
 	}
-	return s.git(ctx, "tag", "-a", tag, "-m", "release: "+tag)
+	_, err := c.git(ctx, "tag", "-a", tag, "-m", "release: "+tag)
+	return err
 }
 
-func (s Store) Checkout(ctx context.Context, ref string, allowDirty bool) (string, error) {
+func (c gitClient) Checkout(ctx context.Context, ref string, allowDirty bool) error {
 	if strings.TrimSpace(ref) == "" {
-		return "", fmt.Errorf("ref is required")
+		return fmt.Errorf("ref is required")
 	}
-	if !allowDirty && s.Dirty(ctx) {
-		return "", fmt.Errorf("checkout requires confirmation because the workspace is dirty")
+	if !allowDirty && c.Dirty(ctx) {
+		return fmt.Errorf("checkout requires confirmation because the workspace is dirty")
 	}
-	return s.git(ctx, "checkout", ref)
+	_, err := c.git(ctx, "checkout", ref)
+	return err
 }
 
-func (s Store) git(ctx context.Context, args ...string) (string, error) {
+func (c gitClient) git(ctx context.Context, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, "git", args...)
-	cmd.Dir = s.Workspace
+	cmd.Dir = c.workspace
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -156,27 +152,30 @@ func (s Store) git(ctx context.Context, args ...string) (string, error) {
 	return stdout.String(), nil
 }
 
-func (s Store) workspaceDiff(ctx context.Context) (string, error) {
-	paths := existingKnowledgePaths(s.Workspace)
+func (c gitClient) workspaceDiff(ctx context.Context) (string, error) {
+	paths, err := c.committableKnowledgePaths(ctx)
+	if err != nil {
+		return "", err
+	}
 	if len(paths) == 0 {
 		return "", nil
 	}
 	var parts []string
-	unstaged, err := s.git(ctx, append([]string{"diff", "--"}, paths...)...)
+	unstaged, err := c.git(ctx, append([]string{"diff", "--"}, paths...)...)
 	if err != nil {
 		return "", err
 	}
 	if strings.TrimSpace(unstaged) != "" {
 		parts = append(parts, strings.TrimRight(unstaged, "\n"))
 	}
-	staged, err := s.git(ctx, append([]string{"diff", "--cached", "--"}, paths...)...)
+	staged, err := c.git(ctx, append([]string{"diff", "--cached", "--"}, paths...)...)
 	if err != nil {
 		return "", err
 	}
 	if strings.TrimSpace(staged) != "" {
 		parts = append(parts, strings.TrimRight(staged, "\n"))
 	}
-	untracked, err := s.untrackedKnowledgeFiles(ctx)
+	untracked, err := c.untrackedKnowledgeFiles(ctx)
 	if err != nil {
 		return "", err
 	}
@@ -186,12 +185,12 @@ func (s Store) workspaceDiff(ctx context.Context) (string, error) {
 	return strings.Join(parts, "\n\n"), nil
 }
 
-func (s Store) untrackedKnowledgeFiles(ctx context.Context) ([]string, error) {
-	paths := existingKnowledgePaths(s.Workspace)
+func (c gitClient) untrackedKnowledgeFiles(ctx context.Context) ([]string, error) {
+	paths := existingKnowledgePaths(c.workspace)
 	if len(paths) == 0 {
 		return nil, nil
 	}
-	out, err := s.git(ctx, append([]string{"ls-files", "--others", "--exclude-standard", "--"}, paths...)...)
+	out, err := c.git(ctx, append([]string{"ls-files", "--others", "--exclude-standard", "--"}, paths...)...)
 	if err != nil {
 		return nil, err
 	}
@@ -212,6 +211,27 @@ func existingKnowledgePaths(workspace string) []string {
 		}
 	}
 	return existing
+}
+
+func (c gitClient) committableKnowledgePaths(ctx context.Context) ([]string, error) {
+	var paths []string
+	for _, path := range knowledgePaths {
+		if _, err := os.Stat(filepath.Join(c.workspace, path)); err == nil {
+			paths = append(paths, path)
+			continue
+		} else if !os.IsNotExist(err) {
+			return nil, err
+		}
+		if c.trackedPath(ctx, path) {
+			paths = append(paths, path)
+		}
+	}
+	return paths, nil
+}
+
+func (c gitClient) trackedPath(ctx context.Context, path string) bool {
+	_, err := c.git(ctx, "ls-files", "--error-unmatch", "--", path)
+	return err == nil
 }
 
 func tagsFromDecoration(decoration string) []string {

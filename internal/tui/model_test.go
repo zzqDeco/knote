@@ -10,9 +10,11 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/zzqDeco/knote/internal/knowledge/kag"
+	"github.com/zzqDeco/knote/internal/knowledge/versioned"
 	"github.com/zzqDeco/knote/internal/protocol"
+	"github.com/zzqDeco/knote/internal/repository/local"
 	"github.com/zzqDeco/knote/internal/runtime"
-	"github.com/zzqDeco/knote/internal/session"
 )
 
 func TestInputHistoryCyclesComposerValues(t *testing.T) {
@@ -79,7 +81,7 @@ func TestOverlaySwitchAndEsc(t *testing.T) {
 
 func TestClearProjectsTranscriptWithoutDeletingSession(t *testing.T) {
 	model := newTestModel(t)
-	store := session.NewStore(model.runtime.Workspace())
+	store := local.New(model.runtime.Workspace())
 	sessionID := model.runtime.SessionID()
 
 	model.composer.SetValue("/help")
@@ -90,7 +92,7 @@ func TestClearProjectsTranscriptWithoutDeletingSession(t *testing.T) {
 	if got := strings.TrimSpace(renderTranscript(model.events)); got != "knote ready" {
 		t.Fatalf("clear should project empty transcript, got:\n%s", got)
 	}
-	events, err := store.Load(sessionID)
+	events, err := store.Load(context.Background(), sessionID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,7 +139,7 @@ func newTestModel(t *testing.T) Model {
 	workspace := t.TempDir()
 	mustRun(t, workspace, "git", "init")
 	t.Setenv("KNOTE_KAG_FAKE", "1")
-	rt, initial, err := runtime.New(context.Background(), runtime.Options{Workspace: workspace})
+	rt, initial, err := newTestAgent(t, workspace)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,6 +150,43 @@ func newTestModel(t *testing.T) Model {
 	model.refreshOverlay()
 	model.refreshViewport()
 	return model
+}
+
+func newTestAgent(t *testing.T, workspace string) (runtime.Runtime, []protocol.Event, error) {
+	t.Helper()
+	ctx := context.Background()
+	repo := local.New(workspace)
+	cfg, err := repo.Config(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	cfg.KAG.Fake = true
+	cfg.Workspace = workspace
+	if err := repo.SaveConfig(ctx, cfg); err != nil {
+		return nil, nil, err
+	}
+	kagClient := kag.Client{
+		AdapterPath: cfg.KAG.AdapterPath,
+		Workspace:   workspace,
+		Host:        cfg.KAG.Host,
+		Fake:        cfg.KAG.Fake,
+		ConfigPath:  cfg.KAG.ConfigPath,
+		ProjectID:   cfg.KAG.ProjectID,
+		Namespace:   cfg.KAG.Namespace,
+		Language:    cfg.KAG.Language,
+		RuntimeDir:  cfg.KAG.RuntimeDir,
+	}
+	rt := runtime.New(runtime.Dependencies{
+		Workspace:     workspace,
+		Config:        cfg,
+		Sessions:      repo,
+		Versions:      repo,
+		WorkspaceRepo: repo,
+		Knowledge:     versioned.New(versioned.Options{Workspace: workspace, Repo: repo, Versions: repo, Backend: kagClient, Mode: versioned.ModeFake}),
+		NewSessionID:  local.NewSessionID,
+	})
+	initial, err := rt.Start(ctx, runtime.StartOptions{})
+	return rt, initial, err
 }
 
 func updateModel(t *testing.T, model *Model, msg tea.Msg) {

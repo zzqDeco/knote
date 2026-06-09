@@ -5,9 +5,15 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	einotools "github.com/zzqDeco/knote/internal/eino/tools"
+	"github.com/zzqDeco/knote/internal/knowledge/kag"
+	"github.com/zzqDeco/knote/internal/knowledge/versioned"
+	"github.com/zzqDeco/knote/internal/protocol"
+	"github.com/zzqDeco/knote/internal/repository/local"
 	"github.com/zzqDeco/knote/internal/runtime"
 	"github.com/zzqDeco/knote/internal/tui"
 )
@@ -29,10 +35,7 @@ func main() {
 		return
 	}
 
-	rt, events, err := runtime.New(context.Background(), runtime.Options{
-		Workspace: *workspace,
-		ResumeID:  *resume,
-	})
+	rt, events, err := newRuntime(context.Background(), *workspace, *resume)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -43,4 +46,70 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+}
+
+func newRuntime(ctx context.Context, workspacePath string, resumeID string) (runtime.Runtime, []protocol.Event, error) {
+	workspace, err := filepath.Abs(workspacePath)
+	if err != nil {
+		return nil, nil, err
+	}
+	repo := local.New(workspace)
+	repoCfg, err := repo.Config(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	if os.Getenv("KNOTE_KAG_FAKE") == "1" {
+		repoCfg.KAG.Fake = true
+	}
+	repoCfg.Workspace = workspace
+	if err := repo.SaveConfig(ctx, repoCfg); err != nil {
+		return nil, nil, err
+	}
+	knowledgeMode := versioned.ModeReal
+	if repoCfg.KAG.Fake {
+		knowledgeMode = versioned.ModeFake
+	}
+	runnerMode := runtime.RunnerModeDirect
+	if os.Getenv("KNOTE_RUNTIME_MODE") == string(runtime.RunnerModeEino) {
+		runnerMode = runtime.RunnerModeEino
+	}
+	kagClient := kag.Client{
+		AdapterPath: repoCfg.KAG.AdapterPath,
+		Workspace:   workspace,
+		Host:        repoCfg.KAG.Host,
+		Fake:        repoCfg.KAG.Fake,
+		ConfigPath:  repoCfg.KAG.ConfigPath,
+		ProjectID:   repoCfg.KAG.ProjectID,
+		Namespace:   repoCfg.KAG.Namespace,
+		Language:    repoCfg.KAG.Language,
+		RuntimeDir:  repoCfg.KAG.RuntimeDir,
+	}
+	knowledgeService := versioned.New(versioned.Options{Workspace: workspace, Repo: repo, Versions: repo, Backend: kagClient, Mode: knowledgeMode})
+	sideEffects := runtime.NewSideEffectBridge()
+	approvedEinoTools := einotools.ByNameWithOptions(einotools.Options{
+		Service:        knowledgeService,
+		SideEffectGate: func(context.Context, einotools.SideEffectRequest) error { return nil },
+	})
+	einoTools := einotools.NewWithOptions(einotools.Options{
+		Service:        knowledgeService,
+		SideEffectGate: newEinoSideEffectGate(sideEffects, approvedEinoTools),
+	})
+	einoRunner, err := newEinoRunner(ctx, runnerMode, repoCfg, einoTools)
+	if err != nil {
+		return nil, nil, err
+	}
+	rt := runtime.New(runtime.Dependencies{
+		Workspace:     workspace,
+		Config:        repoCfg,
+		Sessions:      repo,
+		Versions:      repo,
+		WorkspaceRepo: repo,
+		Knowledge:     knowledgeService,
+		RunnerMode:    runnerMode,
+		EinoRunner:    einoRunner,
+		SideEffects:   sideEffects,
+		NewSessionID:  local.NewSessionID,
+	})
+	events, err := rt.Start(ctx, runtime.StartOptions{ResumeID: resumeID})
+	return rt, events, err
 }

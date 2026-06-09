@@ -169,12 +169,18 @@ def run_fake_mvp(driver: PTYDriver, workspace: Path) -> None:
     driver.expect("files changed", timeout=20)
 
 
+def run_eino_local_proxy(driver: PTYDriver) -> None:
+    run_startup(driver)
+    driver.send("Do not use tools. Reply only with the phrase made from the words knote, eino, ok using hyphens.\r")
+    driver.expect("knote-eino-ok", timeout=60)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--bin")
     parser.add_argument("--go-run", action="store_true")
     parser.add_argument("--workspace", required=True)
-    parser.add_argument("--scenario", choices=["startup", "fake-mvp"], required=True)
+    parser.add_argument("--scenario", choices=["startup", "fake-mvp", "eino-local-proxy"], required=True)
     args = parser.parse_args()
     if not args.go_run and not args.bin:
         parser.error("--bin is required unless --go-run is set")
@@ -197,6 +203,8 @@ def main() -> int:
                 run_startup(driver)
             elif args.scenario == "fake-mvp":
                 run_fake_mvp(driver, workspace)
+            elif args.scenario == "eino-local-proxy":
+                run_eino_local_proxy(driver)
             return 0
         except AssertionError as exc:
             last_error = exc
