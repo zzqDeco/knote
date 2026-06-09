@@ -15,6 +15,7 @@ import (
 	"github.com/zzqDeco/knote/internal/protocol"
 	"github.com/zzqDeco/knote/internal/repository/local"
 	"github.com/zzqDeco/knote/internal/runtime"
+	runtimeeino "github.com/zzqDeco/knote/internal/runtime/eino"
 	"github.com/zzqDeco/knote/internal/tui"
 )
 
@@ -94,7 +95,7 @@ func newRuntime(ctx context.Context, workspacePath string, resumeID string) (run
 		Service:        knowledgeService,
 		SideEffectGate: newEinoSideEffectGate(sideEffects, approvedEinoTools),
 	})
-	toolExecutor := newEinoToolExecutor(einoTools)
+	toolExecutor := runtimeeino.NewToolExecutor(einoTools)
 	einoRunner, err := newEinoRunner(ctx, runnerMode, repoCfg, einoTools)
 	if err != nil {
 		return nil, nil, err
