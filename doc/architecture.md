@@ -4,16 +4,15 @@
 
 1. `cmd/knote` parses CLI flags and wires concrete implementations.
 2. `internal/tui` owns Bubble Tea projection and keyboard interaction.
-3. `internal/runtime` owns session/thread lifecycle, event dispatch, task controls, confirm routing, and runner selection.
-4. `internal/agent` owns the current direct turn handler: natural-language turns, slash commands, confirmations, tasks, and event persistence.
-5. `internal/knowledge/versioned` owns versioned knowledge operations: build/query/explain/eval/diff/commit/release/checkout/status.
-6. `internal/eino/tools` exposes the versioned knowledge service as shallow Eino `InvokableTool` adapters.
-7. `internal/runtime/eino` is the Eino ADK runner bridge. It can construct an OpenAI-compatible `ChatModelAgent`, inventory knote tools, and project ADK events back to knote events.
-8. `internal/repository` defines workspace/session/version interfaces; `internal/repository/local` implements them with the local filesystem and Git CLI.
-9. `internal/knowledge/kag` owns the OpenSPG/KAG boundary and Python NDJSON adapter subprocess.
-10. `internal/repository/remote` is a future adapter skeleton for GitHub/Gitea/GitLab-style backends.
+3. `internal/runtime` owns Eino-only session/thread lifecycle, event dispatch, task controls, slash routing, confirm routing, and runner management.
+4. `internal/knowledge/versioned` owns versioned knowledge operations: build/query/explain/eval/diff/commit/release/checkout/status.
+5. `internal/eino/tools` exposes the versioned knowledge service as shallow Eino `InvokableTool` adapters.
+6. `internal/runtime/eino` is the Eino ADK runner bridge. It constructs an OpenAI-compatible `ChatModelAgent`, inventories knote tools, and projects ADK events back to knote events.
+7. `internal/repository` defines workspace/session/version interfaces; `internal/repository/local` implements them with the local filesystem and Git CLI.
+8. `internal/knowledge/kag` owns the OpenSPG/KAG boundary and Python NDJSON adapter subprocess.
+9. `internal/repository/remote` is a future adapter skeleton for GitHub/Gitea/GitLab-style backends.
 
-The TUI and agent are in the same Go binary. The KAG adapter remains a subprocess because OpenSPG/KAG is Python-native and has heavier environment requirements. The stable artifact contract is owned by knote, not by KAG.
+The TUI and runtime are in the same Go binary. The KAG adapter remains a subprocess because OpenSPG/KAG is Python-native and has heavier environment requirements. The stable artifact contract is owned by knote, not by KAG.
 
 ## Dependency Flow
 
@@ -21,13 +20,12 @@ The TUI and agent are in the same Go binary. The KAG adapter remains a subproces
 flowchart LR
   User["User input"] --> TUI["internal/tui"]
   TUI --> Runtime["internal/runtime"]
-  Runtime --> Agent["internal/agent direct runner"]
   Runtime --> EinoRunner["internal/runtime/eino ADK runner"]
   Runtime --> EinoTools["internal/eino/tools"]
   Runtime --> RepoIf["internal/repository interfaces"]
-  Agent --> RepoIf
-  Agent --> Versioned["internal/knowledge/versioned"]
+  EinoRunner --> EinoTools
   EinoTools --> Versioned
+  Runtime --> Versioned["internal/knowledge/versioned"]
   Versioned --> RepoIf
   Versioned --> Kag["internal/knowledge/kag"]
   Kag --> Adapter["adapters/kag/knote_kag_adapter.py"]
@@ -41,13 +39,13 @@ flowchart LR
   RepoIf -. future .-> Remote["internal/repository/remote"]
 ```
 
-`internal/agent` depends only on `internal/knowledge/versioned`, `internal/repository`, `internal/protocol`, and the standard library. It does not import the local repository, KAG backend, Git wrapper, Python adapter, Eino tools, or TUI. `cmd/knote` is the composition root that creates `local.Store`, `kag.Client`, `versioned.Service`, Eino tools, the Eino runner, and `runtime.Manager`.
+`cmd/knote` is the composition root that creates `local.Store`, `kag.Client`, `versioned.Service`, Eino tools, the Eino runner, and `runtime.Manager`. `internal/runtime` does not import the local repository, KAG backend, Python adapter, or TUI.
 
 ## Runtime Layers
 
-`internal/runtime` is the interaction boundary for TUI now and Web later. It exposes start, message, confirm, interrupt, task stop, status, subscription, and runner info methods. Runtime owns the active session/thread state and fans emitted events to subscribers.
+`internal/runtime` is the interaction boundary for TUI now and Web later. It exposes start, message, confirm, interrupt, task stop, status, subscription, and runner info methods. Runtime owns the active session/thread state, deterministic slash routing, pending side-effect confirmations, and event fanout.
 
-The default runner mode is `direct`. In this mode runtime delegates turns to `internal/agent`, preserving the current TUI behavior. `KNOTE_RUNTIME_MODE=eino` switches runtime to the Eino ADK `ChatModelAgent` path. Eino mode requires an OpenAI-compatible profile and API key from `.knote/config.yaml` plus environment overrides such as `KNOTE_EINO_PROVIDER`, `KNOTE_EINO_MODEL`, `KNOTE_EINO_API_KEY`, `KNOTE_EINO_BASE_URL`, and `KNOTE_EINO_REASONING_EFFORT`.
+The runtime is Eino-only. Ordinary user messages go through the Eino ADK `ChatModelAgent`; slash commands are routed deterministically by runtime to either local session/status behavior or knote Eino tools. Startup requires an OpenAI-compatible profile and API key from `.knote/config.yaml` plus environment overrides such as `KNOTE_EINO_PROVIDER`, `KNOTE_EINO_MODEL`, `KNOTE_EINO_API_KEY`, `KNOTE_EINO_BASE_URL`, and `KNOTE_EINO_REASONING_EFFORT`. `OPENAI_MODEL`, `OPENAI_API_KEY`, and `OPENAI_BASE_URL` are also accepted. `KNOTE_RUNTIME_MODE=direct` is rejected.
 
 `internal/runtime/eino` holds the Eino-facing runner. It converts knote `InvokableTool` adapters into Eino base tools, constructs the OpenAI-compatible chat model, builds the ADK agent, executes turns through `adk.Runner`, and projects ADK tool/assistant/interrupt events into knote protocol events. It does not own knowledge semantics.
 
@@ -55,13 +53,13 @@ The default runner mode is `direct`. In this mode runtime delegates turns to `in
 
 Eino side effects are bridged back through runtime confirmation instead of executing directly. In Eino mode, mutating tools call a `SideEffectGate`; runtime stores the pending request, emits one `confirm.request` at a time, and only executes the approved tool once after TUI approval. Queued confirmations are FIFO, request ids include a monotonic suffix, and adapter failures returned by approved build/eval tools are projected as `tool.error`/`error` rather than `tool.complete`.
 
-The local OpenAI-compatible path is validated manually with `scripts/smoke_eino_local_proxy.sh`. That script probes `/v1/models`, starts `KNOTE_RUNTIME_MODE=eino`, sends a PTY prompt, and waits for the model to return `knote-eino-ok`. The smoke is intentionally manual because it depends on a local proxy and API key.
+The local OpenAI-compatible path is validated manually with `scripts/smoke_eino_local_proxy.sh`. That script probes `/v1/models`, starts the Eino-only TUI, sends a PTY prompt, and waits for the model to return `knote-eino-ok`. The smoke is intentionally manual because it depends on a local proxy and API key.
 
-## Agent And TUI
+## Runtime And TUI
 
 `internal/tui` owns screen projection only. It keeps the transcript, composer history, overlay state, and status line, then calls runtime methods for every user intent. It does not execute Git, artifact, KAG, Eino, or repository side effects directly.
 
-`internal/agent` owns the direct-runner event stream. User messages become `message.user`; read-only commands return status, details, settings, versions, or diff events; side-effecting commands first emit `confirm.request`. Confirmed actions are validated against agent-owned pending confirmation state before they can run.
+`internal/runtime` owns the event stream. User messages become `message.user`; read-only slash commands return status, details, settings, versions, or diff events; side-effecting slash commands first emit `confirm.request`. Confirmed actions are validated against runtime-owned pending confirmation state before they can run.
 
 ## Session Data
 
@@ -125,7 +123,7 @@ The remote model does not simulate a local dirty working tree. It uses explicit 
 - pull or merge request
 - tag or release
 
-This keeps `internal/agent` stable: future remote implementations can make `/commit` create a branch commit or PR without changing TUI or agent command handling.
+This keeps runtime stable: future remote implementations can make `/commit` create a branch commit or PR without changing TUI command handling.
 
 ## Git And Release Gate
 

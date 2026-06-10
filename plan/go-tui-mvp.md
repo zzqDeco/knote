@@ -8,8 +8,7 @@ The MVP is a single Go CLI/TUI binary with a Python KAG subprocess adapter. Bubb
 
 - `cmd/knote` parses `--workspace`, `--resume`, `--version`, and starts the TUI.
 - `internal/tui` renders transcript, composer, permission overlay, tasks, versions, diff pager, and status line.
-- `internal/runtime` manages session/thread lifecycle, event dispatch, task controls, confirm routing, and runner selection.
-- `internal/agent` maps direct-runner user messages and slash commands to build/query/explain/status/version/eval actions.
+- `internal/runtime` manages Eino-only session/thread lifecycle, event dispatch, task controls, slash routing, confirm routing, and runner management.
 - Side-effecting slash commands emit `confirm.request` and run only after TUI approval.
 - `internal/knowledge/versioned` owns versioned build/query/explain/eval/version semantics and normalizes stable knote artifacts.
 - `internal/eino/tools` exposes versioned knowledge as shallow Eino tools.
@@ -45,13 +44,15 @@ The MVP is a single Go CLI/TUI binary with a Python KAG subprocess adapter. Bubb
 - PR #23 `test/eino-runtime-acceptance-docs`: adds repeatable Eino local proxy smoke coverage and updates runtime acceptance docs.
 - PR #24 `fix/eino-smoke-portability`: completed and merged to `dev`.
 - PR #25 `docs/release-v0.1.1-readiness`: prepares `v0.1.1` release-candidate documentation.
+- PR #30 `refactor/eino-only-runtime`: completed and merged to `dev`.
+- PR #31 `refactor/remove-direct-agent`: removes the legacy direct agent package and updates Eino-only docs.
 
 ## Acceptance
 
 - `KNOTE_KAG_FAKE=1 go test ./...` passes.
 - `/usr/bin/python3 -m unittest discover -s adapters/kag -p '*test*.py'` passes.
 - `CGO_ENABLED=0 go build -o bin/knote ./cmd/knote` succeeds.
-- `PYTHON=/usr/bin/python3 KNOTE_SMOKE_FORCE_BIN=1 bash scripts/smoke_fake_mvp.sh` starts the TUI in a PTY, runs fake build/query/diff/commit/resume/eval, and exits cleanly.
+- `PYTHON=/usr/bin/python3 KNOTE_SMOKE_FORCE_BIN=1 bash scripts/smoke_fake_mvp.sh` starts the TUI in a PTY, runs fake build/diff/commit/resume/eval, and exits cleanly. `go test ./...` also covers the `knote_query` Eino tool against fake KAG.
 - `KNOTE_EINO_BASE_URL=http://127.0.0.1:8317/v1 KNOTE_EINO_MODEL=gpt-5.3-codex-spark KNOTE_EINO_REASONING_EFFORT=low bash scripts/smoke_eino_local_proxy.sh` manually validates the OpenAI-compatible Eino runner path when a local proxy and API key are available.
 - `KNOTE_PYTHON=/path/to/python KNOTE_KAG_HOST=http://127.0.0.1:8887 scripts/smoke_real_kag.sh` passes in a local real OpenSPG/KAG environment.
 
@@ -64,7 +65,7 @@ The MVP is a single Go CLI/TUI binary with a Python KAG subprocess adapter. Bubb
 
 ## v0.1.1 Release Candidate
 
-`v0.1.1` is the post-`v0.1.0` runtime/Eino release candidate. It keeps `direct` as the default runner while adding the opt-in Eino ChatModel path, Eino mutating-tool confirmation bridge, local CLIProxyAPI/OpenAI-compatible smoke, and hardened smoke portability.
+`v0.1.1` is the post-`v0.1.0` runtime/Eino release candidate. It uses the Eino ChatModel path as the only runtime, keeps the Eino mutating-tool confirmation bridge, and includes local CLIProxyAPI/OpenAI-compatible smoke plus hardened smoke portability.
 
 Candidate validation must pass on `dev` and again on `release/v0.1.1`:
 

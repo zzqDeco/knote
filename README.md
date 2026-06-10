@@ -4,17 +4,16 @@
 
 ## Version Status
 
-`v0.1.0` is the published MVP baseline. The next release candidate is `v0.1.1`, which keeps the direct runner as the default and adds the opt-in Eino ChatModel runner path, runtime confirmation bridging for mutating Eino tools, local CLIProxyAPI/OpenAI-compatible smoke coverage, and hardened local proxy smoke portability.
+`v0.1.0` is the published MVP baseline. The next release candidate is `v0.1.1`, which makes the Eino ChatModel runner the only runtime path, keeps runtime confirmation bridging for mutating Eino tools, and includes local CLIProxyAPI/OpenAI-compatible smoke coverage plus hardened local proxy smoke portability.
 
 This MVP is Go-first:
 
 - `cmd/knote`: single CLI/TUI binary
 - `internal/tui`: Bubble Tea transcript, composer, overlays, pickers, and status line
-- `internal/runtime`: session/thread lifecycle, event dispatch, task controls, confirm routing, and runner selection
-- `internal/agent`: direct-runner turn handling, slash commands, confirmations, tasks, and session events
+- `internal/runtime`: Eino-only session/thread lifecycle, event dispatch, task controls, slash routing, confirm routing, and runner management
 - `internal/knowledge/versioned`: versioned build/query/explain/eval/diff/commit/release/checkout/status facade
 - `internal/eino/tools`: shallow Eino `InvokableTool` adapters over the versioned knowledge facade
-- `internal/runtime/eino`: OpenAI-compatible Eino ChatModelAgent runner bridge; direct runner remains the default
+- `internal/runtime/eino`: OpenAI-compatible Eino ChatModelAgent runner bridge
 - `internal/repository/local`: local config, sessions, artifacts, evals, and Git versions
 - `internal/knowledge/kag`: Go boundary for fake/real OpenSPG/KAG backends
 - `adapters/kag`: Python NDJSON adapter for OpenSPG/KAG
@@ -23,8 +22,15 @@ This MVP is Go-first:
 
 ```bash
 CGO_ENABLED=0 go build -o bin/knote ./cmd/knote
-KNOTE_KAG_FAKE=1 ./bin/knote --workspace tests/fixtures/basic-kb
+KNOTE_KAG_FAKE=1 \
+KNOTE_EINO_PROVIDER=openai-compatible \
+KNOTE_EINO_MODEL=<model> \
+KNOTE_EINO_API_KEY=<api-key> \
+KNOTE_EINO_BASE_URL=<openai-compatible-base-url> \
+./bin/knote --workspace tests/fixtures/basic-kb
 ```
+
+`KNOTE_KAG_FAKE=1` only selects the deterministic KAG adapter; the Eino ChatModel runtime still requires an OpenAI-compatible model configuration.
 
 Inside the TUI:
 
@@ -76,10 +82,9 @@ Sessions are JSONL event logs under `.knote/sessions/`. `/clear` only clears the
 
 ## Runtime Layers
 
-The TUI talks to `internal/runtime`, not directly to KAG, Git, repositories, or Eino. Runtime uses the direct agent runner by default. Set `KNOTE_RUNTIME_MODE=eino` to start the Eino ADK ChatModelAgent path with an OpenAI-compatible chat model:
+The TUI talks to `internal/runtime`, not directly to KAG, Git, repositories, or KAG adapters. Runtime is Eino-only: slash commands are routed deterministically by runtime, and natural-language turns go through the Eino ADK ChatModelAgent with knote tools.
 
 ```bash
-KNOTE_RUNTIME_MODE=eino \
 KNOTE_EINO_PROVIDER=openai-compatible \
 KNOTE_EINO_MODEL=gpt-4o-mini \
 KNOTE_EINO_API_KEY=your-api-key \
@@ -87,7 +92,7 @@ KNOTE_EINO_BASE_URL=https://api.openai.com/v1 \
 ./bin/knote --workspace tests/fixtures/basic-kb
 ```
 
-`KNOTE_EINO_MODEL_PROFILE` selects a profile from `.knote/config.yaml` and defaults to `default`. Environment variables override the selected profile. `KNOTE_EINO_REASONING_EFFORT` accepts `low`, `medium`, or `high`.
+`KNOTE_EINO_MODEL_PROFILE` selects a profile from `.knote/config.yaml` and defaults to `default`. Environment variables override the selected profile. `OPENAI_MODEL`, `OPENAI_API_KEY`, and `OPENAI_BASE_URL` are also accepted; when those overrides are present, provider defaults to `openai-compatible`. `KNOTE_EINO_REASONING_EFFORT` accepts `low`, `medium`, or `high`. `KNOTE_RUNTIME_MODE=direct` is rejected.
 
 Mutating Eino tools require a runtime side-effect gate, matching the TUI confirmation rule for `/build`, `/commit`, `/release`, `/checkout`, and `/eval`.
 
@@ -100,7 +105,7 @@ KNOTE_EINO_REASONING_EFFORT=low \
 scripts/smoke_eino_local_proxy.sh
 ```
 
-The script probes `/v1/models`, starts `KNOTE_RUNTIME_MODE=eino`, sends a fixed PTY prompt, and waits for `knote-eino-ok`. Set `KNOTE_EINO_API_KEY` explicitly, set `KNOTE_CLIPROXY_CONFIG`, or let the script try documented CLIProxyAPI default config paths such as `~/.cli-proxy-api/config.yaml` and Homebrew `etc/cliproxyapi.conf`.
+The script probes `/v1/models`, starts the Eino-only TUI, sends a fixed PTY prompt, and waits for `knote-eino-ok`. Set `KNOTE_EINO_API_KEY` explicitly, set `KNOTE_CLIPROXY_CONFIG`, or let the script try documented CLIProxyAPI default config paths such as `~/.cli-proxy-api/config.yaml` and Homebrew `etc/cliproxyapi.conf`.
 
 ## Versions And Eval
 
@@ -121,7 +126,7 @@ Default validation:
 KNOTE_KAG_FAKE=1 go test ./...
 python3 -m unittest discover -s adapters/kag -p '*test*.py'
 CGO_ENABLED=0 go build -o bin/knote ./cmd/knote
-scripts/smoke_fake_mvp.sh
+PYTHON=/usr/bin/python3 KNOTE_SMOKE_FORCE_BIN=1 scripts/smoke_fake_mvp.sh
 ```
 
 Manual Eino/OpenAI-compatible validation:
@@ -150,10 +155,10 @@ MVP scope includes:
 - session JSONL persistence
 - task and permission state
 - runtime manager boundary for future TUI/Web reuse
-- Eino tool adapters and OpenAI-compatible ADK runner bridge
+- Eino tool adapters and OpenAI-compatible ADK runner bridge as the only runtime path
 - Git diff/log/commit/tag wrappers
 - release-oriented CI skeleton
 
 Not in v0.1.0: web UI, desktop app, cloud sync, multi-user collaboration, independent version database, graph-database versioning, or MCP dependency.
 
-Not in v0.1.1: changing the default runner away from direct mode, main-branch promotion without a release PR, or automatic tag creation without explicit confirmation.
+Not in v0.1.1: main-branch promotion without a release PR, or automatic tag creation without explicit confirmation.

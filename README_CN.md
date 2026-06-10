@@ -4,17 +4,16 @@
 
 ## 版本状态
 
-`v0.1.0` 是已发布的 MVP 基线。下一个候选版本是 `v0.1.1`，默认仍使用 direct runner，并新增 opt-in 的 Eino ChatModel runner 路径、带副作用 Eino tools 的 runtime confirmation bridge、本地 CLIProxyAPI/OpenAI-compatible smoke，以及更可移植的本地 proxy smoke。
+`v0.1.0` 是已发布的 MVP 基线。下一个候选版本是 `v0.1.1`，将 Eino ChatModel runner 作为唯一 runtime 路径，保留带副作用 Eino tools 的 runtime confirmation bridge，并包含本地 CLIProxyAPI/OpenAI-compatible smoke 与更可移植的本地 proxy smoke。
 
 当前 MVP 调整为 Go-first：
 
 - `cmd/knote`：单一 CLI/TUI binary
 - `internal/tui`：Bubble Tea 实现 transcript、composer、overlay、picker、pager、status line
-- `internal/runtime`：session/thread 生命周期、event dispatch、task control、confirm routing 和 runner 选择
-- `internal/agent`：direct runner 的 turn、slash command、确认、任务和 session event
+- `internal/runtime`：Eino-only session/thread 生命周期、event dispatch、task control、slash routing、confirm routing 和 runner 管理
 - `internal/knowledge/versioned`：带版本语义的 build/query/explain/eval/diff/commit/release/checkout/status facade
 - `internal/eino/tools`：基于 versioned knowledge facade 的浅层 Eino `InvokableTool` adapter
-- `internal/runtime/eino`：OpenAI-compatible Eino ChatModelAgent runner bridge；默认仍使用 direct runner
+- `internal/runtime/eino`：OpenAI-compatible Eino ChatModelAgent runner bridge
 - `internal/repository/local`：本地 config、session、artifact、eval 和 Git version 实现
 - `internal/knowledge/kag`：fake/real OpenSPG/KAG backend 的 Go 边界
 - `adapters/kag`：OpenSPG/KAG Python NDJSON adapter
@@ -23,8 +22,15 @@
 
 ```bash
 CGO_ENABLED=0 go build -o bin/knote ./cmd/knote
-KNOTE_KAG_FAKE=1 ./bin/knote --workspace tests/fixtures/basic-kb
+KNOTE_KAG_FAKE=1 \
+KNOTE_EINO_PROVIDER=openai-compatible \
+KNOTE_EINO_MODEL=<model> \
+KNOTE_EINO_API_KEY=<api-key> \
+KNOTE_EINO_BASE_URL=<openai-compatible-base-url> \
+./bin/knote --workspace tests/fixtures/basic-kb
 ```
+
+`KNOTE_KAG_FAKE=1` 只切换到确定性 KAG adapter；Eino ChatModel runtime 仍然需要 OpenAI-compatible model 配置。
 
 TUI 内可执行：
 
@@ -76,10 +82,9 @@ adapter 会在 `.knote/kag-runtime/` 写入稳定排序的 JSON corpus 和生成
 
 ## Runtime 分层
 
-TUI 只调用 `internal/runtime`，不直接接触 KAG、Git、repository 或 Eino。默认生产路径仍使用 direct agent runner。设置 `KNOTE_RUNTIME_MODE=eino` 后，会启动基于 OpenAI-compatible chat model 的 Eino ADK ChatModelAgent 路径：
+TUI 只调用 `internal/runtime`，不直接接触 KAG、Git、repository 或 KAG adapter。runtime 是 Eino-only：slash command 由 runtime 确定性路由，自然语言 turn 通过带 knote tools 的 Eino ADK ChatModelAgent 执行。
 
 ```bash
-KNOTE_RUNTIME_MODE=eino \
 KNOTE_EINO_PROVIDER=openai-compatible \
 KNOTE_EINO_MODEL=gpt-4o-mini \
 KNOTE_EINO_API_KEY=your-api-key \
@@ -87,7 +92,7 @@ KNOTE_EINO_BASE_URL=https://api.openai.com/v1 \
 ./bin/knote --workspace tests/fixtures/basic-kb
 ```
 
-`KNOTE_EINO_MODEL_PROFILE` 用于选择 `.knote/config.yaml` 中的模型 profile，默认是 `default`。环境变量会覆盖被选中的 profile。`KNOTE_EINO_REASONING_EFFORT` 支持 `low`、`medium`、`high`。
+`KNOTE_EINO_MODEL_PROFILE` 用于选择 `.knote/config.yaml` 中的模型 profile，默认是 `default`。环境变量会覆盖被选中的 profile。也支持 `OPENAI_MODEL`、`OPENAI_API_KEY`、`OPENAI_BASE_URL`；存在这些覆盖时 provider 默认按 `openai-compatible` 处理。`KNOTE_EINO_REASONING_EFFORT` 支持 `low`、`medium`、`high`。`KNOTE_RUNTIME_MODE=direct` 会被拒绝。
 
 带副作用的 Eino tools 必须经过 runtime side-effect gate，这和 TUI 中 `/build`、`/commit`、`/release`、`/checkout`、`/eval` 的确认规则保持一致。
 
@@ -100,7 +105,7 @@ KNOTE_EINO_REASONING_EFFORT=low \
 scripts/smoke_eino_local_proxy.sh
 ```
 
-脚本会先探测 `/v1/models`，再以 `KNOTE_RUNTIME_MODE=eino` 启动 TUI，通过 PTY 发送固定 prompt，并等待返回 `knote-eino-ok`。可以显式设置 `KNOTE_EINO_API_KEY`，设置 `KNOTE_CLIPROXY_CONFIG`，或让脚本尝试 `~/.cli-proxy-api/config.yaml`、Homebrew `etc/cliproxyapi.conf` 等 CLIProxyAPI 默认配置路径。
+脚本会先探测 `/v1/models`，再启动 Eino-only TUI，通过 PTY 发送固定 prompt，并等待返回 `knote-eino-ok`。可以显式设置 `KNOTE_EINO_API_KEY`，设置 `KNOTE_CLIPROXY_CONFIG`，或让脚本尝试 `~/.cli-proxy-api/config.yaml`、Homebrew `etc/cliproxyapi.conf` 等 CLIProxyAPI 默认配置路径。
 
 ## 版本和评估
 
@@ -121,7 +126,7 @@ scripts/smoke_eino_local_proxy.sh
 KNOTE_KAG_FAKE=1 go test ./...
 python3 -m unittest discover -s adapters/kag -p '*test*.py'
 CGO_ENABLED=0 go build -o bin/knote ./cmd/knote
-scripts/smoke_fake_mvp.sh
+PYTHON=/usr/bin/python3 KNOTE_SMOKE_FORCE_BIN=1 scripts/smoke_fake_mvp.sh
 ```
 
 手动 Eino/OpenAI-compatible 验收：
@@ -139,4 +144,4 @@ scripts/smoke_eino_local_proxy.sh
 KNOTE_PYTHON=/path/to/python KNOTE_KAG_HOST=http://127.0.0.1:8887 scripts/smoke_real_kag.sh
 ```
 
-`v0.1.1` 不包含：把默认 runner 从 direct mode 切走、绕过 release PR 推进 main、或未获明确确认就自动创建 tag。
+`v0.1.1` 不包含：绕过 release PR 推进 main，或未获明确确认就自动创建 tag。
