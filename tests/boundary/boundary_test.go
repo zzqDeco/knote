@@ -57,6 +57,7 @@ func TestRuntimePackageImportBoundary(t *testing.T) {
 		t.Fatalf("go list runtime imports: %v", err)
 	}
 	for _, forbidden := range []string{
+		"/internal/agent",
 		"/internal/tui",
 		"/internal/knowledge/" + "kag",
 		"/internal/repository/" + "local",

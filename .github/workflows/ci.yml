@@ -40,4 +40,14 @@ jobs:
         run: CGO_ENABLED=0 go build -o bin/knote ./cmd/knote
 
       - name: Fake MVP acceptance smoke
-        run: scripts/smoke_fake_mvp.sh
+        env:
+          KNOTE_EINO_API_KEY: ${{ secrets.KNOTE_EINO_API_KEY }}
+          KNOTE_EINO_BASE_URL: ${{ vars.KNOTE_EINO_BASE_URL }}
+          KNOTE_EINO_MODEL: ${{ vars.KNOTE_EINO_MODEL }}
+          KNOTE_EINO_REASONING_EFFORT: ${{ vars.KNOTE_EINO_REASONING_EFFORT }}
+        run: |
+          if [[ -z "${KNOTE_EINO_API_KEY:-}" || -z "${KNOTE_EINO_BASE_URL:-}" || -z "${KNOTE_EINO_MODEL:-}" ]]; then
+            echo "Skipping fake MVP acceptance smoke: Eino-only TUI smoke requires KNOTE_EINO_API_KEY, KNOTE_EINO_BASE_URL, and KNOTE_EINO_MODEL."
+            exit 0
+          fi
+          scripts/smoke_fake_mvp.sh

@@ -9,22 +9,18 @@ import (
 	einotool "github.com/cloudwego/eino/components/tool"
 
 	"github.com/zzqDeco/knote/internal/repository"
-	"github.com/zzqDeco/knote/internal/runtime"
 	runtimeeino "github.com/zzqDeco/knote/internal/runtime/eino"
 )
 
-func newEinoRunner(ctx context.Context, mode runtime.RunnerMode, cfg repository.Config, tools []einotool.InvokableTool) (*runtimeeino.Runner, error) {
+func newEinoRunner(ctx context.Context, cfg repository.Config, tools []einotool.InvokableTool) (*runtimeeino.Runner, error) {
 	opts := runtimeeino.Options{Tools: tools}
-	if mode != runtime.RunnerModeEino {
-		return runtimeeino.NewRunner(opts), nil
-	}
 	profile, err := selectEinoModelProfile(cfg)
 	if err != nil {
 		return nil, err
 	}
 	agent, err := runtimeeino.NewChatModelAgent(ctx, runtimeeino.ChatModelAgentOptions{
 		Profile:          profile,
-		ProviderOverride: strings.TrimSpace(os.Getenv("KNOTE_EINO_PROVIDER")),
+		ProviderOverride: einoProviderOverride(),
 		ModelOverride:    firstEnv("KNOTE_EINO_MODEL", "OPENAI_MODEL"),
 		BaseURLOverride:  firstEnv("KNOTE_EINO_BASE_URL", "OPENAI_BASE_URL"),
 		APIKey:           firstEnv("KNOTE_EINO_API_KEY", "OPENAI_API_KEY"),
@@ -36,6 +32,16 @@ func newEinoRunner(ctx context.Context, mode runtime.RunnerMode, cfg repository.
 	}
 	opts.Agent = agent
 	return runtimeeino.NewRunner(opts), nil
+}
+
+func einoProviderOverride() string {
+	if provider := strings.TrimSpace(os.Getenv("KNOTE_EINO_PROVIDER")); provider != "" {
+		return provider
+	}
+	if firstEnv("KNOTE_EINO_MODEL", "OPENAI_MODEL", "KNOTE_EINO_API_KEY", "OPENAI_API_KEY", "KNOTE_EINO_BASE_URL", "OPENAI_BASE_URL") != "" {
+		return "openai-compatible"
+	}
+	return ""
 }
 
 func selectEinoModelProfile(cfg repository.Config) (runtimeeino.ChatModelProfile, error) {

@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -10,8 +11,6 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/zzqDeco/knote/internal/knowledge/kag"
-	"github.com/zzqDeco/knote/internal/knowledge/versioned"
 	"github.com/zzqDeco/knote/internal/protocol"
 	"github.com/zzqDeco/knote/internal/repository/local"
 	"github.com/zzqDeco/knote/internal/runtime"
@@ -165,16 +164,19 @@ func newTestAgent(t *testing.T, workspace string) (runtime.Runtime, []protocol.E
 	if err := repo.SaveConfig(ctx, cfg); err != nil {
 		return nil, nil, err
 	}
-	kagClient := kag.Client{
-		AdapterPath: cfg.KAG.AdapterPath,
-		Workspace:   workspace,
-		Host:        cfg.KAG.Host,
-		Fake:        cfg.KAG.Fake,
-		ConfigPath:  cfg.KAG.ConfigPath,
-		ProjectID:   cfg.KAG.ProjectID,
-		Namespace:   cfg.KAG.Namespace,
-		Language:    cfg.KAG.Language,
-		RuntimeDir:  cfg.KAG.RuntimeDir,
+	bridge := runtime.NewSideEffectBridge()
+	toolExecutor := &fakeToolExecutor{}
+	toolExecutor.onInvoke = func(ctx context.Context, sessionID string, toolName string, args string) ([]protocol.Event, error) {
+		action := strings.TrimPrefix(toolName, "knote_")
+		return nil, bridge.Request(ctx, runtime.SideEffectRequest{
+			ToolName:        toolName,
+			Action:          action,
+			ArgumentsInJSON: args,
+			Summary:         fmt.Sprintf("Run %s.", toolName),
+			Execute: func(context.Context, runtime.SideEffectRequest) ([]protocol.Event, error) {
+				return []protocol.Event{protocol.NewEvent(protocol.EventToolComplete, sessionID, toolName+" complete", nil)}, nil
+			},
+		})
 	}
 	rt := runtime.New(runtime.Dependencies{
 		Workspace:     workspace,
@@ -182,11 +184,38 @@ func newTestAgent(t *testing.T, workspace string) (runtime.Runtime, []protocol.E
 		Sessions:      repo,
 		Versions:      repo,
 		WorkspaceRepo: repo,
-		Knowledge:     versioned.New(versioned.Options{Workspace: workspace, Repo: repo, Versions: repo, Backend: kagClient, Mode: versioned.ModeFake}),
+		EinoRunner:    fakeEinoRunner{},
+		SideEffects:   bridge,
+		ToolExecutor:  toolExecutor,
 		NewSessionID:  local.NewSessionID,
 	})
 	initial, err := rt.Start(ctx, runtime.StartOptions{})
 	return rt, initial, err
+}
+
+type fakeEinoRunner struct{}
+
+func (fakeEinoRunner) Ready(context.Context) error {
+	return nil
+}
+
+func (fakeEinoRunner) ToolInventory(context.Context) ([]runtime.RunnerToolInfo, error) {
+	return []runtime.RunnerToolInfo{{Name: "knote_query", Description: "query knowledge"}}, nil
+}
+
+func (fakeEinoRunner) Run(_ context.Context, input runtime.EinoRunInput) ([]protocol.Event, error) {
+	return []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, input.SessionID, "fake answer", nil)}, nil
+}
+
+type fakeToolExecutor struct {
+	onInvoke func(context.Context, string, string, string) ([]protocol.Event, error)
+}
+
+func (e *fakeToolExecutor) Invoke(ctx context.Context, sessionID string, toolName string, argumentsInJSON string) ([]protocol.Event, error) {
+	if e.onInvoke != nil {
+		return e.onInvoke(ctx, sessionID, toolName, argumentsInJSON)
+	}
+	return []protocol.Event{protocol.NewEvent(protocol.EventToolComplete, sessionID, toolName+" complete", nil)}, nil
 }
 
 func updateModel(t *testing.T, model *Model, msg tea.Msg) {
