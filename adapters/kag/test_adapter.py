@@ -142,10 +142,49 @@ class AdapterTest(unittest.TestCase):
             text = config_path.read_text(encoding="utf-8")
             self.assertNotIn("{{", text)
             self.assertIn('base_url: "http://127.0.0.1:8317/v1"', text)
-            self.assertIn('api_key: "local:key"', text)
+            self.assertNotIn("local:key", text)
+            self.assertIn("api_key: !ENV KNOTE_OPENIE_LLM_API_KEY", text)
+            self.assertIn("api_key: !ENV KNOTE_CHAT_LLM_API_KEY", text)
             self.assertIn('model: "gpt-5.3-codex-spark"', text)
             self.assertIn('type: "mock"', text)
             self.assertIn("vector_dimensions: 256", text)
+
+    def test_generated_runtime_config_is_refreshed_on_build_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            runtime_dir = workspace / ".knote" / "kag-runtime"
+            params = {"workspace": str(workspace)}
+
+            with patch.dict(os.environ, {"KNOTE_OPENIE_LLM_MODEL": "first"}, clear=False):
+                config_path = adapter.select_config(params, runtime_dir)
+            self.assertIn('model: "first"', config_path.read_text(encoding="utf-8"))
+
+            with patch.dict(os.environ, {"KNOTE_OPENIE_LLM_MODEL": "second"}, clear=False):
+                config_path = adapter.select_config(params, runtime_dir)
+            text = config_path.read_text(encoding="utf-8")
+            self.assertIn('model: "second"', text)
+            self.assertNotIn('model: "first"', text)
+
+    def test_generated_config_keeps_env_api_keys_dynamic(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            params = {"workspace": str(workspace)}
+            env = {
+                "KNOTE_OPENIE_LLM_API_KEY": "openie-secret",
+                "KNOTE_CHAT_LLM_API_KEY": "chat-secret",
+                "KNOTE_VECTOR_API_KEY": "vector-secret",
+            }
+
+            with patch.dict(os.environ, env, clear=False):
+                config_path = adapter.select_config(params, workspace / ".knote" / "kag-runtime")
+
+            text = config_path.read_text(encoding="utf-8")
+            self.assertIn("api_key: !ENV KNOTE_OPENIE_LLM_API_KEY", text)
+            self.assertIn("api_key: !ENV KNOTE_CHAT_LLM_API_KEY", text)
+            self.assertIn("api_key: !ENV KNOTE_VECTOR_API_KEY", text)
+            self.assertNotIn("openie-secret", text)
+            self.assertNotIn("chat-secret", text)
+            self.assertNotIn("vector-secret", text)
 
     def test_generated_config_rejects_invalid_vector_dimensions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
