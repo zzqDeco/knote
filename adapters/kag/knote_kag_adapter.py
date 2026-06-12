@@ -14,11 +14,13 @@ import os
 import re
 import sys
 import time
+from ipaddress import ip_address
 from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
 from typing import Any
 from urllib import error as urlerror
+from urllib import parse as urlparse
 from urllib import request as urlrequest
 
 
@@ -276,6 +278,107 @@ def resolve_config_value(value: str) -> str:
             return default.strip().strip("'\"")
         return ""
     return value
+
+
+def split_no_proxy(value: str) -> list[str]:
+    return [entry.strip() for entry in value.split(",") if entry.strip()]
+
+
+def no_proxy_key(entry: str) -> str:
+    return entry.strip().lower()
+
+
+def no_proxy_entries() -> list[str]:
+    entries: list[str] = []
+    seen: set[str] = set()
+    for env_name in ("NO_PROXY", "no_proxy"):
+        for entry in split_no_proxy(os.environ.get(env_name, "")):
+            key = no_proxy_key(entry)
+            if key in seen:
+                continue
+            entries.append(entry)
+            seen.add(key)
+    return entries
+
+
+def endpoint_host(value: str) -> str:
+    value = resolve_config_value(value).strip()
+    if not value:
+        return ""
+    parsed = urlparse.urlparse(value)
+    if not parsed.hostname and "://" not in value:
+        parsed = urlparse.urlparse("//" + value)
+    return (parsed.hostname or "").strip().strip("[]").rstrip(".")
+
+
+def local_no_proxy_host(host: str) -> bool:
+    host = host.strip().strip("[]").rstrip(".").lower()
+    if not host:
+        return False
+    if host == "localhost" or host.endswith(".local"):
+        return True
+    try:
+        addr = ip_address(host)
+    except ValueError:
+        return False
+    return addr.is_loopback or addr.is_private or addr.is_link_local
+
+
+def config_endpoint_values(config_path: Path) -> list[str]:
+    if not config_path.exists():
+        return []
+    values: list[str] = []
+    for line in config_path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if stripped.startswith(("host_addr:", "base_url:")):
+            values.append(stripped.split(":", 1)[1].strip())
+    return values
+
+
+def local_no_proxy_entries(params: dict[str, Any], config_path: Path | None = None) -> list[str]:
+    values: list[str] = [
+        "localhost",
+        "127.0.0.1",
+        "::1",
+        str(params.get("host") or ""),
+        str(params.get("openie_llm_base_url") or ""),
+        str(params.get("chat_llm_base_url") or ""),
+        str(params.get("vector_base_url") or ""),
+        os.environ.get("KNOTE_OPENIE_LLM_BASE_URL", ""),
+        os.environ.get("KNOTE_CHAT_LLM_BASE_URL", ""),
+        os.environ.get("KNOTE_VECTOR_BASE_URL", ""),
+    ]
+    if config_path is not None:
+        values.extend(config_endpoint_values(config_path))
+
+    entries: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        host = endpoint_host(value)
+        if not host and value in {"localhost", "127.0.0.1", "::1"}:
+            host = value
+        if not local_no_proxy_host(host):
+            continue
+        key = no_proxy_key(host)
+        if key in seen:
+            continue
+        entries.append(host)
+        seen.add(key)
+    return entries
+
+
+def ensure_local_no_proxy(params: dict[str, Any], config_path: Path | None = None) -> None:
+    entries = no_proxy_entries()
+    seen = {no_proxy_key(entry) for entry in entries}
+    for entry in local_no_proxy_entries(params, config_path):
+        key = no_proxy_key(entry)
+        if key in seen:
+            continue
+        entries.append(entry)
+        seen.add(key)
+    value = ",".join(entries)
+    os.environ["NO_PROXY"] = value
+    os.environ["no_proxy"] = value
 
 
 def config_setting(params: dict[str, Any], param_name: str, env_name: str, default: str) -> str:
@@ -558,6 +661,7 @@ def fake_response(req: dict[str, Any]) -> None:
 
 def check_real_health(req: dict[str, Any], host_override: str = "") -> tuple[dict[str, Any] | None, str | None]:
     params = req.get("params") or {}
+    ensure_local_no_proxy(params)
     host = (host_override or params.get("host") or "http://127.0.0.1:8887").rstrip("/")
     try:
         import kag  # type: ignore
@@ -606,6 +710,7 @@ def run_kag_build(req: dict[str, Any]) -> dict[str, Any]:
     if not records:
         raise RuntimeError(f"no Markdown or text sources found under {workspace / 'sources'}")
     config_path = select_config(params, out_dir)
+    ensure_local_no_proxy(params, config_path)
     init_kag_config(config_path)
 
     from kag.builder.runner import BuilderChainRunner  # type: ignore
@@ -682,6 +787,7 @@ def run_kag_query(req: dict[str, Any], explain: bool = False) -> dict[str, Any]:
         raise RuntimeError("query is required")
     out_dir = runtime_dir(params)
     config_path = select_config(params, out_dir, generate=False)
+    ensure_local_no_proxy(params, config_path)
     init_kag_config(config_path)
 
     from kag.common.conf import KAG_CONFIG  # type: ignore
@@ -725,6 +831,7 @@ def real_response(req: dict[str, Any]) -> None:
     except Exception as exc:
         error(req_id, str(exc))
         return
+    ensure_local_no_proxy(params, config_path)
     health, health_error = check_real_health(req, config_host(config_path))
     if health_error:
         error(req_id, health_error)
