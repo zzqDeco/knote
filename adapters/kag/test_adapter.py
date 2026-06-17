@@ -186,6 +186,76 @@ class AdapterTest(unittest.TestCase):
             self.assertNotIn("chat-secret", text)
             self.assertNotIn("vector-secret", text)
 
+    def test_local_no_proxy_preserves_existing_entries(self) -> None:
+        with patch.dict(os.environ, {"NO_PROXY": "example.com"}, clear=True):
+            adapter.ensure_local_no_proxy({"host": "http://127.0.0.1:8887"})
+
+            entries = os.environ["NO_PROXY"].split(",")
+            self.assertEqual(entries[0], "example.com")
+            self.assertIn("localhost", entries)
+            self.assertIn("127.0.0.1", entries)
+            self.assertEqual(os.environ["no_proxy"], os.environ["NO_PROXY"])
+
+    def test_local_no_proxy_merges_lowercase_env(self) -> None:
+        with patch.dict(os.environ, {"no_proxy": "example.org"}, clear=True):
+            adapter.ensure_local_no_proxy({"host": "http://localhost:8887"})
+
+            entries = os.environ["NO_PROXY"].split(",")
+            self.assertEqual(entries[0], "example.org")
+            self.assertIn("localhost", entries)
+            self.assertEqual(os.environ["no_proxy"], os.environ["NO_PROXY"])
+
+    def test_local_no_proxy_collects_config_and_private_hosts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "kag_config.yaml"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "project:",
+                        "  host_addr: http://192.168.31.59:8887",
+                        "openie_llm:",
+                        "  base_url: http://127.0.0.1:8317/v1",
+                        "chat_llm:",
+                        "  base_url: https://api.openai.com/v1",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.dict(os.environ, {}, clear=True):
+                adapter.ensure_local_no_proxy({"host": "http://127.0.0.1:8887"}, config_path)
+
+                entries = os.environ["NO_PROXY"].split(",")
+                self.assertIn("127.0.0.1", entries)
+                self.assertIn("192.168.31.59", entries)
+                self.assertNotIn("api.openai.com", entries)
+
+    def test_local_no_proxy_resolves_env_config_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "kag_config.yaml"
+            config_path.write_text(
+                "\n".join(
+                    [
+                        "openie_llm:",
+                        "  base_url: !ENV KNOTE_OPENIE_LLM_BASE_URL",
+                        "chat_llm:",
+                        "  base_url: !ENV KNOTE_CHAT_LLM_BASE_URL",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            env = {
+                "KNOTE_OPENIE_LLM_BASE_URL": "http://127.0.0.1:8317/v1",
+                "KNOTE_CHAT_LLM_BASE_URL": "https://api.openai.com/v1",
+            }
+
+            with patch.dict(os.environ, env, clear=True):
+                adapter.ensure_local_no_proxy({}, config_path)
+
+                entries = os.environ["NO_PROXY"].split(",")
+                self.assertIn("127.0.0.1", entries)
+                self.assertNotIn("api.openai.com", entries)
+
     def test_generated_config_rejects_invalid_vector_dimensions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
