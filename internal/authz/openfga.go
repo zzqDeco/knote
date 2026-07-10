@@ -139,6 +139,9 @@ func (a *OpenFGAAuthorizer) Check(ctx context.Context, request CheckRequest) (De
 }
 
 func (a *OpenFGAAuthorizer) BatchCheck(ctx context.Context, request BatchCheckRequest) ([]Decision, error) {
+	if err := validateBatchSize(len(request.Checks)); err != nil {
+		return nil, err
+	}
 	denied := deniedBatch(request)
 	if ctx == nil {
 		return denied, fmt.Errorf("%w: context is nil", ErrInvalidRequest)

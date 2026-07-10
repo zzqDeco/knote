@@ -20,17 +20,17 @@ func TestLocalAuthorizerTruthTable(t *testing.T) {
 		object   string
 		allowed  bool
 	}{
-		{name: "inherited group read", user: "user:alice", relation: RelationCanRead, object: "document:welcome", allowed: true},
+		{name: "inherited group read", user: "user:alice", relation: RelationCanView, object: "document:welcome", allowed: true},
 		{name: "computed inherited reader", user: "user:alice", relation: relationInheritedReader, object: "document:welcome", allowed: true},
 		{name: "computed unscoped reader", user: "user:alice", relation: relationUnscopedReader, object: "document:welcome", allowed: true},
 		{name: "inherited group edit denied", user: "user:alice", relation: RelationCanEdit, object: "document:welcome", allowed: false},
 		{name: "inherited editor", user: "user:erin", relation: RelationCanEdit, object: "document:welcome", allowed: true},
 		{name: "computed inherited editor", user: "user:erin", relation: relationInheritedEditor, object: "document:welcome", allowed: true},
-		{name: "cross tenant share", user: "user:mallory", relation: RelationCanRead, object: "document:cross-tenant", allowed: false},
-		{name: "restricted inherited read", user: "user:alice", relation: RelationCanRead, object: "document:restricted", allowed: false},
+		{name: "cross tenant share", user: "user:mallory", relation: RelationCanView, object: "document:cross-tenant", allowed: false},
+		{name: "restricted inherited read", user: "user:alice", relation: RelationCanView, object: "document:restricted", allowed: false},
 		{name: "restricted computed inherited read", user: "user:alice", relation: relationInheritedReader, object: "document:restricted", allowed: false},
-		{name: "restricted direct share", user: "user:bob", relation: RelationCanRead, object: "document:restricted", allowed: true},
-		{name: "direct share", user: "user:bob", relation: RelationCanRead, object: "document:direct", allowed: true},
+		{name: "restricted direct share", user: "user:bob", relation: RelationCanView, object: "document:restricted", allowed: true},
+		{name: "direct share", user: "user:bob", relation: RelationCanView, object: "document:direct", allowed: true},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -56,17 +56,17 @@ func TestLocalAuthorizerGroupAddRemoveAndDirectRevoke(t *testing.T) {
 	if err := authorizer.RemoveTuple(membership); err != nil {
 		t.Fatalf("remove membership: %v", err)
 	}
-	assertLocalDecision(t, authorizer, "user:alice", RelationCanRead, "document:welcome", false)
+	assertLocalDecision(t, authorizer, "user:alice", RelationCanView, "document:welcome", false)
 	if err := authorizer.AddTuple(membership); err != nil {
 		t.Fatalf("add membership: %v", err)
 	}
-	assertLocalDecision(t, authorizer, "user:alice", RelationCanRead, "document:welcome", true)
+	assertLocalDecision(t, authorizer, "user:alice", RelationCanView, "document:welcome", true)
 
 	share := Tuple{User: "user:bob", Relation: RelationViewer, Object: "document:direct"}
 	if err := authorizer.RemoveTuple(share); err != nil {
 		t.Fatalf("revoke direct share: %v", err)
 	}
-	assertLocalDecision(t, authorizer, "user:bob", RelationCanRead, "document:direct", false)
+	assertLocalDecision(t, authorizer, "user:bob", RelationCanView, "document:direct", false)
 	if err := authorizer.RemoveTuple(share); err != nil {
 		t.Fatalf("idempotent stale tuple cleanup: %v", err)
 	}
@@ -77,8 +77,8 @@ func TestLocalAuthorizerBatchIsOrderedAndFailsClosed(t *testing.T) {
 	request := BatchCheckRequest{
 		AuthorizationModelID: localTestModelID,
 		Checks: []BatchCheckItem{
-			{CorrelationID: "second", User: "user:mallory", Relation: RelationCanRead, Object: "document:cross-tenant"},
-			{CorrelationID: "first", User: "user:alice", Relation: RelationCanRead, Object: "document:welcome"},
+			{CorrelationID: "second", User: "user:mallory", Relation: RelationCanView, Object: "document:cross-tenant"},
+			{CorrelationID: "first", User: "user:alice", Relation: RelationCanView, Object: "document:welcome"},
 		},
 	}
 	decisions, err := authorizer.BatchCheck(context.Background(), request)
@@ -106,16 +106,49 @@ func TestLocalAuthorizerBatchIsOrderedAndFailsClosed(t *testing.T) {
 }
 
 func TestBatchCheckRequestRejectsOversizedBatch(t *testing.T) {
+	authorizer := newLocalTestAuthorizer(t)
 	checks := make([]BatchCheckItem, MaxBatchChecks+1)
 	for i := range checks {
 		checks[i] = BatchCheckItem{
 			CorrelationID: fmt.Sprintf("check-%d", i), User: "user:alice",
-			Relation: RelationCanRead, Object: "document:welcome",
+			Relation: RelationCanView, Object: "document:welcome",
 		}
 	}
 	request := BatchCheckRequest{AuthorizationModelID: localTestModelID, Checks: checks}
 	if err := request.Validate(); !errors.Is(err, ErrInvalidRequest) {
 		t.Fatalf("oversized batch error = %v", err)
+	}
+	decisions, err := authorizer.BatchCheck(context.Background(), request)
+	if !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("oversized batch check error = %v", err)
+	}
+	if decisions != nil {
+		t.Fatalf("oversized batch allocated decisions: %#v", decisions)
+	}
+}
+
+func TestCheckRequestsRejectUsersetPrincipals(t *testing.T) {
+	authorizer := newLocalTestAuthorizer(t)
+	request := CheckRequest{
+		User:                 "group:engineering#member",
+		Relation:             RelationCanView,
+		Object:               "document:restricted",
+		AuthorizationModelID: localTestModelID,
+	}
+	decision, err := authorizer.Check(context.Background(), request)
+	if !errors.Is(err, ErrInvalidRequest) || decision.Allowed {
+		t.Fatalf("userset check decision=%#v error=%v", decision, err)
+	}
+
+	decisions, err := authorizer.BatchCheck(context.Background(), BatchCheckRequest{
+		AuthorizationModelID: localTestModelID,
+		Checks: []BatchCheckItem{{
+			CorrelationID: "userset", User: request.User,
+			Relation: request.Relation, Object: request.Object,
+		}},
+	})
+	if !errors.Is(err, ErrInvalidRequest) || len(decisions) != 1 || decisions[0].Allowed {
+		t.Fatalf("userset batch decisions=%#v error=%v", decisions, err)
 	}
 }
 
@@ -125,7 +158,7 @@ func TestBatchCheckRequestRejectsInvalidCorrelationIDs(t *testing.T) {
 			AuthorizationModelID: localTestModelID,
 			Checks: []BatchCheckItem{{
 				CorrelationID: correlationID, User: "user:alice",
-				Relation: RelationCanRead, Object: "document:welcome",
+				Relation: RelationCanView, Object: "document:welcome",
 			}},
 		}
 		if err := request.Validate(); !errors.Is(err, ErrInvalidRequest) {
@@ -138,7 +171,7 @@ func TestLocalAuthorizerModelMismatchAndCancellationDeny(t *testing.T) {
 	authorizer := newLocalTestAuthorizer(t)
 	request := CheckRequest{
 		User:                 "user:alice",
-		Relation:             RelationCanRead,
+		Relation:             RelationCanView,
 		Object:               "document:welcome",
 		AuthorizationModelID: "01GXSB9YR785C4FYS3C0RTG7B2",
 	}

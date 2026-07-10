@@ -29,6 +29,9 @@ func TestOpenFGACheckUsesPinnedModelTokenAndConsistency(t *testing.T) {
 		var body struct {
 			AuthorizationModelID string `json:"authorization_model_id"`
 			Consistency          string `json:"consistency"`
+			TupleKey             struct {
+				Relation string `json:"relation"`
+			} `json:"tuple_key"`
 		}
 		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
 			t.Errorf("decode request: %v", err)
@@ -39,12 +42,15 @@ func TestOpenFGACheckUsesPinnedModelTokenAndConsistency(t *testing.T) {
 		if body.Consistency != "HIGHER_CONSISTENCY" {
 			t.Errorf("consistency = %q", body.Consistency)
 		}
+		if body.TupleKey.Relation != RelationCanView {
+			t.Errorf("relation = %q, want %q", body.TupleKey.Relation, RelationCanView)
+		}
 		writeJSON(t, writer, `{"allowed":true}`)
 	}))
 
 	decision, err := authorizer.Check(context.Background(), CheckRequest{
 		User:                 "user:alice",
-		Relation:             RelationCanRead,
+		Relation:             RelationCanView,
 		Object:               "document:welcome",
 		AuthorizationModelID: openFGATestModelID,
 	})
@@ -74,6 +80,33 @@ func TestOpenFGABatchPreservesInputOrderAndOrdinaryDeny(t *testing.T) {
 	}
 	if !reflect.DeepEqual(decisions, want) {
 		t.Fatalf("decisions = %#v, want %#v", decisions, want)
+	}
+}
+
+func TestOpenFGABatchRejectsOversizedWithoutCallingService(t *testing.T) {
+	var calls atomic.Int32
+	authorizer := newTestOpenFGA(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		calls.Add(1)
+	}))
+	checks := make([]BatchCheckItem, MaxBatchChecks+1)
+	for index := range checks {
+		checks[index] = BatchCheckItem{
+			CorrelationID: fmt.Sprintf("check-%d", index), User: "user:alice",
+			Relation: RelationCanView, Object: "document:welcome",
+		}
+	}
+	decisions, err := authorizer.BatchCheck(context.Background(), BatchCheckRequest{
+		AuthorizationModelID: openFGATestModelID,
+		Checks:               checks,
+	})
+	if !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("oversized batch error = %v", err)
+	}
+	if decisions != nil {
+		t.Fatalf("oversized batch allocated decisions: %#v", decisions)
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("service calls = %d, want 0", calls.Load())
 	}
 }
 
@@ -128,7 +161,7 @@ func TestOpenFGATimeoutAndServiceFailureDeny(t *testing.T) {
 		}))
 		decision, err := authorizer.Check(context.Background(), CheckRequest{
 			User:                 "user:alice",
-			Relation:             RelationCanRead,
+			Relation:             RelationCanView,
 			Object:               "document:welcome",
 			AuthorizationModelID: openFGATestModelID,
 		})
@@ -157,7 +190,7 @@ func TestOpenFGAModelMismatchDeniesWithoutCallingService(t *testing.T) {
 	}))
 	decision, err := authorizer.Check(context.Background(), CheckRequest{
 		User:                 "user:alice",
-		Relation:             RelationCanRead,
+		Relation:             RelationCanView,
 		Object:               "document:welcome",
 		AuthorizationModelID: "01GXSB9YR785C4FYS3C0RTG7B2",
 	})
@@ -225,8 +258,8 @@ func testBatchRequest() BatchCheckRequest {
 	return BatchCheckRequest{
 		AuthorizationModelID: openFGATestModelID,
 		Checks: []BatchCheckItem{
-			{CorrelationID: "deny-item", User: "user:mallory", Relation: RelationCanRead, Object: "document:welcome"},
-			{CorrelationID: "allow-item", User: "user:alice", Relation: RelationCanRead, Object: "document:welcome"},
+			{CorrelationID: "deny-item", User: "user:mallory", Relation: RelationCanView, Object: "document:welcome"},
+			{CorrelationID: "allow-item", User: "user:alice", Relation: RelationCanView, Object: "document:welcome"},
 		},
 	}
 }

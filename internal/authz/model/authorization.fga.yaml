@@ -17,7 +17,7 @@ tests:
       - user: user:mallory
         object: document:shared
         assertions:
-          can_read: false
+          can_view: false
 
   - name: group-membership-add
     tuples:
@@ -43,7 +43,7 @@ tests:
       - user: user:alice
         object: document:welcome
         assertions:
-          can_read: true
+          can_view: true
           can_edit: false
 
   - name: group-membership-remove
@@ -67,7 +67,7 @@ tests:
       - user: user:alice
         object: document:welcome
         assertions:
-          can_read: false
+          can_view: false
 
   - name: inherited-read-and-edit
     tuples:
@@ -90,7 +90,7 @@ tests:
       - user: user:erin
         object: document:welcome
         assertions:
-          can_read: true
+          can_view: true
           can_edit: true
 
   - name: restricted-child-blocks-only-inheritance
@@ -123,11 +123,11 @@ tests:
       - user: user:alice
         object: document:restricted
         assertions:
-          can_read: false
+          can_view: false
       - user: user:bob
         object: document:restricted
         assertions:
-          can_read: true
+          can_view: true
 
   - name: direct-share
     tuples:
@@ -144,7 +144,7 @@ tests:
       - user: user:bob
         object: document:direct
         assertions:
-          can_read: true
+          can_view: true
 
   - name: direct-share-revoke
     tuples:
@@ -158,4 +158,4 @@ tests:
       - user: user:bob
         object: document:direct
         assertions:
-          can_read: false
+          can_view: false

@@ -179,6 +179,9 @@ func (a *LocalAuthorizer) Check(ctx context.Context, request CheckRequest) (Deci
 }
 
 func (a *LocalAuthorizer) BatchCheck(ctx context.Context, request BatchCheckRequest) ([]Decision, error) {
+	if err := validateBatchSize(len(request.Checks)); err != nil {
+		return nil, err
+	}
 	denied := deniedBatch(request)
 	if ctx == nil {
 		return denied, fmt.Errorf("%w: context is nil", ErrInvalidRequest)
@@ -261,7 +264,7 @@ func (a *LocalAuthorizer) evaluateKnowledgeBaseLocked(user, relation, object str
 			return viewer, err
 		}
 		return a.directLocked(user, RelationEditor, object, visiting)
-	case RelationCanRead:
+	case RelationCanView:
 		return a.intersectOrganizationLocked(user, relationUnscopedReader, object, visiting)
 	case RelationCanEdit:
 		return a.intersectOrganizationLocked(user, RelationEditor, object, visiting)
@@ -279,7 +282,7 @@ func (a *LocalAuthorizer) evaluateDocumentLocked(user, relation, object string, 
 		if err != nil || restricted {
 			return false, err
 		}
-		parentRelation := RelationCanRead
+		parentRelation := RelationCanView
 		if relation == relationInheritedEditor {
 			parentRelation = RelationCanEdit
 		}
@@ -300,7 +303,7 @@ func (a *LocalAuthorizer) evaluateDocumentLocked(user, relation, object string, 
 			return editor, err
 		}
 		return a.evaluateLocked(user, relationInheritedEditor, object, visiting)
-	case RelationCanRead:
+	case RelationCanView:
 		return a.intersectOrganizationLocked(user, relationUnscopedReader, object, visiting)
 	case RelationCanEdit:
 		return a.intersectOrganizationLocked(user, relationUnscopedEditor, object, visiting)

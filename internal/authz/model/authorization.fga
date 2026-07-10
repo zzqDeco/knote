@@ -17,7 +17,7 @@ type knowledge_base
     define viewer: [user, group#member]
     define editor: [user, group#member]
     define unscoped_reader: viewer or editor
-    define can_read: member from organization and unscoped_reader
+    define can_view: member from organization and unscoped_reader
     define can_edit: member from organization and editor
 
 type document
@@ -27,9 +27,9 @@ type document
     define viewer: [user, group#member]
     define editor: [user, group#member]
     define restricted: [user:*]
-    define inherited_reader: can_read from parent but not restricted
+    define inherited_reader: can_view from parent but not restricted
     define inherited_editor: can_edit from parent but not restricted
     define unscoped_reader: viewer or editor or inherited_reader
     define unscoped_editor: editor or inherited_editor
-    define can_read: member from organization and unscoped_reader
+    define can_view: member from organization and unscoped_reader
     define can_edit: member from organization and unscoped_editor

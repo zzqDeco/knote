@@ -8,6 +8,8 @@ import (
 	"strings"
 	"time"
 	"unicode"
+
+	"github.com/zzqDeco/knote/internal/protocol"
 )
 
 const (
@@ -30,7 +32,7 @@ const (
 	RelationViewer       = "viewer"
 	RelationEditor       = "editor"
 	RelationRestricted   = "restricted"
-	RelationCanRead      = "can_read"
+	RelationCanView      = protocol.EvidenceReadRelation
 	RelationCanEdit      = "can_edit"
 )
 
@@ -120,7 +122,7 @@ func (r CheckRequest) Validate() error {
 	if err := validateModelID(r.AuthorizationModelID); err != nil {
 		return err
 	}
-	if err := validateSubject("user", r.User); err != nil {
+	if err := validatePrincipal("user", r.User); err != nil {
 		return err
 	}
 	if err := validateRelation(r.Relation); err != nil {
@@ -152,11 +154,8 @@ func (r BatchCheckRequest) Validate() error {
 	if err := r.Consistency.validate(true); err != nil {
 		return err
 	}
-	if len(r.Checks) == 0 {
-		return fmt.Errorf("%w: batch must contain at least one check", ErrInvalidRequest)
-	}
-	if len(r.Checks) > MaxBatchChecks {
-		return fmt.Errorf("%w: batch cannot contain more than %d checks", ErrInvalidRequest, MaxBatchChecks)
+	if err := validateBatchSize(len(r.Checks)); err != nil {
+		return err
 	}
 	seen := make(map[string]struct{}, len(r.Checks))
 	for index, check := range r.Checks {
@@ -167,7 +166,7 @@ func (r BatchCheckRequest) Validate() error {
 			return fmt.Errorf("%w: duplicate correlation_id %q", ErrInvalidRequest, check.CorrelationID)
 		}
 		seen[check.CorrelationID] = struct{}{}
-		if err := validateSubject("user", check.User); err != nil {
+		if err := validatePrincipal("user", check.User); err != nil {
 			return fmt.Errorf("check %q: %w", check.CorrelationID, err)
 		}
 		if err := validateRelation(check.Relation); err != nil {
@@ -183,6 +182,16 @@ func (r BatchCheckRequest) Validate() error {
 func validateCorrelationID(value string) error {
 	if !correlationPattern.MatchString(value) {
 		return fmt.Errorf("%w: correlation_id must contain only letters, numbers, or hyphens and be at most 36 characters", ErrInvalidRequest)
+	}
+	return nil
+}
+
+func validateBatchSize(size int) error {
+	if size == 0 {
+		return fmt.Errorf("%w: batch must contain at least one check", ErrInvalidRequest)
+	}
+	if size > MaxBatchChecks {
+		return fmt.Errorf("%w: batch cannot contain more than %d checks", ErrInvalidRequest, MaxBatchChecks)
 	}
 	return nil
 }
@@ -264,6 +273,17 @@ func validateObject(name, value string) error {
 func validateSubject(name, value string) error {
 	_, err := parseReference(name, value, true)
 	return err
+}
+
+func validatePrincipal(name, value string) error {
+	ref, err := parseReference(name, value, false)
+	if err != nil {
+		return err
+	}
+	if ref.typeName != TypeUser || ref.id == "*" {
+		return fmt.Errorf("%w: %s must be a concrete %s:<id>", ErrInvalidRequest, name, TypeUser)
+	}
+	return nil
 }
 
 type reference struct {
