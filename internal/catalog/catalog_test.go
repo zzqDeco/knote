@@ -198,6 +198,108 @@ func TestProjectionPlanIsDeterministicAndBoundToRun(t *testing.T) {
 	}
 }
 
+func TestPlanResourcesRejectsIncompleteDesiredDependencyClosure(t *testing.T) {
+	scope := testScope()
+	currentSnapshot := testSnapshot(t, scope, "source-v1")
+	current := testProjection(t, scope, "projection-v1", currentSnapshot.Ref(), nil)
+	nextSnapshot := testSnapshot(t, scope, "source-v2")
+	run := testRun(scope, current.Version, "projection-v2", nextSnapshot.Ref())
+
+	for _, resourceType := range []protocol.ResourceType{
+		protocol.ResourceClaim, protocol.ResourceEntity, protocol.ResourceDerivedArtifact,
+	} {
+		t.Run(string(resourceType)+" empty dependencies", func(t *testing.T) {
+			desired := testMetadata(
+				t, scope, resourceType, string(resourceType)+":a", "derived", "source-v2",
+				"content-v2", run.ProjectionVersion, "", string(resourceType)+":a",
+			)
+			if _, err := PlanResources(run, current, []ResourceMetadata{desired}); err == nil {
+				t.Fatal("planner returned operations for a dependency-less derived target")
+			}
+		})
+	}
+
+	t.Run("dependency absent from replacement", func(t *testing.T) {
+		desired := testMetadata(
+			t, scope, protocol.ResourceEntity, "entity:a", "entity", "source-v2",
+			"content-v2", run.ProjectionVersion, "", "entity:a",
+		)
+		missing, err := protocol.NewStableResourceID(
+			scope.TenantID, scope.KnowledgeBaseID, protocol.ResourceClaim, "claim:missing",
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		desired.Dependencies = []protocol.ResourceID{missing}
+		if _, err := PlanResources(run, current, []ResourceMetadata{desired}); err == nil {
+			t.Fatal("planner returned operations with a dependency absent from the desired replacement")
+		}
+	})
+}
+
+func TestPlanResourcesAllowsClosedInitialDerivedProjection(t *testing.T) {
+	scope := testScope()
+	currentSnapshot := testSnapshot(t, scope, "source-v1")
+	current := testProjection(t, scope, "projection-v1", currentSnapshot.Ref(), nil)
+	nextSnapshot := testSnapshot(t, scope, "source-v2", "sources/a.md")
+	run := testRun(scope, current.Version, "projection-v2", nextSnapshot.Ref())
+	document := testMetadata(
+		t, scope, protocol.ResourceDocument, "sources/a.md", "document", "source-v2",
+		"content-document-v2", run.ProjectionVersion, "", "doc:a",
+	)
+	entity := testMetadata(
+		t, scope, protocol.ResourceEntity, "entity:a", "entity", "source-v2",
+		"content-entity-v2", run.ProjectionVersion, "", "entity:a",
+	)
+	entity.Dependencies = []protocol.ResourceID{document.ResourceID}
+
+	if _, err := PlanResources(run, current, []ResourceMetadata{document, entity}); err != nil {
+		t.Fatalf("planner rejected a closed initial desired projection: %v", err)
+	}
+}
+
+func TestPlanResourcesRejectsDesiredDocumentCountMismatch(t *testing.T) {
+	scope := testScope()
+	currentSnapshot := testSnapshot(t, scope, "source-v1")
+	current := testProjection(t, scope, "projection-v1", currentSnapshot.Ref(), nil)
+	nextSnapshot := testSnapshot(t, scope, "source-v2", "sources/a.md", "sources/b.md")
+	run := testRun(scope, current.Version, "projection-v2", nextSnapshot.Ref())
+	documentA := testMetadata(
+		t, scope, protocol.ResourceDocument, "sources/a.md", "document-a", "source-v2",
+		"content-a-v2", run.ProjectionVersion, "", "doc:a",
+	)
+
+	if _, err := PlanResources(run, current, []ResourceMetadata{documentA}); err == nil {
+		t.Fatal("planner returned operations for a desired document count that mismatches the source snapshot")
+	}
+}
+
+func TestProjectionDocumentCountHandlesRevokedAndRemovedRecords(t *testing.T) {
+	scope := testScope()
+	withDocument := testSnapshot(t, scope, "source-v1", "sources/a.md")
+	revoked := published(testMetadata(
+		t, scope, protocol.ResourceDocument, "sources/a.md", "document", "source-v1",
+		"content-v1", "projection-v1", "", "doc:a",
+	))
+	revoked.ServingState = StateRevoked
+	if _, err := NewProjection(
+		scope, "projection-v1", withDocument.Ref(), StatePublished, []ResourceMetadata{revoked},
+	); err != nil {
+		t.Fatalf("projection rejected a revoked document still present in the source snapshot: %v", err)
+	}
+
+	withoutDocument := testSnapshot(t, scope, "source-v2")
+	tombstoned := revoked
+	tombstoned.Versions.Source = "source-v2"
+	tombstoned.Versions.Projection = "projection-v2"
+	tombstoned.ServingState = StateTombstoned
+	if _, err := NewProjection(
+		scope, "projection-v2", withoutDocument.Ref(), StatePublished, []ResourceMetadata{tombstoned},
+	); err != nil {
+		t.Fatalf("projection counted a tombstoned document as part of the source snapshot: %v", err)
+	}
+}
+
 func TestFailedACLOrIndexProjectionCannotServe(t *testing.T) {
 	for _, failedKind := range []OperationKind{OperationProjectACL, OperationProjectIndex} {
 		t.Run(string(failedKind), func(t *testing.T) {
@@ -715,7 +817,7 @@ func TestRevocationOfUnknownResourceReturnsErrorWithoutPanic(t *testing.T) {
 
 func TestPlannerSkipsAlreadyTerminalResources(t *testing.T) {
 	scope := testScope()
-	snapshot := testSnapshot(t, scope, "source-v1", "sources/old.md")
+	snapshot := testSnapshot(t, scope, "source-v1")
 	terminal := published(testMetadata(t, scope, protocol.ResourceDocument, "sources/old.md", "old", "source-v1", "content-v1", "projection-v1", "", "doc:old"))
 	terminal.ServingState = StateSuperseded
 	current := testProjection(t, scope, "projection-v1", snapshot.Ref(), []ResourceMetadata{terminal})

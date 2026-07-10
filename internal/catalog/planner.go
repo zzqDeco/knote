@@ -214,6 +214,7 @@ func (p Projection) Validate() error {
 		return err
 	}
 	resourcesByID := make(map[protocol.ResourceID]ResourceMetadata, len(p.Resources))
+	snapshotDocumentCount := 0
 	for i, resource := range p.Resources {
 		if err := resource.Validate(); err != nil {
 			return fmt.Errorf("resource %s: %w", resource.ResourceID, err)
@@ -240,6 +241,16 @@ func (p Projection) Validate() error {
 		if p.State != StatePublished && resource.IsServing() {
 			return fmt.Errorf("non-published projection contains serving resource %s", resource.ResourceID)
 		}
+		if p.State == StatePublished && resource.Type == protocol.ResourceDocument &&
+			(resource.IsServing() || resource.ServingState == StateRevoked) {
+			snapshotDocumentCount++
+		}
+	}
+	if p.State == StatePublished && snapshotDocumentCount != p.SourceSnapshot.DocumentCount {
+		return fmt.Errorf(
+			"projection document count %d does not match source snapshot document count %d",
+			snapshotDocumentCount, p.SourceSnapshot.DocumentCount,
+		)
 	}
 	for _, resource := range p.Resources {
 		if resource.IsServing() && resource.Type != protocol.ResourceDocument &&
@@ -488,6 +499,9 @@ func planResources(
 	for _, resource := range current.Resources {
 		currentByID[resource.ResourceID] = resource
 	}
+	if err := validateDesiredReplacement(run, current, targets, targetByID, staleKind); err != nil {
+		return ProjectionPlan{}, err
+	}
 	operations := make([]ProjectionOperation, 0, len(targets)*7+len(current.Resources))
 	for _, resource := range targets {
 		if previous, ok := currentByID[resource.ResourceID]; ok && !sameResourceDefinition(previous, resource) {
@@ -528,6 +542,43 @@ func planResources(
 		return ProjectionPlan{}, err
 	}
 	return plan, nil
+}
+
+func validateDesiredReplacement(
+	run SyncRun,
+	current Projection,
+	targets []ResourceMetadata,
+	targetByID map[protocol.ResourceID]ResourceMetadata,
+	staleKind OperationKind,
+) error {
+	resources := make([]ResourceMetadata, 0, len(targets)+len(current.Resources))
+	for _, resource := range targets {
+		resource.ServingState = StatePublished
+		resource.ProjectionStatus = SucceededProjectionStatus()
+		resources = append(resources, resource)
+	}
+	for _, resource := range current.Resources {
+		if _, targeted := targetByID[resource.ResourceID]; targeted || resource.ServingState.IsTerminal() {
+			continue
+		}
+		resource.Versions.Source = run.SourceSnapshot.Version
+		resource.Versions.Projection = run.ProjectionVersion
+		if staleKind == OperationRevoke {
+			resource.ServingState = StateRevoked
+		} else {
+			resource.ServingState = StateTombstoned
+		}
+		resources = append(resources, resource)
+	}
+	projection := Projection{
+		Scope: run.Scope, Version: run.ProjectionVersion, SourceSnapshot: run.SourceSnapshot,
+		State: StatePublished, Resources: resources,
+	}
+	projection.normalize()
+	if err := projection.Validate(); err != nil {
+		return fmt.Errorf("desired replacement projection: %w", err)
+	}
+	return nil
 }
 
 func validateChunkBoundaries(resources []ResourceMetadata) error {
