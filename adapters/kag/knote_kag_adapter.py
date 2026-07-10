@@ -9,8 +9,9 @@ an explicit fake mode for deterministic local tests:
 
 from __future__ import annotations
 
-import json
 import hashlib
+import json
+import math
 import os
 import re
 import sys
@@ -822,6 +823,8 @@ def validate_candidate(value: Any, field: str) -> dict[str, Any]:
     score = value.get("score")
     if isinstance(score, bool) or not isinstance(score, (int, float)):
         raise AdapterRequestError(f"{field}.score must be a number")
+    if not math.isfinite(score):
+        raise AdapterRequestError(f"{field}.score must be finite")
     if score < 0 or score > 1:
         raise AdapterRequestError(f"{field}.score must be between 0 and 1")
     return {"resource": resource, "score": float(score)}

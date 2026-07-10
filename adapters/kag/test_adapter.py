@@ -336,6 +336,14 @@ class AdapterTest(unittest.TestCase):
                 {
                     "id": "bad",
                     "method": "kag.expand",
+                    "params": {"frontier": [{**valid_candidate, "score": float("nan")}]},
+                },
+                "score must be finite",
+            ),
+            (
+                {
+                    "id": "bad",
+                    "method": "kag.expand",
                     "params": {
                         "frontier": [
                             {
