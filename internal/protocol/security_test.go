@@ -182,6 +182,12 @@ func TestChunkAuthorizationUsesParentDocumentBoundary(t *testing.T) {
 	if err := selfBound.Validate(); err == nil {
 		t.Fatal("chunk authorization through a forged document sharing the chunk id should fail")
 	}
+
+	staleACL := decision
+	staleACL.AuthorizationResource.Versions.ACL = "acl-v0"
+	if err := staleACL.Validate(); err == nil {
+		t.Fatal("chunk authorization through a parent with a different ACL version should fail")
+	}
 }
 
 func TestEvidencePackageBinding(t *testing.T) {
@@ -428,9 +434,60 @@ func TestNestedEntityProvenanceRequiresAuthorizedSourceSupport(t *testing.T) {
 		t.Fatal("nested entity without a document or chunk support should fail")
 	}
 
+	pkg.Items[0].Supports = append(pkg.Items[0].Supports, ProvenanceSupport{
+		SupportID: "support-grounded-entity", Resource: entity,
+		Evidence: []ResourceHandle{entity, document}, Complete: true,
+	})
+	if err := pkg.ValidateFor(auth); err == nil {
+		t.Fatal("an entity-only support should not borrow source support from another support")
+	}
+
 	pkg.Items[0].Supports[0].Evidence = []ResourceHandle{entity, document}
 	if err := pkg.ValidateFor(auth); err != nil {
 		t.Fatalf("nested entity with authorized document support: %v", err)
+	}
+}
+
+func TestDerivedArtifactDefaultsToAllRequiredProvenance(t *testing.T) {
+	auth := testAuthorizationContext()
+	documentID, err := NewStableResourceID("local", "default", ResourceDocument, "sources/intro.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifactID, err := NewStableResourceID("local", "default", ResourceDerivedArtifact, "summary:default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	document := testResourceHandle(t, documentID)
+	artifact := testResourceHandle(t, artifactID)
+	artifact.Type = ResourceDerivedArtifact
+	artifact.ContentDigest = NewContentDigest("derived summary")
+	fingerprint, err := NewVisibilityFingerprint(auth, artifact.Versions.Projection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifactDecision := testDecision(t, artifactID)
+	artifactDecision.Resource = artifact
+	artifactDecision.AuthorizationResource = artifact
+	pkg := EvidencePackage{
+		Version: SecurityContractVersion, TenantID: auth.TenantID, KnowledgeBaseID: auth.KnowledgeBaseID,
+		PrincipalID: auth.PrincipalID, SessionID: auth.SessionID, RequestID: auth.RequestID,
+		AgentID: auth.AgentID, TaskID: auth.TaskID, AuthorizationModelID: auth.AuthorizationModelID,
+		IdentityWatermark: auth.IdentityWatermark, ACLWatermark: auth.ACLWatermark,
+		Consistency: auth.Consistency, ProjectionVersion: artifact.Versions.Projection,
+		VisibilityFingerprint: fingerprint,
+		Items: []EvidenceItem{{
+			Resource: artifact, Content: "derived summary",
+			Supports: []ProvenanceSupport{{
+				SupportID: "support-document", Resource: document,
+				Evidence: []ResourceHandle{document}, Complete: false,
+			}},
+			Citation: Citation{Handle: "citation-artifact", Resource: artifact},
+		}},
+		Decisions: []AuthorizationDecision{artifactDecision, testDecision(t, documentID)},
+	}
+	if err := pkg.ValidateFor(auth); err != nil {
+		t.Fatalf("derived artifact should default to all_required: %v", err)
 	}
 }
 

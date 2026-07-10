@@ -365,6 +365,9 @@ func (d AuthorizationDecision) validateAuthorizationBoundary() error {
 		if d.Resource.AuthorizationID != boundary.AuthorizationID {
 			return fmt.Errorf("chunk authorization object does not match parent document")
 		}
+		if d.Resource.Versions.ACL != boundary.Versions.ACL {
+			return fmt.Errorf("chunk ACL version does not match parent document")
+		}
 		return nil
 	}
 	if boundary != d.Resource {
@@ -534,47 +537,35 @@ func (p EvidencePackage) ValidateFor(auth AuthorizationContext) error {
 		if NewContentDigest(item.Content) != item.Resource.ContentDigest {
 			return fmt.Errorf("evidence resource %s content does not match the authorized resource handle", item.Resource.ResourceID)
 		}
-		if err := ValidateProvenance(item.Derivation, item.Supports); err != nil {
-			return err
+		derivation := item.Derivation
+		if item.Resource.Type == ResourceDerivedArtifact && derivation == "" {
+			derivation = DerivationAllRequired
 		}
-		requiredEntitySupport := make(map[ResourceID]struct{})
-		supportedEntities := make(map[ResourceID]struct{})
-		if item.Resource.Type == ResourceEntity {
-			requiredEntitySupport[item.Resource.ResourceID] = struct{}{}
+		if err := ValidateProvenance(derivation, item.Supports); err != nil {
+			return err
 		}
 		for _, support := range item.Supports {
 			if err := validateAuthorizedHandle(allowed, support.Resource, "provenance support"); err != nil {
 				return err
 			}
-			handles := make([]ResourceHandle, 0, 1+len(support.Evidence))
-			handles = append(handles, support.Resource)
 			hasSource := isSourceSupport(support.Resource)
+			entityID := ResourceID("")
+			if item.Resource.Type == ResourceEntity {
+				entityID = item.Resource.ResourceID
+			}
 			if support.Resource.Type == ResourceEntity {
-				requiredEntitySupport[support.Resource.ResourceID] = struct{}{}
+				entityID = support.Resource.ResourceID
 			}
 			for _, evidence := range support.Evidence {
 				if err := validateAuthorizedHandle(allowed, evidence, "provenance evidence"); err != nil {
 					return err
 				}
-				handles = append(handles, evidence)
 				hasSource = hasSource || isSourceSupport(evidence)
 				if evidence.Type == ResourceEntity {
-					requiredEntitySupport[evidence.ResourceID] = struct{}{}
+					entityID = evidence.ResourceID
 				}
 			}
-			if hasSource {
-				if item.Resource.Type == ResourceEntity {
-					supportedEntities[item.Resource.ResourceID] = struct{}{}
-				}
-				for _, handle := range handles {
-					if handle.Type == ResourceEntity {
-						supportedEntities[handle.ResourceID] = struct{}{}
-					}
-				}
-			}
-		}
-		for entityID := range requiredEntitySupport {
-			if _, ok := supportedEntities[entityID]; !ok {
+			if entityID != "" && !hasSource {
 				return fmt.Errorf("entity evidence %s requires an authorized document or chunk support", entityID)
 			}
 		}
