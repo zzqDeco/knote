@@ -10,6 +10,7 @@ an explicit fake mode for deterministic local tests:
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import sys
@@ -73,6 +74,7 @@ RESOURCE_FIELDS = frozenset(
         "knowledge_base_id",
         "authz_object",
         "authorization_resource_id",
+        "content_digest",
         "versions",
         "serving_state",
     }
@@ -80,6 +82,7 @@ RESOURCE_FIELDS = frozenset(
 RESOURCE_VERSION_FIELDS = frozenset({"source", "content", "acl", "index", "graph", "projection"})
 EVIDENCE_FIELDS = frozenset({"resource", "content", "citation_handle"})
 RESOURCE_ID_RE = re.compile(r"res_[0-9a-f]{32}\Z")
+CONTENT_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 RESOURCE_TYPES = frozenset({"document", "chunk", "entity", "claim", "derived_artifact"})
 
 FAKE_INTRO_ID = "res_00000000000000000000000000000001"
@@ -110,6 +113,8 @@ def fake_resource(resource_id: str, resource_type: str) -> dict[str, Any]:
         "knowledge_base_id": "kb_fake",
         "authz_object": f"{resource_type}:{resource_id}",
         "authorization_resource_id": resource_id,
+        "content_digest": "sha256:"
+        + hashlib.sha256(FAKE_CONTENT_BY_ID[resource_id].encode("utf-8")).hexdigest(),
         "versions": {
             "source": "source_fake_v1",
             "content": "content_fake_v1",
@@ -776,6 +781,9 @@ def validate_resource(value: Any, field: str) -> dict[str, Any]:
         raise AdapterRequestError(
             f"{field}.authorization_resource_id must match non-chunk resource_id"
         )
+    content_digest = required_string(value.get("content_digest"), f"{field}.content_digest")
+    if not CONTENT_DIGEST_RE.fullmatch(content_digest):
+        raise AdapterRequestError(f"{field}.content_digest must be a sha256 digest")
     versions = value.get("versions")
     if not isinstance(versions, dict):
         raise AdapterRequestError(f"{field}.versions must be an object")
@@ -794,6 +802,7 @@ def validate_resource(value: Any, field: str) -> dict[str, Any]:
         "knowledge_base_id": knowledge_base_id,
         "authz_object": authz_object,
         "authorization_resource_id": authorization_resource_id,
+        "content_digest": content_digest,
         "versions": normalized_versions,
         "serving_state": serving_state,
     }
@@ -816,9 +825,14 @@ def validate_evidence(value: Any, field: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise AdapterRequestError(f"{field} must be an object")
     validate_exact_fields(value, EVIDENCE_FIELDS, field)
+    resource = validate_resource(value.get("resource"), f"{field}.resource")
+    content = required_string(value.get("content"), f"{field}.content")
+    content_digest = "sha256:" + hashlib.sha256(content.encode("utf-8")).hexdigest()
+    if content_digest != resource["content_digest"]:
+        raise AdapterRequestError(f"{field}.content does not match resource.content_digest")
     return {
-        "resource": validate_resource(value.get("resource"), f"{field}.resource"),
-        "content": required_string(value.get("content"), f"{field}.content"),
+        "resource": resource,
+        "content": content,
         "citation_handle": required_string(value.get("citation_handle"), f"{field}.citation_handle"),
     }
 

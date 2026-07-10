@@ -103,6 +103,7 @@ class AdapterTest(unittest.TestCase):
             self.assertEqual(set(resource["versions"]), adapter.RESOURCE_VERSION_FIELDS)
             self.assertRegex(resource["resource_id"], r"^res_[0-9a-f]{32}$")
             self.assertEqual(resource["authorization_resource_id"], resource["resource_id"])
+            self.assertRegex(resource["content_digest"], r"^sha256:[0-9a-f]{64}$")
             self.assertEqual(resource["serving_state"], "serving")
             self.assertTrue(all(resource["versions"].values()))
             self.assertTrue({"body", "text", "title", "path"}.isdisjoint(resource))
@@ -149,7 +150,7 @@ class AdapterTest(unittest.TestCase):
             },
             {
                 "resource": fake_resource_handle(adapter.FAKE_LOCAL_FIRST_ID),
-                "content": "The runtime delegates graph storage to KAG.",
+                "content": "Its runtime can authorize graph stages before generation.",
                 "citation_handle": "cite_runtime",
             },
         ]
@@ -185,7 +186,7 @@ class AdapterTest(unittest.TestCase):
             {"resource_ids": [adapter.FAKE_INTRO_ID, adapter.FAKE_LOCAL_FIRST_ID], "count": 2},
         )
         self.assertIn("knote is local-first.", data["answer"])
-        self.assertIn("The runtime delegates graph storage to KAG.", data["answer"])
+        self.assertIn("Its runtime can authorize graph stages before generation.", data["answer"])
 
     def test_denied_candidates_are_absent_from_later_hops_and_generation(self) -> None:
         denied_candidate_id = adapter.FAKE_DENIED_CANARY_ID
@@ -383,13 +384,30 @@ class AdapterTest(unittest.TestCase):
                                     **valid_resource,
                                     "versions": {**valid_resource["versions"], "acl": "acl_other"},
                                 },
-                                "content": "authorized body",
+                                "content": adapter.FAKE_CONTENT_BY_ID[adapter.FAKE_INTRO_ID],
                                 "citation_handle": "cite_intro",
                             }
                         ],
                     },
                 },
                 "does not match the exact fake serving resource handle",
+            ),
+            (
+                {
+                    "id": "bad",
+                    "method": "kag.generate",
+                    "params": {
+                        "question": "q",
+                        "evidence": [
+                            {
+                                "resource": valid_resource,
+                                "content": "body from a different resource",
+                                "citation_handle": "cite_intro",
+                            }
+                        ],
+                    },
+                },
+                "does not match resource.content_digest",
             ),
             (
                 {"id": "bad", "method": "kag.retrieve", "params": []},

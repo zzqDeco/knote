@@ -164,6 +164,9 @@ func (e AuthorizedEvidence) Validate() error {
 	if strings.TrimSpace(e.Content) == "" {
 		return fmt.Errorf("authorized evidence content is required")
 	}
+	if protocol.NewContentDigest(e.Content) != e.Resource.ContentDigest {
+		return fmt.Errorf("authorized evidence content does not match the resource handle")
+	}
 	if strings.TrimSpace(e.CitationHandle) == "" {
 		return fmt.Errorf("citation_handle is required")
 	}

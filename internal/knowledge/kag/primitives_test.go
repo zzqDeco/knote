@@ -52,8 +52,8 @@ func TestPrimitiveClientActualFakeAdapterRoundTrip(t *testing.T) {
 	generated, err := client.Generate(context.Background(), GenerateRequest{
 		Question: "What is knote?",
 		Evidence: []AuthorizedEvidence{
-			{Resource: intro.Resource, Content: "knote is local-first", CitationHandle: "cite-intro"},
-			{Resource: local.Resource, Content: "authorized graph evidence", CitationHandle: "cite-local"},
+			{Resource: intro.Resource, Content: "knote is local-first.", CitationHandle: "cite-intro"},
+			{Resource: local.Resource, Content: "Its runtime can authorize graph stages before generation.", CitationHandle: "cite-local"},
 		},
 	})
 	if err != nil {
@@ -81,7 +81,7 @@ func TestPrimitiveClientActualRealAdapterReturnsUnsupportedBeforeKAGSetup(t *tes
 	t.Setenv("KNOTE_KAG_FAKE", "")
 	candidate := CandidateHandle{Resource: testPrimitiveResource(testResourceA), Score: 0.9}
 	evidence := AuthorizedEvidence{
-		Resource: candidate.Resource, Content: "already authorized", CitationHandle: "citation-1",
+		Resource: candidate.Resource, Content: "allowed body", CitationHandle: "citation-1",
 	}
 
 	_, retrieveErr := client.Retrieve(context.Background(), RetrieveRequest{Query: "knote", Limit: 10})
@@ -101,14 +101,14 @@ func TestPrimitiveClientActualRealAdapterReturnsUnsupportedBeforeKAGSetup(t *tes
 func TestPrimitiveClientRoundTrip(t *testing.T) {
 	workspace := t.TempDir()
 	adapter := writePrimitiveAdapter(t, workspace, `
-import json, sys
+import hashlib, json, sys
 req = json.loads(sys.stdin.readline())
 method = req["method"]
 params = req["params"]
 a = "res_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 b = "res_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 def resource(resource_id):
-    return {"resource_id": resource_id, "type": "document", "tenant_id": "local", "knowledge_base_id": "default", "authz_object": "document:" + resource_id, "authorization_resource_id": resource_id, "versions": {"source": "source-v1", "content": "content-v1", "acl": "acl-v1", "index": "index-v1", "graph": "graph-v1", "projection": "projection-v1"}, "serving_state": "serving"}
+    return {"resource_id": resource_id, "type": "document", "tenant_id": "local", "knowledge_base_id": "default", "authz_object": "document:" + resource_id, "authorization_resource_id": resource_id, "content_digest": "sha256:" + hashlib.sha256(b"allowed body").hexdigest(), "versions": {"source": "source-v1", "content": "content-v1", "acl": "acl-v1", "index": "index-v1", "graph": "graph-v1", "projection": "projection-v1"}, "serving_state": "serving"}
 candidate = {"resource": resource(a), "score": 0.9}
 if method == "kag.retrieve":
     data = {"mode": "fake", "candidates": [candidate]}
@@ -269,13 +269,22 @@ func TestPrimitiveRequestsFailClosedBeforeAdapterExecution(t *testing.T) {
 	if _, err := client.Generate(context.Background(), GenerateRequest{Question: "knote"}); err == nil {
 		t.Fatal("empty authorized evidence should fail")
 	}
+	if _, err := client.Generate(context.Background(), GenerateRequest{
+		Question: "knote",
+		Evidence: []AuthorizedEvidence{{
+			Resource: testPrimitiveResource(testResourceA), Content: "wrong body", CitationHandle: "citation-1",
+		}},
+	}); err == nil {
+		t.Fatal("evidence body not bound to its resource digest should fail before adapter execution")
+	}
 }
 
 func testPrimitiveResource(resourceID protocol.ResourceID) protocol.ResourceHandle {
 	return protocol.ResourceHandle{
 		ResourceID: resourceID, Type: protocol.ResourceDocument, TenantID: "local", KnowledgeBaseID: "default",
 		AuthorizationID: "document:" + string(resourceID), AuthorizationResourceID: resourceID,
-		ServingState: protocol.ServingActive,
+		ContentDigest: protocol.NewContentDigest("allowed body"),
+		ServingState:  protocol.ServingActive,
 		Versions: protocol.ResourceVersions{
 			Source: "source-v1", Content: "content-v1", ACL: "acl-v1",
 			Index: "index-v1", Graph: "graph-v1", Projection: "projection-v1",

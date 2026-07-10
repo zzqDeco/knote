@@ -102,6 +102,7 @@ Candidate handles contain only:
     "knowledge_base_id": "kb-1",
     "authz_object": "document:res_22222222222222222222222222222222",
     "authorization_resource_id": "res_22222222222222222222222222222222",
+    "content_digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
     "versions": {
       "source": "source-v1",
       "content": "content-v1",
@@ -118,7 +119,7 @@ Candidate handles contain only:
 
 They do not contain titles, paths, snippets, relation labels, or bodies. Expansion output adds only opaque source and target resource IDs plus a hop number.
 
-Generation input is the first primitive allowed to carry bodies. Its `evidence` array is explicitly defined as already authorized and contains the exact versioned resource handle, body, and citation handle. Generation output carries only the answer, citation handles, evidence resource IDs, and a handle/count trace.
+Generation input is the first primitive allowed to carry bodies. Its `evidence` array is explicitly defined as already authorized and contains the exact versioned resource handle, body, and citation handle. Both Go and the adapter verify the body against the handle's canonical SHA-256 digest before generation. Generation output carries only the answer, citation handles, evidence resource IDs, and a handle/count trace.
 
 Authorization context is not part of these adapter JSON parameters. The trusted Go gateway owns authorization and invokes `kag.expand` and `kag.generate` only after the required checks.
 
