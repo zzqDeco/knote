@@ -122,6 +122,44 @@ func TestAuthorizationDecisionFailsClosed(t *testing.T) {
 	}
 }
 
+func TestChunkAuthorizationUsesParentDocumentBoundary(t *testing.T) {
+	documentID, err := NewStableResourceID("local", "default", ResourceDocument, "sources/intro.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunkID, err := NewStableResourceID("local", "default", ResourceChunk, "sources/intro.md#chunk-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	document := testResourceHandle(t, documentID)
+	chunk := testResourceHandle(t, chunkID)
+	chunk.Type = ResourceChunk
+	chunk.AuthorizationID = document.AuthorizationID
+
+	decision := testDecision(t, chunkID)
+	decision.Resource = chunk
+	decision.AuthorizationResource = document
+	if err := decision.Validate(); err != nil {
+		t.Fatalf("valid inherited document authorization: %v", err)
+	}
+
+	chunkScoped := decision
+	chunkScoped.AuthorizationResource = chunk
+	if err := chunkScoped.Validate(); err == nil {
+		t.Fatal("chunk-scoped authorization should fail")
+	}
+
+	otherDocumentID, err := NewStableResourceID("local", "default", ResourceDocument, "sources/other.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongParent := decision
+	wrongParent.AuthorizationResource = testResourceHandle(t, otherDocumentID)
+	if err := wrongParent.Validate(); err == nil {
+		t.Fatal("authorization through a different document should fail")
+	}
+}
+
 func TestEvidencePackageBinding(t *testing.T) {
 	auth := testAuthorizationContext()
 	id, err := NewStableResourceID("local", "default", ResourceDocument, "sources/intro.md")
@@ -144,7 +182,9 @@ func TestEvidencePackageBinding(t *testing.T) {
 		SessionID:             auth.SessionID,
 		RequestID:             auth.RequestID,
 		AuthorizationModelID:  auth.AuthorizationModelID,
+		IdentityWatermark:     auth.IdentityWatermark,
 		ACLWatermark:          auth.ACLWatermark,
+		Consistency:           auth.Consistency,
 		ProjectionVersion:     resource.Versions.Projection,
 		VisibilityFingerprint: fingerprint,
 		Items: []EvidenceItem{{
@@ -181,6 +221,18 @@ func TestEvidencePackageBinding(t *testing.T) {
 	}
 	mismatched = pkg
 	mismatched.Decisions = append([]AuthorizationDecision(nil), pkg.Decisions...)
+	mismatched.Decisions[0].IdentityWatermark = "identity-v0"
+	if err := mismatched.ValidateFor(auth); err == nil {
+		t.Fatal("decision from another identity watermark should fail")
+	}
+	mismatched = pkg
+	mismatched.Decisions = append([]AuthorizationDecision(nil), pkg.Decisions...)
+	mismatched.Decisions[0].Consistency = ConsistencyMinimizeLatency
+	if err := mismatched.ValidateFor(auth); err == nil {
+		t.Fatal("decision from another consistency boundary should fail")
+	}
+	mismatched = pkg
+	mismatched.Decisions = append([]AuthorizationDecision(nil), pkg.Decisions...)
 	mismatched.Decisions[0].Relation = "can_edit"
 	if err := mismatched.ValidateFor(auth); err == nil {
 		t.Fatal("non-read allow decision should fail")
@@ -207,6 +259,29 @@ func TestEvidencePackageBinding(t *testing.T) {
 	mismatched.Items[0].Resource.Versions.Projection = "other-projection"
 	if err := mismatched.ValidateFor(auth); err == nil {
 		t.Fatal("projection mismatch should fail")
+	}
+	mismatched = pkg
+	mismatched.Items = append([]EvidenceItem(nil), pkg.Items...)
+	mismatched.Items[0].Resource.Versions.Content = "content-v2"
+	mismatched.Items[0].Citation.Resource = mismatched.Items[0].Resource
+	if err := mismatched.ValidateFor(auth); err == nil {
+		t.Fatal("resource version not covered by the allow decision should fail")
+	}
+}
+
+func TestVisibilityFingerprintIncludesConsistency(t *testing.T) {
+	auth := testAuthorizationContext()
+	strict, err := NewVisibilityFingerprint(auth, "projection-v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	auth.Consistency = ConsistencyMinimizeLatency
+	fast, err := NewVisibilityFingerprint(auth, "projection-v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strict == fast {
+		t.Fatal("consistency preference must change the visibility fingerprint")
 	}
 }
 
@@ -256,10 +331,12 @@ func testResourceHandle(t *testing.T, id ResourceID) ResourceHandle {
 
 func testDecision(t *testing.T, id ResourceID) AuthorizationDecision {
 	t.Helper()
+	resource := testResourceHandle(t, id)
 	decision := AuthorizationDecision{
 		CorrelationID: "decision-1", RequestID: "request-1", PrincipalID: "local-user",
-		Relation: EvidenceReadRelation, Resource: testResourceHandle(t, id),
-		Outcome: DecisionAllow, AuthorizationModelID: "local-v1", ACLWatermark: "acl-v1",
+		Relation: EvidenceReadRelation, Resource: resource, AuthorizationResource: resource,
+		Outcome: DecisionAllow, AuthorizationModelID: "local-v1", IdentityWatermark: "identity-v1",
+		ACLWatermark: "acl-v1", Consistency: ConsistencyHigherConsistency,
 		CheckedAt: time.Unix(1, 0).UTC(),
 	}
 	if err := decision.Validate(); err != nil {

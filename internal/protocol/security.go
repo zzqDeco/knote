@@ -242,15 +242,18 @@ const (
 )
 
 type AuthorizationDecision struct {
-	CorrelationID        string          `json:"correlation_id"`
-	RequestID            string          `json:"request_id"`
-	PrincipalID          string          `json:"principal_id"`
-	Relation             string          `json:"relation"`
-	Resource             ResourceHandle  `json:"resource"`
-	Outcome              DecisionOutcome `json:"outcome"`
-	AuthorizationModelID string          `json:"authorization_model_id"`
-	ACLWatermark         string          `json:"acl_watermark"`
-	CheckedAt            time.Time       `json:"checked_at"`
+	CorrelationID         string                `json:"correlation_id"`
+	RequestID             string                `json:"request_id"`
+	PrincipalID           string                `json:"principal_id"`
+	Relation              string                `json:"relation"`
+	Resource              ResourceHandle        `json:"resource"`
+	AuthorizationResource ResourceHandle        `json:"authorization_resource"`
+	Outcome               DecisionOutcome       `json:"outcome"`
+	AuthorizationModelID  string                `json:"authorization_model_id"`
+	IdentityWatermark     string                `json:"identity_watermark"`
+	ACLWatermark          string                `json:"acl_watermark"`
+	Consistency           ConsistencyPreference `json:"consistency"`
+	CheckedAt             time.Time             `json:"checked_at"`
 }
 
 func (d AuthorizationDecision) Authorized() bool {
@@ -264,6 +267,7 @@ func (d AuthorizationDecision) Validate() error {
 		"principal_id":           d.PrincipalID,
 		"relation":               d.Relation,
 		"authorization_model_id": d.AuthorizationModelID,
+		"identity_watermark":     d.IdentityWatermark,
 		"acl_watermark":          d.ACLWatermark,
 	} {
 		if err := validateToken(name, value); err != nil {
@@ -273,8 +277,19 @@ func (d AuthorizationDecision) Validate() error {
 	if err := d.Resource.Validate(); err != nil {
 		return err
 	}
+	if err := d.AuthorizationResource.Validate(); err != nil {
+		return fmt.Errorf("authorization resource: %w", err)
+	}
+	if err := d.validateAuthorizationBoundary(); err != nil {
+		return err
+	}
 	if d.CheckedAt.IsZero() {
 		return fmt.Errorf("checked_at is required")
+	}
+	switch d.Consistency {
+	case ConsistencyMinimizeLatency, ConsistencyHigherConsistency:
+	default:
+		return fmt.Errorf("unsupported decision consistency preference %q", d.Consistency)
 	}
 	switch d.Outcome {
 	case DecisionAllow, DecisionDeny, DecisionIndeterminate:
@@ -282,6 +297,29 @@ func (d AuthorizationDecision) Validate() error {
 	default:
 		return fmt.Errorf("unsupported authorization decision %q", d.Outcome)
 	}
+}
+
+func (d AuthorizationDecision) validateAuthorizationBoundary() error {
+	boundary := d.AuthorizationResource
+	if boundary.TenantID != d.Resource.TenantID || boundary.KnowledgeBaseID != d.Resource.KnowledgeBaseID {
+		return fmt.Errorf("authorization resource crosses the resource scope")
+	}
+	if boundary.Versions.Projection != d.Resource.Versions.Projection {
+		return fmt.Errorf("authorization resource projection does not match resource")
+	}
+	if d.Resource.Type == ResourceChunk {
+		if boundary.Type != ResourceDocument {
+			return fmt.Errorf("chunk authorization resource must be its parent document")
+		}
+		if d.Resource.AuthorizationID != boundary.AuthorizationID {
+			return fmt.Errorf("chunk authorization object does not match parent document")
+		}
+		return nil
+	}
+	if boundary != d.Resource {
+		return fmt.Errorf("non-chunk authorization resource must match the protected resource")
+	}
+	return nil
 }
 
 type VisibilityFingerprint string
@@ -307,7 +345,7 @@ func NewVisibilityFingerprint(auth AuthorizationContext, projectionVersion strin
 	parts := []string{
 		auth.Version, auth.TenantID, auth.KnowledgeBaseID, auth.PrincipalID,
 		auth.AuthorizationModelID, auth.IdentityWatermark, auth.ACLWatermark,
-		auth.AgentID, auth.TaskID, projectionVersion,
+		auth.AgentID, auth.TaskID, string(auth.Consistency), projectionVersion,
 	}
 	sum := sha256.Sum256([]byte(strings.Join(parts, "\x00")))
 	return VisibilityFingerprint("vis_" + hex.EncodeToString(sum[:16])), nil
@@ -334,7 +372,9 @@ type EvidencePackage struct {
 	SessionID             string                  `json:"session_id"`
 	RequestID             string                  `json:"request_id"`
 	AuthorizationModelID  string                  `json:"authorization_model_id"`
+	IdentityWatermark     string                  `json:"identity_watermark"`
 	ACLWatermark          string                  `json:"acl_watermark"`
+	Consistency           ConsistencyPreference   `json:"consistency"`
 	ProjectionVersion     string                  `json:"projection_version"`
 	VisibilityFingerprint VisibilityFingerprint   `json:"visibility_fingerprint"`
 	Items                 []EvidenceItem          `json:"items"`
@@ -359,7 +399,9 @@ func (p EvidencePackage) ValidateFor(auth AuthorizationContext) error {
 		{"session_id", p.SessionID, auth.SessionID},
 		{"request_id", p.RequestID, auth.RequestID},
 		{"authorization_model_id", p.AuthorizationModelID, auth.AuthorizationModelID},
+		{"identity_watermark", p.IdentityWatermark, auth.IdentityWatermark},
 		{"acl_watermark", p.ACLWatermark, auth.ACLWatermark},
+		{"consistency", string(p.Consistency), string(auth.Consistency)},
 	}
 	for _, binding := range bindings {
 		if binding.got != binding.want {
@@ -382,7 +424,7 @@ func (p EvidencePackage) ValidateFor(auth AuthorizationContext) error {
 	if len(p.Items) == 0 {
 		return fmt.Errorf("evidence package has no items")
 	}
-	allowed := make(map[ResourceID]struct{}, len(p.Decisions))
+	allowed := make(map[ResourceID]AuthorizationDecision, len(p.Decisions))
 	for _, decision := range p.Decisions {
 		if err := decision.Validate(); err != nil {
 			return err
@@ -390,7 +432,10 @@ func (p EvidencePackage) ValidateFor(auth AuthorizationContext) error {
 		if !decision.Authorized() {
 			return fmt.Errorf("evidence package contains a non-allow decision")
 		}
-		if decision.AuthorizationModelID != p.AuthorizationModelID || decision.ACLWatermark != p.ACLWatermark {
+		if decision.AuthorizationModelID != p.AuthorizationModelID ||
+			decision.IdentityWatermark != p.IdentityWatermark ||
+			decision.ACLWatermark != p.ACLWatermark ||
+			decision.Consistency != p.Consistency {
 			return fmt.Errorf("decision authorization binding does not match evidence package")
 		}
 		if decision.RequestID != p.RequestID || decision.PrincipalID != p.PrincipalID {
@@ -408,7 +453,7 @@ func (p EvidencePackage) ValidateFor(auth AuthorizationContext) error {
 		if _, duplicate := allowed[decision.Resource.ResourceID]; duplicate {
 			return fmt.Errorf("duplicate allow decision for resource %s", decision.Resource.ResourceID)
 		}
-		allowed[decision.Resource.ResourceID] = struct{}{}
+		allowed[decision.Resource.ResourceID] = decision
 	}
 	for _, item := range p.Items {
 		if err := item.Resource.Validate(); err != nil {
@@ -420,8 +465,12 @@ func (p EvidencePackage) ValidateFor(auth AuthorizationContext) error {
 		if item.Resource.Versions.Projection != p.ProjectionVersion {
 			return fmt.Errorf("evidence resource projection does not match package")
 		}
-		if _, ok := allowed[item.Resource.ResourceID]; !ok {
+		decision, ok := allowed[item.Resource.ResourceID]
+		if !ok {
 			return fmt.Errorf("evidence resource %s has no allow decision", item.Resource.ResourceID)
+		}
+		if decision.Resource != item.Resource {
+			return fmt.Errorf("evidence resource %s does not match the authorized resource handle", item.Resource.ResourceID)
 		}
 		if strings.TrimSpace(item.Content) == "" {
 			return fmt.Errorf("evidence resource %s has empty content", item.Resource.ResourceID)

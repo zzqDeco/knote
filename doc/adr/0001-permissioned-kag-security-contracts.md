@@ -25,13 +25,13 @@ Fallback is allowed only when it reads the current serving projection, returns r
 
 `ResourceID` is an opaque, tenant-scoped identity derived from stable source identity, never content. Source, content, ACL, index, graph, and projection versions are independent. Updating content or ACLs must not create a new canonical resource.
 
-Document is the Phase 1 ACL boundary. Chunk inherits its Document. Entity existence requires at least one authorized support. Claim authorization is independent from Entity visibility. A denied Claim or frontier item cannot participate in a later graph hop.
+Document is the Phase 1 ACL boundary. Chunk inherits its Document and every Chunk decision carries the exact parent Document handle used as the authorization resource; a Chunk-scoped authorization object is invalid. Entity existence requires at least one authorized support. Claim authorization is independent from Entity visibility. A denied Claim or frontier item cannot participate in a later graph hop.
 
 ### Provenance and derived knowledge
 
 Every evidence item carries explicit provenance. In `any_support`, each listed support must independently and completely justify the result. Otherwise the result uses source-scoped claims or `all_required`. Derived artifacts default to `all_required`.
 
-An `EvidencePackage` contains only authorized resources and binds its decisions, citations, model ID, ACL watermark, projection, and visibility fingerprint to the originating request. Denied titles, paths, bodies, and graph structure are never included.
+An `EvidencePackage` contains only authorized resources and binds its decisions, citations, model ID, identity and ACL watermarks, consistency preference, projection, and visibility fingerprint to the originating request. An allow decision covers one exact `ResourceHandle`, including every mutable version, rather than every version sharing the same stable `ResourceID`. Denied titles, paths, bodies, and graph structure are never included.
 
 ### KAG execution boundary
 
