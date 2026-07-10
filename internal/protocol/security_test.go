@@ -1,0 +1,239 @@
+package protocol
+
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestAuthorizationContextRoundTripAndValidation(t *testing.T) {
+	auth := testAuthorizationContext()
+	if err := auth.Validate(); err != nil {
+		t.Fatalf("validate context: %v", err)
+	}
+	data, err := json.Marshal(auth)
+	if err != nil {
+		t.Fatalf("marshal context: %v", err)
+	}
+	for _, field := range []string{"tenant_id", "principal_id", "authorization_model_id", "acl_watermark"} {
+		if !strings.Contains(string(data), `"`+field+`"`) {
+			t.Fatalf("serialized context missing %s: %s", field, data)
+		}
+	}
+	var decoded AuthorizationContext
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("unmarshal context: %v", err)
+	}
+	if decoded != auth {
+		t.Fatalf("round trip mismatch:\nwant %#v\n got %#v", auth, decoded)
+	}
+
+	invalid := auth
+	invalid.Version = "v2"
+	if err := invalid.Validate(); err == nil {
+		t.Fatal("unsupported context version should fail")
+	}
+	invalid = auth
+	invalid.Consistency = "eventual"
+	if err := invalid.Validate(); err == nil {
+		t.Fatal("unsupported consistency should fail")
+	}
+	invalid = auth
+	invalid.RequestID = ""
+	if err := invalid.Validate(); err == nil {
+		t.Fatal("missing request id should fail")
+	}
+}
+
+func TestStableResourceIDIgnoresMutableVersions(t *testing.T) {
+	id, err := NewStableResourceID("local", "default", ResourceDocument, "sources/intro.md")
+	if err != nil {
+		t.Fatalf("stable resource id: %v", err)
+	}
+	if err := id.Validate(); err != nil {
+		t.Fatalf("validate resource id: %v", err)
+	}
+	handleA := testResourceHandle(t, id)
+	handleB := handleA
+	handleB.Versions = ResourceVersions{
+		Source: "source-v2", Content: "content-v2", ACL: "acl-v2",
+		Index: "index-v2", Graph: "graph-v2", Projection: "projection-v2",
+	}
+	if handleA.ResourceID != handleB.ResourceID {
+		t.Fatal("resource identity changed with mutable versions")
+	}
+	other, err := NewStableResourceID("local", "default", ResourceDocument, "sources/other.md")
+	if err != nil {
+		t.Fatalf("second stable resource id: %v", err)
+	}
+	if other == id {
+		t.Fatal("different source keys produced the same resource id")
+	}
+}
+
+func TestProvenanceSemantics(t *testing.T) {
+	id, err := NewStableResourceID("local", "default", ResourceDocument, "sources/intro.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	support := ProvenanceSupport{
+		SupportID: "support-1", ResourceID: id, Evidence: []ResourceID{id}, Complete: true,
+	}
+	if err := ValidateProvenance(DerivationAnySupport, []ProvenanceSupport{support}); err != nil {
+		t.Fatalf("valid any-support provenance: %v", err)
+	}
+	incomplete := support
+	incomplete.Complete = false
+	if err := ValidateProvenance(DerivationAnySupport, []ProvenanceSupport{incomplete}); err == nil {
+		t.Fatal("incomplete any-support provenance should fail")
+	}
+	if err := ValidateProvenance(DerivationAllRequired, []ProvenanceSupport{incomplete}); err != nil {
+		t.Fatalf("partial supports may combine under all-required: %v", err)
+	}
+	if err := ValidateProvenance(DerivationAllRequired, nil); err == nil {
+		t.Fatal("empty provenance should fail")
+	}
+}
+
+func TestAuthorizationDecisionFailsClosed(t *testing.T) {
+	id, err := NewStableResourceID("local", "default", ResourceDocument, "sources/intro.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision := testDecision(t, id)
+	if !decision.Authorized() {
+		t.Fatal("allow decision should authorize")
+	}
+	decision.Outcome = DecisionDeny
+	if decision.Authorized() {
+		t.Fatal("deny decision authorized")
+	}
+	decision.Outcome = DecisionIndeterminate
+	if decision.Authorized() {
+		t.Fatal("indeterminate decision authorized")
+	}
+	if err := decision.Validate(); err != nil {
+		t.Fatalf("indeterminate is a valid fail-closed outcome: %v", err)
+	}
+	decision.CheckedAt = time.Time{}
+	if err := decision.Validate(); err == nil {
+		t.Fatal("decision without checked_at should fail validation")
+	}
+}
+
+func TestEvidencePackageBinding(t *testing.T) {
+	auth := testAuthorizationContext()
+	id, err := NewStableResourceID("local", "default", ResourceDocument, "sources/intro.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resource := testResourceHandle(t, id)
+	fingerprint, err := NewVisibilityFingerprint(auth, resource.Versions.Projection)
+	if err != nil {
+		t.Fatalf("visibility fingerprint: %v", err)
+	}
+	support := ProvenanceSupport{
+		SupportID: "support-1", ResourceID: id, Evidence: []ResourceID{id}, Complete: true,
+	}
+	pkg := EvidencePackage{
+		Version:               SecurityContractVersion,
+		TenantID:              auth.TenantID,
+		KnowledgeBaseID:       auth.KnowledgeBaseID,
+		PrincipalID:           auth.PrincipalID,
+		SessionID:             auth.SessionID,
+		RequestID:             auth.RequestID,
+		AuthorizationModelID:  auth.AuthorizationModelID,
+		ACLWatermark:          auth.ACLWatermark,
+		ProjectionVersion:     resource.Versions.Projection,
+		VisibilityFingerprint: fingerprint,
+		Items: []EvidenceItem{{
+			Resource: resource, Content: "authorized content", Derivation: DerivationAnySupport,
+			Supports: []ProvenanceSupport{support}, Citation: Citation{Handle: "citation-1", Resource: resource},
+		}},
+		Decisions: []AuthorizationDecision{testDecision(t, id)},
+	}
+	if err := pkg.ValidateFor(auth); err != nil {
+		t.Fatalf("valid evidence package: %v", err)
+	}
+
+	mismatched := pkg
+	mismatched.PrincipalID = "another-user"
+	if err := mismatched.ValidateFor(auth); err == nil {
+		t.Fatal("principal mismatch should fail")
+	}
+	mismatched = pkg
+	mismatched.VisibilityFingerprint = "vis_00000000000000000000000000000000"
+	if err := mismatched.ValidateFor(auth); err == nil {
+		t.Fatal("visibility fingerprint mismatch should fail")
+	}
+	mismatched = pkg
+	mismatched.Decisions = append([]AuthorizationDecision(nil), pkg.Decisions...)
+	mismatched.Decisions[0].Outcome = DecisionIndeterminate
+	if err := mismatched.ValidateFor(auth); err == nil {
+		t.Fatal("indeterminate evidence decision should fail closed")
+	}
+	mismatched = pkg
+	mismatched.Items = append([]EvidenceItem(nil), pkg.Items...)
+	mismatched.Items[0].Resource.Versions.Projection = "other-projection"
+	if err := mismatched.ValidateFor(auth); err == nil {
+		t.Fatal("projection mismatch should fail")
+	}
+}
+
+func TestActionApprovalCompatibilityAliases(t *testing.T) {
+	legacy := PermissionRequest{RequestID: "request-1", Tool: "knote_build"}
+	var canonical ActionApprovalRequest = legacy
+	if canonical.RequestID != legacy.RequestID || canonical.Tool != legacy.Tool {
+		t.Fatal("action approval alias changed legacy values")
+	}
+	confirm := ConfirmRequest{RequestID: "request-2", Action: "build"}
+	var canonicalConfirm ActionConfirmationRequest = confirm
+	if canonicalConfirm != confirm {
+		t.Fatal("action confirmation alias changed legacy values")
+	}
+}
+
+func testAuthorizationContext() AuthorizationContext {
+	return AuthorizationContext{
+		Version:              SecurityContractVersion,
+		TenantID:             "local",
+		KnowledgeBaseID:      "default",
+		PrincipalID:          "local-user",
+		SessionID:            "session-1",
+		RequestID:            "request-1",
+		AuthorizationModelID: "local-v1",
+		IdentityWatermark:    "identity-v1",
+		ACLWatermark:         "acl-v1",
+		Consistency:          ConsistencyHigherConsistency,
+	}
+}
+
+func testResourceHandle(t *testing.T, id ResourceID) ResourceHandle {
+	t.Helper()
+	handle := ResourceHandle{
+		ResourceID: id, Type: ResourceDocument, TenantID: "local", KnowledgeBaseID: "default",
+		AuthorizationID: "document:" + string(id), ServingState: ServingActive,
+		Versions: ResourceVersions{
+			Source: "source-v1", Content: "content-v1", ACL: "acl-v1",
+			Index: "index-v1", Graph: "graph-v1", Projection: "projection-v1",
+		},
+	}
+	if err := handle.Validate(); err != nil {
+		t.Fatalf("validate resource handle: %v", err)
+	}
+	return handle
+}
+
+func testDecision(t *testing.T, id ResourceID) AuthorizationDecision {
+	t.Helper()
+	decision := AuthorizationDecision{
+		CorrelationID: "decision-1", Relation: "can_view", Resource: testResourceHandle(t, id),
+		Outcome: DecisionAllow, AuthorizationModelID: "local-v1", ACLWatermark: "acl-v1",
+		CheckedAt: time.Unix(1, 0).UTC(),
+	}
+	if err := decision.Validate(); err != nil {
+		t.Fatalf("validate decision: %v", err)
+	}
+	return decision
+}

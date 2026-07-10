@@ -96,6 +96,14 @@ type PermissionRequest struct {
 	CreatedAt time.Time          `json:"created_at"`
 }
 
+// ActionApprovalOption is the canonical name for an option presented before a
+// local side effect. PermissionOption remains available for API compatibility.
+type ActionApprovalOption = PermissionOption
+
+// ActionApprovalRequest is the canonical name for a local side-effect
+// approval. It is separate from resource authorization decisions.
+type ActionApprovalRequest = PermissionRequest
+
 type ConfirmRequest struct {
 	RequestID   string    `json:"request_id"`
 	Action      string    `json:"action"`
@@ -106,6 +114,10 @@ type ConfirmRequest struct {
 	RejectText  string    `json:"reject_text"`
 	CreatedAt   time.Time `json:"created_at"`
 }
+
+// ActionConfirmationRequest is the canonical name for confirming a local
+// side effect. ConfirmRequest remains available for API compatibility.
+type ActionConfirmationRequest = ConfirmRequest
 
 type ArtifactManifest struct {
 	Version       int       `json:"version"`
