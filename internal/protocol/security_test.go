@@ -206,6 +206,8 @@ func TestEvidencePackageBinding(t *testing.T) {
 		PrincipalID:           auth.PrincipalID,
 		SessionID:             auth.SessionID,
 		RequestID:             auth.RequestID,
+		AgentID:               auth.AgentID,
+		TaskID:                auth.TaskID,
 		AuthorizationModelID:  auth.AuthorizationModelID,
 		IdentityWatermark:     auth.IdentityWatermark,
 		ACLWatermark:          auth.ACLWatermark,
@@ -243,6 +245,18 @@ func TestEvidencePackageBinding(t *testing.T) {
 	mismatched.Decisions[0].SessionID = "another-session"
 	if err := mismatched.ValidateFor(auth); err == nil {
 		t.Fatal("decision from another session should fail")
+	}
+	mismatched = pkg
+	mismatched.Decisions = append([]AuthorizationDecision(nil), pkg.Decisions...)
+	mismatched.Decisions[0].AgentID = "another-agent"
+	if err := mismatched.ValidateFor(auth); err == nil {
+		t.Fatal("decision from another agent scope should fail")
+	}
+	mismatched = pkg
+	mismatched.Decisions = append([]AuthorizationDecision(nil), pkg.Decisions...)
+	mismatched.Decisions[0].TaskID = "another-task"
+	if err := mismatched.ValidateFor(auth); err == nil {
+		t.Fatal("decision from another task scope should fail")
 	}
 	mismatched = pkg
 	mismatched.Decisions = append([]AuthorizationDecision(nil), pkg.Decisions...)
@@ -337,6 +351,8 @@ func TestEntityEvidenceRequiresAuthorizedSourceSupport(t *testing.T) {
 		PrincipalID:           auth.PrincipalID,
 		SessionID:             auth.SessionID,
 		RequestID:             auth.RequestID,
+		AgentID:               auth.AgentID,
+		TaskID:                auth.TaskID,
 		AuthorizationModelID:  auth.AuthorizationModelID,
 		IdentityWatermark:     auth.IdentityWatermark,
 		ACLWatermark:          auth.ACLWatermark,
@@ -369,6 +385,52 @@ func TestEntityEvidenceRequiresAuthorizedSourceSupport(t *testing.T) {
 	pkg.Decisions = append(pkg.Decisions, testDecision(t, documentID))
 	if err := pkg.ValidateFor(auth); err != nil {
 		t.Fatalf("entity with authorized document support: %v", err)
+	}
+}
+
+func TestNestedEntityProvenanceRequiresAuthorizedSourceSupport(t *testing.T) {
+	auth := testAuthorizationContext()
+	documentID, err := NewStableResourceID("local", "default", ResourceDocument, "sources/intro.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	entityID, err := NewStableResourceID("local", "default", ResourceEntity, "entity:knote")
+	if err != nil {
+		t.Fatal(err)
+	}
+	document := testResourceHandle(t, documentID)
+	entity := testResourceHandle(t, entityID)
+	entity.Type = ResourceEntity
+	fingerprint, err := NewVisibilityFingerprint(auth, document.Versions.Projection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pkg := EvidencePackage{
+		Version: SecurityContractVersion, TenantID: auth.TenantID, KnowledgeBaseID: auth.KnowledgeBaseID,
+		PrincipalID: auth.PrincipalID, SessionID: auth.SessionID, RequestID: auth.RequestID,
+		AgentID: auth.AgentID, TaskID: auth.TaskID, AuthorizationModelID: auth.AuthorizationModelID,
+		IdentityWatermark: auth.IdentityWatermark, ACLWatermark: auth.ACLWatermark,
+		Consistency: auth.Consistency, ProjectionVersion: document.Versions.Projection,
+		VisibilityFingerprint: fingerprint,
+		Items: []EvidenceItem{{
+			Resource: document, Content: "authorized content", Derivation: DerivationAnySupport,
+			Supports: []ProvenanceSupport{{
+				SupportID: "support-entity", Resource: entity,
+				Evidence: []ResourceHandle{entity}, Complete: true,
+			}},
+			Citation: Citation{Handle: "citation-document", Resource: document},
+		}},
+		Decisions: []AuthorizationDecision{testDecision(t, documentID), testDecision(t, entityID)},
+	}
+	pkg.Decisions[1].Resource = entity
+	pkg.Decisions[1].AuthorizationResource = entity
+	if err := pkg.ValidateFor(auth); err == nil {
+		t.Fatal("nested entity without a document or chunk support should fail")
+	}
+
+	pkg.Items[0].Supports[0].Evidence = []ResourceHandle{entity, document}
+	if err := pkg.ValidateFor(auth); err != nil {
+		t.Fatalf("nested entity with authorized document support: %v", err)
 	}
 }
 
@@ -409,6 +471,8 @@ func testAuthorizationContext() AuthorizationContext {
 		PrincipalID:          "local-user",
 		SessionID:            "session-1",
 		RequestID:            "request-1",
+		AgentID:              "agent-1",
+		TaskID:               "task-1",
 		AuthorizationModelID: "local-v1",
 		IdentityWatermark:    "identity-v1",
 		ACLWatermark:         "acl-v1",
@@ -438,6 +502,7 @@ func testDecision(t *testing.T, id ResourceID) AuthorizationDecision {
 	resource := testResourceHandle(t, id)
 	decision := AuthorizationDecision{
 		CorrelationID: "decision-1", RequestID: "request-1", SessionID: "session-1", PrincipalID: "local-user",
+		AgentID: "agent-1", TaskID: "task-1",
 		Relation: EvidenceReadRelation, Resource: resource, AuthorizationResource: resource,
 		Outcome: DecisionAllow, AuthorizationModelID: "local-v1", IdentityWatermark: "identity-v1",
 		ACLWatermark: "acl-v1", Consistency: ConsistencyHigherConsistency,

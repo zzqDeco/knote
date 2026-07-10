@@ -280,6 +280,8 @@ type AuthorizationDecision struct {
 	RequestID             string                `json:"request_id"`
 	SessionID             string                `json:"session_id"`
 	PrincipalID           string                `json:"principal_id"`
+	AgentID               string                `json:"agent_id,omitempty"`
+	TaskID                string                `json:"task_id,omitempty"`
 	Relation              string                `json:"relation"`
 	Resource              ResourceHandle        `json:"resource"`
 	AuthorizationResource ResourceHandle        `json:"authorization_resource"`
@@ -307,6 +309,16 @@ func (d AuthorizationDecision) Validate() error {
 		"acl_watermark":          d.ACLWatermark,
 	} {
 		if err := validateToken(name, value); err != nil {
+			return err
+		}
+	}
+	if d.AgentID != "" {
+		if err := validateToken("agent_id", d.AgentID); err != nil {
+			return err
+		}
+	}
+	if d.TaskID != "" {
+		if err := validateToken("task_id", d.TaskID); err != nil {
 			return err
 		}
 	}
@@ -410,6 +422,8 @@ type EvidencePackage struct {
 	PrincipalID           string                  `json:"principal_id"`
 	SessionID             string                  `json:"session_id"`
 	RequestID             string                  `json:"request_id"`
+	AgentID               string                  `json:"agent_id,omitempty"`
+	TaskID                string                  `json:"task_id,omitempty"`
 	AuthorizationModelID  string                  `json:"authorization_model_id"`
 	IdentityWatermark     string                  `json:"identity_watermark"`
 	ACLWatermark          string                  `json:"acl_watermark"`
@@ -437,6 +451,8 @@ func (p EvidencePackage) ValidateFor(auth AuthorizationContext) error {
 		{"principal_id", p.PrincipalID, auth.PrincipalID},
 		{"session_id", p.SessionID, auth.SessionID},
 		{"request_id", p.RequestID, auth.RequestID},
+		{"agent_id", p.AgentID, auth.AgentID},
+		{"task_id", p.TaskID, auth.TaskID},
 		{"authorization_model_id", p.AuthorizationModelID, auth.AuthorizationModelID},
 		{"identity_watermark", p.IdentityWatermark, auth.IdentityWatermark},
 		{"acl_watermark", p.ACLWatermark, auth.ACLWatermark},
@@ -477,7 +493,8 @@ func (p EvidencePackage) ValidateFor(auth AuthorizationContext) error {
 			decision.Consistency != p.Consistency {
 			return fmt.Errorf("decision authorization binding does not match evidence package")
 		}
-		if decision.RequestID != p.RequestID || decision.SessionID != p.SessionID || decision.PrincipalID != p.PrincipalID {
+		if decision.RequestID != p.RequestID || decision.SessionID != p.SessionID ||
+			decision.PrincipalID != p.PrincipalID || decision.AgentID != p.AgentID || decision.TaskID != p.TaskID {
 			return fmt.Errorf("decision request binding does not match evidence package")
 		}
 		if decision.Relation != EvidenceReadRelation {
@@ -520,25 +537,46 @@ func (p EvidencePackage) ValidateFor(auth AuthorizationContext) error {
 		if err := ValidateProvenance(item.Derivation, item.Supports); err != nil {
 			return err
 		}
-		hasEntitySourceSupport := item.Resource.Type != ResourceEntity
+		requiredEntitySupport := make(map[ResourceID]struct{})
+		supportedEntities := make(map[ResourceID]struct{})
+		if item.Resource.Type == ResourceEntity {
+			requiredEntitySupport[item.Resource.ResourceID] = struct{}{}
+		}
 		for _, support := range item.Supports {
 			if err := validateAuthorizedHandle(allowed, support.Resource, "provenance support"); err != nil {
 				return err
 			}
-			if isEntitySourceSupport(item.Resource, support.Resource) {
-				hasEntitySourceSupport = true
+			handles := make([]ResourceHandle, 0, 1+len(support.Evidence))
+			handles = append(handles, support.Resource)
+			hasSource := isSourceSupport(support.Resource)
+			if support.Resource.Type == ResourceEntity {
+				requiredEntitySupport[support.Resource.ResourceID] = struct{}{}
 			}
 			for _, evidence := range support.Evidence {
 				if err := validateAuthorizedHandle(allowed, evidence, "provenance evidence"); err != nil {
 					return err
 				}
-				if isEntitySourceSupport(item.Resource, evidence) {
-					hasEntitySourceSupport = true
+				handles = append(handles, evidence)
+				hasSource = hasSource || isSourceSupport(evidence)
+				if evidence.Type == ResourceEntity {
+					requiredEntitySupport[evidence.ResourceID] = struct{}{}
+				}
+			}
+			if hasSource {
+				if item.Resource.Type == ResourceEntity {
+					supportedEntities[item.Resource.ResourceID] = struct{}{}
+				}
+				for _, handle := range handles {
+					if handle.Type == ResourceEntity {
+						supportedEntities[handle.ResourceID] = struct{}{}
+					}
 				}
 			}
 		}
-		if !hasEntitySourceSupport {
-			return fmt.Errorf("entity evidence %s requires an authorized document or chunk support", item.Resource.ResourceID)
+		for entityID := range requiredEntitySupport {
+			if _, ok := supportedEntities[entityID]; !ok {
+				return fmt.Errorf("entity evidence %s requires an authorized document or chunk support", entityID)
+			}
 		}
 		if err := validateToken("citation_handle", item.Citation.Handle); err != nil {
 			return err
@@ -564,10 +602,7 @@ func validateAuthorizedHandle(allowed map[ResourceID]AuthorizationDecision, reso
 	return nil
 }
 
-func isEntitySourceSupport(entity, support ResourceHandle) bool {
-	if support.ResourceID == entity.ResourceID {
-		return false
-	}
+func isSourceSupport(support ResourceHandle) bool {
 	return support.Type == ResourceDocument || support.Type == ResourceChunk
 }
 

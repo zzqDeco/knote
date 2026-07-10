@@ -15,7 +15,7 @@ Permissioned KAG requires authorization before protected content participates in
 
 ### Trusted authorization context
 
-Every protected read uses an immutable `AuthorizationContext` created by a trusted runtime or API boundary. It is never accepted from LLM-controlled tool JSON. The context binds tenant, knowledge base, principal, session, request, authorization model, identity and ACL watermarks, consistency, and optional agent/task scope. Agent and task scope may narrow access but never broaden it.
+Every protected read uses an immutable `AuthorizationContext` created by a trusted runtime or API boundary. It is never accepted from LLM-controlled tool JSON. The context binds tenant, knowledge base, principal, session, request, authorization model, identity and ACL watermarks, consistency, and optional agent/task scope. Agent and task scope may narrow access but never broaden it, so each allow decision and evidence package records and matches the exact optional scope.
 
 Missing, malformed, stale, timed-out, partial, or indeterminate authorization information fails closed. Policy denial and hidden-resource absence are externally indistinguishable.
 
@@ -25,7 +25,7 @@ Fallback is allowed only when it reads the current serving projection, returns r
 
 `ResourceID` is an opaque, tenant-scoped identity derived from stable source identity, never content. Source, content, ACL, index, graph, and projection versions are independent. Updating content or ACLs must not create a new canonical resource. The versioned handle also carries the canonical content SHA-256 digest so evidence validation can reject a body paired with the wrong authorized handle.
 
-Document is the Phase 1 ACL boundary. Every resource handle carries the stable identity of its authorization boundary. Chunk inherits its Document and every Chunk decision must match both that immutable parent Document identity and the exact parent Document handle used as the authorization resource; a Chunk-scoped or unrelated Document authorization object is invalid. Entity existence requires at least one authorized Document or Chunk support and cannot be established by self-support. Claim authorization is independent from Entity visibility. A denied Claim or frontier item cannot participate in a later graph hop.
+Document is the Phase 1 ACL boundary. Every resource handle carries the stable identity of its authorization boundary. Chunk inherits its Document and every Chunk decision must match both that immutable parent Document identity and the exact parent Document handle used as the authorization resource; a Chunk-scoped or unrelated Document authorization object is invalid. Every Entity handle, including an Entity nested in another item's provenance, requires at least one authorized Document or Chunk in the same support and cannot be established by self-support. Claim authorization is independent from Entity visibility. A denied Claim or frontier item cannot participate in a later graph hop.
 
 ### Provenance and derived knowledge
 
