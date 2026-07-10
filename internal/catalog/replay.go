@@ -88,9 +88,13 @@ func Replay(
 		return Projection{}, ReplayReport{}, err
 	}
 	if containsSorted(current.AppliedPlanIDs, plan.PlanID) {
+		runState, err := runStateForAppliedPlan(current, plan)
+		if err != nil {
+			return Projection{}, ReplayReport{}, err
+		}
 		return cloneProjection(current), ReplayReport{
 			PlanID: plan.PlanID, RunID: plan.Run.RunID,
-			RunState: runStateForProjection(current), IdempotentNoop: true,
+			RunState: runState, IdempotentNoop: true,
 		}, nil
 	}
 	if current.State != StatePublished {
@@ -340,11 +344,26 @@ func containsSorted(values []string, target string) bool {
 	return index < len(values) && values[index] == target
 }
 
-func runStateForProjection(projection Projection) RunState {
-	if projection.State == StatePublished {
-		return RunSucceeded
+func runStateForAppliedPlan(projection Projection, plan ProjectionPlan) (RunState, error) {
+	runState := RunSucceeded
+	for _, operation := range plan.Operations {
+		index := sort.Search(len(projection.AppliedOperations), func(i int) bool {
+			return projection.AppliedOperations[i].OperationID >= operation.OperationID
+		})
+		if index == len(projection.AppliedOperations) || projection.AppliedOperations[index].OperationID != operation.OperationID {
+			return "", fmt.Errorf("applied plan %s is missing receipt for operation %s", plan.PlanID, operation.OperationID)
+		}
+		receipt := projection.AppliedOperations[index]
+		if receipt.RunID != operation.RunID ||
+			receipt.ProjectionVersion != operation.ProjectionVersion ||
+			receipt.IdempotencyKey != operation.IdempotencyKey {
+			return "", fmt.Errorf("applied plan %s has a mismatched receipt for operation %s", plan.PlanID, operation.OperationID)
+		}
+		if receipt.Outcome == OperationFailed {
+			runState = RunFailed
+		}
 	}
-	return RunFailed
+	return runState, nil
 }
 
 func cloneProjection(projection Projection) Projection {

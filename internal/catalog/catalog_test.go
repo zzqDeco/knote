@@ -278,6 +278,74 @@ func TestProjectionPlanReplayIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestIdempotentReplayReportsMatchedPlanState(t *testing.T) {
+	scope := testScope()
+	currentSnapshot := testSnapshot(t, scope, "source-v1")
+	current := testProjection(t, scope, "projection-v1", currentSnapshot.Ref(), nil)
+
+	firstSnapshot := testSnapshot(t, scope, "source-v2", "sources/a.md")
+	firstRun := testRun(scope, current.Version, "projection-v2", firstSnapshot.Ref())
+	firstDesired := testMetadata(t, scope, protocol.ResourceDocument, "sources/a.md", "v2", "source-v2", "content-v2", firstRun.ProjectionVersion, "", "doc:a")
+	firstPlan, err := PlanResources(firstRun, current, []ResourceMetadata{firstDesired})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, _, err := Replay(firstPlan, current, SuccessfulResults(firstPlan))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	secondSnapshot := testSnapshot(t, scope, "source-v3", "sources/a.md")
+	secondRun := testRun(scope, first.Version, "projection-v3", secondSnapshot.Ref())
+	secondDesired := testMetadata(t, scope, protocol.ResourceDocument, "sources/a.md", "v3", "source-v3", "content-v3", secondRun.ProjectionVersion, "", "doc:a")
+	secondPlan, err := PlanResources(secondRun, first, []ResourceMetadata{secondDesired})
+	if err != nil {
+		t.Fatal(err)
+	}
+	failedResults := SuccessfulResults(secondPlan)
+	for i, operation := range secondPlan.Operations {
+		if operation.Kind == OperationProjectACL {
+			failedResults[i] = OperationResult{
+				OperationID: operation.OperationID,
+				Outcome:     OperationFailed,
+				ErrorCode:   "acl_projection_failed",
+			}
+		}
+	}
+	failedSuccessor, _, err := Replay(secondPlan, first, failedResults)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if failedSuccessor.State != StateFailed {
+		t.Fatalf("successor state = %q, want failed", failedSuccessor.State)
+	}
+
+	replayed, report, err := Replay(firstPlan, failedSuccessor, SuccessfulResults(firstPlan))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !report.IdempotentNoop || report.RunState != RunSucceeded {
+		t.Fatalf("old successful plan reported successor state: %+v", report)
+	}
+	if !reflect.DeepEqual(replayed, failedSuccessor) {
+		t.Fatal("idempotent replay changed the successor projection")
+	}
+
+	missingReceipt := failedSuccessor
+	for index, receipt := range missingReceipt.AppliedOperations {
+		if receipt.OperationID == firstPlan.Operations[0].OperationID {
+			missingReceipt.AppliedOperations = append(
+				append([]OperationReceipt(nil), missingReceipt.AppliedOperations[:index]...),
+				missingReceipt.AppliedOperations[index+1:]...,
+			)
+			break
+		}
+	}
+	if _, _, err := Replay(firstPlan, missingReceipt, SuccessfulResults(firstPlan)); err == nil {
+		t.Fatal("idempotent replay accepted an applied plan with a missing receipt")
+	}
+}
+
 func TestReplayRejectsIncompleteProjectionPlan(t *testing.T) {
 	scope := testScope()
 	currentSnapshot := testSnapshot(t, scope, "source-v1", "sources/a.md")
@@ -325,6 +393,64 @@ func TestCatalogRejectsMixedSecurityDomains(t *testing.T) {
 	}
 }
 
+func TestCatalogRejectsUnresolvedCrossResourceReferences(t *testing.T) {
+	scope := testScope()
+	snapshot := testSnapshot(t, scope, "source-v2", "sources/a.md")
+	document := Document{
+		Metadata: testMetadata(t, scope, protocol.ResourceDocument, "sources/a.md", "document", "source-v2", "content-doc-v2", "projection-v2", "", "doc:a"),
+		Snapshot: snapshot.Ref(),
+		Path:     "sources/a.md",
+	}
+	chunk := Chunk{
+		Metadata: testMetadata(t, scope, protocol.ResourceChunk, "sources/a.md#chunk:0", "chunk", "source-v2", "content-chunk-v2", "projection-v2", document.Metadata.ResourceID, document.Metadata.AuthorizationObject),
+		Document: document.VersionRef(),
+		Ordinal:  0,
+		Span:     [2]int{0, 5},
+	}
+	provenance := Provenance{
+		DerivationMode: protocol.DerivationAnySupport,
+		Supports: []Support{{
+			SupportID: "support-a-v2",
+			Evidence:  []EvidenceRef{chunk.EvidenceRef()},
+			Complete:  true,
+		}},
+	}
+	claim := Claim{
+		Metadata:       testMetadata(t, scope, protocol.ResourceClaim, "sources/a.md#claim:0", "claim", "source-v2", "content-claim-v2", "projection-v2", "", "claim:a:0"),
+		SourceDocument: document.VersionRef(),
+		Text:           "claim",
+		Provenance:     provenance,
+	}
+	entity := Entity{
+		Metadata:   testMetadata(t, scope, protocol.ResourceEntity, "entity:a", "entity", "source-v2", "content-entity-v2", "projection-v2", "", "entity:a"),
+		Name:       "A",
+		EntityType: "Topic",
+		Provenance: provenance,
+	}
+	artifact := DerivedArtifact{
+		Metadata:   testMetadata(t, scope, protocol.ResourceDerivedArtifact, "artifact:a", "artifact", "source-v2", "content-artifact-v2", "projection-v2", "", "artifact:a"),
+		Kind:       "summary",
+		Provenance: provenance,
+	}
+
+	tests := []struct {
+		name    string
+		catalog Catalog
+	}{
+		{name: "claim source document", catalog: Catalog{Chunks: []Chunk{chunk}, Claims: []Claim{claim}}},
+		{name: "claim evidence", catalog: Catalog{Documents: []Document{document}, Claims: []Claim{claim}}},
+		{name: "entity evidence", catalog: Catalog{Documents: []Document{document}, Entities: []Entity{entity}}},
+		{name: "derived artifact evidence", catalog: Catalog{Documents: []Document{document}, DerivedArtifacts: []DerivedArtifact{artifact}}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if err := test.catalog.Validate(); err == nil {
+				t.Fatal("catalog accepted an unresolved cross-resource reference")
+			}
+		})
+	}
+}
+
 func TestFullReconciliationTombstonesStaleResources(t *testing.T) {
 	scope := testScope()
 	currentSnapshot := testSnapshot(t, scope, "source-v1", "sources/keep.md", "sources/stale.md")
@@ -360,6 +486,51 @@ func TestFullReconciliationTombstonesStaleResources(t *testing.T) {
 	}
 	if !projection.IsServing(keepV2.ResourceID) {
 		t.Fatalf("retained resource is not serving in the complete projection: %+v", projection)
+	}
+}
+
+func TestFullReconciliationRequiresExactDocumentSnapshot(t *testing.T) {
+	scope := testScope()
+	currentSnapshot := testSnapshot(t, scope, "source-v1")
+	current := testProjection(t, scope, "projection-v1", currentSnapshot.Ref(), nil)
+	nextSnapshot := testSnapshot(t, scope, "source-v2", "sources/a.md")
+	run := testRun(scope, current.Version, "projection-v2", nextSnapshot.Ref())
+	document := Document{
+		Metadata: testMetadata(t, scope, protocol.ResourceDocument, "sources/a.md", "document", "source-v2", "content-v2", run.ProjectionVersion, "", "doc:a"),
+		Snapshot: nextSnapshot.Ref(),
+		Path:     "sources/a.md",
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*SourceSnapshotRef)
+	}{
+		{name: "source id", mutate: func(snapshot *SourceSnapshotRef) { snapshot.SourceID = "other-source" }},
+		{name: "digest", mutate: func(snapshot *SourceSnapshotRef) { snapshot.Digest = protocol.NewContentDigest("other-snapshot") }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			mismatched := document
+			test.mutate(&mismatched.Snapshot)
+			if _, err := PlanFullReconciliation(run, current, Catalog{Documents: []Document{mismatched}}); err == nil {
+				t.Fatal("full reconciliation accepted a document from another source snapshot")
+			}
+		})
+	}
+}
+
+func TestPlannerRejectsSecurityDomainTransition(t *testing.T) {
+	scope := testScope()
+	currentSnapshot := testSnapshot(t, scope, "source-v1", "sources/stale.md")
+	stale := published(testMetadata(t, scope, protocol.ResourceDocument, "sources/stale.md", "stale", "source-v1", "content-v1", "projection-v1", "", "doc:stale"))
+	current := testProjection(t, scope, "projection-v1", currentSnapshot.Ref(), []ResourceMetadata{stale})
+	nextSnapshot, err := NewSourceSnapshot(scope, "git", "source-v2", "repo:other", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := testRun(scope, current.Version, "projection-v2", nextSnapshot.Ref())
+	if _, err := PlanResources(run, current, nil); err == nil {
+		t.Fatal("planner accepted a security-domain transition while planning stale resources")
 	}
 }
 
@@ -426,6 +597,41 @@ func TestProjectionRejectsResourceFromAnotherSourceVersion(t *testing.T) {
 	resource := published(testMetadata(t, scope, protocol.ResourceDocument, "sources/a.md", "a", "source-v1", "content-v1", "projection-v2", "", "doc:a"))
 	if _, err := NewProjection(scope, "projection-v2", snapshot.Ref(), StatePublished, []ResourceMetadata{resource}); err == nil {
 		t.Fatal("projection accepted a resource from another source version")
+	}
+}
+
+func TestProjectionValidatesServingChunkAuthorizationBoundary(t *testing.T) {
+	scope := testScope()
+	snapshot := testSnapshot(t, scope, "source-v2", "sources/a.md")
+	document := published(testMetadata(t, scope, protocol.ResourceDocument, "sources/a.md", "document", "source-v2", "content-doc-v2", "projection-v2", "", "doc:a"))
+	chunk := published(testMetadata(t, scope, protocol.ResourceChunk, "sources/a.md#chunk:0", "chunk", "source-v2", "content-chunk-v2", "projection-v2", document.ResourceID, document.AuthorizationObject))
+
+	if _, err := NewProjection(scope, "projection-v2", snapshot.Ref(), StatePublished, []ResourceMetadata{document, chunk}); err != nil {
+		t.Fatalf("valid serving chunk boundary: %v", err)
+	}
+
+	tests := []struct {
+		name      string
+		resources []ResourceMetadata
+	}{
+		{name: "missing parent", resources: []ResourceMetadata{chunk}},
+		{name: "authorization object mismatch", resources: []ResourceMetadata{document, func() ResourceMetadata {
+			mismatched := chunk
+			mismatched.AuthorizationObject = "document:other"
+			return mismatched
+		}()}},
+		{name: "acl version mismatch", resources: []ResourceMetadata{document, func() ResourceMetadata {
+			mismatched := chunk
+			mismatched.Versions.ACL = "acl-v2"
+			return mismatched
+		}()}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := NewProjection(scope, "projection-v2", snapshot.Ref(), StatePublished, test.resources); err == nil {
+				t.Fatal("projection accepted an invalid serving chunk authorization boundary")
+			}
+		})
 	}
 }
 

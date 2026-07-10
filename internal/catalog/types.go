@@ -560,6 +560,11 @@ type Catalog struct {
 	DerivedArtifacts []DerivedArtifact `json:"derived_artifacts"`
 }
 
+func (c Catalog) Validate() error {
+	_, err := c.ResourceMetadata()
+	return err
+}
+
 // Canonical returns a validated deep copy with deterministic collection order.
 func (c Catalog) Canonical() (Catalog, error) {
 	out := Catalog{
@@ -652,7 +657,71 @@ func (c Catalog) ResourceMetadata() ([]ResourceMetadata, error) {
 			return nil, fmt.Errorf("duplicate resource_id %s", resources[i].ResourceID)
 		}
 	}
+	if err := c.validateReferences(resources); err != nil {
+		return nil, err
+	}
 	return resources, nil
+}
+
+func (c Catalog) validateReferences(resources []ResourceMetadata) error {
+	resourcesByID := make(map[protocol.ResourceID]ResourceMetadata, len(resources))
+	for _, resource := range resources {
+		resourcesByID[resource.ResourceID] = resource
+	}
+	documentsByID := make(map[protocol.ResourceID]DocumentVersionRef, len(c.Documents))
+	for _, document := range c.Documents {
+		documentsByID[document.Metadata.ResourceID] = document.VersionRef()
+	}
+
+	for _, claim := range c.Claims {
+		if err := resolveDocumentReference(claim.SourceDocument, documentsByID); err != nil {
+			return fmt.Errorf("claim %s source document: %w", claim.Metadata.ResourceID, err)
+		}
+		if err := resolveProvenanceReferences(claim.Provenance, resourcesByID, documentsByID); err != nil {
+			return fmt.Errorf("claim %s provenance: %w", claim.Metadata.ResourceID, err)
+		}
+	}
+	for _, entity := range c.Entities {
+		if err := resolveProvenanceReferences(entity.Provenance, resourcesByID, documentsByID); err != nil {
+			return fmt.Errorf("entity %s provenance: %w", entity.Metadata.ResourceID, err)
+		}
+	}
+	for _, artifact := range c.DerivedArtifacts {
+		if err := resolveProvenanceReferences(artifact.EffectiveProvenance(), resourcesByID, documentsByID); err != nil {
+			return fmt.Errorf("derived artifact %s provenance: %w", artifact.Metadata.ResourceID, err)
+		}
+	}
+	return nil
+}
+
+func resolveProvenanceReferences(
+	provenance Provenance,
+	resourcesByID map[protocol.ResourceID]ResourceMetadata,
+	documentsByID map[protocol.ResourceID]DocumentVersionRef,
+) error {
+	for _, support := range provenance.Supports {
+		for _, evidence := range support.Evidence {
+			resource, ok := resourcesByID[evidence.ResourceID]
+			if !ok || resource.Type != evidence.Type || resource.Versions != evidence.Versions {
+				return fmt.Errorf("support %s evidence %s does not resolve in the catalog", support.SupportID, evidence.ResourceID)
+			}
+			if err := resolveDocumentReference(evidence.Document, documentsByID); err != nil {
+				return fmt.Errorf("support %s evidence %s document: %w", support.SupportID, evidence.ResourceID, err)
+			}
+		}
+	}
+	return nil
+}
+
+func resolveDocumentReference(
+	reference DocumentVersionRef,
+	documentsByID map[protocol.ResourceID]DocumentVersionRef,
+) error {
+	document, ok := documentsByID[reference.ResourceID]
+	if !ok || document != reference {
+		return fmt.Errorf("document %s does not resolve in the catalog", reference.ResourceID)
+	}
+	return nil
 }
 
 func validateResourceType(resourceType protocol.ResourceType) error {

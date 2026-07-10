@@ -197,7 +197,7 @@ func (p Projection) Validate() error {
 	if err := p.State.Validate(); err != nil {
 		return err
 	}
-	seenResources := make(map[protocol.ResourceID]struct{}, len(p.Resources))
+	resourcesByID := make(map[protocol.ResourceID]ResourceMetadata, len(p.Resources))
 	for i, resource := range p.Resources {
 		if err := resource.Validate(); err != nil {
 			return fmt.Errorf("resource %s: %w", resource.ResourceID, err)
@@ -211,10 +211,10 @@ func (p Projection) Validate() error {
 		if resource.SecurityDomain != p.SourceSnapshot.SecurityDomain {
 			return fmt.Errorf("resource %s crosses the projection security domain", resource.ResourceID)
 		}
-		if _, ok := seenResources[resource.ResourceID]; ok {
+		if _, ok := resourcesByID[resource.ResourceID]; ok {
 			return fmt.Errorf("duplicate resource_id %s", resource.ResourceID)
 		}
-		seenResources[resource.ResourceID] = struct{}{}
+		resourcesByID[resource.ResourceID] = resource
 		if i > 0 && p.Resources[i-1].ResourceID > resource.ResourceID {
 			return fmt.Errorf("projection resources are not in canonical order")
 		}
@@ -223,6 +223,18 @@ func (p Projection) Validate() error {
 		}
 		if p.State != StatePublished && resource.IsServing() {
 			return fmt.Errorf("non-published projection contains serving resource %s", resource.ResourceID)
+		}
+	}
+	for _, resource := range p.Resources {
+		if resource.Type != protocol.ResourceChunk || !resource.IsServing() {
+			continue
+		}
+		document, ok := resourcesByID[resource.AuthorizationResourceID]
+		if !ok || document.Type != protocol.ResourceDocument || !document.IsServing() {
+			return fmt.Errorf("serving chunk %s has no serving parent document", resource.ResourceID)
+		}
+		if !chunkInheritsDocumentAuthorization(resource, document) {
+			return fmt.Errorf("serving chunk %s does not inherit its parent document authorization boundary", resource.ResourceID)
 		}
 	}
 	if !sort.StringsAreSorted(p.AppliedPlanIDs) {
@@ -259,6 +271,11 @@ func PlanFullReconciliation(run SyncRun, current Projection, desired Catalog) (P
 	canonical, err := desired.Canonical()
 	if err != nil {
 		return ProjectionPlan{}, err
+	}
+	for _, document := range canonical.Documents {
+		if document.Snapshot != run.SourceSnapshot {
+			return ProjectionPlan{}, fmt.Errorf("desired document %s is not bound to the run source snapshot", document.Metadata.ResourceID)
+		}
 	}
 	resources, err := canonical.ResourceMetadata()
 	if err != nil {
@@ -331,6 +348,9 @@ func planResources(
 	}
 	if current.Scope != run.Scope || current.Version != run.BaseProjectionVersion {
 		return ProjectionPlan{}, fmt.Errorf("sync run does not match the current projection")
+	}
+	if current.SourceSnapshot.SecurityDomain != run.SourceSnapshot.SecurityDomain {
+		return ProjectionPlan{}, fmt.Errorf("sync run security domain does not match the current projection")
 	}
 
 	targets := make([]ResourceMetadata, len(desired))
@@ -420,14 +440,18 @@ func validateChunkBoundaries(resources []ResourceMetadata) error {
 		if !ok || document.Type != protocol.ResourceDocument {
 			return fmt.Errorf("chunk %s has no desired parent document", resource.ResourceID)
 		}
-		if document.AuthorizationObject != resource.AuthorizationObject ||
-			document.Versions.Source != resource.Versions.Source ||
-			document.Versions.ACL != resource.Versions.ACL ||
-			document.Versions.Projection != resource.Versions.Projection {
+		if !chunkInheritsDocumentAuthorization(resource, document) {
 			return fmt.Errorf("chunk %s does not inherit the desired parent document authorization boundary", resource.ResourceID)
 		}
 	}
 	return nil
+}
+
+func chunkInheritsDocumentAuthorization(chunk, document ResourceMetadata) bool {
+	return document.AuthorizationObject == chunk.AuthorizationObject &&
+		document.Versions.Source == chunk.Versions.Source &&
+		document.Versions.ACL == chunk.Versions.ACL &&
+		document.Versions.Projection == chunk.Versions.Projection
 }
 
 func sameResourceDefinition(left, right ResourceMetadata) bool {
