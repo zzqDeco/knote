@@ -87,14 +87,14 @@ func Replay(
 	if err := current.Validate(); err != nil {
 		return Projection{}, ReplayReport{}, err
 	}
-	if current.State != StatePublished {
-		return Projection{}, ReplayReport{}, fmt.Errorf("projection replay requires a published base projection")
-	}
 	if containsSorted(current.AppliedPlanIDs, plan.PlanID) {
 		return cloneProjection(current), ReplayReport{
 			PlanID: plan.PlanID, RunID: plan.Run.RunID,
 			RunState: runStateForProjection(current), IdempotentNoop: true,
 		}, nil
+	}
+	if current.State != StatePublished {
+		return Projection{}, ReplayReport{}, fmt.Errorf("projection replay requires a published base projection")
 	}
 	if current.Scope != plan.Run.Scope || current.Version != plan.Run.BaseProjectionVersion {
 		return Projection{}, ReplayReport{}, fmt.Errorf("projection plan does not apply to the current projection")
@@ -256,7 +256,7 @@ func validateReplayPlan(plan ProjectionPlan, current Projection) error {
 				expectedState = StateRevoked
 			}
 			terminal := group.byKind[kind].Resource
-			if terminal.ServingState != expectedState || !sameResourceDefinition(previous, terminal) {
+			if terminal.ServingState != expectedState || !sameTerminalDefinition(previous, terminal) {
 				return fmt.Errorf("terminal operation for resource %s does not match the current resource", resourceID)
 			}
 			continue
@@ -286,6 +286,11 @@ func validateReplayPlan(plan ProjectionPlan, current Projection) error {
 		}
 	}
 	return nil
+}
+
+func sameTerminalDefinition(previous, terminal ResourceMetadata) bool {
+	previous.Versions.Source = terminal.Versions.Source
+	return sameResourceDefinition(previous, terminal)
 }
 
 func isTargetOperation(kind OperationKind) bool {

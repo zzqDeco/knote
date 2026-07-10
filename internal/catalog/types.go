@@ -461,7 +461,10 @@ func (e Entity) Validate() error {
 	if err := validateToken("entity type", e.EntityType); err != nil {
 		return err
 	}
-	return e.Provenance.Validate()
+	if err := e.Provenance.Validate(); err != nil {
+		return err
+	}
+	return validateProvenanceVersions(e.Metadata, e.Provenance)
 }
 
 type Claim struct {
@@ -482,10 +485,18 @@ func (c Claim) Validate() error {
 	if err := c.SourceDocument.Validate(); err != nil {
 		return err
 	}
+	if c.Metadata.Versions.Source != c.SourceDocument.SourceVersion ||
+		c.Metadata.Versions.ACL != c.SourceDocument.ACLVersion ||
+		c.Metadata.Versions.Projection != c.SourceDocument.ProjectionVersion {
+		return fmt.Errorf("claim metadata does not match its source document versions")
+	}
 	if err := validateToken("claim text", c.Text); err != nil {
 		return err
 	}
 	if err := c.Provenance.Validate(); err != nil {
+		return err
+	}
+	if err := validateProvenanceVersions(c.Metadata, c.Provenance); err != nil {
 		return err
 	}
 	for _, support := range c.Provenance.Supports {
@@ -514,7 +525,23 @@ func (a DerivedArtifact) Validate() error {
 	if err := validateToken("artifact kind", a.Kind); err != nil {
 		return err
 	}
-	return a.EffectiveProvenance().Validate()
+	provenance := a.EffectiveProvenance()
+	if err := provenance.Validate(); err != nil {
+		return err
+	}
+	return validateProvenanceVersions(a.Metadata, provenance)
+}
+
+func validateProvenanceVersions(metadata ResourceMetadata, provenance Provenance) error {
+	for _, support := range provenance.Supports {
+		for _, evidence := range support.Evidence {
+			if evidence.Versions.Source != metadata.Versions.Source ||
+				evidence.Versions.Projection != metadata.Versions.Projection {
+				return fmt.Errorf("support %s evidence %s is stale for resource %s", support.SupportID, evidence.ResourceID, metadata.ResourceID)
+			}
+		}
+	}
+	return nil
 }
 
 func (a DerivedArtifact) EffectiveProvenance() Provenance {

@@ -205,6 +205,9 @@ func (p Projection) Validate() error {
 		if resource.Scope != p.Scope || resource.Versions.Projection != p.Version {
 			return fmt.Errorf("resource %s crosses the projection scope or version", resource.ResourceID)
 		}
+		if resource.Versions.Source != p.SourceSnapshot.Version {
+			return fmt.Errorf("resource %s crosses the projection source version", resource.ResourceID)
+		}
 		if resource.SecurityDomain != p.SourceSnapshot.SecurityDomain {
 			return fmt.Errorf("resource %s crosses the projection security domain", resource.ResourceID)
 		}
@@ -285,13 +288,13 @@ func PlanRevocations(
 		}
 		revoked[resourceID] = struct{}{}
 	}
-	desired := make([]ResourceMetadata, 0, len(current.Resources)-len(revoked))
+	desired := make([]ResourceMetadata, 0, len(current.Resources))
 	for _, resource := range current.Resources {
 		if _, selected := revoked[resource.ResourceID]; selected {
 			delete(revoked, resource.ResourceID)
 			continue
 		}
-		if resource.ServingState == StateTombstoned || resource.ServingState == StateRevoked {
+		if resource.ServingState.IsTerminal() {
 			continue
 		}
 		resource.Versions.Projection = run.ProjectionVersion
@@ -379,11 +382,11 @@ func planResources(
 		}
 	}
 	for _, resource := range current.Resources {
-		if _, ok := targetByID[resource.ResourceID]; ok ||
-			resource.ServingState == StateTombstoned || resource.ServingState == StateRevoked {
+		if _, ok := targetByID[resource.ResourceID]; ok || resource.ServingState.IsTerminal() {
 			continue
 		}
 		terminal := resource
+		terminal.Versions.Source = run.SourceSnapshot.Version
 		terminal.Versions.Projection = run.ProjectionVersion
 		if staleKind == OperationRevoke {
 			terminal.ServingState = StateRevoked

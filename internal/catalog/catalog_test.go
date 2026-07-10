@@ -149,6 +149,11 @@ func TestCanonicalTypesPinProvenanceToDocumentVersions(t *testing.T) {
 	if err := wrongVersion.Validate(); err == nil {
 		t.Fatal("claim provenance from another document version should fail")
 	}
+	staleEntity := entity
+	staleEntity.Metadata.Versions.Projection = "projection-v3"
+	if err := staleEntity.Validate(); err == nil {
+		t.Fatal("entity accepted provenance from an older projection")
+	}
 }
 
 func TestProjectionPlanIsDeterministicAndBoundToRun(t *testing.T) {
@@ -230,6 +235,13 @@ func TestFailedACLOrIndexProjectionCannotServe(t *testing.T) {
 			retryDesired.ProjectionStatus = PendingProjectionStatus()
 			if _, err := PlanResources(retryRun, projection, []ResourceMetadata{retryDesired}); err == nil {
 				t.Fatal("failed projection was accepted as the base of another run")
+			}
+			replayed, replayReport, err := Replay(plan, projection, results)
+			if err != nil {
+				t.Fatalf("idempotent failed replay: %v", err)
+			}
+			if !replayReport.IdempotentNoop || !reflect.DeepEqual(replayed, projection) {
+				t.Fatalf("failed replay was not idempotent: report=%+v", replayReport)
 			}
 		})
 	}
@@ -371,6 +383,49 @@ func TestExplicitRevocationProducesNonServingReplacementProjection(t *testing.T)
 	revoked := resourceByID(t, projection, resource.ResourceID)
 	if revoked.ServingState != StateRevoked || projection.IsServing(resource.ResourceID) {
 		t.Fatalf("revoked resource is still serving: %+v", revoked)
+	}
+}
+
+func TestRevocationOfUnknownResourceReturnsErrorWithoutPanic(t *testing.T) {
+	scope := testScope()
+	snapshot := testSnapshot(t, scope, "source-v1")
+	current := testProjection(t, scope, "projection-v1", snapshot.Ref(), nil)
+	run := testRun(scope, current.Version, "projection-v2", snapshot.Ref())
+	unknown, err := protocol.NewStableResourceID(scope.TenantID, scope.KnowledgeBaseID, protocol.ResourceDocument, "sources/missing.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := PlanRevocations(run, current, []protocol.ResourceID{unknown}); err == nil {
+		t.Fatal("unknown revocation target should return an error")
+	}
+}
+
+func TestPlannerSkipsAlreadyTerminalResources(t *testing.T) {
+	scope := testScope()
+	snapshot := testSnapshot(t, scope, "source-v1", "sources/old.md")
+	terminal := published(testMetadata(t, scope, protocol.ResourceDocument, "sources/old.md", "old", "source-v1", "content-v1", "projection-v1", "", "doc:old"))
+	terminal.ServingState = StateSuperseded
+	current := testProjection(t, scope, "projection-v1", snapshot.Ref(), []ResourceMetadata{terminal})
+	nextSnapshot := testSnapshot(t, scope, "source-v2")
+	run := testRun(scope, current.Version, "projection-v2", nextSnapshot.Ref())
+	plan, err := PlanResources(run, current, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Operations) != 0 {
+		t.Fatalf("terminal resource produced stale operations: %+v", plan.Operations)
+	}
+	if _, _, err := Replay(plan, current, nil); err != nil {
+		t.Fatalf("replay terminal cleanup plan: %v", err)
+	}
+}
+
+func TestProjectionRejectsResourceFromAnotherSourceVersion(t *testing.T) {
+	scope := testScope()
+	snapshot := testSnapshot(t, scope, "source-v2", "sources/a.md")
+	resource := published(testMetadata(t, scope, protocol.ResourceDocument, "sources/a.md", "a", "source-v1", "content-v1", "projection-v2", "", "doc:a"))
+	if _, err := NewProjection(scope, "projection-v2", snapshot.Ref(), StatePublished, []ResourceMetadata{resource}); err == nil {
+		t.Fatal("projection accepted a resource from another source version")
 	}
 }
 
