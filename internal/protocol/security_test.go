@@ -78,7 +78,8 @@ func TestProvenanceSemantics(t *testing.T) {
 		t.Fatal(err)
 	}
 	support := ProvenanceSupport{
-		SupportID: "support-1", ResourceID: id, Evidence: []ResourceID{id}, Complete: true,
+		SupportID: "support-1", Resource: testResourceHandle(t, id),
+		Evidence: []ResourceHandle{testResourceHandle(t, id)}, Complete: true,
 	}
 	if err := ValidateProvenance(DerivationAnySupport, []ProvenanceSupport{support}); err != nil {
 		t.Fatalf("valid any-support provenance: %v", err)
@@ -135,6 +136,7 @@ func TestChunkAuthorizationUsesParentDocumentBoundary(t *testing.T) {
 	chunk := testResourceHandle(t, chunkID)
 	chunk.Type = ResourceChunk
 	chunk.AuthorizationID = document.AuthorizationID
+	chunk.AuthorizationResourceID = document.ResourceID
 
 	decision := testDecision(t, chunkID)
 	decision.Resource = chunk
@@ -155,8 +157,9 @@ func TestChunkAuthorizationUsesParentDocumentBoundary(t *testing.T) {
 	}
 	wrongParent := decision
 	wrongParent.AuthorizationResource = testResourceHandle(t, otherDocumentID)
+	wrongParent.AuthorizationResource.AuthorizationID = document.AuthorizationID
 	if err := wrongParent.Validate(); err == nil {
-		t.Fatal("authorization through a different document should fail")
+		t.Fatal("authorization through a forged document with the same authorization object should fail")
 	}
 }
 
@@ -172,7 +175,8 @@ func TestEvidencePackageBinding(t *testing.T) {
 		t.Fatalf("visibility fingerprint: %v", err)
 	}
 	support := ProvenanceSupport{
-		SupportID: "support-1", ResourceID: id, Evidence: []ResourceID{id}, Complete: true,
+		SupportID: "support-1", Resource: resource,
+		Evidence: []ResourceHandle{resource}, Complete: true,
 	}
 	pkg := EvidencePackage{
 		Version:               SecurityContractVersion,
@@ -215,6 +219,12 @@ func TestEvidencePackageBinding(t *testing.T) {
 	}
 	mismatched = pkg
 	mismatched.Decisions = append([]AuthorizationDecision(nil), pkg.Decisions...)
+	mismatched.Decisions[0].SessionID = "another-session"
+	if err := mismatched.ValidateFor(auth); err == nil {
+		t.Fatal("decision from another session should fail")
+	}
+	mismatched = pkg
+	mismatched.Decisions = append([]AuthorizationDecision(nil), pkg.Decisions...)
 	mismatched.Decisions[0].PrincipalID = "another-user"
 	if err := mismatched.ValidateFor(auth); err == nil {
 		t.Fatal("decision for another principal should fail")
@@ -244,9 +254,16 @@ func TestEvidencePackageBinding(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mismatched.Items[0].Supports[0].Evidence = []ResourceID{unauthorizedID}
+	mismatched.Items[0].Supports[0].Evidence = []ResourceHandle{testResourceHandle(t, unauthorizedID)}
 	if err := mismatched.ValidateFor(auth); err == nil {
 		t.Fatal("unauthorized provenance evidence should fail")
+	}
+	mismatched = pkg
+	mismatched.Items = append([]EvidenceItem(nil), pkg.Items...)
+	mismatched.Items[0].Supports = append([]ProvenanceSupport(nil), pkg.Items[0].Supports...)
+	mismatched.Items[0].Supports[0].Resource.Versions.Content = "content-v0"
+	if err := mismatched.ValidateFor(auth); err == nil {
+		t.Fatal("provenance from another resource version should fail")
 	}
 	mismatched = pkg
 	mismatched.Decisions = append([]AuthorizationDecision(nil), pkg.Decisions...)
@@ -266,6 +283,64 @@ func TestEvidencePackageBinding(t *testing.T) {
 	mismatched.Items[0].Citation.Resource = mismatched.Items[0].Resource
 	if err := mismatched.ValidateFor(auth); err == nil {
 		t.Fatal("resource version not covered by the allow decision should fail")
+	}
+}
+
+func TestEntityEvidenceRequiresAuthorizedSourceSupport(t *testing.T) {
+	auth := testAuthorizationContext()
+	entityID, err := NewStableResourceID("local", "default", ResourceEntity, "entity:knote")
+	if err != nil {
+		t.Fatal(err)
+	}
+	entity := testResourceHandle(t, entityID)
+	entity.Type = ResourceEntity
+	entityDecision := testDecision(t, entityID)
+	entityDecision.Resource = entity
+	entityDecision.AuthorizationResource = entity
+
+	fingerprint, err := NewVisibilityFingerprint(auth, entity.Versions.Projection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pkg := EvidencePackage{
+		Version:               SecurityContractVersion,
+		TenantID:              auth.TenantID,
+		KnowledgeBaseID:       auth.KnowledgeBaseID,
+		PrincipalID:           auth.PrincipalID,
+		SessionID:             auth.SessionID,
+		RequestID:             auth.RequestID,
+		AuthorizationModelID:  auth.AuthorizationModelID,
+		IdentityWatermark:     auth.IdentityWatermark,
+		ACLWatermark:          auth.ACLWatermark,
+		Consistency:           auth.Consistency,
+		ProjectionVersion:     entity.Versions.Projection,
+		VisibilityFingerprint: fingerprint,
+		Items: []EvidenceItem{{
+			Resource: entity, Content: "knote", Derivation: DerivationAnySupport,
+			Supports: []ProvenanceSupport{{
+				SupportID: "support-self", Resource: entity,
+				Evidence: []ResourceHandle{entity}, Complete: true,
+			}},
+			Citation: Citation{Handle: "citation-entity", Resource: entity},
+		}},
+		Decisions: []AuthorizationDecision{entityDecision},
+	}
+	if err := pkg.ValidateFor(auth); err == nil {
+		t.Fatal("entity self-support should fail")
+	}
+
+	documentID, err := NewStableResourceID("local", "default", ResourceDocument, "sources/intro.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	document := testResourceHandle(t, documentID)
+	pkg.Items[0].Supports[0] = ProvenanceSupport{
+		SupportID: "support-document", Resource: document,
+		Evidence: []ResourceHandle{document}, Complete: true,
+	}
+	pkg.Decisions = append(pkg.Decisions, testDecision(t, documentID))
+	if err := pkg.ValidateFor(auth); err != nil {
+		t.Fatalf("entity with authorized document support: %v", err)
 	}
 }
 
@@ -317,7 +392,7 @@ func testResourceHandle(t *testing.T, id ResourceID) ResourceHandle {
 	t.Helper()
 	handle := ResourceHandle{
 		ResourceID: id, Type: ResourceDocument, TenantID: "local", KnowledgeBaseID: "default",
-		AuthorizationID: "document:" + string(id), ServingState: ServingActive,
+		AuthorizationID: "document:" + string(id), AuthorizationResourceID: id, ServingState: ServingActive,
 		Versions: ResourceVersions{
 			Source: "source-v1", Content: "content-v1", ACL: "acl-v1",
 			Index: "index-v1", Graph: "graph-v1", Projection: "projection-v1",
@@ -333,7 +408,7 @@ func testDecision(t *testing.T, id ResourceID) AuthorizationDecision {
 	t.Helper()
 	resource := testResourceHandle(t, id)
 	decision := AuthorizationDecision{
-		CorrelationID: "decision-1", RequestID: "request-1", PrincipalID: "local-user",
+		CorrelationID: "decision-1", RequestID: "request-1", SessionID: "session-1", PrincipalID: "local-user",
 		Relation: EvidenceReadRelation, Resource: resource, AuthorizationResource: resource,
 		Outcome: DecisionAllow, AuthorizationModelID: "local-v1", IdentityWatermark: "identity-v1",
 		ACLWatermark: "acl-v1", Consistency: ConsistencyHigherConsistency,

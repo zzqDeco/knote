@@ -152,18 +152,22 @@ const (
 )
 
 type ResourceHandle struct {
-	ResourceID      ResourceID       `json:"resource_id"`
-	Type            ResourceType     `json:"type"`
-	TenantID        string           `json:"tenant_id"`
-	KnowledgeBaseID string           `json:"knowledge_base_id"`
-	AuthorizationID string           `json:"authz_object"`
-	Versions        ResourceVersions `json:"versions"`
-	ServingState    ServingState     `json:"serving_state"`
+	ResourceID              ResourceID       `json:"resource_id"`
+	Type                    ResourceType     `json:"type"`
+	TenantID                string           `json:"tenant_id"`
+	KnowledgeBaseID         string           `json:"knowledge_base_id"`
+	AuthorizationID         string           `json:"authz_object"`
+	AuthorizationResourceID ResourceID       `json:"authorization_resource_id"`
+	Versions                ResourceVersions `json:"versions"`
+	ServingState            ServingState     `json:"serving_state"`
 }
 
 func (h ResourceHandle) Validate() error {
 	if err := h.ResourceID.Validate(); err != nil {
 		return err
+	}
+	if err := h.AuthorizationResourceID.Validate(); err != nil {
+		return fmt.Errorf("authorization_resource_id: %w", err)
 	}
 	for name, value := range map[string]string{
 		"tenant_id":         h.TenantID,
@@ -179,6 +183,9 @@ func (h ResourceHandle) Validate() error {
 	default:
 		return fmt.Errorf("unsupported resource type %q", h.Type)
 	}
+	if h.Type != ResourceChunk && h.AuthorizationResourceID != h.ResourceID {
+		return fmt.Errorf("non-chunk resource must use itself as the authorization boundary")
+	}
 	if h.ServingState != ServingActive {
 		return fmt.Errorf("resource %s is not serving", h.ResourceID)
 	}
@@ -193,10 +200,10 @@ const (
 )
 
 type ProvenanceSupport struct {
-	SupportID  string       `json:"support_id"`
-	ResourceID ResourceID   `json:"resource_id"`
-	Evidence   []ResourceID `json:"evidence_resource_ids"`
-	Complete   bool         `json:"complete"`
+	SupportID string           `json:"support_id"`
+	Resource  ResourceHandle   `json:"resource"`
+	Evidence  []ResourceHandle `json:"evidence_resources"`
+	Complete  bool             `json:"complete"`
 }
 
 func ValidateProvenance(mode DerivationMode, supports []ProvenanceSupport) error {
@@ -215,14 +222,14 @@ func ValidateProvenance(mode DerivationMode, supports []ProvenanceSupport) error
 			return fmt.Errorf("duplicate support_id %q", support.SupportID)
 		}
 		seen[support.SupportID] = struct{}{}
-		if err := support.ResourceID.Validate(); err != nil {
+		if err := support.Resource.Validate(); err != nil {
 			return fmt.Errorf("support %s: %w", support.SupportID, err)
 		}
 		if len(support.Evidence) == 0 {
 			return fmt.Errorf("support %s has no evidence", support.SupportID)
 		}
-		for _, evidenceID := range support.Evidence {
-			if err := evidenceID.Validate(); err != nil {
+		for _, evidence := range support.Evidence {
+			if err := evidence.Validate(); err != nil {
 				return fmt.Errorf("support %s evidence: %w", support.SupportID, err)
 			}
 		}
@@ -244,6 +251,7 @@ const (
 type AuthorizationDecision struct {
 	CorrelationID         string                `json:"correlation_id"`
 	RequestID             string                `json:"request_id"`
+	SessionID             string                `json:"session_id"`
 	PrincipalID           string                `json:"principal_id"`
 	Relation              string                `json:"relation"`
 	Resource              ResourceHandle        `json:"resource"`
@@ -264,6 +272,7 @@ func (d AuthorizationDecision) Validate() error {
 	for name, value := range map[string]string{
 		"correlation_id":         d.CorrelationID,
 		"request_id":             d.RequestID,
+		"session_id":             d.SessionID,
 		"principal_id":           d.PrincipalID,
 		"relation":               d.Relation,
 		"authorization_model_id": d.AuthorizationModelID,
@@ -310,6 +319,9 @@ func (d AuthorizationDecision) validateAuthorizationBoundary() error {
 	if d.Resource.Type == ResourceChunk {
 		if boundary.Type != ResourceDocument {
 			return fmt.Errorf("chunk authorization resource must be its parent document")
+		}
+		if d.Resource.AuthorizationResourceID != boundary.ResourceID {
+			return fmt.Errorf("chunk authorization resource does not match its parent document identity")
 		}
 		if d.Resource.AuthorizationID != boundary.AuthorizationID {
 			return fmt.Errorf("chunk authorization object does not match parent document")
@@ -438,7 +450,7 @@ func (p EvidencePackage) ValidateFor(auth AuthorizationContext) error {
 			decision.Consistency != p.Consistency {
 			return fmt.Errorf("decision authorization binding does not match evidence package")
 		}
-		if decision.RequestID != p.RequestID || decision.PrincipalID != p.PrincipalID {
+		if decision.RequestID != p.RequestID || decision.SessionID != p.SessionID || decision.PrincipalID != p.PrincipalID {
 			return fmt.Errorf("decision request binding does not match evidence package")
 		}
 		if decision.Relation != EvidenceReadRelation {
@@ -478,15 +490,25 @@ func (p EvidencePackage) ValidateFor(auth AuthorizationContext) error {
 		if err := ValidateProvenance(item.Derivation, item.Supports); err != nil {
 			return err
 		}
+		hasEntitySourceSupport := item.Resource.Type != ResourceEntity
 		for _, support := range item.Supports {
-			if _, ok := allowed[support.ResourceID]; !ok {
-				return fmt.Errorf("provenance support resource %s has no allow decision", support.ResourceID)
+			if err := validateAuthorizedHandle(allowed, support.Resource, "provenance support"); err != nil {
+				return err
 			}
-			for _, evidenceID := range support.Evidence {
-				if _, ok := allowed[evidenceID]; !ok {
-					return fmt.Errorf("provenance evidence resource %s has no allow decision", evidenceID)
+			if isEntitySourceSupport(item.Resource, support.Resource) {
+				hasEntitySourceSupport = true
+			}
+			for _, evidence := range support.Evidence {
+				if err := validateAuthorizedHandle(allowed, evidence, "provenance evidence"); err != nil {
+					return err
+				}
+				if isEntitySourceSupport(item.Resource, evidence) {
+					hasEntitySourceSupport = true
 				}
 			}
+		}
+		if !hasEntitySourceSupport {
+			return fmt.Errorf("entity evidence %s requires an authorized document or chunk support", item.Resource.ResourceID)
 		}
 		if err := validateToken("citation_handle", item.Citation.Handle); err != nil {
 			return err
@@ -499,6 +521,24 @@ func (p EvidencePackage) ValidateFor(auth AuthorizationContext) error {
 		}
 	}
 	return nil
+}
+
+func validateAuthorizedHandle(allowed map[ResourceID]AuthorizationDecision, resource ResourceHandle, label string) error {
+	decision, ok := allowed[resource.ResourceID]
+	if !ok {
+		return fmt.Errorf("%s resource %s has no allow decision", label, resource.ResourceID)
+	}
+	if decision.Resource != resource {
+		return fmt.Errorf("%s resource %s does not match the authorized resource handle", label, resource.ResourceID)
+	}
+	return nil
+}
+
+func isEntitySourceSupport(entity, support ResourceHandle) bool {
+	if support.ResourceID == entity.ResourceID {
+		return false
+	}
+	return support.Type == ResourceDocument || support.Type == ResourceChunk
 }
 
 type QueryRequest struct {
