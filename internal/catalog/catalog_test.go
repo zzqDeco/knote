@@ -451,6 +451,70 @@ func TestCatalogRejectsUnresolvedCrossResourceReferences(t *testing.T) {
 	}
 }
 
+func TestCatalogRejectsChunkEvidenceAttributedToAnotherDocument(t *testing.T) {
+	scope := testScope()
+	snapshot := testSnapshot(t, scope, "source-v2", "sources/a.md", "sources/b.md")
+	documentA := Document{
+		Metadata: testMetadata(t, scope, protocol.ResourceDocument, "sources/a.md", "document-a", "source-v2", "content-a-v2", "projection-v2", "", "doc:a"),
+		Snapshot: snapshot.Ref(),
+		Path:     "sources/a.md",
+	}
+	documentB := Document{
+		Metadata: testMetadata(t, scope, protocol.ResourceDocument, "sources/b.md", "document-b", "source-v2", "content-b-v2", "projection-v2", "", "doc:b"),
+		Snapshot: snapshot.Ref(),
+		Path:     "sources/b.md",
+	}
+	chunk := Chunk{
+		Metadata: testMetadata(t, scope, protocol.ResourceChunk, "sources/a.md#chunk:0", "chunk-a", "source-v2", "content-chunk-v2", "projection-v2", documentA.Metadata.ResourceID, documentA.Metadata.AuthorizationObject),
+		Document: documentA.VersionRef(),
+		Ordinal:  0,
+		Span:     [2]int{0, 5},
+	}
+	evidence := chunk.EvidenceRef()
+	evidence.Document = documentB.VersionRef()
+	entity := Entity{
+		Metadata:   testMetadata(t, scope, protocol.ResourceEntity, "entity:a", "entity", "source-v2", "content-entity-v2", "projection-v2", "", "entity:a"),
+		Name:       "A",
+		EntityType: "Topic",
+		Provenance: Provenance{
+			DerivationMode: protocol.DerivationAnySupport,
+			Supports: []Support{{
+				SupportID: "support-a-v2",
+				Evidence:  []EvidenceRef{evidence},
+				Complete:  true,
+			}},
+		},
+	}
+
+	if err := (Catalog{
+		Documents: []Document{documentA, documentB},
+		Chunks:    []Chunk{chunk},
+		Entities:  []Entity{entity},
+	}).Validate(); err == nil {
+		t.Fatal("catalog accepted chunk evidence attributed to another document")
+	}
+}
+
+func TestCatalogRejectsChunkWithUnresolvedDocument(t *testing.T) {
+	scope := testScope()
+	snapshot := testSnapshot(t, scope, "source-v2", "sources/a.md")
+	document := Document{
+		Metadata: testMetadata(t, scope, protocol.ResourceDocument, "sources/a.md", "document", "source-v2", "content-doc-v2", "projection-v2", "", "doc:a"),
+		Snapshot: snapshot.Ref(),
+		Path:     "sources/a.md",
+	}
+	chunk := Chunk{
+		Metadata: testMetadata(t, scope, protocol.ResourceChunk, "sources/a.md#chunk:0", "chunk", "source-v2", "content-chunk-v2", "projection-v2", document.Metadata.ResourceID, document.Metadata.AuthorizationObject),
+		Document: document.VersionRef(),
+		Ordinal:  0,
+		Span:     [2]int{0, 5},
+	}
+
+	if err := (Catalog{Chunks: []Chunk{chunk}}).Validate(); err == nil {
+		t.Fatal("catalog accepted a chunk whose document is absent")
+	}
+}
+
 func TestFullReconciliationTombstonesStaleResources(t *testing.T) {
 	scope := testScope()
 	currentSnapshot := testSnapshot(t, scope, "source-v1", "sources/keep.md", "sources/stale.md")
@@ -516,6 +580,45 @@ func TestFullReconciliationRequiresExactDocumentSnapshot(t *testing.T) {
 				t.Fatal("full reconciliation accepted a document from another source snapshot")
 			}
 		})
+	}
+}
+
+func TestFullReconciliationRejectsIncompleteDesiredDocumentSet(t *testing.T) {
+	scope := testScope()
+	currentSnapshot := testSnapshot(t, scope, "source-v1", "sources/a.md", "sources/b.md")
+	currentA := published(testMetadata(t, scope, protocol.ResourceDocument, "sources/a.md", "a-v1", "source-v1", "content-a-v1", "projection-v1", "", "doc:a"))
+	currentB := published(testMetadata(t, scope, protocol.ResourceDocument, "sources/b.md", "b-v1", "source-v1", "content-b-v1", "projection-v1", "", "doc:b"))
+	current := testProjection(t, scope, "projection-v1", currentSnapshot.Ref(), []ResourceMetadata{currentA, currentB})
+	nextSnapshot := testSnapshot(t, scope, "source-v2", "sources/a.md", "sources/b.md")
+	run := testRun(scope, current.Version, "projection-v2", nextSnapshot.Ref())
+	documentA := Document{
+		Metadata: testMetadata(t, scope, protocol.ResourceDocument, "sources/a.md", "a-v2", "source-v2", "content-a-v2", run.ProjectionVersion, "", "doc:a"),
+		Snapshot: nextSnapshot.Ref(),
+		Path:     "sources/a.md",
+	}
+
+	if _, err := PlanFullReconciliation(run, current, Catalog{Documents: []Document{documentA}}); err == nil {
+		t.Fatal("full reconciliation accepted fewer desired documents than the source snapshot")
+	}
+}
+
+func TestProjectionOperationRejectsNonCanonicalOperationID(t *testing.T) {
+	scope := testScope()
+	currentSnapshot := testSnapshot(t, scope, "source-v1")
+	current := testProjection(t, scope, "projection-v1", currentSnapshot.Ref(), nil)
+	nextSnapshot := testSnapshot(t, scope, "source-v2", "sources/a.md")
+	run := testRun(scope, current.Version, "projection-v2", nextSnapshot.Ref())
+	desired := testMetadata(t, scope, protocol.ResourceDocument, "sources/a.md", "a", "source-v2", "content-v2", run.ProjectionVersion, "", "doc:a")
+	plan, err := PlanResources(run, current, []ResourceMetadata{desired})
+	if err != nil {
+		t.Fatal(err)
+	}
+	operation := plan.Operations[0]
+	operation.OperationID = "op_caller_supplied"
+	operation.IdempotencyKey = operationIdempotencyKey(run.IdempotencyKey, operation.OperationID)
+
+	if err := operation.Validate(run); err == nil {
+		t.Fatal("operation accepted a caller-supplied non-canonical operation ID")
 	}
 }
 

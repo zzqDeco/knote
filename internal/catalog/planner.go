@@ -101,15 +101,19 @@ func (o ProjectionOperation) Validate(run SyncRun) error {
 	if o.RunID != run.RunID || o.ProjectionVersion != run.ProjectionVersion {
 		return fmt.Errorf("operation %s is not bound to its run and projection", o.OperationID)
 	}
-	expectedKey := operationIdempotencyKey(run.IdempotencyKey, o.OperationID)
-	if o.IdempotencyKey != expectedKey {
-		return fmt.Errorf("operation %s has an invalid idempotency binding", o.OperationID)
-	}
 	if err := validateOperationKind(o.Kind); err != nil {
 		return err
 	}
 	if err := o.Resource.Validate(); err != nil {
 		return fmt.Errorf("operation %s resource: %w", o.OperationID, err)
+	}
+	expectedID := projectionOperationID(run, o.Kind, o.Resource)
+	if o.OperationID != expectedID {
+		return fmt.Errorf("operation_id does not match the canonical operation contents")
+	}
+	expectedKey := operationIdempotencyKey(run.IdempotencyKey, expectedID)
+	if o.IdempotencyKey != expectedKey {
+		return fmt.Errorf("operation %s has an invalid idempotency binding", o.OperationID)
 	}
 	return nil
 }
@@ -271,6 +275,12 @@ func PlanFullReconciliation(run SyncRun, current Projection, desired Catalog) (P
 	canonical, err := desired.Canonical()
 	if err != nil {
 		return ProjectionPlan{}, err
+	}
+	if len(canonical.Documents) != run.SourceSnapshot.DocumentCount {
+		return ProjectionPlan{}, fmt.Errorf(
+			"desired document count %d does not match source snapshot document count %d",
+			len(canonical.Documents), run.SourceSnapshot.DocumentCount,
+		)
 	}
 	for _, document := range canonical.Documents {
 		if document.Snapshot != run.SourceSnapshot {
@@ -462,7 +472,17 @@ func sameResourceDefinition(left, right ResourceMetadata) bool {
 }
 
 func newProjectionOperation(run SyncRun, kind OperationKind, resource ResourceMetadata) ProjectionOperation {
-	operationID := stableID("op_", struct {
+	operationID := projectionOperationID(run, kind, resource)
+	return ProjectionOperation{
+		OperationID: operationID, Kind: kind, RunID: run.RunID,
+		ProjectionVersion: run.ProjectionVersion,
+		IdempotencyKey:    operationIdempotencyKey(run.IdempotencyKey, operationID),
+		Resource:          resource,
+	}
+}
+
+func projectionOperationID(run SyncRun, kind OperationKind, resource ResourceMetadata) string {
+	return stableID("op_", struct {
 		RunID             string                    `json:"run_id"`
 		ProjectionVersion string                    `json:"projection_version"`
 		Kind              OperationKind             `json:"kind"`
@@ -473,12 +493,6 @@ func newProjectionOperation(run SyncRun, kind OperationKind, resource ResourceMe
 		RunID: run.RunID, ProjectionVersion: run.ProjectionVersion, Kind: kind,
 		ResourceID: resource.ResourceID, ContentDigest: resource.ContentDigest, Versions: resource.Versions,
 	})
-	return ProjectionOperation{
-		OperationID: operationID, Kind: kind, RunID: run.RunID,
-		ProjectionVersion: run.ProjectionVersion,
-		IdempotencyKey:    operationIdempotencyKey(run.IdempotencyKey, operationID),
-		Resource:          resource,
-	}
 }
 
 func operationIdempotencyKey(runKey, operationID string) string {

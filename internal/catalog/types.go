@@ -673,6 +673,11 @@ func (c Catalog) validateReferences(resources []ResourceMetadata) error {
 		documentsByID[document.Metadata.ResourceID] = document.VersionRef()
 	}
 
+	for _, chunk := range c.Chunks {
+		if err := resolveDocumentReference(chunk.Document, documentsByID); err != nil {
+			return fmt.Errorf("chunk %s document: %w", chunk.Metadata.ResourceID, err)
+		}
+	}
 	for _, claim := range c.Claims {
 		if err := resolveDocumentReference(claim.SourceDocument, documentsByID); err != nil {
 			return fmt.Errorf("claim %s source document: %w", claim.Metadata.ResourceID, err)
@@ -704,6 +709,9 @@ func resolveProvenanceReferences(
 			resource, ok := resourcesByID[evidence.ResourceID]
 			if !ok || resource.Type != evidence.Type || resource.Versions != evidence.Versions {
 				return fmt.Errorf("support %s evidence %s does not resolve in the catalog", support.SupportID, evidence.ResourceID)
+			}
+			if resource.Type == protocol.ResourceChunk && resource.AuthorizationResourceID != evidence.Document.ResourceID {
+				return fmt.Errorf("support %s chunk evidence %s does not resolve to its authorization document", support.SupportID, evidence.ResourceID)
 			}
 			if err := resolveDocumentReference(evidence.Document, documentsByID); err != nil {
 				return fmt.Errorf("support %s evidence %s document: %w", support.SupportID, evidence.ResourceID, err)
