@@ -102,6 +102,7 @@ class AdapterTest(unittest.TestCase):
             self.assertEqual(set(resource), adapter.RESOURCE_FIELDS)
             self.assertEqual(set(resource["versions"]), adapter.RESOURCE_VERSION_FIELDS)
             self.assertRegex(resource["resource_id"], r"^res_[0-9a-f]{32}$")
+            self.assertEqual(resource["authorization_resource_id"], resource["resource_id"])
             self.assertEqual(resource["serving_state"], "serving")
             self.assertTrue(all(resource["versions"].values()))
             self.assertTrue({"body", "text", "title", "path"}.isdisjoint(resource))

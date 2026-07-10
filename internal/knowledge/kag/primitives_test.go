@@ -108,7 +108,7 @@ params = req["params"]
 a = "res_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 b = "res_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 def resource(resource_id):
-    return {"resource_id": resource_id, "type": "chunk", "tenant_id": "local", "knowledge_base_id": "default", "authz_object": "document:" + resource_id, "versions": {"source": "source-v1", "content": "content-v1", "acl": "acl-v1", "index": "index-v1", "graph": "graph-v1", "projection": "projection-v1"}, "serving_state": "serving"}
+    return {"resource_id": resource_id, "type": "document", "tenant_id": "local", "knowledge_base_id": "default", "authz_object": "document:" + resource_id, "authorization_resource_id": resource_id, "versions": {"source": "source-v1", "content": "content-v1", "acl": "acl-v1", "index": "index-v1", "graph": "graph-v1", "projection": "projection-v1"}, "serving_state": "serving"}
 candidate = {"resource": resource(a), "score": 0.9}
 if method == "kag.retrieve":
     data = {"mode": "fake", "candidates": [candidate]}
@@ -273,8 +273,9 @@ func TestPrimitiveRequestsFailClosedBeforeAdapterExecution(t *testing.T) {
 
 func testPrimitiveResource(resourceID protocol.ResourceID) protocol.ResourceHandle {
 	return protocol.ResourceHandle{
-		ResourceID: resourceID, Type: protocol.ResourceChunk, TenantID: "local", KnowledgeBaseID: "default",
-		AuthorizationID: "document:" + string(resourceID), ServingState: protocol.ServingActive,
+		ResourceID: resourceID, Type: protocol.ResourceDocument, TenantID: "local", KnowledgeBaseID: "default",
+		AuthorizationID: "document:" + string(resourceID), AuthorizationResourceID: resourceID,
+		ServingState: protocol.ServingActive,
 		Versions: protocol.ResourceVersions{
 			Source: "source-v1", Content: "content-v1", ACL: "acl-v1",
 			Index: "index-v1", Graph: "graph-v1", Projection: "projection-v1",

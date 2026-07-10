@@ -72,6 +72,7 @@ RESOURCE_FIELDS = frozenset(
         "tenant_id",
         "knowledge_base_id",
         "authz_object",
+        "authorization_resource_id",
         "versions",
         "serving_state",
     }
@@ -108,6 +109,7 @@ def fake_resource(resource_id: str, resource_type: str) -> dict[str, Any]:
         "tenant_id": "tenant_fake",
         "knowledge_base_id": "kb_fake",
         "authz_object": f"{resource_type}:{resource_id}",
+        "authorization_resource_id": resource_id,
         "versions": {
             "source": "source_fake_v1",
             "content": "content_fake_v1",
@@ -763,6 +765,17 @@ def validate_resource(value: Any, field: str) -> dict[str, Any]:
     tenant_id = required_string(value.get("tenant_id"), f"{field}.tenant_id")
     knowledge_base_id = required_string(value.get("knowledge_base_id"), f"{field}.knowledge_base_id")
     authz_object = required_string(value.get("authz_object"), f"{field}.authz_object")
+    authorization_resource_id = required_string(
+        value.get("authorization_resource_id"), f"{field}.authorization_resource_id"
+    )
+    if not RESOURCE_ID_RE.fullmatch(authorization_resource_id):
+        raise AdapterRequestError(
+            f"{field}.authorization_resource_id must be an opaque res_ identifier"
+        )
+    if resource_type != "chunk" and authorization_resource_id != resource_id:
+        raise AdapterRequestError(
+            f"{field}.authorization_resource_id must match non-chunk resource_id"
+        )
     versions = value.get("versions")
     if not isinstance(versions, dict):
         raise AdapterRequestError(f"{field}.versions must be an object")
@@ -780,6 +793,7 @@ def validate_resource(value: Any, field: str) -> dict[str, Any]:
         "tenant_id": tenant_id,
         "knowledge_base_id": knowledge_base_id,
         "authz_object": authz_object,
+        "authorization_resource_id": authorization_resource_id,
         "versions": normalized_versions,
         "serving_state": serving_state,
     }

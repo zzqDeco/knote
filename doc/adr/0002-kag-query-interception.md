@@ -96,11 +96,12 @@ Candidate handles contain only:
 ```json
 {
   "resource": {
-    "resource_id": "res_...",
+    "resource_id": "res_11111111111111111111111111111111",
     "type": "chunk",
     "tenant_id": "tenant-1",
     "knowledge_base_id": "kb-1",
-    "authz_object": "document:res_...",
+    "authz_object": "document:res_22222222222222222222222222222222",
+    "authorization_resource_id": "res_22222222222222222222222222222222",
     "versions": {
       "source": "source-v1",
       "content": "content-v1",
