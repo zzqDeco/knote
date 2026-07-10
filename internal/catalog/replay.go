@@ -138,7 +138,11 @@ func Replay(
 			statuses[operation.Resource.ResourceID] = PendingProjectionStatus()
 		}
 		if operation.Kind == OperationTombstone || operation.Kind == OperationRevoke {
-			terminalResources[operation.Resource.ResourceID] = operation.Resource
+			terminal := operation.Resource
+			if result.Outcome == OperationFailed {
+				terminal.ServingState = StateFailed
+			}
+			terminalResources[operation.Resource.ResourceID] = terminal
 		}
 		if result.Outcome == OperationFailed {
 			runFailed = true
@@ -277,7 +281,9 @@ func validateReplayPlan(plan ProjectionPlan, current Projection) error {
 		if changed != hasSupersede {
 			return fmt.Errorf("resource %s has an invalid supersede transition", resourceID)
 		}
-		if hasSupersede && group.byKind[OperationSupersede].Resource != previous {
+		expectedSupersede := previous
+		expectedSupersede.Versions.Projection = plan.Run.ProjectionVersion
+		if hasSupersede && group.byKind[OperationSupersede].Resource != expectedSupersede {
 			return fmt.Errorf("supersede operation for resource %s does not match the current resource", resourceID)
 		}
 	}

@@ -682,30 +682,34 @@ func (c Catalog) validateReferences(resources []ResourceMetadata) error {
 		if err := resolveDocumentReference(claim.SourceDocument, documentsByID); err != nil {
 			return fmt.Errorf("claim %s source document: %w", claim.Metadata.ResourceID, err)
 		}
-		if err := resolveProvenanceReferences(claim.Provenance, resourcesByID, documentsByID); err != nil {
+		if err := resolveProvenanceReferences(claim.Metadata.ResourceID, claim.Provenance, resourcesByID, documentsByID); err != nil {
 			return fmt.Errorf("claim %s provenance: %w", claim.Metadata.ResourceID, err)
 		}
 	}
 	for _, entity := range c.Entities {
-		if err := resolveProvenanceReferences(entity.Provenance, resourcesByID, documentsByID); err != nil {
+		if err := resolveProvenanceReferences(entity.Metadata.ResourceID, entity.Provenance, resourcesByID, documentsByID); err != nil {
 			return fmt.Errorf("entity %s provenance: %w", entity.Metadata.ResourceID, err)
 		}
 	}
 	for _, artifact := range c.DerivedArtifacts {
-		if err := resolveProvenanceReferences(artifact.EffectiveProvenance(), resourcesByID, documentsByID); err != nil {
+		if err := resolveProvenanceReferences(artifact.Metadata.ResourceID, artifact.EffectiveProvenance(), resourcesByID, documentsByID); err != nil {
 			return fmt.Errorf("derived artifact %s provenance: %w", artifact.Metadata.ResourceID, err)
 		}
 	}
-	return nil
+	return c.validateProvenanceAcyclic()
 }
 
 func resolveProvenanceReferences(
+	resourceID protocol.ResourceID,
 	provenance Provenance,
 	resourcesByID map[protocol.ResourceID]ResourceMetadata,
 	documentsByID map[protocol.ResourceID]DocumentVersionRef,
 ) error {
 	for _, support := range provenance.Supports {
 		for _, evidence := range support.Evidence {
+			if evidence.ResourceID == resourceID {
+				return fmt.Errorf("support %s is self-referential", support.SupportID)
+			}
 			resource, ok := resourcesByID[evidence.ResourceID]
 			if !ok || resource.Type != evidence.Type || resource.Versions != evidence.Versions {
 				return fmt.Errorf("support %s evidence %s does not resolve in the catalog", support.SupportID, evidence.ResourceID)
@@ -715,6 +719,54 @@ func resolveProvenanceReferences(
 			}
 			if err := resolveDocumentReference(evidence.Document, documentsByID); err != nil {
 				return fmt.Errorf("support %s evidence %s document: %w", support.SupportID, evidence.ResourceID, err)
+			}
+		}
+	}
+	return nil
+}
+
+func (c Catalog) validateProvenanceAcyclic() error {
+	provenanceByID := make(map[protocol.ResourceID]Provenance, len(c.Claims)+len(c.Entities)+len(c.DerivedArtifacts))
+	for _, claim := range c.Claims {
+		provenanceByID[claim.Metadata.ResourceID] = claim.Provenance
+	}
+	for _, entity := range c.Entities {
+		provenanceByID[entity.Metadata.ResourceID] = entity.Provenance
+	}
+	for _, artifact := range c.DerivedArtifacts {
+		provenanceByID[artifact.Metadata.ResourceID] = artifact.EffectiveProvenance()
+	}
+	resourceIDs := make([]protocol.ResourceID, 0, len(provenanceByID))
+	for resourceID := range provenanceByID {
+		resourceIDs = append(resourceIDs, resourceID)
+	}
+	sort.Slice(resourceIDs, func(i, j int) bool { return resourceIDs[i] < resourceIDs[j] })
+	states := make(map[protocol.ResourceID]uint8, len(provenanceByID))
+	var visit func(protocol.ResourceID) error
+	visit = func(resourceID protocol.ResourceID) error {
+		states[resourceID] = 1
+		for _, support := range provenanceByID[resourceID].Supports {
+			for _, evidence := range support.Evidence {
+				if _, derived := provenanceByID[evidence.ResourceID]; !derived {
+					continue
+				}
+				switch states[evidence.ResourceID] {
+				case 1:
+					return fmt.Errorf("provenance cycle includes resources %s and %s", resourceID, evidence.ResourceID)
+				case 0:
+					if err := visit(evidence.ResourceID); err != nil {
+						return err
+					}
+				}
+			}
+		}
+		states[resourceID] = 2
+		return nil
+	}
+	for _, resourceID := range resourceIDs {
+		if states[resourceID] == 0 {
+			if err := visit(resourceID); err != nil {
+				return err
 			}
 		}
 	}

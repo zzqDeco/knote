@@ -107,6 +107,9 @@ func (o ProjectionOperation) Validate(run SyncRun) error {
 	if err := o.Resource.Validate(); err != nil {
 		return fmt.Errorf("operation %s resource: %w", o.OperationID, err)
 	}
+	if o.Resource.Versions.Projection != run.ProjectionVersion {
+		return fmt.Errorf("operation %s resource is not bound to the run projection", o.OperationID)
+	}
 	expectedID := projectionOperationID(run, o.Kind, o.Resource)
 	if o.OperationID != expectedID {
 		return fmt.Errorf("operation_id does not match the canonical operation contents")
@@ -287,6 +290,31 @@ func PlanFullReconciliation(run SyncRun, current Projection, desired Catalog) (P
 			return ProjectionPlan{}, fmt.Errorf("desired document %s is not bound to the run source snapshot", document.Metadata.ResourceID)
 		}
 	}
+	snapshotDocuments := make([]SourceDocumentSnapshot, len(canonical.Documents))
+	for i, document := range canonical.Documents {
+		snapshotDocuments[i] = SourceDocumentSnapshot{
+			SourceKey:           document.Metadata.SourceKey,
+			SourceVersion:       document.Metadata.Versions.Source,
+			ContentDigest:       document.Metadata.ContentDigest,
+			ACLVersion:          document.Metadata.Versions.ACL,
+			AuthorizationObject: document.Metadata.AuthorizationObject,
+			Sensitivity:         document.Metadata.Sensitivity,
+			SecurityDomain:      document.Metadata.SecurityDomain,
+		}
+	}
+	rebuilt, err := NewSourceSnapshot(
+		run.SourceSnapshot.Scope,
+		run.SourceSnapshot.SourceID,
+		run.SourceSnapshot.Version,
+		run.SourceSnapshot.SecurityDomain,
+		snapshotDocuments,
+	)
+	if err != nil {
+		return ProjectionPlan{}, fmt.Errorf("reconstruct source snapshot from desired documents: %w", err)
+	}
+	if rebuilt.Ref() != run.SourceSnapshot {
+		return ProjectionPlan{}, fmt.Errorf("desired documents do not reconstruct the run source snapshot")
+	}
 	resources, err := canonical.ResourceMetadata()
 	if err != nil {
 		return ProjectionPlan{}, err
@@ -305,20 +333,41 @@ func PlanRevocations(
 	current Projection,
 	resourceIDs []protocol.ResourceID,
 ) (ProjectionPlan, error) {
-	revoked := make(map[protocol.ResourceID]struct{}, len(resourceIDs))
+	selected := make(map[protocol.ResourceID]struct{}, len(resourceIDs))
 	for _, resourceID := range resourceIDs {
 		if err := resourceID.Validate(); err != nil {
 			return ProjectionPlan{}, err
 		}
-		if _, duplicate := revoked[resourceID]; duplicate {
+		if _, duplicate := selected[resourceID]; duplicate {
 			return ProjectionPlan{}, fmt.Errorf("duplicate revoked resource_id %s", resourceID)
 		}
-		revoked[resourceID] = struct{}{}
+		selected[resourceID] = struct{}{}
+	}
+	present := make(map[protocol.ResourceID]struct{}, len(current.Resources))
+	for _, resource := range current.Resources {
+		present[resource.ResourceID] = struct{}{}
+	}
+	missing := make([]string, 0)
+	for resourceID := range selected {
+		if _, ok := present[resourceID]; !ok {
+			missing = append(missing, string(resourceID))
+		}
+	}
+	if len(missing) != 0 {
+		sort.Strings(missing)
+		return ProjectionPlan{}, fmt.Errorf("revoked resources are not in the current projection: %v", missing)
+	}
+	for _, resource := range current.Resources {
+		if resource.Type != protocol.ResourceChunk {
+			continue
+		}
+		if _, parentSelected := selected[resource.AuthorizationResourceID]; parentSelected {
+			selected[resource.ResourceID] = struct{}{}
+		}
 	}
 	desired := make([]ResourceMetadata, 0, len(current.Resources))
 	for _, resource := range current.Resources {
-		if _, selected := revoked[resource.ResourceID]; selected {
-			delete(revoked, resource.ResourceID)
+		if _, revoked := selected[resource.ResourceID]; revoked {
 			continue
 		}
 		if resource.ServingState.IsTerminal() {
@@ -326,14 +375,6 @@ func PlanRevocations(
 		}
 		resource.Versions.Projection = run.ProjectionVersion
 		desired = append(desired, resource)
-	}
-	if len(revoked) != 0 {
-		missing := make([]string, 0, len(revoked))
-		for resourceID := range revoked {
-			missing = append(missing, string(resourceID))
-		}
-		sort.Strings(missing)
-		return ProjectionPlan{}, fmt.Errorf("revoked resources are not in the current projection: %v", missing)
 	}
 	return planResources(run, current, desired, OperationRevoke)
 }
@@ -402,7 +443,9 @@ func planResources(
 	operations := make([]ProjectionOperation, 0, len(targets)*7+len(current.Resources))
 	for _, resource := range targets {
 		if previous, ok := currentByID[resource.ResourceID]; ok && !sameResourceDefinition(previous, resource) {
-			operations = append(operations, newProjectionOperation(run, OperationSupersede, previous))
+			superseded := previous
+			superseded.Versions.Projection = run.ProjectionVersion
+			operations = append(operations, newProjectionOperation(run, OperationSupersede, superseded))
 		}
 		for _, kind := range []OperationKind{
 			OperationStage, OperationProjectContent, OperationProjectACL, OperationProjectIndex,
