@@ -242,9 +242,17 @@ func (p Projection) Validate() error {
 		}
 	}
 	for _, resource := range p.Resources {
+		if resource.IsServing() && resource.Type != protocol.ResourceDocument &&
+			resource.Type != protocol.ResourceChunk && len(resource.Dependencies) == 0 {
+			return fmt.Errorf("serving resource %s has no canonical dependencies", resource.ResourceID)
+		}
 		for _, dependency := range resource.Dependencies {
-			if _, ok := resourcesByID[dependency]; !ok {
+			dependencyResource, ok := resourcesByID[dependency]
+			if !ok {
 				return fmt.Errorf("resource %s dependency %s is not in the projection", resource.ResourceID, dependency)
+			}
+			if resource.IsServing() && !dependencyResource.IsServing() {
+				return fmt.Errorf("serving resource %s depends on non-serving resource %s", resource.ResourceID, dependency)
 			}
 		}
 		if resource.Type != protocol.ResourceChunk || !resource.IsServing() {

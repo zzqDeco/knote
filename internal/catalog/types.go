@@ -754,6 +754,10 @@ func (c Catalog) validateReferences(resources []ResourceMetadata) error {
 	for _, document := range c.Documents {
 		documentsByID[document.Metadata.ResourceID] = document.VersionRef()
 	}
+	claimDocumentsByID := make(map[protocol.ResourceID]DocumentVersionRef, len(c.Claims))
+	for _, claim := range c.Claims {
+		claimDocumentsByID[claim.Metadata.ResourceID] = claim.SourceDocument
+	}
 
 	for _, chunk := range c.Chunks {
 		if err := resolveDocumentReference(chunk.Document, documentsByID); err != nil {
@@ -764,17 +768,17 @@ func (c Catalog) validateReferences(resources []ResourceMetadata) error {
 		if err := resolveDocumentReference(claim.SourceDocument, documentsByID); err != nil {
 			return fmt.Errorf("claim %s source document: %w", claim.Metadata.ResourceID, err)
 		}
-		if err := resolveProvenanceReferences(claim.Metadata.ResourceID, claim.Provenance, resourcesByID, documentsByID); err != nil {
+		if err := resolveProvenanceReferences(claim.Metadata, claim.Provenance, resourcesByID, documentsByID, claimDocumentsByID); err != nil {
 			return fmt.Errorf("claim %s provenance: %w", claim.Metadata.ResourceID, err)
 		}
 	}
 	for _, entity := range c.Entities {
-		if err := resolveProvenanceReferences(entity.Metadata.ResourceID, entity.Provenance, resourcesByID, documentsByID); err != nil {
+		if err := resolveProvenanceReferences(entity.Metadata, entity.Provenance, resourcesByID, documentsByID, claimDocumentsByID); err != nil {
 			return fmt.Errorf("entity %s provenance: %w", entity.Metadata.ResourceID, err)
 		}
 	}
 	for _, artifact := range c.DerivedArtifacts {
-		if err := resolveProvenanceReferences(artifact.Metadata.ResourceID, artifact.EffectiveProvenance(), resourcesByID, documentsByID); err != nil {
+		if err := resolveProvenanceReferences(artifact.Metadata, artifact.EffectiveProvenance(), resourcesByID, documentsByID, claimDocumentsByID); err != nil {
 			return fmt.Errorf("derived artifact %s provenance: %w", artifact.Metadata.ResourceID, err)
 		}
 	}
@@ -782,14 +786,17 @@ func (c Catalog) validateReferences(resources []ResourceMetadata) error {
 }
 
 func resolveProvenanceReferences(
-	resourceID protocol.ResourceID,
+	metadata ResourceMetadata,
 	provenance Provenance,
 	resourcesByID map[protocol.ResourceID]ResourceMetadata,
 	documentsByID map[protocol.ResourceID]DocumentVersionRef,
+	claimDocumentsByID map[protocol.ResourceID]DocumentVersionRef,
 ) error {
 	for _, support := range provenance.Supports {
+		requiresSource := metadata.Type == protocol.ResourceEntity
+		hasSource := false
 		for _, evidence := range support.Evidence {
-			if evidence.ResourceID == resourceID {
+			if evidence.ResourceID == metadata.ResourceID {
 				return fmt.Errorf("support %s is self-referential", support.SupportID)
 			}
 			resource, ok := resourcesByID[evidence.ResourceID]
@@ -799,9 +806,17 @@ func resolveProvenanceReferences(
 			if resource.Type == protocol.ResourceChunk && resource.AuthorizationResourceID != evidence.Document.ResourceID {
 				return fmt.Errorf("support %s chunk evidence %s does not resolve to its authorization document", support.SupportID, evidence.ResourceID)
 			}
+			if resource.Type == protocol.ResourceClaim && claimDocumentsByID[evidence.ResourceID] != evidence.Document {
+				return fmt.Errorf("support %s claim evidence %s does not resolve to its source document", support.SupportID, evidence.ResourceID)
+			}
 			if err := resolveDocumentReference(evidence.Document, documentsByID); err != nil {
 				return fmt.Errorf("support %s evidence %s document: %w", support.SupportID, evidence.ResourceID, err)
 			}
+			requiresSource = requiresSource || evidence.Type == protocol.ResourceEntity
+			hasSource = hasSource || evidence.Type == protocol.ResourceDocument || evidence.Type == protocol.ResourceChunk
+		}
+		if requiresSource && !hasSource {
+			return fmt.Errorf("support %s involving entity evidence requires document or chunk evidence", support.SupportID)
 		}
 	}
 	return nil

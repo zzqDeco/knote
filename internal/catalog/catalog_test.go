@@ -496,6 +496,44 @@ func TestCatalogRejectsChunkEvidenceAttributedToAnotherDocument(t *testing.T) {
 	}
 }
 
+func TestCatalogRejectsClaimEvidenceAttributedToAnotherDocument(t *testing.T) {
+	scope := testScope()
+	snapshot := testSnapshot(t, scope, "source-v2", "sources/a.md", "sources/b.md")
+	documentA := Document{
+		Metadata: testMetadata(t, scope, protocol.ResourceDocument, "sources/a.md", "document-a", "source-v2", "content-a-v2", "projection-v2", "", "doc:a"),
+		Snapshot: snapshot.Ref(), Path: "sources/a.md",
+	}
+	documentB := Document{
+		Metadata: testMetadata(t, scope, protocol.ResourceDocument, "sources/b.md", "document-b", "source-v2", "content-b-v2", "projection-v2", "", "doc:b"),
+		Snapshot: snapshot.Ref(), Path: "sources/b.md",
+	}
+	claim := Claim{
+		Metadata:       testMetadata(t, scope, protocol.ResourceClaim, "claim:a", "claim", "source-v2", "content-claim-v2", "projection-v2", "", "claim:a"),
+		SourceDocument: documentA.VersionRef(),
+		Text:           "claim from document A",
+		Provenance: Provenance{DerivationMode: protocol.DerivationAnySupport, Supports: []Support{{
+			SupportID: "support-a", Evidence: []EvidenceRef{documentA.EvidenceRef()}, Complete: true,
+		}}},
+	}
+	artifact := DerivedArtifact{
+		Metadata: testMetadata(t, scope, protocol.ResourceDerivedArtifact, "artifact:a", "artifact", "source-v2", "content-artifact-v2", "projection-v2", "", "artifact:a"),
+		Kind:     "summary",
+		Provenance: Provenance{DerivationMode: protocol.DerivationAnySupport, Supports: []Support{{
+			SupportID: "support-claim", Evidence: []EvidenceRef{{
+				ResourceID: claim.Metadata.ResourceID, Type: claim.Metadata.Type,
+				Versions: claim.Metadata.Versions, Document: documentB.VersionRef(),
+			}}, Complete: true,
+		}}},
+	}
+
+	if err := (Catalog{
+		Documents: []Document{documentA, documentB}, Claims: []Claim{claim},
+		DerivedArtifacts: []DerivedArtifact{artifact},
+	}).Validate(); err == nil {
+		t.Fatal("catalog accepted claim evidence attributed to another document")
+	}
+}
+
 func TestCatalogRejectsChunkWithUnresolvedDocument(t *testing.T) {
 	scope := testScope()
 	snapshot := testSnapshot(t, scope, "source-v2", "sources/a.md")
@@ -1056,9 +1094,9 @@ func TestRevocationCascadesThroughCanonicalDependencies(t *testing.T) {
 		Metadata: testMetadata(t, scope, protocol.ResourceChunk, "sources/a.md#chunk:0", "chunk", "source-v1", "content-chunk-v1", "projection-v1", document.Metadata.ResourceID, document.Metadata.AuthorizationObject),
 		Document: document.VersionRef(), Ordinal: 0, Span: [2]int{0, 10},
 	}
-	provenance := func(id string, evidence EvidenceRef) Provenance {
+	provenance := func(id string, evidence ...EvidenceRef) Provenance {
 		return Provenance{DerivationMode: protocol.DerivationAllRequired, Supports: []Support{{
-			SupportID: id, Evidence: []EvidenceRef{evidence}, Complete: true,
+			SupportID: id, Evidence: evidence, Complete: true,
 		}}}
 	}
 	claim := Claim{
@@ -1070,14 +1108,14 @@ func TestRevocationCascadesThroughCanonicalDependencies(t *testing.T) {
 		Name:     "Entity", EntityType: "Topic", Provenance: provenance("entity-support", EvidenceRef{
 			ResourceID: claim.Metadata.ResourceID, Type: claim.Metadata.Type,
 			Versions: claim.Metadata.Versions, Document: document.VersionRef(),
-		}),
+		}, document.EvidenceRef()),
 	}
 	artifact := DerivedArtifact{
 		Metadata: testMetadata(t, scope, protocol.ResourceDerivedArtifact, "artifact:a", "artifact", "source-v1", "content-artifact-v1", "projection-v1", "", "artifact:a"),
 		Kind:     "summary", Provenance: provenance("artifact-support", EvidenceRef{
 			ResourceID: entity.Metadata.ResourceID, Type: entity.Metadata.Type,
 			Versions: entity.Metadata.Versions, Document: document.VersionRef(),
-		}),
+		}, document.EvidenceRef()),
 	}
 	resources, err := (Catalog{
 		Documents: []Document{document}, Chunks: []Chunk{chunk}, Claims: []Claim{claim},
@@ -1130,6 +1168,79 @@ func TestRevocationCascadesThroughCanonicalDependencies(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestRevocationRejectsDependencylessDerivedProjection(t *testing.T) {
+	scope := testScope()
+	snapshot := testSnapshot(t, scope, "source-v1", "sources/a.md")
+	document := published(testMetadata(
+		t, scope, protocol.ResourceDocument, "sources/a.md", "document", "source-v1",
+		"content-document-v1", "projection-v1", "", "doc:a",
+	))
+	entity := published(testMetadata(
+		t, scope, protocol.ResourceEntity, "entity:a", "entity", "source-v1",
+		"content-entity-v1", "projection-v1", "", "entity:a",
+	))
+	current := Projection{
+		Scope: scope, Version: "projection-v1", SourceSnapshot: snapshot.Ref(),
+		State: StatePublished, Resources: []ResourceMetadata{document, entity},
+	}
+	current.normalize()
+	run := testRun(scope, current.Version, "projection-v2", snapshot.Ref())
+
+	if _, err := PlanRevocations(run, current, []protocol.ResourceID{document.ResourceID}); err == nil {
+		t.Fatal("revocation accepted dependency-less derived metadata")
+	}
+}
+
+func TestPublishedProjectionRejectsServingResourceWithTerminalDependency(t *testing.T) {
+	scope := testScope()
+	snapshot := testSnapshot(t, scope, "source-v1", "sources/a.md")
+	document := published(testMetadata(
+		t, scope, protocol.ResourceDocument, "sources/a.md", "document", "source-v1",
+		"content-document-v1", "projection-v1", "", "doc:a",
+	))
+	document.ServingState = StateRevoked
+	entity := published(testMetadata(
+		t, scope, protocol.ResourceEntity, "entity:a", "entity", "source-v1",
+		"content-entity-v1", "projection-v1", "", "entity:a",
+	))
+	entity.Dependencies = []protocol.ResourceID{document.ResourceID}
+
+	if _, err := NewProjection(
+		scope, "projection-v1", snapshot.Ref(), StatePublished, []ResourceMetadata{document, entity},
+	); err == nil {
+		t.Fatal("published projection accepted a serving resource with a terminal dependency")
+	}
+}
+
+func TestCatalogRejectsEntitySupportWithoutDocumentOrChunkEvidence(t *testing.T) {
+	scope := testScope()
+	snapshot := testSnapshot(t, scope, "source-v1", "sources/a.md")
+	document := Document{
+		Metadata: testMetadata(t, scope, protocol.ResourceDocument, "sources/a.md", "document", "source-v1", "content-document-v1", "projection-v1", "", "doc:a"),
+		Snapshot: snapshot.Ref(), Path: "sources/a.md",
+	}
+	provenance := func(supportID string, evidence ...EvidenceRef) Provenance {
+		return Provenance{DerivationMode: protocol.DerivationAnySupport, Supports: []Support{{
+			SupportID: supportID, Evidence: evidence, Complete: true,
+		}}}
+	}
+	grounded := Entity{
+		Metadata: testMetadata(t, scope, protocol.ResourceEntity, "entity:grounded", "grounded", "source-v1", "content-grounded-v1", "projection-v1", "", "entity:grounded"),
+		Name:     "Grounded", EntityType: "Topic", Provenance: provenance("support-document", document.EvidenceRef()),
+	}
+	ungrounded := Entity{
+		Metadata: testMetadata(t, scope, protocol.ResourceEntity, "entity:ungrounded", "ungrounded", "source-v1", "content-ungrounded-v1", "projection-v1", "", "entity:ungrounded"),
+		Name:     "Ungrounded", EntityType: "Topic", Provenance: provenance("support-entity", EvidenceRef{
+			ResourceID: grounded.Metadata.ResourceID, Type: grounded.Metadata.Type,
+			Versions: grounded.Metadata.Versions, Document: document.VersionRef(),
+		}),
+	}
+
+	if err := (Catalog{Documents: []Document{document}, Entities: []Entity{grounded, ungrounded}}).Validate(); err == nil {
+		t.Fatal("catalog accepted entity provenance without direct document or chunk evidence")
 	}
 }
 
