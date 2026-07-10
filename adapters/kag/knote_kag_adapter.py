@@ -734,6 +734,12 @@ def required_string(value: Any, field: str) -> str:
     return value.strip()
 
 
+def required_content(value: Any, field: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise AdapterRequestError(f"{field} must be a non-empty string")
+    return value
+
+
 def primitive_limit(params: dict[str, Any], default: int) -> int:
     value = params.get("limit", default)
     if isinstance(value, bool) or not isinstance(value, int):
@@ -826,7 +832,7 @@ def validate_evidence(value: Any, field: str) -> dict[str, Any]:
         raise AdapterRequestError(f"{field} must be an object")
     validate_exact_fields(value, EVIDENCE_FIELDS, field)
     resource = validate_resource(value.get("resource"), f"{field}.resource")
-    content = required_string(value.get("content"), f"{field}.content")
+    content = required_content(value.get("content"), f"{field}.content")
     content_digest = "sha256:" + hashlib.sha256(content.encode("utf-8")).hexdigest()
     if content_digest != resource["content_digest"]:
         raise AdapterRequestError(f"{field}.content does not match resource.content_digest")

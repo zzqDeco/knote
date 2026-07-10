@@ -189,6 +189,16 @@ func TestPrimitiveDecodeRejectsUnknownLeakFields(t *testing.T) {
 	}
 }
 
+func TestPrimitiveDecodeRejectsNonResultFrame(t *testing.T) {
+	response := Response{Type: "progress", Data: map[string]any{
+		"mode":       "fake",
+		"candidates": []any{},
+	}}
+	if _, err := decodePrimitive[RetrieveResult](response); err == nil {
+		t.Fatal("progress data must not decode as a terminal primitive result")
+	}
+}
+
 func TestGenerateRejectsForeignCitationAndTrace(t *testing.T) {
 	req := GenerateRequest{
 		Question: "knote",
@@ -255,6 +265,25 @@ func TestPrimitiveClientDeadlineReturnsContextError(t *testing.T) {
 	_, err := client.Retrieve(ctx, RetrieveRequest{Query: "knote", Limit: 10})
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("expected context deadline exceeded, got %T: %v", err, err)
+	}
+}
+
+func TestPrimitiveClientContextErrorWinsAfterAdapterError(t *testing.T) {
+	workspace := t.TempDir()
+	adapter := writePrimitiveAdapter(t, workspace, `
+import json, sys, time
+req = json.loads(sys.stdin.readline())
+print(json.dumps({"id": req["id"], "type": "error", "code": "unsupported_primitive", "error": "early adapter error"}), flush=True)
+time.sleep(5)
+`)
+	t.Setenv("KNOTE_PYTHON", pythonForTest())
+	client := Client{AdapterPath: adapter, Workspace: workspace}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	_, err := client.Retrieve(ctx, RetrieveRequest{Query: "knote", Limit: 10})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("context deadline should take precedence over an early adapter error, got %T: %v", err, err)
 	}
 }
 

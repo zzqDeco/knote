@@ -318,6 +318,9 @@ func (c Client) Generate(ctx context.Context, req GenerateRequest) (GenerateResu
 
 func decodePrimitive[T any](response Response) (T, error) {
 	var value T
+	if response.Type != "result" {
+		return value, fmt.Errorf("primitive response must be a result frame")
+	}
 	data, err := json.Marshal(response.Data)
 	if err != nil {
 		return value, err

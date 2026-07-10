@@ -159,17 +159,20 @@ func (c Client) call(ctx context.Context, method string, params map[string]any) 
 		return Response{}, err
 	}
 	waitErr := cmd.Wait()
-	if last.Type == "error" {
-		return last, &AdapterError{Code: last.Code, Message: last.Error}
-	}
 	if ctx.Err() != nil {
 		return last, ctx.Err()
+	}
+	if last.Type == "error" {
+		return last, &AdapterError{Code: last.Code, Message: last.Error}
 	}
 	if waitErr != nil {
 		return last, fmt.Errorf("kag adapter failed: %w: %s", waitErr, stderr.String())
 	}
 	if last.ID == "" {
 		return Response{}, fmt.Errorf("kag adapter returned no response: %s", stderr.String())
+	}
+	if last.Type != "result" {
+		return last, fmt.Errorf("kag adapter ended without a result frame")
 	}
 	return last, nil
 }

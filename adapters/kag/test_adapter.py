@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -187,6 +188,18 @@ class AdapterTest(unittest.TestCase):
         )
         self.assertIn("knote is local-first.", data["answer"])
         self.assertIn("Its runtime can authorize graph stages before generation.", data["answer"])
+
+    def test_validate_evidence_preserves_whitespace_for_digest(self) -> None:
+        content = "  authorized body with boundary whitespace  \n"
+        resource = fake_resource_handle(adapter.FAKE_INTRO_ID)
+        resource["content_digest"] = "sha256:" + hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+        validated = adapter.validate_evidence(
+            {"resource": resource, "content": content, "citation_handle": "cite-whitespace"},
+            "evidence[0]",
+        )
+
+        self.assertEqual(validated["content"], content)
 
     def test_denied_candidates_are_absent_from_later_hops_and_generation(self) -> None:
         denied_candidate_id = adapter.FAKE_DENIED_CANARY_ID
