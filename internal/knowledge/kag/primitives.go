@@ -186,6 +186,7 @@ func (r GenerateRequest) Validate() error {
 		return fmt.Errorf("authorized evidence is required")
 	}
 	seen := make(map[protocol.ResourceID]struct{}, len(r.Evidence))
+	seenCitations := make(map[string]struct{}, len(r.Evidence))
 	for index, evidence := range r.Evidence {
 		if err := evidence.Validate(); err != nil {
 			return fmt.Errorf("evidence %d: %w", index, err)
@@ -194,6 +195,10 @@ func (r GenerateRequest) Validate() error {
 			return fmt.Errorf("duplicate evidence resource %s", evidence.Resource.ResourceID)
 		}
 		seen[evidence.Resource.ResourceID] = struct{}{}
+		if _, duplicate := seenCitations[evidence.CitationHandle]; duplicate {
+			return fmt.Errorf("duplicate citation_handle %q", evidence.CitationHandle)
+		}
+		seenCitations[evidence.CitationHandle] = struct{}{}
 	}
 	return nil
 }

@@ -277,6 +277,15 @@ func TestPrimitiveRequestsFailClosedBeforeAdapterExecution(t *testing.T) {
 	}); err == nil {
 		t.Fatal("evidence body not bound to its resource digest should fail before adapter execution")
 	}
+	if _, err := client.Generate(context.Background(), GenerateRequest{
+		Question: "knote",
+		Evidence: []AuthorizedEvidence{
+			{Resource: testPrimitiveResource(testResourceA), Content: "allowed body", CitationHandle: "citation-1"},
+			{Resource: testPrimitiveResource(testResourceB), Content: "allowed body", CitationHandle: "citation-1"},
+		},
+	}); err == nil {
+		t.Fatal("duplicate citation handles should fail before adapter execution")
+	}
 }
 
 func testPrimitiveResource(resourceID protocol.ResourceID) protocol.ResourceHandle {
