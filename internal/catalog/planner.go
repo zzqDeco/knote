@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"sort"
 
 	"github.com/zzqDeco/knote/internal/protocol"
@@ -109,6 +110,14 @@ func (o ProjectionOperation) Validate(run SyncRun) error {
 	}
 	if o.Resource.Versions.Projection != run.ProjectionVersion {
 		return fmt.Errorf("operation %s resource is not bound to the run projection", o.OperationID)
+	}
+	if o.Resource.Scope != run.Scope ||
+		o.Resource.Versions.Source != run.SourceSnapshot.Version ||
+		o.Resource.SecurityDomain != run.SourceSnapshot.SecurityDomain {
+		return fmt.Errorf("operation %s resource crosses the run boundary", o.OperationID)
+	}
+	if o.Kind == OperationSupersede && o.Resource.ServingState != StateSuperseded {
+		return fmt.Errorf("operation %s supersede resource is not terminal", o.OperationID)
 	}
 	expectedID := projectionOperationID(run, o.Kind, o.Resource)
 	if o.OperationID != expectedID {
@@ -233,6 +242,11 @@ func (p Projection) Validate() error {
 		}
 	}
 	for _, resource := range p.Resources {
+		for _, dependency := range resource.Dependencies {
+			if _, ok := resourcesByID[dependency]; !ok {
+				return fmt.Errorf("resource %s dependency %s is not in the projection", resource.ResourceID, dependency)
+			}
+		}
 		if resource.Type != protocol.ResourceChunk || !resource.IsServing() {
 			continue
 		}
@@ -357,12 +371,38 @@ func PlanRevocations(
 		sort.Strings(missing)
 		return ProjectionPlan{}, fmt.Errorf("revoked resources are not in the current projection: %v", missing)
 	}
+	dependents := make(map[protocol.ResourceID][]protocol.ResourceID)
 	for _, resource := range current.Resources {
 		if resource.Type != protocol.ResourceChunk {
+			for _, dependency := range resource.Dependencies {
+				dependents[dependency] = append(dependents[dependency], resource.ResourceID)
+			}
 			continue
 		}
-		if _, parentSelected := selected[resource.AuthorizationResourceID]; parentSelected {
-			selected[resource.ResourceID] = struct{}{}
+		dependencies := resource.Dependencies
+		if len(dependencies) == 0 {
+			dependencies = []protocol.ResourceID{resource.AuthorizationResourceID}
+		}
+		for _, dependency := range dependencies {
+			dependents[dependency] = append(dependents[dependency], resource.ResourceID)
+		}
+	}
+	queue := make([]protocol.ResourceID, 0, len(selected))
+	for resourceID := range selected {
+		queue = append(queue, resourceID)
+	}
+	sort.Slice(queue, func(i, j int) bool { return queue[i] < queue[j] })
+	for len(queue) > 0 {
+		resourceID := queue[0]
+		queue = queue[1:]
+		next := dependents[resourceID]
+		sort.Slice(next, func(i, j int) bool { return next[i] < next[j] })
+		for _, dependent := range next {
+			if _, alreadySelected := selected[dependent]; alreadySelected {
+				continue
+			}
+			selected[dependent] = struct{}{}
+			queue = append(queue, dependent)
 		}
 	}
 	desired := make([]ResourceMetadata, 0, len(current.Resources))
@@ -444,7 +484,9 @@ func planResources(
 	for _, resource := range targets {
 		if previous, ok := currentByID[resource.ResourceID]; ok && !sameResourceDefinition(previous, resource) {
 			superseded := previous
+			superseded.Versions.Source = run.SourceSnapshot.Version
 			superseded.Versions.Projection = run.ProjectionVersion
+			superseded.ServingState = StateSuperseded
 			operations = append(operations, newProjectionOperation(run, OperationSupersede, superseded))
 		}
 		for _, kind := range []OperationKind{
@@ -511,7 +553,17 @@ func sameResourceDefinition(left, right ResourceMetadata) bool {
 	left.Versions.Projection, right.Versions.Projection = "", ""
 	left.ServingState, right.ServingState = StateStaged, StateStaged
 	left.ProjectionStatus, right.ProjectionStatus = PendingProjectionStatus(), PendingProjectionStatus()
-	return left == right
+	return resourceMetadataEqual(left, right)
+}
+
+func resourceMetadataEqual(left, right ResourceMetadata) bool {
+	if len(left.Dependencies) == 0 {
+		left.Dependencies = nil
+	}
+	if len(right.Dependencies) == 0 {
+		right.Dependencies = nil
+	}
+	return reflect.DeepEqual(left, right)
 }
 
 func newProjectionOperation(run SyncRun, kind OperationKind, resource ResourceMetadata) ProjectionOperation {
@@ -526,15 +578,13 @@ func newProjectionOperation(run SyncRun, kind OperationKind, resource ResourceMe
 
 func projectionOperationID(run SyncRun, kind OperationKind, resource ResourceMetadata) string {
 	return stableID("op_", struct {
-		RunID             string                    `json:"run_id"`
-		ProjectionVersion string                    `json:"projection_version"`
-		Kind              OperationKind             `json:"kind"`
-		ResourceID        protocol.ResourceID       `json:"resource_id"`
-		ContentDigest     protocol.ContentDigest    `json:"content_digest"`
-		Versions          protocol.ResourceVersions `json:"versions"`
+		RunID             string           `json:"run_id"`
+		ProjectionVersion string           `json:"projection_version"`
+		Kind              OperationKind    `json:"kind"`
+		Resource          ResourceMetadata `json:"resource"`
 	}{
 		RunID: run.RunID, ProjectionVersion: run.ProjectionVersion, Kind: kind,
-		ResourceID: resource.ResourceID, ContentDigest: resource.ContentDigest, Versions: resource.Versions,
+		Resource: resource,
 	})
 }
 

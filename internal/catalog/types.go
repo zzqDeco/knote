@@ -150,6 +150,7 @@ type ResourceMetadata struct {
 	ProjectionStatus        ProjectionStatus          `json:"projection_status"`
 	Sensitivity             Sensitivity               `json:"sensitivity"`
 	SecurityDomain          string                    `json:"security_domain"`
+	Dependencies            []protocol.ResourceID     `json:"dependencies,omitempty"`
 }
 
 func NewResourceMetadata(
@@ -233,7 +234,21 @@ func (m ResourceMetadata) Validate() error {
 	if err := m.Sensitivity.Validate(); err != nil {
 		return err
 	}
-	return validateToken("security_domain", m.SecurityDomain)
+	if err := validateToken("security_domain", m.SecurityDomain); err != nil {
+		return err
+	}
+	for i, dependency := range m.Dependencies {
+		if err := dependency.Validate(); err != nil {
+			return fmt.Errorf("dependency %d: %w", i, err)
+		}
+		if dependency == m.ResourceID {
+			return fmt.Errorf("resource cannot depend on itself")
+		}
+		if i > 0 && m.Dependencies[i-1] >= dependency {
+			return fmt.Errorf("resource dependencies must be unique and in canonical order")
+		}
+	}
+	return nil
 }
 
 func (m ResourceMetadata) IsServing() bool {
@@ -613,31 +628,52 @@ func (c Catalog) ResourceMetadata() ([]ResourceMetadata, error) {
 		if err := document.Validate(); err != nil {
 			return nil, fmt.Errorf("document %s: %w", document.Metadata.ResourceID, err)
 		}
-		resources = append(resources, document.Metadata)
+		metadata, err := metadataWithDependencies(document.Metadata, nil)
+		if err != nil {
+			return nil, fmt.Errorf("document %s: %w", document.Metadata.ResourceID, err)
+		}
+		resources = append(resources, metadata)
 	}
 	for _, chunk := range c.Chunks {
 		if err := chunk.Validate(); err != nil {
 			return nil, fmt.Errorf("chunk %s: %w", chunk.Metadata.ResourceID, err)
 		}
-		resources = append(resources, chunk.Metadata)
+		metadata, err := metadataWithDependencies(chunk.Metadata, []protocol.ResourceID{chunk.Document.ResourceID})
+		if err != nil {
+			return nil, fmt.Errorf("chunk %s: %w", chunk.Metadata.ResourceID, err)
+		}
+		resources = append(resources, metadata)
 	}
 	for _, entity := range c.Entities {
 		if err := entity.Validate(); err != nil {
 			return nil, fmt.Errorf("entity %s: %w", entity.Metadata.ResourceID, err)
 		}
-		resources = append(resources, entity.Metadata)
+		metadata, err := metadataWithDependencies(entity.Metadata, provenanceDependencies(entity.Provenance))
+		if err != nil {
+			return nil, fmt.Errorf("entity %s: %w", entity.Metadata.ResourceID, err)
+		}
+		resources = append(resources, metadata)
 	}
 	for _, claim := range c.Claims {
 		if err := claim.Validate(); err != nil {
 			return nil, fmt.Errorf("claim %s: %w", claim.Metadata.ResourceID, err)
 		}
-		resources = append(resources, claim.Metadata)
+		dependencies := append(provenanceDependencies(claim.Provenance), claim.SourceDocument.ResourceID)
+		metadata, err := metadataWithDependencies(claim.Metadata, dependencies)
+		if err != nil {
+			return nil, fmt.Errorf("claim %s: %w", claim.Metadata.ResourceID, err)
+		}
+		resources = append(resources, metadata)
 	}
 	for _, artifact := range c.DerivedArtifacts {
 		if err := artifact.Validate(); err != nil {
 			return nil, fmt.Errorf("derived artifact %s: %w", artifact.Metadata.ResourceID, err)
 		}
-		resources = append(resources, artifact.Metadata)
+		metadata, err := metadataWithDependencies(artifact.Metadata, provenanceDependencies(artifact.EffectiveProvenance()))
+		if err != nil {
+			return nil, fmt.Errorf("derived artifact %s: %w", artifact.Metadata.ResourceID, err)
+		}
+		resources = append(resources, metadata)
 	}
 	sort.Slice(resources, func(i, j int) bool { return resources[i].ResourceID < resources[j].ResourceID })
 	if len(resources) > 0 {
@@ -661,6 +697,52 @@ func (c Catalog) ResourceMetadata() ([]ResourceMetadata, error) {
 		return nil, err
 	}
 	return resources, nil
+}
+
+func provenanceDependencies(provenance Provenance) []protocol.ResourceID {
+	dependencies := make([]protocol.ResourceID, 0)
+	for _, support := range provenance.Supports {
+		for _, evidence := range support.Evidence {
+			dependencies = append(dependencies, evidence.ResourceID)
+		}
+	}
+	return dependencies
+}
+
+func metadataWithDependencies(metadata ResourceMetadata, dependencies []protocol.ResourceID) (ResourceMetadata, error) {
+	dependencies = canonicalResourceIDs(dependencies)
+	if len(metadata.Dependencies) != 0 && !resourceIDsEqual(metadata.Dependencies, dependencies) {
+		return ResourceMetadata{}, fmt.Errorf("dependencies do not match canonical catalog references")
+	}
+	metadata.Dependencies = dependencies
+	return metadata, nil
+}
+
+func canonicalResourceIDs(resourceIDs []protocol.ResourceID) []protocol.ResourceID {
+	if len(resourceIDs) == 0 {
+		return nil
+	}
+	canonical := append([]protocol.ResourceID(nil), resourceIDs...)
+	sort.Slice(canonical, func(i, j int) bool { return canonical[i] < canonical[j] })
+	result := canonical[:0]
+	for _, resourceID := range canonical {
+		if len(result) == 0 || result[len(result)-1] != resourceID {
+			result = append(result, resourceID)
+		}
+	}
+	return result
+}
+
+func resourceIDsEqual(left, right []protocol.ResourceID) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func (c Catalog) validateReferences(resources []ResourceMetadata) error {

@@ -229,7 +229,7 @@ func validateReplayPlan(plan ProjectionPlan, current Projection) error {
 			if group.target == nil {
 				target := operation.Resource
 				group.target = &target
-			} else if *group.target != operation.Resource {
+			} else if !resourceMetadataEqual(*group.target, operation.Resource) {
 				return fmt.Errorf("projection plan uses inconsistent target definitions for resource %s", resourceID)
 			}
 		}
@@ -282,8 +282,10 @@ func validateReplayPlan(plan ProjectionPlan, current Projection) error {
 			return fmt.Errorf("resource %s has an invalid supersede transition", resourceID)
 		}
 		expectedSupersede := previous
+		expectedSupersede.Versions.Source = plan.Run.SourceSnapshot.Version
 		expectedSupersede.Versions.Projection = plan.Run.ProjectionVersion
-		if hasSupersede && group.byKind[OperationSupersede].Resource != expectedSupersede {
+		expectedSupersede.ServingState = StateSuperseded
+		if hasSupersede && !resourceMetadataEqual(group.byKind[OperationSupersede].Resource, expectedSupersede) {
 			return fmt.Errorf("supersede operation for resource %s does not match the current resource", resourceID)
 		}
 	}
@@ -375,6 +377,9 @@ func runStateForAppliedPlan(projection Projection, plan ProjectionPlan) (RunStat
 func cloneProjection(projection Projection) Projection {
 	clone := projection
 	clone.Resources = append([]ResourceMetadata(nil), projection.Resources...)
+	for i := range clone.Resources {
+		clone.Resources[i].Dependencies = append([]protocol.ResourceID(nil), projection.Resources[i].Dependencies...)
+	}
 	clone.AppliedPlanIDs = append([]string(nil), projection.AppliedPlanIDs...)
 	clone.AppliedOperations = append([]OperationReceipt(nil), projection.AppliedOperations...)
 	return clone

@@ -3,6 +3,7 @@ package catalog
 import (
 	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/zzqDeco/knote/internal/protocol"
@@ -954,6 +955,202 @@ func TestProjectionOperationRejectsResourceFromAnotherProjectionVersion(t *testi
 
 	if err := operation.Validate(run); err == nil {
 		t.Fatal("operation accepted a resource from another projection version")
+	}
+}
+
+func TestProjectionOperationBindsResourceToRunBoundary(t *testing.T) {
+	scope := testScope()
+	currentSnapshot := testSnapshot(t, scope, "source-v1")
+	current := testProjection(t, scope, "projection-v1", currentSnapshot.Ref(), nil)
+	nextSnapshot := testSnapshot(t, scope, "source-v2", "sources/a.md")
+	run := testRun(scope, current.Version, "projection-v2", nextSnapshot.Ref())
+	desired := testMetadata(t, scope, protocol.ResourceDocument, "sources/a.md", "a", "source-v2", "content-v2", run.ProjectionVersion, "", "doc:a")
+	plan, err := PlanResources(run, current, []ResourceMetadata{desired})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*ResourceMetadata)
+	}{
+		{name: "scope", mutate: func(resource *ResourceMetadata) {
+			resource.Scope = Scope{TenantID: "tenant-other", KnowledgeBaseID: scope.KnowledgeBaseID}
+			resource.ResourceID, err = protocol.NewStableResourceID(
+				resource.Scope.TenantID, resource.Scope.KnowledgeBaseID, resource.Type, resource.SourceKey,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resource.AuthorizationResourceID = resource.ResourceID
+		}},
+		{name: "source version", mutate: func(resource *ResourceMetadata) {
+			resource.Versions.Source = "source-other"
+		}},
+		{name: "security domain", mutate: func(resource *ResourceMetadata) {
+			resource.SecurityDomain = "repo:other"
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			operation := plan.Operations[0]
+			test.mutate(&operation.Resource)
+			operation.OperationID = projectionOperationID(run, operation.Kind, operation.Resource)
+			operation.IdempotencyKey = operationIdempotencyKey(run.IdempotencyKey, operation.OperationID)
+			if err := operation.Validate(run); err == nil {
+				t.Fatal("operation accepted resource outside its run boundary")
+			}
+		})
+	}
+}
+
+func TestSupersedeOperationCarriesTerminalMetadata(t *testing.T) {
+	scope := testScope()
+	currentSnapshot := testSnapshot(t, scope, "source-v1", "sources/a.md")
+	currentResource := published(testMetadata(t, scope, protocol.ResourceDocument, "sources/a.md", "old", "source-v1", "content-v1", "projection-v1", "", "doc:a"))
+	current := testProjection(t, scope, "projection-v1", currentSnapshot.Ref(), []ResourceMetadata{currentResource})
+	nextSnapshot := testSnapshot(t, scope, "source-v2", "sources/a.md")
+	run := testRun(scope, current.Version, "projection-v2", nextSnapshot.Ref())
+	desired := testMetadata(t, scope, protocol.ResourceDocument, "sources/a.md", "new", "source-v2", "content-v2", run.ProjectionVersion, "", "doc:a")
+	plan, err := PlanResources(run, current, []ResourceMetadata{desired})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, operation := range plan.Operations {
+		if operation.Kind == OperationSupersede {
+			if operation.Resource.ServingState != StateSuperseded {
+				t.Fatalf("supersede metadata state = %q, want %q", operation.Resource.ServingState, StateSuperseded)
+			}
+			return
+		}
+	}
+	t.Fatal("changed resource has no supersede operation")
+}
+
+func TestProjectionOperationIdentityIncludesAllResourceMetadata(t *testing.T) {
+	scope := testScope()
+	currentSnapshot := testSnapshot(t, scope, "source-v1")
+	current := testProjection(t, scope, "projection-v1", currentSnapshot.Ref(), nil)
+	nextSnapshot := testSnapshot(t, scope, "source-v2", "sources/a.md")
+	run := testRun(scope, current.Version, "projection-v2", nextSnapshot.Ref())
+	desired := testMetadata(t, scope, protocol.ResourceDocument, "sources/a.md", "a", "source-v2", "content-v2", run.ProjectionVersion, "", "doc:a")
+	plan, err := PlanResources(run, current, []ResourceMetadata{desired})
+	if err != nil {
+		t.Fatal(err)
+	}
+	operation := plan.Operations[0]
+	operation.Resource.Sensitivity = SensitivityRestricted
+	if err := operation.Validate(run); err == nil {
+		t.Fatal("operation identity ignored side-effecting resource metadata")
+	}
+}
+
+func TestRevocationCascadesThroughCanonicalDependencies(t *testing.T) {
+	scope := testScope()
+	snapshot := testSnapshot(t, scope, "source-v1", "sources/a.md")
+	document := Document{
+		Metadata: testMetadata(t, scope, protocol.ResourceDocument, "sources/a.md", "document", "source-v1", "content-doc-v1", "projection-v1", "", "doc:a"),
+		Snapshot: snapshot.Ref(), Path: "sources/a.md",
+	}
+	chunk := Chunk{
+		Metadata: testMetadata(t, scope, protocol.ResourceChunk, "sources/a.md#chunk:0", "chunk", "source-v1", "content-chunk-v1", "projection-v1", document.Metadata.ResourceID, document.Metadata.AuthorizationObject),
+		Document: document.VersionRef(), Ordinal: 0, Span: [2]int{0, 10},
+	}
+	provenance := func(id string, evidence EvidenceRef) Provenance {
+		return Provenance{DerivationMode: protocol.DerivationAllRequired, Supports: []Support{{
+			SupportID: id, Evidence: []EvidenceRef{evidence}, Complete: true,
+		}}}
+	}
+	claim := Claim{
+		Metadata:       testMetadata(t, scope, protocol.ResourceClaim, "claim:a", "claim", "source-v1", "content-claim-v1", "projection-v1", "", "claim:a"),
+		SourceDocument: document.VersionRef(), Text: "claim", Provenance: provenance("claim-support", chunk.EvidenceRef()),
+	}
+	entity := Entity{
+		Metadata: testMetadata(t, scope, protocol.ResourceEntity, "entity:a", "entity", "source-v1", "content-entity-v1", "projection-v1", "", "entity:a"),
+		Name:     "Entity", EntityType: "Topic", Provenance: provenance("entity-support", EvidenceRef{
+			ResourceID: claim.Metadata.ResourceID, Type: claim.Metadata.Type,
+			Versions: claim.Metadata.Versions, Document: document.VersionRef(),
+		}),
+	}
+	artifact := DerivedArtifact{
+		Metadata: testMetadata(t, scope, protocol.ResourceDerivedArtifact, "artifact:a", "artifact", "source-v1", "content-artifact-v1", "projection-v1", "", "artifact:a"),
+		Kind:     "summary", Provenance: provenance("artifact-support", EvidenceRef{
+			ResourceID: entity.Metadata.ResourceID, Type: entity.Metadata.Type,
+			Versions: entity.Metadata.Versions, Document: document.VersionRef(),
+		}),
+	}
+	resources, err := (Catalog{
+		Documents: []Document{document}, Chunks: []Chunk{chunk}, Claims: []Claim{claim},
+		Entities: []Entity{entity}, DerivedArtifacts: []DerivedArtifact{artifact},
+	}).ResourceMetadata()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range resources {
+		resources[i] = published(resources[i])
+	}
+	current := testProjection(t, scope, "projection-v1", snapshot.Ref(), resources)
+	tests := []struct {
+		name        string
+		selected    protocol.ResourceID
+		wantRevoked map[protocol.ResourceID]bool
+	}{
+		{
+			name: "document", selected: document.Metadata.ResourceID,
+			wantRevoked: map[protocol.ResourceID]bool{
+				document.Metadata.ResourceID: true, chunk.Metadata.ResourceID: true,
+				claim.Metadata.ResourceID: true, entity.Metadata.ResourceID: true,
+				artifact.Metadata.ResourceID: true,
+			},
+		},
+		{
+			name: "chunk", selected: chunk.Metadata.ResourceID,
+			wantRevoked: map[protocol.ResourceID]bool{
+				chunk.Metadata.ResourceID: true, claim.Metadata.ResourceID: true,
+				entity.Metadata.ResourceID: true, artifact.Metadata.ResourceID: true,
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			run := testRun(scope, current.Version, "projection-v2", snapshot.Ref())
+			plan, err := PlanRevocations(run, current, []protocol.ResourceID{test.selected})
+			if err != nil {
+				t.Fatal(err)
+			}
+			revoked := make(map[protocol.ResourceID]bool)
+			for _, operation := range plan.Operations {
+				if operation.Kind == OperationRevoke {
+					revoked[operation.Resource.ResourceID] = true
+				}
+			}
+			for _, resource := range resources {
+				if revoked[resource.ResourceID] != test.wantRevoked[resource.ResourceID] {
+					t.Errorf("resource %s revoked=%t, want %t", resource.ResourceID, revoked[resource.ResourceID], test.wantRevoked[resource.ResourceID])
+				}
+			}
+		})
+	}
+}
+
+func TestResourceMetadataDependenciesAreBackwardCompatibleJSON(t *testing.T) {
+	metadata := testMetadata(t, testScope(), protocol.ResourceDocument, "sources/a.md", "document", "source-v1", "content-v1", "projection-v1", "", "doc:a")
+	data, err := json.Marshal(metadata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), `"dependencies"`) {
+		t.Fatalf("empty dependencies should remain omitted: %s", data)
+	}
+	var decoded ResourceMetadata
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if err := decoded.Validate(); err != nil {
+		t.Fatalf("legacy metadata without dependencies is invalid: %v", err)
+	}
+	if len(decoded.Dependencies) != 0 {
+		t.Fatalf("legacy metadata gained dependencies: %+v", decoded.Dependencies)
 	}
 }
 
