@@ -44,8 +44,11 @@ def progress(req_id: str, message: str, current: int = 0, total: int = 0) -> Non
     )
 
 
-def error(req_id: str, message: str) -> None:
-    emit({"id": req_id, "type": "error", "error": message})
+def error(req_id: str, message: str, code: str = "") -> None:
+    payload = {"id": req_id, "type": "error", "error": message}
+    if code:
+        payload["code"] = code
+    emit(payload)
 
 
 BUILD_SUMMARY_RE = re.compile(
@@ -55,6 +58,97 @@ BUILD_SUMMARY_RE = re.compile(
 CONFIG_TEMPLATE_RE = re.compile(
     r"\{\{\s*(?P<name>[A-Za-z_][A-Za-z0-9_]*)(?:\s*\|\s*default\(\s*(?P<default>[^)]*)\s*\))?\s*\}\}"
 )
+PRIMITIVE_METHODS = frozenset({"kag.retrieve", "kag.expand", "kag.generate"})
+UNSUPPORTED_PRIMITIVE_CODE = "unsupported_primitive"
+INVALID_REQUEST_CODE = "invalid_request"
+TEST_STAGE_SPY_ENV = "KNOTE_KAG_TEST_STAGE_SPY"
+TEST_DELAY_MS_ENV = "KNOTE_KAG_TEST_DELAY_MS"
+
+CANDIDATE_FIELDS = frozenset({"resource", "score"})
+RESOURCE_FIELDS = frozenset(
+    {
+        "resource_id",
+        "type",
+        "tenant_id",
+        "knowledge_base_id",
+        "authz_object",
+        "versions",
+        "serving_state",
+    }
+)
+RESOURCE_VERSION_FIELDS = frozenset({"source", "content", "acl", "index", "graph", "projection"})
+EVIDENCE_FIELDS = frozenset({"resource", "content", "citation_handle"})
+RESOURCE_ID_RE = re.compile(r"res_[0-9a-f]{32}\Z")
+RESOURCE_TYPES = frozenset({"document", "chunk", "entity", "claim", "derived_artifact"})
+
+FAKE_INTRO_ID = "res_00000000000000000000000000000001"
+FAKE_DENIED_CANARY_ID = "res_00000000000000000000000000000002"
+FAKE_OVERVIEW_ID = "res_00000000000000000000000000000003"
+FAKE_LOCAL_FIRST_ID = "res_00000000000000000000000000000004"
+FAKE_DENIED_FRONTIER_ID = "res_00000000000000000000000000000005"
+FAKE_DENIED_CANARY_DETAIL_ID = "res_00000000000000000000000000000006"
+FAKE_DENIED_NEXT_HOP_ID = "res_00000000000000000000000000000007"
+FAKE_RUNTIME_ID = "res_00000000000000000000000000000008"
+FAKE_CONTENT_BY_ID = {
+    FAKE_INTRO_ID: "knote is local-first.",
+    FAKE_DENIED_CANARY_ID: "DENIED CANARY BODY must never cross the authorization boundary",
+    FAKE_OVERVIEW_ID: "knote exposes a versioned knowledge workflow.",
+    FAKE_LOCAL_FIRST_ID: "Its runtime can authorize graph stages before generation.",
+    FAKE_DENIED_FRONTIER_ID: "DENIED FRONTIER BODY must never reach a later hop",
+    FAKE_DENIED_CANARY_DETAIL_ID: "DENIED CANARY DETAIL must never reach graph output",
+    FAKE_DENIED_NEXT_HOP_ID: "DENIED NEXT HOP BODY must never be expanded",
+    FAKE_RUNTIME_ID: "The runtime delegates graph storage to KAG.",
+}
+
+
+def fake_resource(resource_id: str, resource_type: str) -> dict[str, Any]:
+    return {
+        "resource_id": resource_id,
+        "type": resource_type,
+        "tenant_id": "tenant_fake",
+        "knowledge_base_id": "kb_fake",
+        "authz_object": f"{resource_type}:{resource_id}",
+        "versions": {
+            "source": "source_fake_v1",
+            "content": "content_fake_v1",
+            "acl": "acl_fake_v1",
+            "index": "index_fake_v1",
+            "graph": "graph_fake_v1",
+            "projection": "projection_fake_v1",
+        },
+        "serving_state": "serving",
+    }
+
+
+FAKE_CANDIDATES = (
+    {"resource": fake_resource(FAKE_INTRO_ID, "document"), "score": 0.99},
+    {"resource": fake_resource(FAKE_DENIED_CANARY_ID, "document"), "score": 0.98},
+    {"resource": fake_resource(FAKE_OVERVIEW_ID, "document"), "score": 0.90},
+    {"resource": fake_resource(FAKE_LOCAL_FIRST_ID, "claim"), "score": 0.96},
+    {"resource": fake_resource(FAKE_DENIED_FRONTIER_ID, "claim"), "score": 0.95},
+    {"resource": fake_resource(FAKE_DENIED_CANARY_DETAIL_ID, "claim"), "score": 0.94},
+    {"resource": fake_resource(FAKE_DENIED_NEXT_HOP_ID, "document"), "score": 0.93},
+    {"resource": fake_resource(FAKE_RUNTIME_ID, "document"), "score": 0.91},
+)
+FAKE_CANDIDATES_BY_ID = {
+    candidate["resource"]["resource_id"]: candidate for candidate in FAKE_CANDIDATES
+}
+FAKE_RETRIEVE_IDS = (FAKE_INTRO_ID, FAKE_DENIED_CANARY_ID, FAKE_OVERVIEW_ID)
+FAKE_EXPANSIONS = {
+    FAKE_INTRO_ID: (
+        (FAKE_LOCAL_FIRST_ID, 1),
+        (FAKE_DENIED_FRONTIER_ID, 1),
+    ),
+    FAKE_DENIED_CANARY_ID: ((FAKE_DENIED_CANARY_DETAIL_ID, 1),),
+    FAKE_LOCAL_FIRST_ID: ((FAKE_RUNTIME_ID, 2),),
+    FAKE_DENIED_FRONTIER_ID: ((FAKE_DENIED_NEXT_HOP_ID, 2),),
+}
+
+
+class AdapterRequestError(RuntimeError):
+    def __init__(self, message: str, code: str = INVALID_REQUEST_CODE) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 def capture_stdout(fn: Any, *args: Any, **kwargs: Any) -> tuple[Any, str]:
@@ -618,15 +712,264 @@ kag_solver_pipeline:
     atomic_write_text(path, config)
 
 
+def primitive_params(req: dict[str, Any]) -> dict[str, Any]:
+    params = req.get("params")
+    if params is None:
+        return {}
+    if not isinstance(params, dict):
+        raise AdapterRequestError("params must be an object")
+    return params
+
+
+def required_string(value: Any, field: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise AdapterRequestError(f"{field} must be a non-empty string")
+    return value.strip()
+
+
+def primitive_limit(params: dict[str, Any], default: int) -> int:
+    value = params.get("limit", default)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise AdapterRequestError("limit must be an integer")
+    if value < 1 or value > 100:
+        raise AdapterRequestError("limit must be between 1 and 100")
+    return value
+
+
+def validate_exact_fields(value: dict[str, Any], expected: frozenset[str], field: str) -> None:
+    actual = set(value)
+    if actual == expected:
+        return
+    missing = sorted(expected - actual)
+    unexpected = sorted(actual - expected)
+    details: list[str] = []
+    if missing:
+        details.append("missing " + ", ".join(missing))
+    if unexpected:
+        details.append("unexpected " + ", ".join(unexpected))
+    raise AdapterRequestError(f"{field} has invalid fields ({'; '.join(details)})")
+
+
+def validate_resource(value: Any, field: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise AdapterRequestError(f"{field} must be an object")
+    validate_exact_fields(value, RESOURCE_FIELDS, field)
+    resource_id = required_string(value.get("resource_id"), f"{field}.resource_id")
+    if not RESOURCE_ID_RE.fullmatch(resource_id):
+        raise AdapterRequestError(f"{field}.resource_id must be an opaque res_ identifier")
+    resource_type = required_string(value.get("type"), f"{field}.type")
+    if resource_type not in RESOURCE_TYPES:
+        raise AdapterRequestError(f"{field}.type is unsupported")
+    tenant_id = required_string(value.get("tenant_id"), f"{field}.tenant_id")
+    knowledge_base_id = required_string(value.get("knowledge_base_id"), f"{field}.knowledge_base_id")
+    authz_object = required_string(value.get("authz_object"), f"{field}.authz_object")
+    versions = value.get("versions")
+    if not isinstance(versions, dict):
+        raise AdapterRequestError(f"{field}.versions must be an object")
+    validate_exact_fields(versions, RESOURCE_VERSION_FIELDS, f"{field}.versions")
+    normalized_versions = {
+        name: required_string(versions.get(name), f"{field}.versions.{name}")
+        for name in sorted(RESOURCE_VERSION_FIELDS)
+    }
+    serving_state = required_string(value.get("serving_state"), f"{field}.serving_state")
+    if serving_state != "serving":
+        raise AdapterRequestError(f"{field}.serving_state must be serving")
+    return {
+        "resource_id": resource_id,
+        "type": resource_type,
+        "tenant_id": tenant_id,
+        "knowledge_base_id": knowledge_base_id,
+        "authz_object": authz_object,
+        "versions": normalized_versions,
+        "serving_state": serving_state,
+    }
+
+
+def validate_candidate(value: Any, field: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise AdapterRequestError(f"{field} must be an object")
+    validate_exact_fields(value, CANDIDATE_FIELDS, field)
+    resource = validate_resource(value.get("resource"), f"{field}.resource")
+    score = value.get("score")
+    if isinstance(score, bool) or not isinstance(score, (int, float)):
+        raise AdapterRequestError(f"{field}.score must be a number")
+    if score < 0 or score > 1:
+        raise AdapterRequestError(f"{field}.score must be between 0 and 1")
+    return {"resource": resource, "score": float(score)}
+
+
+def validate_evidence(value: Any, field: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise AdapterRequestError(f"{field} must be an object")
+    validate_exact_fields(value, EVIDENCE_FIELDS, field)
+    return {
+        "resource": validate_resource(value.get("resource"), f"{field}.resource"),
+        "content": required_string(value.get("content"), f"{field}.content"),
+        "citation_handle": required_string(value.get("citation_handle"), f"{field}.citation_handle"),
+    }
+
+
+def copy_fake_candidate(resource_id: str) -> dict[str, Any]:
+    candidate = FAKE_CANDIDATES_BY_ID[resource_id]
+    resource = candidate["resource"]
+    return {
+        "resource": {**resource, "versions": dict(resource["versions"])},
+        "score": candidate["score"],
+    }
+
+
+def require_fake_resource_binding(resource: dict[str, Any], field: str) -> None:
+    resource_id = resource["resource_id"]
+    candidate = FAKE_CANDIDATES_BY_ID.get(resource_id)
+    if candidate is None:
+        raise AdapterRequestError(f"{field}.resource_id is not present in the fake serving projection")
+    if resource != candidate["resource"]:
+        raise AdapterRequestError(f"{field} does not match the exact fake serving resource handle")
+
+
+def maybe_test_primitive_delay() -> None:
+    value = os.environ.get(TEST_DELAY_MS_ENV, "")
+    if not value:
+        return
+    try:
+        delay_ms = int(value)
+    except ValueError as exc:
+        raise AdapterRequestError(f"{TEST_DELAY_MS_ENV} must be an integer") from exc
+    if delay_ms < 0 or delay_ms > 5000:
+        raise AdapterRequestError(f"{TEST_DELAY_MS_ENV} must be between 0 and 5000")
+    time.sleep(delay_ms / 1000)
+
+
+def add_test_stage_spy(
+    data: dict[str, Any], stages: list[tuple[str, list[str]]]
+) -> dict[str, Any]:
+    if os.environ.get(TEST_STAGE_SPY_ENV) != "1":
+        return data
+    data["debug"] = {
+        "stages": [
+            {"stage": stage, "resource_ids": list(resource_ids), "count": len(resource_ids)}
+            for stage, resource_ids in stages
+        ]
+    }
+    return data
+
+
+def fake_retrieve(params: dict[str, Any]) -> dict[str, Any]:
+    required_string(params.get("query"), "query")
+    limit = primitive_limit(params, len(FAKE_RETRIEVE_IDS))
+    maybe_test_primitive_delay()
+    retrieved = [
+        (copy_fake_candidate(resource_id), FAKE_CONTENT_BY_ID[resource_id])
+        for resource_id in FAKE_RETRIEVE_IDS[:limit]
+    ]
+    candidates = [candidate for candidate, _protected_content in retrieved]
+    resource_ids = [candidate["resource"]["resource_id"] for candidate in candidates]
+    return add_test_stage_spy(
+        {"mode": "fake", "candidates": candidates},
+        [("retrieve.output", resource_ids)],
+    )
+
+
+def fake_expand(params: dict[str, Any]) -> dict[str, Any]:
+    frontier = params.get("frontier")
+    if not isinstance(frontier, list) or not frontier:
+        raise AdapterRequestError("frontier must be a list of candidate handles")
+    handles = [validate_candidate(value, f"frontier[{index}]") for index, value in enumerate(frontier)]
+    for index, handle in enumerate(handles):
+        require_fake_resource_binding(handle["resource"], f"frontier[{index}].resource")
+    frontier_ids = sorted(handle["resource"]["resource_id"] for handle in handles)
+    if len(frontier_ids) != len(set(frontier_ids)):
+        raise AdapterRequestError("frontier contains duplicate resource_id values")
+    limit = primitive_limit(params, 10)
+    maybe_test_primitive_delay()
+
+    edges: list[dict[str, Any]] = []
+    candidate_ids: set[str] = set()
+    for from_resource_id in frontier_ids:
+        for to_resource_id, hop in FAKE_EXPANSIONS.get(from_resource_id, ()):
+            candidate_ids.add(to_resource_id)
+            edges.append(
+                {
+                    "from_resource_id": from_resource_id,
+                    "to_resource_id": to_resource_id,
+                    "hop": hop,
+                }
+            )
+    candidates = sorted(
+        (copy_fake_candidate(resource_id) for resource_id in candidate_ids),
+        key=lambda candidate: (-candidate["score"], candidate["resource"]["resource_id"]),
+    )[:limit]
+    output_ids = [candidate["resource"]["resource_id"] for candidate in candidates]
+    included = set(output_ids)
+    expansions = sorted(
+        (edge for edge in edges if edge["to_resource_id"] in included),
+        key=lambda edge: (edge["hop"], edge["from_resource_id"], edge["to_resource_id"]),
+    )
+    return add_test_stage_spy(
+        {"mode": "fake", "candidates": candidates, "expansions": expansions},
+        [
+            ("expand.frontier_input", frontier_ids),
+            ("expand.candidate_output", output_ids),
+        ],
+    )
+
+
+def fake_generate(params: dict[str, Any]) -> dict[str, Any]:
+    question = required_string(params.get("question"), "question")
+    evidence = params.get("evidence")
+    if not isinstance(evidence, list) or not evidence:
+        raise AdapterRequestError("evidence must be a non-empty list of already-authorized evidence objects")
+    items = [validate_evidence(value, f"evidence[{index}]") for index, value in enumerate(evidence)]
+    for index, item in enumerate(items):
+        require_fake_resource_binding(item["resource"], f"evidence[{index}].resource")
+    resource_ids = [item["resource"]["resource_id"] for item in items]
+    citation_handles = [item["citation_handle"] for item in items]
+    if len(resource_ids) != len(set(resource_ids)):
+        raise AdapterRequestError("evidence contains duplicate resource_id values")
+    if len(citation_handles) != len(set(citation_handles)):
+        raise AdapterRequestError("evidence contains duplicate citation_handle values")
+    maybe_test_primitive_delay()
+
+    answer = f"Fake generated answer for: {question} Supported by: " + " ".join(
+        item["content"] for item in items
+    )
+    citations = [
+        {"handle": item["citation_handle"], "resource_id": item["resource"]["resource_id"]}
+        for item in items
+    ]
+    return add_test_stage_spy(
+        {
+            "mode": "fake",
+            "answer": answer,
+            "citations": citations,
+            "evidence_resource_ids": resource_ids,
+            "trace": {"resource_ids": resource_ids, "count": len(resource_ids)},
+        },
+        [
+            ("generate.evidence_input", resource_ids),
+            ("generate.citation_output", resource_ids),
+        ],
+    )
+
+
 def fake_response(req: dict[str, Any]) -> None:
     req_id = req.get("id", "")
     method = req.get("method", "")
+    if method in PRIMITIVE_METHODS:
+        params = primitive_params(req)
+        handlers = {
+            "kag.retrieve": fake_retrieve,
+            "kag.expand": fake_expand,
+            "kag.generate": fake_generate,
+        }
+        result(req_id, handlers[method](params))
+        return
     params = req.get("params") or {}
-    workspace = workspace_path(params)
     query = params.get("query") or ""
     if method == "kag.health":
         result(req_id, {"status": "ok", "mode": "fake", "version": "0.8.0"})
     elif method == "kag.build":
+        workspace = workspace_path(params)
         out_dir = runtime_dir(params)
         corpus_path, records = prepare_corpus(workspace, out_dir, params)
         progress(req_id, "scanning sources", 1, 3)
@@ -816,6 +1159,13 @@ def run_kag_query(req: dict[str, Any], explain: bool = False) -> dict[str, Any]:
 def real_response(req: dict[str, Any]) -> None:
     req_id = req.get("id", "")
     method = req.get("method", "")
+    if method in PRIMITIVE_METHODS:
+        error(
+            req_id,
+            f"{method} is not supported by the real OpenSPG/KAG adapter",
+            UNSUPPORTED_PRIMITIVE_CODE,
+        )
+        return
     if method == "kag.health":
         real_health(req)
         return
@@ -870,13 +1220,19 @@ def main() -> int:
         except json.JSONDecodeError as exc:
             error("", f"invalid json: {exc}")
             continue
+        if not isinstance(req, dict):
+            error("", "request must be a JSON object", INVALID_REQUEST_CODE)
+            continue
+        req_id = req.get("id", "")
         try:
             if fake:
                 fake_response(req)
             else:
                 real_response(req)
+        except AdapterRequestError as exc:
+            error(req_id, str(exc), exc.code)
         except Exception as exc:  # pragma: no cover - defensive boundary
-            error(req.get("id", ""), str(exc))
+            error(req_id, str(exc))
         time.sleep(0.01)
         break
     return 0

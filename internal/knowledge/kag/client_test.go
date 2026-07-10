@@ -13,7 +13,9 @@ func TestClientReadsLargeNDJSONLine(t *testing.T) {
 	adapter := filepath.Join(workspace, "adapter.py")
 	largeAnswer := strings.Repeat("x", 128*1024)
 	script := `import json
-print(json.dumps({"id":"req","type":"result","data":{"answer":"` + largeAnswer + `"}}))
+import sys
+req = json.loads(sys.stdin.readline())
+print(json.dumps({"id":req["id"],"type":"result","data":{"answer":"` + largeAnswer + `"}}))
 `
 	if err := os.WriteFile(adapter, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
@@ -26,6 +28,23 @@ print(json.dumps({"id":"req","type":"result","data":{"answer":"` + largeAnswer +
 	}
 	if got := resp.Data["answer"]; got != largeAnswer {
 		t.Fatalf("large answer mismatch: %T", got)
+	}
+}
+
+func TestClientRejectsResponseForAnotherRequest(t *testing.T) {
+	workspace := t.TempDir()
+	adapter := filepath.Join(workspace, "adapter.py")
+	script := `import json
+print(json.dumps({"id":"wrong-request","type":"result","data":{"answer":"wrong"}}))
+`
+	if err := os.WriteFile(adapter, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("KNOTE_PYTHON", pythonForTest())
+
+	_, err := Client{AdapterPath: adapter, Workspace: workspace}.Query(context.Background(), "hello")
+	if err == nil || !strings.Contains(err.Error(), "does not match request") {
+		t.Fatalf("expected response id mismatch, got %v", err)
 	}
 }
 

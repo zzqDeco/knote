@@ -37,9 +37,27 @@ type Request struct {
 type Response struct {
 	ID      string         `json:"id"`
 	Type    string         `json:"type"`
+	Code    string         `json:"code,omitempty"`
 	Message string         `json:"message,omitempty"`
 	Data    map[string]any `json:"data,omitempty"`
 	Error   string         `json:"error,omitempty"`
+}
+
+type AdapterError struct {
+	Code    string
+	Message string
+}
+
+func (e *AdapterError) Error() string {
+	return e.Message
+}
+
+func (e *AdapterError) Is(target error) bool {
+	return target == ErrUnsupportedPrimitive && e.Code == ErrorCodeUnsupportedPrimitive
+}
+
+func IsUnsupportedPrimitive(err error) bool {
+	return errors.Is(err, ErrUnsupportedPrimitive)
 }
 
 type Backend interface {
@@ -117,8 +135,14 @@ func (c Client) call(ctx context.Context, method string, params map[string]any) 
 	for scanner.Scan() {
 		var resp Response
 		if err := json.Unmarshal(scanner.Bytes(), &resp); err != nil {
+			_ = cmd.Process.Kill()
 			_ = cmd.Wait()
 			return Response{}, err
+		}
+		if resp.ID != req.ID {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			return Response{}, fmt.Errorf("kag adapter response id %q does not match request %q", resp.ID, req.ID)
 		}
 		mu.Lock()
 		last = resp
@@ -129,11 +153,17 @@ func (c Client) call(ctx context.Context, method string, params map[string]any) 
 	}
 	if err := scanner.Err(); err != nil {
 		_ = cmd.Wait()
+		if ctx.Err() != nil {
+			return Response{}, ctx.Err()
+		}
 		return Response{}, err
 	}
 	waitErr := cmd.Wait()
 	if last.Type == "error" {
-		return last, errors.New(last.Error)
+		return last, &AdapterError{Code: last.Code, Message: last.Error}
+	}
+	if ctx.Err() != nil {
+		return last, ctx.Err()
 	}
 	if waitErr != nil {
 		return last, fmt.Errorf("kag adapter failed: %w: %s", waitErr, stderr.String())

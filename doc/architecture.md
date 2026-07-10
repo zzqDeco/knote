@@ -83,8 +83,17 @@ Each session is a JSONL event log under `.knote/sessions/<session-id>.jsonl`. `/
 - `kag.query`
 - `kag.explain`
 - `kag.cancel`
+- `kag.retrieve`
+- `kag.expand`
+- `kag.generate`
 
-Fake mode is selected with `KNOTE_KAG_FAKE=1` and returns deterministic responses for tests and local development. Real mode expects OpenSPG at `127.0.0.1:8887` by default and `openspg-kag` importable from `KNOTE_PYTHON`. KAG output is normalized into knote-owned artifacts before it becomes part of the public workspace contract.
+The first five methods are legacy/build compatibility contracts. The complete real `kag.query` and `kag.explain` solver path is not a permissioned-query boundary: retrieval summaries, graph selectors, task memory, and intermediate LLM calls can observe content before the final answer returns.
+
+The three primitive methods define the future authorized path. Retrieve and expand return complete versioned resource handles without bodies or relation text. Generate accepts only explicit already-authorized evidence. Fake mode implements these contracts deterministically for boundary and leak tests. Real mode currently returns `unsupported_primitive` before KAG initialization; issue #39 must supply proven low-level implementations before runtime can select them. The decision and source inspection are recorded in `doc/adr/0002-kag-query-interception.md`.
+
+Each Go client call starts one adapter subprocess. Context cancellation or timeout terminates that subprocess through `exec.CommandContext` and returns the caller's context error after reaping it. `kag.cancel` only acknowledges its own one-request process and cannot interrupt another call. A future real primitive that starts child processes must add process-group termination before it is considered cancellation-safe.
+
+Fake mode is selected with `KNOTE_KAG_FAKE=1` and returns deterministic responses for tests and local development. Real mode expects OpenSPG at `127.0.0.1:8887` by default and `openspg-kag` importable from `KNOTE_PYTHON`. KAG build output is normalized into knote-owned artifacts before it becomes part of the public workspace contract.
 
 ## Local Repository
 

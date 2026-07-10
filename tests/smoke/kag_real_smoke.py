@@ -26,7 +26,14 @@ def ensure_real_kag(host: str) -> None:
         raise SystemExit(f"OpenSPG host is not reachable at {host}: {exc}") from exc
 
 
-def call_adapter(adapter: Path, workspace: Path, host: str, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+def call_adapter(
+    adapter: Path,
+    workspace: Path,
+    host: str,
+    method: str,
+    params: dict[str, Any] | None = None,
+    expected_error_code: str = "",
+) -> dict[str, Any]:
     payload = {
         "id": method.replace(".", "_"),
         "method": method,
@@ -55,7 +62,11 @@ def call_adapter(adapter: Path, workspace: Path, host: str, method: str, params:
         raise SystemExit(f"{method} returned no NDJSON output\nstderr:\n{proc.stderr}")
     last = lines[-1]
     if last.get("type") == "error":
+        if expected_error_code and last.get("code") == expected_error_code:
+            return last
         raise SystemExit(f"{method} adapter error: {last.get('error')}\nstderr:\n{proc.stderr}")
+    if expected_error_code:
+        raise SystemExit(f"{method} returned a result; expected error code {expected_error_code}: {last}")
     if last.get("type") != "result":
         raise SystemExit(f"{method} did not end with a result: {last}")
     return last
@@ -80,6 +91,16 @@ def main() -> int:
     ]:
         result = call_adapter(adapter, workspace, args.host, method, params)
         print(json.dumps({"method": method, "message": result.get("message"), "data": result.get("data")}, ensure_ascii=False))
+
+    for method in ("kag.retrieve", "kag.expand", "kag.generate"):
+        result = call_adapter(
+            adapter,
+            workspace,
+            args.host,
+            method,
+            expected_error_code="unsupported_primitive",
+        )
+        print(json.dumps({"method": method, "error_code": result.get("code")}, ensure_ascii=False))
 
     return 0
 
