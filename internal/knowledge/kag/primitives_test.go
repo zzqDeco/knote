@@ -176,7 +176,7 @@ func TestPrimitiveDecodeRejectsUnknownLeakFields(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	response := Response{Data: map[string]any{
+	response := Response{Type: "result", Data: map[string]any{
 		"mode": "fake",
 		"candidates": []any{map[string]any{
 			"resource": resource,
@@ -196,6 +196,34 @@ func TestPrimitiveDecodeRejectsNonResultFrame(t *testing.T) {
 	}}
 	if _, err := decodePrimitive[RetrieveResult](response); err == nil {
 		t.Fatal("progress data must not decode as a terminal primitive result")
+	}
+}
+
+func TestPrimitiveClientRejectsTopLevelLeakFields(t *testing.T) {
+	workspace := t.TempDir()
+	adapter := writePrimitiveAdapter(t, workspace, `
+import hashlib, json, sys
+req = json.loads(sys.stdin.readline())
+resource_id = "res_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+resource = {"resource_id": resource_id, "type": "document", "tenant_id": "local", "knowledge_base_id": "default", "authz_object": "document:" + resource_id, "authorization_resource_id": resource_id, "content_digest": "sha256:" + hashlib.sha256(b"allowed body").hexdigest(), "versions": {"source": "source-v1", "content": "content-v1", "acl": "acl-v1", "index": "index-v1", "graph": "graph-v1", "projection": "projection-v1"}, "serving_state": "serving"}
+data = {"mode": "fake", "candidates": [{"resource": resource, "score": 0.9}]}
+print(json.dumps({"id": req["id"], "type": "result", "message": "protected body", "debug": {"trace": "protected body"}, "data": data}))
+`)
+	t.Setenv("KNOTE_PYTHON", pythonForTest())
+	client := Client{AdapterPath: adapter, Workspace: workspace}
+
+	if _, err := client.Retrieve(context.Background(), RetrieveRequest{Query: "knote", Limit: 40}); err == nil {
+		t.Fatal("primitive result with top-level leak fields should fail strict frame decoding")
+	}
+}
+
+func TestPrimitiveDecodeRejectsTopLevelMessage(t *testing.T) {
+	var response Response
+	if err := json.Unmarshal([]byte(`{"id":"req","type":"result","message":"protected body","data":{"mode":"fake","candidates":[]}}`), &response); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := decodePrimitive[RetrieveResult](response); err == nil {
+		t.Fatal("primitive result with a non-empty top-level message should fail strict frame decoding")
 	}
 }
 

@@ -41,6 +41,27 @@ type Response struct {
 	Message string         `json:"message,omitempty"`
 	Data    map[string]any `json:"data,omitempty"`
 	Error   string         `json:"error,omitempty"`
+	raw     json.RawMessage
+}
+
+func (r *Response) UnmarshalJSON(data []byte) error {
+	type responseWire struct {
+		ID      string         `json:"id"`
+		Type    string         `json:"type"`
+		Code    string         `json:"code,omitempty"`
+		Message string         `json:"message,omitempty"`
+		Data    map[string]any `json:"data,omitempty"`
+		Error   string         `json:"error,omitempty"`
+	}
+	var wire responseWire
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	*r = Response{
+		ID: wire.ID, Type: wire.Type, Code: wire.Code, Message: wire.Message,
+		Data: wire.Data, Error: wire.Error, raw: append(json.RawMessage(nil), data...),
+	}
+	return nil
 }
 
 type AdapterError struct {

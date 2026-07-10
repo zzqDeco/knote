@@ -316,10 +316,35 @@ func (c Client) Generate(ctx context.Context, req GenerateRequest) (GenerateResu
 	return result, result.ValidateFor(req)
 }
 
+type primitiveResponse[T any] struct {
+	ID      string `json:"id"`
+	Type    string `json:"type"`
+	Message string `json:"message,omitempty"`
+	Data    T      `json:"data"`
+}
+
 func decodePrimitive[T any](response Response) (T, error) {
 	var value T
 	if response.Type != "result" {
 		return value, fmt.Errorf("primitive response must be a result frame")
+	}
+	if len(response.raw) > 0 {
+		var frame primitiveResponse[T]
+		decoder := json.NewDecoder(bytes.NewReader(response.raw))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&frame); err != nil {
+			return value, err
+		}
+		if frame.Type != "result" {
+			return value, fmt.Errorf("primitive response must be a result frame")
+		}
+		if frame.Message != "" {
+			return value, fmt.Errorf("primitive result frame contains a non-empty message")
+		}
+		return frame.Data, nil
+	}
+	if response.Code != "" || response.Message != "" || response.Error != "" {
+		return value, fmt.Errorf("primitive result frame contains non-data fields")
 	}
 	data, err := json.Marshal(response.Data)
 	if err != nil {
