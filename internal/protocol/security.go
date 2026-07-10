@@ -75,6 +75,26 @@ func (c AuthorizationContext) Validate() error {
 
 type ResourceID string
 
+type ContentDigest string
+
+const contentDigestPrefix = "sha256:"
+
+func NewContentDigest(content string) ContentDigest {
+	sum := sha256.Sum256([]byte(content))
+	return ContentDigest(contentDigestPrefix + hex.EncodeToString(sum[:]))
+}
+
+func (d ContentDigest) Validate() error {
+	value := string(d)
+	if !strings.HasPrefix(value, contentDigestPrefix) || len(value) != len(contentDigestPrefix)+sha256.Size*2 {
+		return fmt.Errorf("content_digest must be a sha256 digest")
+	}
+	if _, err := hex.DecodeString(strings.TrimPrefix(value, contentDigestPrefix)); err != nil {
+		return fmt.Errorf("content_digest must be hexadecimal: %w", err)
+	}
+	return nil
+}
+
 type ResourceType string
 
 const (
@@ -158,6 +178,7 @@ type ResourceHandle struct {
 	KnowledgeBaseID         string           `json:"knowledge_base_id"`
 	AuthorizationID         string           `json:"authz_object"`
 	AuthorizationResourceID ResourceID       `json:"authorization_resource_id"`
+	ContentDigest           ContentDigest    `json:"content_digest"`
 	Versions                ResourceVersions `json:"versions"`
 	ServingState            ServingState     `json:"serving_state"`
 }
@@ -168,6 +189,9 @@ func (h ResourceHandle) Validate() error {
 	}
 	if err := h.AuthorizationResourceID.Validate(); err != nil {
 		return fmt.Errorf("authorization_resource_id: %w", err)
+	}
+	if err := h.ContentDigest.Validate(); err != nil {
+		return err
 	}
 	for name, value := range map[string]string{
 		"tenant_id":         h.TenantID,
@@ -185,6 +209,9 @@ func (h ResourceHandle) Validate() error {
 	}
 	if h.Type != ResourceChunk && h.AuthorizationResourceID != h.ResourceID {
 		return fmt.Errorf("non-chunk resource must use itself as the authorization boundary")
+	}
+	if h.Type == ResourceChunk && h.AuthorizationResourceID == h.ResourceID {
+		return fmt.Errorf("chunk authorization boundary must be a distinct parent document")
 	}
 	if h.ServingState != ServingActive {
 		return fmt.Errorf("resource %s is not serving", h.ResourceID)
@@ -486,6 +513,9 @@ func (p EvidencePackage) ValidateFor(auth AuthorizationContext) error {
 		}
 		if strings.TrimSpace(item.Content) == "" {
 			return fmt.Errorf("evidence resource %s has empty content", item.Resource.ResourceID)
+		}
+		if NewContentDigest(item.Content) != item.Resource.ContentDigest {
+			return fmt.Errorf("evidence resource %s content does not match the authorized resource handle", item.Resource.ResourceID)
 		}
 		if err := ValidateProvenance(item.Derivation, item.Supports); err != nil {
 			return err

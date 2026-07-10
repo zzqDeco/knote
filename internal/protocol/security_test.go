@@ -72,6 +72,19 @@ func TestStableResourceIDIgnoresMutableVersions(t *testing.T) {
 	}
 }
 
+func TestContentDigestBindsCanonicalContent(t *testing.T) {
+	digest := NewContentDigest("authorized content")
+	if err := digest.Validate(); err != nil {
+		t.Fatalf("validate content digest: %v", err)
+	}
+	if digest == NewContentDigest("denied content") {
+		t.Fatal("different content produced the same digest")
+	}
+	if err := ContentDigest("sha256:not-a-digest").Validate(); err == nil {
+		t.Fatal("malformed content digest should fail")
+	}
+}
+
 func TestProvenanceSemantics(t *testing.T) {
 	id, err := NewStableResourceID("local", "default", ResourceDocument, "sources/intro.md")
 	if err != nil {
@@ -160,6 +173,14 @@ func TestChunkAuthorizationUsesParentDocumentBoundary(t *testing.T) {
 	wrongParent.AuthorizationResource.AuthorizationID = document.AuthorizationID
 	if err := wrongParent.Validate(); err == nil {
 		t.Fatal("authorization through a forged document with the same authorization object should fail")
+	}
+
+	selfBound := decision
+	selfBound.Resource.AuthorizationResourceID = selfBound.Resource.ResourceID
+	selfBound.AuthorizationResource = testResourceHandle(t, chunkID)
+	selfBound.AuthorizationResource.AuthorizationID = selfBound.Resource.AuthorizationID
+	if err := selfBound.Validate(); err == nil {
+		t.Fatal("chunk authorization through a forged document sharing the chunk id should fail")
 	}
 }
 
@@ -284,6 +305,12 @@ func TestEvidencePackageBinding(t *testing.T) {
 	if err := mismatched.ValidateFor(auth); err == nil {
 		t.Fatal("resource version not covered by the allow decision should fail")
 	}
+	mismatched = pkg
+	mismatched.Items = append([]EvidenceItem(nil), pkg.Items...)
+	mismatched.Items[0].Content = "denied content paired with an allowed handle"
+	if err := mismatched.ValidateFor(auth); err == nil {
+		t.Fatal("content not bound to the authorized handle should fail")
+	}
 }
 
 func TestEntityEvidenceRequiresAuthorizedSourceSupport(t *testing.T) {
@@ -294,6 +321,7 @@ func TestEntityEvidenceRequiresAuthorizedSourceSupport(t *testing.T) {
 	}
 	entity := testResourceHandle(t, entityID)
 	entity.Type = ResourceEntity
+	entity.ContentDigest = NewContentDigest("knote")
 	entityDecision := testDecision(t, entityID)
 	entityDecision.Resource = entity
 	entityDecision.AuthorizationResource = entity
@@ -393,6 +421,7 @@ func testResourceHandle(t *testing.T, id ResourceID) ResourceHandle {
 	handle := ResourceHandle{
 		ResourceID: id, Type: ResourceDocument, TenantID: "local", KnowledgeBaseID: "default",
 		AuthorizationID: "document:" + string(id), AuthorizationResourceID: id, ServingState: ServingActive,
+		ContentDigest: NewContentDigest("authorized content"),
 		Versions: ResourceVersions{
 			Source: "source-v1", Content: "content-v1", ACL: "acl-v1",
 			Index: "index-v1", Graph: "graph-v1", Projection: "projection-v1",

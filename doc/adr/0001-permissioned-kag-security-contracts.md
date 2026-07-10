@@ -23,7 +23,7 @@ Fallback is allowed only when it reads the current serving projection, returns r
 
 ### Resource identity and versions
 
-`ResourceID` is an opaque, tenant-scoped identity derived from stable source identity, never content. Source, content, ACL, index, graph, and projection versions are independent. Updating content or ACLs must not create a new canonical resource.
+`ResourceID` is an opaque, tenant-scoped identity derived from stable source identity, never content. Source, content, ACL, index, graph, and projection versions are independent. Updating content or ACLs must not create a new canonical resource. The versioned handle also carries the canonical content SHA-256 digest so evidence validation can reject a body paired with the wrong authorized handle.
 
 Document is the Phase 1 ACL boundary. Every resource handle carries the stable identity of its authorization boundary. Chunk inherits its Document and every Chunk decision must match both that immutable parent Document identity and the exact parent Document handle used as the authorization resource; a Chunk-scoped or unrelated Document authorization object is invalid. Entity existence requires at least one authorized Document or Chunk support and cannot be established by self-support. Claim authorization is independent from Entity visibility. A denied Claim or frontier item cannot participate in a later graph hop.
 
@@ -31,7 +31,7 @@ Document is the Phase 1 ACL boundary. Every resource handle carries the stable i
 
 Every evidence item carries explicit provenance. Provenance records exact versioned resource handles, not stable IDs alone. In `any_support`, each listed support must independently and completely justify the result. Otherwise the result uses source-scoped claims or `all_required`. Derived artifacts default to `all_required`.
 
-An `EvidencePackage` contains only authorized resources and binds its decisions, citations, model ID, identity and ACL watermarks, consistency preference, projection, and visibility fingerprint to the originating session and request. An allow decision covers one exact `ResourceHandle`, including every mutable version, rather than every version sharing the same stable `ResourceID`. Denied titles, paths, bodies, and graph structure are never included.
+An `EvidencePackage` contains only authorized resources and binds its decisions, citations, authorization model ID, identity and ACL watermarks, consistency preference, projection, and visibility fingerprint to the originating session and request. An allow decision covers one exact `ResourceHandle`, including every mutable version and the canonical content digest, rather than every version sharing the same stable `ResourceID`. Generator model identity belongs to the generation/audit contract introduced with the authorized gateway; it is not an input to resource authorization. Denied titles, paths, bodies, and graph structure are never included.
 
 ### KAG execution boundary
 
