@@ -34,7 +34,7 @@ jobs:
         run: KNOTE_KAG_FAKE=1 go test ./...
 
       - name: OpenFGA authorization model tests
-        run: go run github.com/openfga/cli/cmd/fga@v0.7.17 model test --tests internal/authz/model/authorization.fga.yaml
+        run: GOTOOLCHAIN=go1.25.12 go run github.com/openfga/cli/cmd/fga@v0.7.17 model test --tests internal/authz/model/authorization.fga.yaml
 
       - name: Python adapter smoke
         run: python -m unittest discover -s adapters/kag -p '*test*.py'

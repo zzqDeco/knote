@@ -44,9 +44,10 @@ var (
 )
 
 var (
-	ulidPattern     = regexp.MustCompile(`^[0-7][0-9A-HJKMNP-TV-Z]{25}$`)
-	typePattern     = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
-	relationPattern = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
+	ulidPattern        = regexp.MustCompile(`^[0-7][0-9A-HJKMNP-TV-Z]{25}$`)
+	typePattern        = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
+	relationPattern    = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
+	correlationPattern = regexp.MustCompile(`^[A-Za-z0-9-]{1,36}$`)
 )
 
 type Consistency string
@@ -159,7 +160,7 @@ func (r BatchCheckRequest) Validate() error {
 	}
 	seen := make(map[string]struct{}, len(r.Checks))
 	for index, check := range r.Checks {
-		if err := validateToken("correlation_id", check.CorrelationID); err != nil {
+		if err := validateCorrelationID(check.CorrelationID); err != nil {
 			return fmt.Errorf("check %d: %w", index, err)
 		}
 		if _, ok := seen[check.CorrelationID]; ok {
@@ -175,6 +176,13 @@ func (r BatchCheckRequest) Validate() error {
 		if err := validateObject("object", check.Object); err != nil {
 			return fmt.Errorf("check %q: %w", check.CorrelationID, err)
 		}
+	}
+	return nil
+}
+
+func validateCorrelationID(value string) error {
+	if !correlationPattern.MatchString(value) {
+		return fmt.Errorf("%w: correlation_id must contain only letters, numbers, or hyphens and be at most 36 characters", ErrInvalidRequest)
 	}
 	return nil
 }

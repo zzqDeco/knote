@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -115,6 +116,21 @@ func TestBatchCheckRequestRejectsOversizedBatch(t *testing.T) {
 	request := BatchCheckRequest{AuthorizationModelID: localTestModelID, Checks: checks}
 	if err := request.Validate(); !errors.Is(err, ErrInvalidRequest) {
 		t.Fatalf("oversized batch error = %v", err)
+	}
+}
+
+func TestBatchCheckRequestRejectsInvalidCorrelationIDs(t *testing.T) {
+	for _, correlationID := range []string{"foo_bar", strings.Repeat("a", 37)} {
+		request := BatchCheckRequest{
+			AuthorizationModelID: localTestModelID,
+			Checks: []BatchCheckItem{{
+				CorrelationID: correlationID, User: "user:alice",
+				Relation: RelationCanRead, Object: "document:welcome",
+			}},
+		}
+		if err := request.Validate(); !errors.Is(err, ErrInvalidRequest) {
+			t.Fatalf("correlation_id %q error = %v", correlationID, err)
+		}
 	}
 }
 
