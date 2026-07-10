@@ -11,6 +11,8 @@ import (
 
 const SecurityContractVersion = "v1"
 
+const EvidenceReadRelation = "can_view"
+
 type ConsistencyPreference string
 
 const (
@@ -241,6 +243,8 @@ const (
 
 type AuthorizationDecision struct {
 	CorrelationID        string          `json:"correlation_id"`
+	RequestID            string          `json:"request_id"`
+	PrincipalID          string          `json:"principal_id"`
 	Relation             string          `json:"relation"`
 	Resource             ResourceHandle  `json:"resource"`
 	Outcome              DecisionOutcome `json:"outcome"`
@@ -256,6 +260,8 @@ func (d AuthorizationDecision) Authorized() bool {
 func (d AuthorizationDecision) Validate() error {
 	for name, value := range map[string]string{
 		"correlation_id":         d.CorrelationID,
+		"request_id":             d.RequestID,
+		"principal_id":           d.PrincipalID,
 		"relation":               d.Relation,
 		"authorization_model_id": d.AuthorizationModelID,
 		"acl_watermark":          d.ACLWatermark,
@@ -387,6 +393,12 @@ func (p EvidencePackage) ValidateFor(auth AuthorizationContext) error {
 		if decision.AuthorizationModelID != p.AuthorizationModelID || decision.ACLWatermark != p.ACLWatermark {
 			return fmt.Errorf("decision authorization binding does not match evidence package")
 		}
+		if decision.RequestID != p.RequestID || decision.PrincipalID != p.PrincipalID {
+			return fmt.Errorf("decision request binding does not match evidence package")
+		}
+		if decision.Relation != EvidenceReadRelation {
+			return fmt.Errorf("evidence requires an allow decision for %s", EvidenceReadRelation)
+		}
 		if decision.Resource.TenantID != p.TenantID || decision.Resource.KnowledgeBaseID != p.KnowledgeBaseID {
 			return fmt.Errorf("decision resource crosses the authorization scope")
 		}
@@ -416,6 +428,16 @@ func (p EvidencePackage) ValidateFor(auth AuthorizationContext) error {
 		}
 		if err := ValidateProvenance(item.Derivation, item.Supports); err != nil {
 			return err
+		}
+		for _, support := range item.Supports {
+			if _, ok := allowed[support.ResourceID]; !ok {
+				return fmt.Errorf("provenance support resource %s has no allow decision", support.ResourceID)
+			}
+			for _, evidenceID := range support.Evidence {
+				if _, ok := allowed[evidenceID]; !ok {
+					return fmt.Errorf("provenance evidence resource %s has no allow decision", evidenceID)
+				}
+			}
 		}
 		if err := validateToken("citation_handle", item.Citation.Handle); err != nil {
 			return err

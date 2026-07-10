@@ -169,6 +169,35 @@ func TestEvidencePackageBinding(t *testing.T) {
 	}
 	mismatched = pkg
 	mismatched.Decisions = append([]AuthorizationDecision(nil), pkg.Decisions...)
+	mismatched.Decisions[0].RequestID = "another-request"
+	if err := mismatched.ValidateFor(auth); err == nil {
+		t.Fatal("decision from another request should fail")
+	}
+	mismatched = pkg
+	mismatched.Decisions = append([]AuthorizationDecision(nil), pkg.Decisions...)
+	mismatched.Decisions[0].PrincipalID = "another-user"
+	if err := mismatched.ValidateFor(auth); err == nil {
+		t.Fatal("decision for another principal should fail")
+	}
+	mismatched = pkg
+	mismatched.Decisions = append([]AuthorizationDecision(nil), pkg.Decisions...)
+	mismatched.Decisions[0].Relation = "can_edit"
+	if err := mismatched.ValidateFor(auth); err == nil {
+		t.Fatal("non-read allow decision should fail")
+	}
+	mismatched = pkg
+	mismatched.Items = append([]EvidenceItem(nil), pkg.Items...)
+	mismatched.Items[0].Supports = append([]ProvenanceSupport(nil), pkg.Items[0].Supports...)
+	unauthorizedID, err := NewStableResourceID("local", "default", ResourceDocument, "sources/private.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mismatched.Items[0].Supports[0].Evidence = []ResourceID{unauthorizedID}
+	if err := mismatched.ValidateFor(auth); err == nil {
+		t.Fatal("unauthorized provenance evidence should fail")
+	}
+	mismatched = pkg
+	mismatched.Decisions = append([]AuthorizationDecision(nil), pkg.Decisions...)
 	mismatched.Decisions[0].Outcome = DecisionIndeterminate
 	if err := mismatched.ValidateFor(auth); err == nil {
 		t.Fatal("indeterminate evidence decision should fail closed")
@@ -228,7 +257,8 @@ func testResourceHandle(t *testing.T, id ResourceID) ResourceHandle {
 func testDecision(t *testing.T, id ResourceID) AuthorizationDecision {
 	t.Helper()
 	decision := AuthorizationDecision{
-		CorrelationID: "decision-1", Relation: "can_view", Resource: testResourceHandle(t, id),
+		CorrelationID: "decision-1", RequestID: "request-1", PrincipalID: "local-user",
+		Relation: EvidenceReadRelation, Resource: testResourceHandle(t, id),
 		Outcome: DecisionAllow, AuthorizationModelID: "local-v1", ACLWatermark: "acl-v1",
 		CheckedAt: time.Unix(1, 0).UTC(),
 	}
