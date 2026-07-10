@@ -1,0 +1,35 @@
+model
+  schema 1.1
+
+type user
+
+type group
+  relations
+    define member: [user]
+
+type organization
+  relations
+    define member: [user, group#member]
+
+type knowledge_base
+  relations
+    define organization: [organization]
+    define viewer: [user, group#member]
+    define editor: [user, group#member]
+    define unscoped_reader: viewer or editor
+    define can_view: member from organization and unscoped_reader
+    define can_edit: member from organization and editor
+
+type document
+  relations
+    define organization: [organization]
+    define parent: [knowledge_base]
+    define viewer: [user, group#member]
+    define editor: [user, group#member]
+    define restricted: [user:*]
+    define inherited_reader: can_view from parent but not restricted
+    define inherited_editor: can_edit from parent but not restricted
+    define unscoped_reader: viewer or editor or inherited_reader
+    define unscoped_editor: editor or inherited_editor
+    define can_view: member from organization and unscoped_reader
+    define can_edit: member from organization and unscoped_editor
