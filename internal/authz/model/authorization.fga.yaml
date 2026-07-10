@@ -1,0 +1,161 @@
+name: knote authorization model
+model_file: ./authorization.fga
+
+tests:
+  - name: cross-tenant-direct-share
+    tuples:
+      - user: user:mallory
+        relation: member
+        object: organization:other
+      - user: organization:acme
+        relation: organization
+        object: document:shared
+      - user: user:mallory
+        relation: viewer
+        object: document:shared
+    check:
+      - user: user:mallory
+        object: document:shared
+        assertions:
+          can_read: false
+
+  - name: group-membership-add
+    tuples:
+      - user: user:alice
+        relation: member
+        object: group:engineering
+      - user: group:engineering#member
+        relation: member
+        object: organization:acme
+      - user: organization:acme
+        relation: organization
+        object: knowledge_base:handbook
+      - user: group:engineering#member
+        relation: viewer
+        object: knowledge_base:handbook
+      - user: organization:acme
+        relation: organization
+        object: document:welcome
+      - user: knowledge_base:handbook
+        relation: parent
+        object: document:welcome
+    check:
+      - user: user:alice
+        object: document:welcome
+        assertions:
+          can_read: true
+          can_edit: false
+
+  - name: group-membership-remove
+    tuples:
+      - user: group:engineering#member
+        relation: member
+        object: organization:acme
+      - user: organization:acme
+        relation: organization
+        object: knowledge_base:handbook
+      - user: group:engineering#member
+        relation: viewer
+        object: knowledge_base:handbook
+      - user: organization:acme
+        relation: organization
+        object: document:welcome
+      - user: knowledge_base:handbook
+        relation: parent
+        object: document:welcome
+    check:
+      - user: user:alice
+        object: document:welcome
+        assertions:
+          can_read: false
+
+  - name: inherited-read-and-edit
+    tuples:
+      - user: user:erin
+        relation: member
+        object: organization:acme
+      - user: organization:acme
+        relation: organization
+        object: knowledge_base:handbook
+      - user: user:erin
+        relation: editor
+        object: knowledge_base:handbook
+      - user: organization:acme
+        relation: organization
+        object: document:welcome
+      - user: knowledge_base:handbook
+        relation: parent
+        object: document:welcome
+    check:
+      - user: user:erin
+        object: document:welcome
+        assertions:
+          can_read: true
+          can_edit: true
+
+  - name: restricted-child-blocks-only-inheritance
+    tuples:
+      - user: user:alice
+        relation: member
+        object: organization:acme
+      - user: user:bob
+        relation: member
+        object: organization:acme
+      - user: organization:acme
+        relation: organization
+        object: knowledge_base:handbook
+      - user: user:alice
+        relation: viewer
+        object: knowledge_base:handbook
+      - user: organization:acme
+        relation: organization
+        object: document:restricted
+      - user: knowledge_base:handbook
+        relation: parent
+        object: document:restricted
+      - user: user:*
+        relation: restricted
+        object: document:restricted
+      - user: user:bob
+        relation: viewer
+        object: document:restricted
+    check:
+      - user: user:alice
+        object: document:restricted
+        assertions:
+          can_read: false
+      - user: user:bob
+        object: document:restricted
+        assertions:
+          can_read: true
+
+  - name: direct-share
+    tuples:
+      - user: user:bob
+        relation: member
+        object: organization:acme
+      - user: organization:acme
+        relation: organization
+        object: document:direct
+      - user: user:bob
+        relation: viewer
+        object: document:direct
+    check:
+      - user: user:bob
+        object: document:direct
+        assertions:
+          can_read: true
+
+  - name: direct-share-revoke
+    tuples:
+      - user: user:bob
+        relation: member
+        object: organization:acme
+      - user: organization:acme
+        relation: organization
+        object: document:direct
+    check:
+      - user: user:bob
+        object: document:direct
+        assertions:
+          can_read: false
