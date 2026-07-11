@@ -46,7 +46,7 @@ func (p ServingPointer) Validate() error {
 	if err := validateJournalToken("projection_version", p.ProjectionVersion); err != nil {
 		return err
 	}
-	if err := validateJournalToken("source_snapshot_version", p.SourceSnapshotVersion); err != nil {
+	if err := validateToken("source_snapshot_version", p.SourceSnapshotVersion); err != nil {
 		return err
 	}
 	if (p.RunID == "") != (p.PlanID == "") {
@@ -132,7 +132,11 @@ func (s *ProjectionStore) InitializeServing(projection Projection) error {
 			if readErr != nil {
 				return readErr
 			}
-			if !reflect.DeepEqual(persisted, projection) {
+			equal, compareErr := projectionsEqual(persisted, projection)
+			if compareErr != nil {
+				return compareErr
+			}
+			if !equal {
 				return ErrJournalConflict
 			}
 			return nil
@@ -318,7 +322,7 @@ func (s *ProjectionStore) stageLocked(plan ProjectionPlan) error {
 	if err := validateJournalToken("projection_version", plan.Run.ProjectionVersion); err != nil {
 		return err
 	}
-	if err := validateJournalToken("source_snapshot_version", plan.Run.SourceSnapshot.Version); err != nil {
+	if err := validateToken("source_snapshot_version", plan.Run.SourceSnapshot.Version); err != nil {
 		return err
 	}
 	for _, operation := range plan.Operations {
@@ -541,7 +545,11 @@ func (s *ProjectionStore) reconcilePointerOwnerLocked(pointer ServingPointer) er
 		if readErr != nil {
 			return readErr
 		}
-		if !reflect.DeepEqual(persisted, serving) {
+		equal, compareErr := projectionsEqual(persisted, serving)
+		if compareErr != nil {
+			return compareErr
+		}
+		if !equal {
 			return ErrJournalConflict
 		}
 		return nil
@@ -571,7 +579,11 @@ func (s *ProjectionStore) reconcilePointerOwnerLocked(pointer ServingPointer) er
 	if err != nil {
 		return err
 	}
-	if !reflect.DeepEqual(projection, serving) {
+	equal, compareErr := projectionsEqual(projection, serving)
+	if compareErr != nil {
+		return compareErr
+	}
+	if !equal {
 		return ErrJournalConflict
 	}
 	if err := s.persistProjectionLocked(plan, projection); err != nil {
@@ -686,10 +698,26 @@ func (s *ProjectionStore) verifyBaseProjectionLocked(current Projection, plan Pr
 	if err != nil {
 		return err
 	}
-	if !reflect.DeepEqual(persisted, current) {
+	equal, compareErr := projectionsEqual(persisted, current)
+	if compareErr != nil {
+		return compareErr
+	}
+	if !equal {
 		return ErrJournalConflict
 	}
 	return nil
+}
+
+func projectionsEqual(left, right Projection) (bool, error) {
+	leftJSON, err := deterministicJSON(left)
+	if err != nil {
+		return false, err
+	}
+	rightJSON, err := deterministicJSON(right)
+	if err != nil {
+		return false, err
+	}
+	return string(leftJSON) == string(rightJSON), nil
 }
 
 func (s *ProjectionStore) readServingPointerLocked() (ServingPointer, error) {

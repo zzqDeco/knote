@@ -423,6 +423,92 @@ func TestProjectionStoreStageUsesCanonicalPlanBytes(t *testing.T) {
 	}
 }
 
+func TestProjectionStoreUsesCanonicalProjectionEquality(t *testing.T) {
+	scope := testScope()
+	snapshot := testSnapshot(t, scope, "source-v1", "sources/a.md")
+	document := published(testMetadata(
+		t, scope, protocol.ResourceDocument, "sources/a.md", "content-v1",
+		"source-v1", "content-v1", "projection-v1", "", "doc:a",
+	))
+	document.Dependencies = make([]protocol.ResourceID, 0)
+	current := testProjection(t, scope, "projection-v1", snapshot.Ref(), []ResourceMetadata{document})
+	if current.Resources[0].Dependencies == nil {
+		t.Fatal("fixture lost its empty non-nil dependency list")
+	}
+	store, err := NewProjectionStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InitializeServing(current); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InitializeServing(current); err != nil {
+		t.Fatalf("canonical InitializeServing retry: %v", err)
+	}
+	plan := testProjectionStorePlanFromCurrent(t, current, "projection-v2")
+	var executorCalls atomic.Int64
+	execution, err := store.Execute(context.Background(), plan, current, successfulCountingExecutor(&executorCalls))
+	if err != nil {
+		t.Fatalf("Execute with canonical base projection: %v", err)
+	}
+	if !execution.PointerAdvanced || execution.Report.RunState != RunSucceeded {
+		t.Fatalf("execution = %+v", execution)
+	}
+	if executorCalls.Load() != int64(len(plan.Operations)) {
+		t.Fatalf("executor calls = %d, want %d", executorCalls.Load(), len(plan.Operations))
+	}
+}
+
+func TestProjectionStoreAllowsNonPathSnapshotVersions(t *testing.T) {
+	versions := []string{
+		"2026-07-10T22:40:38Z",
+		"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+	}
+	for _, snapshotVersion := range versions {
+		t.Run(snapshotVersion, func(t *testing.T) {
+			scope := testScope()
+			currentSnapshot := testSnapshot(t, scope, snapshotVersion+"-current")
+			current := testProjection(t, scope, "projection-v1", currentSnapshot.Ref(), nil)
+			store, err := NewProjectionStore(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := store.InitializeServing(current); err != nil {
+				t.Fatalf("InitializeServing: %v", err)
+			}
+
+			nextSnapshot := testSnapshot(t, scope, snapshotVersion, "sources/a.md")
+			run := testRun(scope, current.Version, "projection-v2", nextSnapshot.Ref())
+			desired := testMetadata(
+				t, scope, protocol.ResourceDocument, "sources/a.md", "content-v2",
+				snapshotVersion, "content-v2", run.ProjectionVersion, "", "doc:a",
+			)
+			plan, err := PlanResources(run, current, []ResourceMetadata{desired})
+			if err != nil {
+				t.Fatal(err)
+			}
+			execution, err := store.Execute(context.Background(), plan, current, successfulCountingExecutor(nil))
+			if err != nil {
+				t.Fatalf("Execute: %v", err)
+			}
+			if execution.Pointer.SourceSnapshotVersion != snapshotVersion {
+				t.Fatalf("pointer snapshot version = %q, want %q", execution.Pointer.SourceSnapshotVersion, snapshotVersion)
+			}
+			reopened, err := NewProjectionStore(store.Root())
+			if err != nil {
+				t.Fatal(err)
+			}
+			pointer, err := reopened.ServingPointer()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if pointer.SourceSnapshotVersion != snapshotVersion {
+				t.Fatalf("reopened pointer snapshot version = %q, want %q", pointer.SourceSnapshotVersion, snapshotVersion)
+			}
+		})
+	}
+}
+
 func TestProjectionStoreIdempotentWriteRetriesParentSync(t *testing.T) {
 	store, _, plan := testProjectionStorePlan(t, t.TempDir(), "projection-v2")
 	path := store.resultPath(plan.Run.RunID, plan.Operations[0].OperationID)
