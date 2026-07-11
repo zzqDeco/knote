@@ -271,9 +271,11 @@ func (s *ProjectionStore) Execute(
 				OperationID: operation.OperationID, Outcome: OperationFailed,
 				ErrorCode: "operation_execution_failed",
 			}
+			executorInvoked := false
 			if operationFailed {
 				result.ErrorCode = "operation_blocked"
 			} else if ctx.Err() == nil {
+				executorInvoked = true
 				candidate, executeErr := executor.Execute(ctx, operation)
 				if executeErr == nil && candidate.OperationID == operation.OperationID && candidate.Validate() == nil {
 					result = candidate
@@ -286,7 +288,7 @@ func (s *ProjectionStore) Execute(
 			if err := s.recordResultLocked(plan, result); err != nil {
 				return err
 			}
-			if result.ErrorCode != "operation_blocked" {
+			if executorInvoked {
 				execution.ExecutedOperationIDs = append(execution.ExecutedOperationIDs, operation.OperationID)
 			}
 			operationFailed = operationFailed || result.Outcome == OperationFailed

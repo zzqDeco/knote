@@ -14,9 +14,9 @@ func syncDirectory(path string) error {
 	if err != nil {
 		return err
 	}
-	// Windows has no fsync(2) directory primitive. A write-capable directory
-	// handle plus FlushFileBuffers is the strongest supported handle-level flush;
-	// failures are returned rather than weakening the durability contract.
+	// For atomic replacement, file contents were synced before rename. Windows
+	// has no portable directory fsync, so FlushFileBuffers is best effort on a
+	// validated handle; only documented unsupported errors are tolerated below.
 	handle, err := windows.CreateFile(
 		pathPointer,
 		windows.GENERIC_READ|windows.GENERIC_WRITE,
@@ -39,7 +39,11 @@ func syncDirectory(path string) error {
 	if information.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
 		return errors.Join(errors.New("directory sync target is a reparse point"), windows.CloseHandle(handle))
 	}
-	flushErr := windows.FlushFileBuffers(handle)
+	flushErr := ignoreUnsupportedDirectoryFlushError(
+		windows.FlushFileBuffers(handle),
+		windows.ERROR_INVALID_HANDLE,
+		windows.ERROR_NOT_SUPPORTED,
+	)
 	closeErr := windows.CloseHandle(handle)
 	return errors.Join(flushErr, closeErr)
 }

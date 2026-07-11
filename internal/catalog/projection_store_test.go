@@ -3,6 +3,7 @@ package catalog
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -170,6 +171,53 @@ func TestProjectionStorePersistedLaterFailureBlocksAllMissingOperations(t *testi
 		}
 	}
 	assertServingVersion(t, store, current.Version)
+}
+
+func TestProjectionStoreCancelledContextDoesNotReportExecutedOperations(t *testing.T) {
+	store, current, plan := testProjectionStorePlan(t, t.TempDir(), "projection-v2")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var calls atomic.Int64
+	execution, err := store.Execute(ctx, plan, current, successfulCountingExecutor(&calls))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("executor calls = %d, want 0 for a cancelled context", calls.Load())
+	}
+	if len(execution.ExecutedOperationIDs) != 0 {
+		t.Fatalf("cancelled execution reported operation IDs: %v", execution.ExecutedOperationIDs)
+	}
+	if execution.Projection.State != StateFailed || execution.Report.RunState != RunFailed {
+		t.Fatalf("cancelled execution was not failed and non-serving: %+v", execution)
+	}
+	assertServingVersion(t, store, current.Version)
+}
+
+func TestIgnoreUnsupportedDirectoryFlushError(t *testing.T) {
+	unsupportedInvalidHandle := errors.New("invalid handle")
+	unsupportedFilesystem := errors.New("not supported")
+	ioFailure := errors.New("I/O failure")
+	tests := []struct {
+		name string
+		err  error
+		want error
+	}{
+		{name: "nil"},
+		{name: "invalid handle", err: unsupportedInvalidHandle},
+		{name: "wrapped not supported", err: fmt.Errorf("flush: %w", unsupportedFilesystem)},
+		{name: "other error", err: ioFailure, want: ioFailure},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := ignoreUnsupportedDirectoryFlushError(
+				test.err, unsupportedInvalidHandle, unsupportedFilesystem,
+			)
+			if !errors.Is(got, test.want) || (got == nil) != (test.want == nil) {
+				t.Fatalf("classification error = %v, want %v", got, test.want)
+			}
+		})
+	}
 }
 
 func TestProjectionStoreLockSerializesIndependentInstances(t *testing.T) {
