@@ -251,6 +251,7 @@ func TestProjectionStoreRejectsInapplicablePlanBeforeSideEffects(t *testing.T) {
 }
 
 func TestIgnoreUnsupportedDirectoryFlushError(t *testing.T) {
+	unsupportedInvalidFunction := errors.New("invalid function")
 	unsupportedInvalidHandle := errors.New("invalid handle")
 	unsupportedFilesystem := errors.New("not supported")
 	ioFailure := errors.New("I/O failure")
@@ -260,6 +261,7 @@ func TestIgnoreUnsupportedDirectoryFlushError(t *testing.T) {
 		want error
 	}{
 		{name: "nil"},
+		{name: "invalid function", err: unsupportedInvalidFunction},
 		{name: "invalid handle", err: unsupportedInvalidHandle},
 		{name: "wrapped not supported", err: fmt.Errorf("flush: %w", unsupportedFilesystem)},
 		{name: "other error", err: ioFailure, want: ioFailure},
@@ -267,7 +269,7 @@ func TestIgnoreUnsupportedDirectoryFlushError(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			got := ignoreUnsupportedDirectoryFlushError(
-				test.err, unsupportedInvalidHandle, unsupportedFilesystem,
+				test.err, unsupportedInvalidFunction, unsupportedInvalidHandle, unsupportedFilesystem,
 			)
 			if !errors.Is(got, test.want) || (got == nil) != (test.want == nil) {
 				t.Fatalf("classification error = %v, want %v", got, test.want)
@@ -378,6 +380,58 @@ func TestProjectionStorePersistsNonServingProjectionWhenCASTurnsStaleAfterReceip
 		if resource.IsServing() {
 			t.Fatalf("stale CAS left resource serving: %+v", resource)
 		}
+	}
+	assertServingVersion(t, store, winner.Run.ProjectionVersion)
+}
+
+func TestProjectionStoreRejectsUnverifiedBaseBeforeJournalingStaleFailure(t *testing.T) {
+	root := t.TempDir()
+	scope := testScope()
+	baseSnapshot := testSnapshot(t, scope, "source-v1", "sources/current.md")
+	currentResource := published(testMetadata(
+		t, scope, protocol.ResourceDocument, "sources/current.md", "current",
+		"source-v1", "content-current", "projection-v1", "", "doc:current",
+	))
+	current := testProjection(t, scope, "projection-v1", baseSnapshot.Ref(), []ResourceMetadata{currentResource})
+	store, err := NewProjectionStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InitializeServing(current); err != nil {
+		t.Fatal(err)
+	}
+	winner := testProjectionStorePlanFromCurrent(t, current, "projection-v2")
+	stale := testProjectionStorePlanFromCurrent(t, current, "projection-v3")
+	if _, err := store.Execute(context.Background(), winner, current, successfulCountingExecutor(nil)); err != nil {
+		t.Fatal(err)
+	}
+
+	forged := current
+	forged.Resources = append([]ResourceMetadata(nil), current.Resources...)
+	forged.Resources[0].AuthorizationObject += "-forged"
+	if err := forged.Validate(); err != nil {
+		t.Fatalf("forged projection must remain structurally valid: %v", err)
+	}
+
+	var calls atomic.Int64
+	if _, err := store.Execute(
+		context.Background(), stale, forged, successfulCountingExecutor(&calls),
+	); !errors.Is(err, ErrJournalConflict) {
+		t.Fatalf("stale Execute error = %v, want ErrJournalConflict", err)
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("stale Execute ran %d side effects", calls.Load())
+	}
+	if _, err := store.Finalize(stale, forged); !errors.Is(err, ErrJournalConflict) {
+		t.Fatalf("stale Finalize error = %v, want ErrJournalConflict", err)
+	}
+	for _, operation := range stale.Operations {
+		if _, err := store.readResultLocked(stale.Run.RunID, operation.OperationID); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("stale operation %s persisted a receipt: %v", operation.OperationID, err)
+		}
+	}
+	if _, err := os.Stat(store.projectionPath(stale.Run.ProjectionVersion)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stale unverified projection was persisted: %v", err)
 	}
 	assertServingVersion(t, store, winner.Run.ProjectionVersion)
 }
@@ -722,6 +776,36 @@ func TestCreateDirectoriesDurablyRetriesExistingParentSync(t *testing.T) {
 	}
 	if syncCalls != 1 {
 		t.Fatalf("retry parent sync calls = %d, want 1", syncCalls)
+	}
+}
+
+func TestNewProjectionStoreRetriesExistingRootParentSync(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "projections")
+	injected := errors.New("injected root parent sync failure")
+	if _, err := newProjectionStore(root, func(path string) error {
+		if path == parent {
+			return injected
+		}
+		return nil
+	}); !errors.Is(err, injected) {
+		t.Fatalf("first NewProjectionStore error = %v, want injected sync failure", err)
+	}
+	if info, err := os.Lstat(root); err != nil || !info.IsDir() {
+		t.Fatalf("projection root is not visible after sync failure: info=%v err=%v", info, err)
+	}
+
+	rootParentSyncs := 0
+	if _, err := newProjectionStore(root, func(path string) error {
+		if path == parent {
+			rootParentSyncs++
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("NewProjectionStore retry: %v", err)
+	}
+	if rootParentSyncs != 1 {
+		t.Fatalf("root parent sync calls = %d, want 1", rootParentSyncs)
 	}
 }
 

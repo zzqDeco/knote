@@ -82,6 +82,10 @@ type ProjectionStore struct {
 }
 
 func NewProjectionStore(root string) (*ProjectionStore, error) {
+	return newProjectionStore(root, syncDirectory)
+}
+
+func newProjectionStore(root string, syncDir func(string) error) (*ProjectionStore, error) {
 	if strings.TrimSpace(root) == "" || !filepath.IsAbs(root) {
 		return nil, fmt.Errorf("projection store root must be an absolute path")
 	}
@@ -95,13 +99,14 @@ func NewProjectionStore(root string) (*ProjectionStore, error) {
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("inspect projection store root: %w", err)
-	} else if err := createDirectoriesDurably(root, syncDirectory); err != nil {
+	}
+	if err := createDirectoriesDurably(root, syncDir); err != nil {
 		return nil, fmt.Errorf("create projection store root: %w", err)
 	}
 	if err := secureProjectionDirectory(root); err != nil {
 		return nil, fmt.Errorf("secure projection store root: %w", err)
 	}
-	store := &ProjectionStore{root: root, syncDirectory: syncDirectory}
+	store := &ProjectionStore{root: root, syncDirectory: syncDir}
 	for _, path := range []string{store.runsDir(), store.projectionsDir()} {
 		if err := store.ensureDir(path); err != nil {
 			return nil, err
@@ -237,6 +242,9 @@ func (s *ProjectionStore) Execute(
 			execution, err = s.persistedExecutionLocked(plan, journalRun.State)
 			return err
 		}
+		if err := s.verifyBaseProjectionLocked(current, plan); err != nil {
+			return err
+		}
 		if !pointerMatchesBase(pointer, plan, current) {
 			if pointer.ProjectionVersion == plan.Run.ProjectionVersion &&
 				pointer.RunID == plan.Run.RunID && pointer.PlanID == plan.PlanID {
@@ -248,9 +256,6 @@ func (s *ProjectionStore) Execute(
 				return err
 			}
 			return ErrStaleServingPointer
-		}
-		if err := s.verifyBaseProjectionLocked(current, plan); err != nil {
-			return err
 		}
 		if err := validateReplayPlan(plan, current); err != nil {
 			return fmt.Errorf("preflight projection plan: %w", err)
@@ -422,6 +427,9 @@ func (s *ProjectionStore) finalizeLocked(plan ProjectionPlan, current Projection
 	if journalRun.State == RunSucceeded || journalRun.State == RunFailed {
 		return s.persistedExecutionLocked(plan, journalRun.State)
 	}
+	if err := s.verifyBaseProjectionLocked(current, plan); err != nil {
+		return ProjectionExecution{}, err
+	}
 	if !pointerMatchesBase(pointer, plan, current) {
 		if pointer.ProjectionVersion == plan.Run.ProjectionVersion &&
 			pointer.RunID == plan.Run.RunID && pointer.PlanID == plan.PlanID {
@@ -453,9 +461,6 @@ func (s *ProjectionStore) finalizeLocked(plan ProjectionPlan, current Projection
 			return ProjectionExecution{}, persistErr
 		}
 		return execution, ErrStaleServingPointer
-	}
-	if err := s.verifyBaseProjectionLocked(current, plan); err != nil {
-		return ProjectionExecution{}, err
 	}
 	results, err := s.completeResultsLocked(plan)
 	if err != nil {

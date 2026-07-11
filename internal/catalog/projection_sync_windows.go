@@ -41,6 +41,7 @@ func syncDirectory(path string) error {
 	}
 	flushErr := ignoreUnsupportedDirectoryFlushError(
 		windows.FlushFileBuffers(handle),
+		windows.ERROR_INVALID_FUNCTION,
 		windows.ERROR_INVALID_HANDLE,
 		windows.ERROR_NOT_SUPPORTED,
 	)
