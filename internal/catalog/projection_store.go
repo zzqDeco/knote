@@ -176,6 +176,22 @@ func (s *ProjectionStore) ServingPointer() (ServingPointer, error) {
 	return pointer, err
 }
 
+// ServingProjection returns the canonical projection selected by the private
+// control-plane pointer. Callers use this value to bind external serving
+// mirrors to the same projection version.
+func (s *ProjectionStore) ServingProjection() (Projection, error) {
+	var projection Projection
+	err := s.withLock(func() error {
+		pointer, err := s.readServingPointerLocked()
+		if err != nil {
+			return err
+		}
+		projection, err = s.readProjectionFile(s.projectionPath(pointer.ProjectionVersion))
+		return err
+	})
+	return projection, err
+}
+
 func (s *ProjectionStore) Stage(plan ProjectionPlan) error {
 	return s.withLock(func() error { return s.stageLocked(plan) })
 }

@@ -178,8 +178,9 @@ type Summary struct {
 }
 
 type BuildResult struct {
-	Manifest protocolManifestAlias `json:"manifest"`
-	Report   string                `json:"report"`
+	Manifest       protocolManifestAlias  `json:"manifest"`
+	BundleManifest ArtifactBundleManifest `json:"bundle_manifest,omitempty"`
+	Report         string                 `json:"report"`
 }
 
 type protocolManifestAlias = ArtifactManifest

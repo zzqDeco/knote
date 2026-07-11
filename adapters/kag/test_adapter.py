@@ -760,6 +760,30 @@ class AdapterTest(unittest.TestCase):
             with self.assertRaisesRegex(FileNotFoundError, "explicit KAG config not found"):
                 adapter.select_config(params, workspace / ".knote" / "kag-runtime")
 
+    def test_projection_namespace_materializes_isolated_explicit_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            base = workspace / ".knote" / "kag_config.yaml"
+            base.parent.mkdir(parents=True)
+            base.write_text(
+                "project:\n  host_addr: http://127.0.0.1:8887\n  namespace: shared\n  checkpoint_path: shared/ckpt\n",
+                encoding="utf-8",
+            )
+            out_dir = workspace / ".knote" / "kag-runtime" / "projections" / "projection-one"
+            selected = adapter.select_config(
+                {
+                    "workspace": str(workspace),
+                    "config_path": str(base),
+                    "namespace": "projection-one",
+                },
+                out_dir,
+            )
+            text = selected.read_text(encoding="utf-8")
+            self.assertEqual(selected, (out_dir / "kag_config.yaml").resolve())
+            self.assertIn('namespace: "projection-one"', text)
+            self.assertIn(f'checkpoint_path: "{out_dir / "ckpt"}"', text)
+            self.assertIn("namespace: shared", base.read_text(encoding="utf-8"))
+
     def test_select_config_excludes_generated_config_from_git_status(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)

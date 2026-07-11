@@ -3,12 +3,16 @@ package versioned
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 	"unicode/utf8"
 
+	"github.com/zzqDeco/knote/internal/catalog"
 	"github.com/zzqDeco/knote/internal/knowledge/kag"
 	"github.com/zzqDeco/knote/internal/protocol"
 	"github.com/zzqDeco/knote/internal/repository"
@@ -121,6 +125,7 @@ func TestServiceBuildArtifactsAreStableAndEntityIsPerDocument(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	repo.sourceModTimes["sources/long.md"] = time.Unix(99, 0).UTC()
 	second, err := svc.Build(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -132,8 +137,19 @@ func TestServiceBuildArtifactsAreStableAndEntityIsPerDocument(t *testing.T) {
 	if string(firstManifest) != string(secondManifest) {
 		t.Fatalf("manifest changed on no-op rebuild:\nfirst=%s\nsecond=%s", firstManifest, secondManifest)
 	}
-	if !first.Manifest.GeneratedAt.Equal(time.Unix(42, 0).UTC()) {
-		t.Fatalf("generated_at should come from stable source mtime, got %s", first.Manifest.GeneratedAt)
+	firstBundle, err := json.Marshal(first.BundleManifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondBundle, err := json.Marshal(second.BundleManifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(firstBundle) != string(secondBundle) {
+		t.Fatalf("v2 bundle manifest changed on no-op rebuild:\nfirst=%s\nsecond=%s", firstBundle, secondBundle)
+	}
+	if !first.Manifest.GeneratedAt.Equal(time.Unix(0, 0).UTC()) {
+		t.Fatalf("generated_at must exclude source mtimes, got %s", first.Manifest.GeneratedAt)
 	}
 	if len(repo.artifacts.Chunks) < 2 {
 		t.Fatalf("test source did not split into multiple chunks: %+v", repo.artifacts.Chunks)
@@ -143,6 +159,154 @@ func TestServiceBuildArtifactsAreStableAndEntityIsPerDocument(t *testing.T) {
 	}
 	if got, want := len(repo.artifacts.Entities[0].EvidenceChunkIDs), len(repo.artifacts.Chunks); got != want {
 		t.Fatalf("document entity evidence chunk count = %d, want %d", got, want)
+	}
+}
+
+func TestServiceBuildUsesProjectionIsolatedKAGNamespaceAndMetadata(t *testing.T) {
+	ctx := context.Background()
+	repo := newMemoryRepo()
+	repo.config.KAG.Namespace = "Team Knowledge"
+	repo.sources["sources/intro.md"] = "first\n"
+	backend := &recordingNamespacedBackend{}
+	svc := New(Options{Workspace: repo.config.Workspace, Repo: repo, Backend: backend, Mode: ModeFake})
+
+	first, err := svc.Build(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if backend.buildNamespace != first.BundleManifest.Namespace {
+		t.Fatalf("KAG build namespace = %q, want %q", backend.buildNamespace, first.BundleManifest.Namespace)
+	}
+	if !strings.HasPrefix(first.BundleManifest.Namespace, "Team_Knowledge__prj_") {
+		t.Fatalf("namespace was not canonical and projection isolated: %q", first.BundleManifest.Namespace)
+	}
+	if first.BundleManifest.ProjectionVersion != first.BundleManifest.ProjectionID ||
+		first.BundleManifest.AuthorizationVersion == "" {
+		t.Fatalf("projection/authz metadata is inconsistent: %+v", first.BundleManifest)
+	}
+	answer, err := svc.Query(ctx, "what is here?")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if backend.queryNamespace != first.BundleManifest.Namespace ||
+		answer.ProjectionVersion != first.BundleManifest.ProjectionVersion || answer.Namespace != first.BundleManifest.Namespace ||
+		answer.AuthorizationObject != first.BundleManifest.AuthorizationObject ||
+		answer.AuthorizationVersion != first.BundleManifest.AuthorizationVersion {
+		t.Fatalf("retrieval metadata does not match serving build: answer=%+v manifest=%+v", answer, first.BundleManifest)
+	}
+
+	repo.sources["sources/intro.md"] = "second\n"
+	firstDocumentID := repo.artifacts.Documents[0].DocumentID
+	second, err := svc.Build(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.BundleManifest.ProjectionID == first.BundleManifest.ProjectionID ||
+		second.BundleManifest.Namespace == first.BundleManifest.Namespace ||
+		second.BundleManifest.AuthorizationObject != first.BundleManifest.AuthorizationObject ||
+		second.BundleManifest.AuthorizationVersion != first.BundleManifest.AuthorizationVersion {
+		t.Fatalf("content-only projection change altered identity isolation or ACL version:\nfirst=%+v\nsecond=%+v", first.BundleManifest, second.BundleManifest)
+	}
+	if backend.buildNamespace != second.BundleManifest.Namespace {
+		t.Fatalf("second KAG build namespace = %q, want %q", backend.buildNamespace, second.BundleManifest.Namespace)
+	}
+	if repo.artifacts.Documents[0].DocumentID != firstDocumentID {
+		t.Fatalf("content update changed stable document identity: first=%s second=%s", firstDocumentID, repo.artifacts.Documents[0].DocumentID)
+	}
+}
+
+func TestProjectionIdentityExcludesAbsoluteWorkspacePaths(t *testing.T) {
+	ctx := context.Background()
+	build := func(workspace string) BuildResult {
+		repo := newMemoryRepo()
+		repo.config.Workspace = workspace
+		repo.config.KAG.Namespace = "PortableKB"
+		repo.sources["sources/intro.md"] = "portable\n"
+		result, err := New(Options{Workspace: workspace, Repo: repo, Backend: fakeBackend{}, Mode: ModeFake}).Build(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(repo.artifacts.ProjectionJSON), workspace) {
+			t.Fatalf("public projection contains absolute workspace path %q", workspace)
+		}
+		return result
+	}
+	first := build("/private/checkout/one")
+	second := build("/different/checkout/two")
+	if first.BundleManifest.ProjectionVersion != second.BundleManifest.ProjectionVersion ||
+		first.BundleManifest.Namespace != second.BundleManifest.Namespace {
+		t.Fatalf("absolute workspace path changed projection identity: first=%+v second=%+v", first.BundleManifest, second.BundleManifest)
+	}
+}
+
+func TestServiceFailedProjectionLeavesCatalogAndArtifactPointersServingPriorVersion(t *testing.T) {
+	ctx := context.Background()
+	repo := newMemoryRepo()
+	repo.config.KAG.Namespace = "FailureTest"
+	repo.sources["sources/intro.md"] = "first\n"
+	backend := &recordingNamespacedBackend{}
+	svc := New(Options{Workspace: repo.config.Workspace, Repo: repo, Backend: backend, Mode: ModeFake})
+	first, err := svc.Build(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend.buildErr = errFakeUnavailable
+	repo.sources["sources/intro.md"] = "second\n"
+	failed, err := svc.Build(ctx)
+	if err == nil || failed.AdapterError == "" {
+		t.Fatalf("expected projection KAG failure, result=%+v err=%v", failed, err)
+	}
+	if repo.artifacts.BundleManifest.ProjectionVersion != first.BundleManifest.ProjectionVersion {
+		t.Fatalf("failed projection replaced artifact pointer: got=%s want=%s",
+			repo.artifacts.BundleManifest.ProjectionVersion, first.BundleManifest.ProjectionVersion)
+	}
+	store, err := catalog.NewProjectionStore(filepath.Join(repo.projectionRoot, "by-base", "projection-empty"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pointer, err := store.ServingPointer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pointer.ProjectionVersion != first.BundleManifest.ProjectionVersion {
+		t.Fatalf("failed projection advanced catalog pointer: got=%s want=%s", pointer.ProjectionVersion, first.BundleManifest.ProjectionVersion)
+	}
+}
+
+func TestServiceRetryRecoversArtifactPointerAfterCatalogCAS(t *testing.T) {
+	ctx := context.Background()
+	repo := newMemoryRepo()
+	repo.config.KAG.Namespace = "RecoveryTest"
+	repo.sources["sources/intro.md"] = "first\n"
+	backend := &recordingNamespacedBackend{}
+	svc := New(Options{Workspace: repo.config.Workspace, Repo: repo, Backend: backend, Mode: ModeFake})
+	first, err := svc.Build(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo.sources["sources/intro.md"] = "second\n"
+	repo.publishErr = errors.New("injected public pointer failure")
+	failed, err := svc.Build(ctx)
+	if err == nil || !strings.Contains(err.Error(), "injected public pointer failure") {
+		t.Fatalf("expected public pointer failure, result=%+v err=%v", failed, err)
+	}
+	if repo.artifacts.BundleManifest.ProjectionVersion != first.BundleManifest.ProjectionVersion {
+		t.Fatal("failed public pointer publication changed selected artifacts")
+	}
+	callsAfterCAS := backend.buildCalls
+	repo.publishErr = nil
+	recovered, err := svc.Build(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered.BundleManifest.ProjectionVersion != failed.BundleManifest.ProjectionVersion ||
+		repo.artifacts.BundleManifest.ProjectionVersion != failed.BundleManifest.ProjectionVersion {
+		t.Fatalf("retry did not finish the catalog-selected projection: failed=%s recovered=%s current=%s",
+			failed.BundleManifest.ProjectionVersion, recovered.BundleManifest.ProjectionVersion,
+			repo.artifacts.BundleManifest.ProjectionVersion)
+	}
+	if backend.buildCalls != callsAfterCAS {
+		t.Fatalf("artifact pointer recovery reran KAG: before=%d after=%d", callsAfterCAS, backend.buildCalls)
 	}
 }
 
@@ -239,7 +403,9 @@ type memoryRepo struct {
 	sources             map[string]string
 	sourceModTimes      map[string]time.Time
 	artifacts           repository.ArtifactSet
+	stagedArtifacts     repository.ArtifactSet
 	writeArtifactsCalls int
+	publishErr          error
 	eval                repository.EvalReport
 	hash                string
 	status              repository.Status
@@ -251,14 +417,20 @@ type memoryRepo struct {
 	tagged              string
 	checkoutRef         string
 	checkoutOpts        repository.CheckoutOptions
+	projectionRoot      string
 }
 
 func newMemoryRepo() *memoryRepo {
+	projectionRoot, err := os.MkdirTemp("", "knote-versioned-projections-")
+	if err != nil {
+		panic(err)
+	}
 	return &memoryRepo{
 		config:         repository.Config{Workspace: "/memory"},
 		sources:        map[string]string{},
 		sourceModTimes: map[string]time.Time{},
 		hash:           "current-knowledge-hash",
+		projectionRoot: projectionRoot,
 	}
 }
 
@@ -297,8 +469,38 @@ func (r *memoryRepo) WriteArtifacts(_ context.Context, set repository.ArtifactSe
 	return nil
 }
 
+func (r *memoryRepo) StageArtifacts(_ context.Context, set repository.ArtifactSet) error {
+	r.writeArtifactsCalls++
+	r.stagedArtifacts = set
+	return nil
+}
+
+func (r *memoryRepo) PublishArtifacts(context.Context, protocol.ArtifactBundleManifest) error {
+	if r.publishErr != nil {
+		return r.publishErr
+	}
+	r.artifacts = r.stagedArtifacts
+	return nil
+}
+
+func (r *memoryRepo) ReadCurrentProjection(context.Context) ([]byte, error) {
+	if len(r.artifacts.ProjectionJSON) == 0 {
+		return nil, repository.ErrArtifactCurrentNotFound
+	}
+	return append([]byte(nil), r.artifacts.ProjectionJSON...), nil
+}
+
+func (r *memoryRepo) ProjectionStoreRoot() string { return r.projectionRoot }
+
 func (r *memoryRepo) ReadManifest(context.Context) (protocol.ArtifactManifest, error) {
 	return r.artifacts.Manifest, nil
+}
+
+func (r *memoryRepo) ReadCurrentArtifactManifest(context.Context) (protocol.ArtifactBundleManifest, error) {
+	if r.artifacts.BundleManifest.Version == 0 {
+		return protocol.ArtifactBundleManifest{}, repository.ErrArtifactCurrentNotFound
+	}
+	return r.artifacts.BundleManifest, nil
 }
 
 func (r *memoryRepo) ReadSummaries(context.Context) ([]protocol.Summary, error) {
@@ -365,6 +567,57 @@ func (fakeBackend) Explain(context.Context, string) (kag.Response, error) {
 	return kag.Response{Data: map[string]any{"answer": "Fake KAG answer", "explanation": "because", "mode": "fake"}}, nil
 }
 
+func (b fakeBackend) BuildInNamespace(ctx context.Context, _ string) (kag.Response, error) {
+	return b.Build(ctx)
+}
+
+func (b fakeBackend) QueryInNamespace(ctx context.Context, _ string, query string) (kag.Response, error) {
+	return b.Query(ctx, query)
+}
+
+func (b fakeBackend) ExplainInNamespace(ctx context.Context, _ string, query string) (kag.Response, error) {
+	return b.Explain(ctx, query)
+}
+
+type recordingNamespacedBackend struct {
+	buildNamespace   string
+	queryNamespace   string
+	explainNamespace string
+	buildErr         error
+	buildCalls       int
+}
+
+func (b *recordingNamespacedBackend) Build(context.Context) (kag.Response, error) {
+	return kag.Response{Data: map[string]any{"mode": "legacy"}}, nil
+}
+
+func (b *recordingNamespacedBackend) Query(context.Context, string) (kag.Response, error) {
+	return kag.Response{Data: map[string]any{"answer": "legacy"}}, nil
+}
+
+func (b *recordingNamespacedBackend) Explain(context.Context, string) (kag.Response, error) {
+	return kag.Response{Data: map[string]any{"answer": "legacy"}}, nil
+}
+
+func (b *recordingNamespacedBackend) BuildInNamespace(_ context.Context, namespace string) (kag.Response, error) {
+	b.buildNamespace = namespace
+	b.buildCalls++
+	if b.buildErr != nil {
+		return kag.Response{}, b.buildErr
+	}
+	return kag.Response{Data: map[string]any{"mode": "namespaced", "namespace": namespace}}, nil
+}
+
+func (b *recordingNamespacedBackend) QueryInNamespace(_ context.Context, namespace, _ string) (kag.Response, error) {
+	b.queryNamespace = namespace
+	return kag.Response{Data: map[string]any{"answer": "namespaced", "namespace": namespace}}, nil
+}
+
+func (b *recordingNamespacedBackend) ExplainInNamespace(_ context.Context, namespace, _ string) (kag.Response, error) {
+	b.explainNamespace = namespace
+	return kag.Response{Data: map[string]any{"answer": "namespaced", "namespace": namespace}}, nil
+}
+
 type failingBackend struct{}
 
 func (failingBackend) Build(context.Context) (kag.Response, error) {
@@ -377,6 +630,18 @@ func (failingBackend) Query(context.Context, string) (kag.Response, error) {
 
 func (failingBackend) Explain(context.Context, string) (kag.Response, error) {
 	return kag.Response{}, errFakeUnavailable
+}
+
+func (b failingBackend) BuildInNamespace(ctx context.Context, _ string) (kag.Response, error) {
+	return b.Build(ctx)
+}
+
+func (b failingBackend) QueryInNamespace(ctx context.Context, _ string, query string) (kag.Response, error) {
+	return b.Query(ctx, query)
+}
+
+func (b failingBackend) ExplainInNamespace(ctx context.Context, _ string, query string) (kag.Response, error) {
+	return b.Explain(ctx, query)
 }
 
 var errFakeUnavailable = &fakeError{"fake unavailable"}
@@ -393,6 +658,18 @@ func (buildFailingBackend) Query(context.Context, string) (kag.Response, error) 
 
 func (buildFailingBackend) Explain(context.Context, string) (kag.Response, error) {
 	return kag.Response{}, errFakeUnavailable
+}
+
+func (b buildFailingBackend) BuildInNamespace(ctx context.Context, _ string) (kag.Response, error) {
+	return b.Build(ctx)
+}
+
+func (b buildFailingBackend) QueryInNamespace(ctx context.Context, _ string, query string) (kag.Response, error) {
+	return b.Query(ctx, query)
+}
+
+func (b buildFailingBackend) ExplainInNamespace(ctx context.Context, _ string, query string) (kag.Response, error) {
+	return b.Explain(ctx, query)
 }
 
 type fakeError struct {

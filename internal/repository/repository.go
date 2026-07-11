@@ -77,15 +77,18 @@ type Source struct {
 }
 
 type ArtifactSet struct {
-	Manifest    protocol.ArtifactManifest
-	Documents   []protocol.Document
-	Chunks      []protocol.Chunk
-	Entities    []protocol.Entity
-	Relations   []protocol.Relation
-	Claims      []protocol.Claim
-	Summaries   []protocol.Summary
-	SchemaYAML  string
-	BuildReport string
+	Manifest                protocol.ArtifactManifest
+	BundleManifest          protocol.ArtifactBundleManifest
+	ProjectionJSON          []byte
+	ProjectionResourceCount int
+	Documents               []protocol.Document
+	Chunks                  []protocol.Chunk
+	Entities                []protocol.Entity
+	Relations               []protocol.Relation
+	Claims                  []protocol.Claim
+	Summaries               []protocol.Summary
+	SchemaYAML              string
+	BuildReport             string
 }
 
 type EvalQuestion struct {

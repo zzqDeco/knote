@@ -55,7 +55,7 @@ func TestSideEffectExecutorPreservesEvalReportWithAdapterErrors(t *testing.T) {
 
 func TestToolExecutorReportsSuccessfulBuildCompletion(t *testing.T) {
 	executor := NewToolExecutor([]einotool.InvokableTool{
-		staticTool{name: einotools.NameBuild, out: `{"manifest":{"version":1}}`},
+		staticTool{name: einotools.NameBuild, out: `{"manifest":{"version":1},"bundle_manifest":{"version":2,"projection_version":"prj_test","namespace":"ns","authz_object":"kb:test","authz_version":"acl-v1"}}`},
 	})
 	events, err := executor.Invoke(context.Background(), "sess_eino", einotools.NameBuild, "{}")
 	if err != nil {
@@ -63,6 +63,15 @@ func TestToolExecutorReportsSuccessfulBuildCompletion(t *testing.T) {
 	}
 	if !hasToolEvent(events, protocol.EventToolComplete) || !hasToolEvent(events, protocol.EventBuildComplete) {
 		t.Fatalf("successful build should report completion: %+v", events)
+	}
+	for _, event := range events {
+		if event.Type != protocol.EventBuildComplete {
+			continue
+		}
+		data, ok := event.Payload.(map[string]any)
+		if !ok || data["version"] != float64(1) || data["projection_version"] != "prj_test" || data["namespace"] != "ns" {
+			t.Fatalf("build.complete did not preserve v1 fields and add projection metadata: %+v", event.Payload)
+		}
 	}
 }
 

@@ -336,11 +336,11 @@ def select_config(params: dict[str, Any], out_dir: Path, *, generate: bool = Tru
         candidate = path if path.is_absolute() else workspace / path
         if not candidate.exists():
             raise FileNotFoundError(f"explicit KAG config not found: {candidate}")
-        return candidate.resolve()
+        return projection_config(candidate.resolve(), out_dir, params)
     candidates = [workspace / ".knote" / "kag_config.yaml", workspace / "kag_config.yaml"]
     for candidate in candidates:
         if candidate.exists():
-            return candidate.resolve()
+            return projection_config(candidate.resolve(), out_dir, params)
     generated = out_dir / "kag_config.yaml"
     if generated.exists():
         if generate:
@@ -352,6 +352,48 @@ def select_config(params: dict[str, Any], out_dir: Path, *, generate: bool = Tru
     ensure_runtime_excluded(workspace, out_dir)
     generate_kag_config(generated, params)
     return generated
+
+
+def projection_config(base: Path, out_dir: Path, params: dict[str, Any]) -> Path:
+    namespace = str(params.get("namespace") or "").strip()
+    if not namespace:
+        return base
+    target = out_dir / "kag_config.yaml"
+    if base.resolve() == target.resolve():
+        return base
+    lines = base.read_text(encoding="utf-8").splitlines()
+    project_index: int | None = None
+    project_end = len(lines)
+    namespace_written = False
+    checkpoint_written = False
+    for index, line in enumerate(lines):
+        if line.strip() == "project:" and not line.startswith((" ", "\t")):
+            project_index = index
+            continue
+        if project_index is None or index <= project_index:
+            continue
+        if line and not line.startswith((" ", "\t")):
+            project_end = index
+            break
+        stripped = line.strip()
+        if stripped.startswith("namespace:"):
+            lines[index] = f"  namespace: {quoted_config(namespace)}"
+            namespace_written = True
+        elif stripped.startswith("checkpoint_path:"):
+            lines[index] = f"  checkpoint_path: {quoted_config(str(out_dir / 'ckpt'))}"
+            checkpoint_written = True
+    if project_index is None:
+        raise RuntimeError(f"KAG config has no top-level project section: {base}")
+    additions: list[str] = []
+    if not namespace_written:
+        additions.append(f"  namespace: {quoted_config(namespace)}")
+    if not checkpoint_written:
+        additions.append(f"  checkpoint_path: {quoted_config(str(out_dir / 'ckpt'))}")
+    if additions:
+        lines[project_end:project_end] = additions
+    ensure_runtime_excluded(workspace_path(params), out_dir)
+    atomic_write_text(target, "\n".join(lines) + "\n")
+    return target.resolve()
 
 
 def config_host(config_path: Path) -> str:

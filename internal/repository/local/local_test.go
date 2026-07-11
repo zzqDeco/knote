@@ -2,6 +2,9 @@ package local
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -168,6 +171,223 @@ func TestArtifactsEvalAndGate(t *testing.T) {
 	if err := store.EvalGate(ctx); err == nil || !strings.Contains(err.Error(), "stale") {
 		t.Fatalf("stale eval should block release gate, got %v", err)
 	}
+}
+
+func TestArtifactBundleCutoverIsImmutableDeterministicAndKeepsV1Exports(t *testing.T) {
+	ctx := context.Background()
+	workspace := t.TempDir()
+	store := New(workspace)
+	set := testBundleArtifactSet(t, "prj_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "first")
+	if err := store.WriteArtifacts(ctx, set); err != nil {
+		t.Fatal(err)
+	}
+	bundleDir := filepath.Join(workspace, "artifacts", "bundles", set.BundleManifest.ProjectionID)
+	manifestBefore := mustRead(t, filepath.Join(bundleDir, "manifest.json"))
+	pointerBefore := mustRead(t, filepath.Join(workspace, "artifacts", "current.json"))
+	if err := store.WriteArtifacts(ctx, set); err != nil {
+		t.Fatal(err)
+	}
+	if got := mustRead(t, filepath.Join(bundleDir, "manifest.json")); got != manifestBefore {
+		t.Fatal("no-op build changed immutable v2 manifest")
+	}
+	if got := mustRead(t, filepath.Join(workspace, "artifacts", "current.json")); got != pointerBefore {
+		t.Fatal("no-op build changed serving pointer")
+	}
+
+	current, err := store.ReadCurrentArtifactManifest(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Version != 2 || current.ProjectionVersion != set.BundleManifest.ProjectionVersion ||
+		current.Namespace != set.BundleManifest.Namespace || current.AuthorizationObject != set.BundleManifest.AuthorizationObject {
+		t.Fatalf("unexpected current bundle manifest: %+v", current)
+	}
+	var compatibility protocol.ArtifactManifest
+	if err := json.Unmarshal([]byte(mustRead(t, filepath.Join(workspace, "artifacts", "manifest.json"))), &compatibility); err != nil {
+		t.Fatal(err)
+	}
+	if compatibility.Version != 1 || compatibility.SummaryCount != 1 {
+		t.Fatalf("v1 compatibility manifest changed contract: %+v", compatibility)
+	}
+	if got := mustRead(t, filepath.Join(workspace, "artifacts", "summaries.jsonl")); !strings.Contains(got, "first") {
+		t.Fatalf("v1 summary compatibility export missing: %s", got)
+	}
+
+	// Flat compatibility files are not the serving source of truth.
+	mustWrite(t, filepath.Join(workspace, "artifacts", "summaries.jsonl"), "{\"summary_id\":\"flat\",\"text\":\"wrong\",\"evidence_chunk_ids\":[]}\n")
+	summaries, err := store.ReadSummaries(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summaries) != 1 || summaries[0].Text != "first" {
+		t.Fatalf("retrieval read flat compatibility export instead of bundle: %+v", summaries)
+	}
+
+	mustWrite(t, filepath.Join(bundleDir, "summaries.jsonl"), "tampered\n")
+	if err := store.WriteArtifacts(ctx, set); err == nil || !strings.Contains(err.Error(), "immutable artifact bundle") {
+		t.Fatalf("tampered immutable bundle was accepted: %v", err)
+	}
+}
+
+func TestArtifactPointerFailurePreservesPreviouslyServingBundle(t *testing.T) {
+	ctx := context.Background()
+	workspace := t.TempDir()
+	first := testBundleArtifactSet(t, "prj_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "first")
+	second := testBundleArtifactSet(t, "prj_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "second")
+	store := New(workspace)
+	if err := store.WriteArtifacts(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	failing := Store{
+		workspace: workspace,
+		beforePointerWrite: func(protocol.ArtifactCurrentPointer) error {
+			return errors.New("injected pointer failure")
+		},
+	}
+	if err := failing.WriteArtifacts(ctx, second); err == nil || !strings.Contains(err.Error(), "injected pointer failure") {
+		t.Fatalf("expected pointer failure, got %v", err)
+	}
+	current, err := store.ReadCurrentArtifactManifest(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.ProjectionID != first.BundleManifest.ProjectionID {
+		t.Fatalf("failed build advanced current pointer: %+v", current)
+	}
+	summaries, err := store.ReadSummaries(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summaries) != 1 || summaries[0].Text != "first" {
+		t.Fatalf("failed build changed serving bundle: %+v", summaries)
+	}
+	if _, err := os.Stat(filepath.Join(workspace, "artifacts", "bundles", second.BundleManifest.ProjectionID)); err != nil {
+		t.Fatalf("fully written failed candidate may remain immutable for retry: %v", err)
+	}
+}
+
+func TestKnowledgeHashUsesOnlyCurrentPointerAndSelectedBundle(t *testing.T) {
+	ctx := context.Background()
+	workspace := t.TempDir()
+	store := New(workspace)
+	mustWrite(t, filepath.Join(workspace, ".knote", "config.yaml"), "workspace: test\n")
+	mustWrite(t, filepath.Join(workspace, "sources", "intro.md"), "stable\n")
+	set := testBundleArtifactSet(t, "prj_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "first")
+	if err := store.WriteArtifacts(ctx, set); err != nil {
+		t.Fatal(err)
+	}
+	before, err := store.KnowledgeHash(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(workspace, "artifacts", "bundles", "prj_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "orphan"), "ignored\n")
+	mustWrite(t, filepath.Join(workspace, "artifacts", "summaries.jsonl"), "legacy compatibility changed\n")
+	after, err := store.KnowledgeHash(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after != before {
+		t.Fatalf("orphan bundle or v1 compatibility export changed serving knowledge hash: before=%s after=%s", before, after)
+	}
+}
+
+func TestArtifactReadsFailClosedWhenCurrentPointerIsMalformed(t *testing.T) {
+	ctx := context.Background()
+	workspace := t.TempDir()
+	store := New(workspace)
+	set := testBundleArtifactSet(t, "prj_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "first")
+	if err := store.WriteArtifacts(ctx, set); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(workspace, "artifacts", "current.json"), "{}\n")
+	if _, err := store.ReadManifest(ctx); err == nil {
+		t.Fatal("malformed v2 current pointer fell back to flat v1 manifest")
+	}
+	if _, err := store.ReadSummaries(ctx); err == nil {
+		t.Fatal("malformed v2 current pointer fell back to flat v1 summaries")
+	}
+}
+
+func TestArtifactReadsFailClosedWhenSelectedBundleIsMissing(t *testing.T) {
+	ctx := context.Background()
+	workspace := t.TempDir()
+	store := New(workspace)
+	set := testBundleArtifactSet(t, "prj_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "first")
+	if err := store.WriteArtifacts(ctx, set); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(
+		workspace, "artifacts", "bundles", set.BundleManifest.ProjectionID, "manifest.json",
+	)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ReadManifest(ctx); err == nil {
+		t.Fatal("missing selected bundle fell back to flat v1 manifest")
+	}
+	if _, err := store.ReadSummaries(ctx); err == nil {
+		t.Fatal("missing selected bundle fell back to flat v1 summaries")
+	}
+	if _, err := store.KnowledgeHash(ctx); err == nil {
+		t.Fatal("missing selected bundle produced a legacy knowledge hash")
+	}
+}
+
+func TestArtifactBundleRejectsSymlinkedProjectionDirectory(t *testing.T) {
+	ctx := context.Background()
+	workspace := t.TempDir()
+	set := testBundleArtifactSet(t, "prj_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "first")
+	bundlesDir := filepath.Join(workspace, "artifacts", "bundles")
+	if err := os.MkdirAll(bundlesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	outside := t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(bundlesDir, set.BundleManifest.ProjectionID)); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	if err := New(workspace).WriteArtifacts(ctx, set); err == nil || !strings.Contains(err.Error(), "real directory") {
+		t.Fatalf("symlinked bundle directory was accepted: %v", err)
+	}
+}
+
+func testBundleArtifactSet(t *testing.T, projectionID, summary string) repository.ArtifactSet {
+	t.Helper()
+	generatedAt := time.Unix(42, 0).UTC()
+	manifest := protocol.ArtifactManifest{
+		Version: 1, Workspace: "test", GeneratedAt: generatedAt, SourceCount: 1, SummaryCount: 1,
+	}
+	set := repository.ArtifactSet{
+		Manifest:   manifest,
+		Summaries:  []protocol.Summary{{SummaryID: "summary", Text: summary, EvidenceChunkIDs: []string{}}},
+		SchemaYAML: "version: 1\n", BuildReport: "# report\n",
+		BundleManifest: protocol.ArtifactBundleManifest{
+			Version: 2, ProjectionID: projectionID, ProjectionVersion: projectionID,
+			Namespace:            "KnoteKB__" + projectionID,
+			AuthorizationObject:  "knowledge-base:test:" + projectionID,
+			AuthorizationVersion: "authz_0123456789abcdef01234567",
+			SourceSnapshot: protocol.ArtifactSourceSnapshot{
+				Version: "src_0123456789abcdef01234567",
+				Digest:  strings.Repeat("1", 64), DocumentCount: 1,
+			},
+			GeneratedAt: generatedAt, Compatibility: manifest,
+		},
+	}
+	set.ProjectionJSON = []byte(fmt.Sprintf("{\"version\":%q}\n", projectionID))
+	set.ProjectionResourceCount = 1
+	payloads, err := repository.CanonicalArtifactFiles(set)
+	if err != nil {
+		t.Fatal(err)
+	}
+	set.BundleManifest.Files = repository.ArtifactFileDescriptors(payloads)
+	return set
+}
+
+func mustRead(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
 }
 
 func TestEvalQuestionsFallbackAndSorting(t *testing.T) {

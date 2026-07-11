@@ -115,10 +115,8 @@ func buildTool(opts Options) einotool.InvokableTool {
 				return nil, err
 			}
 			return buildResult{
-				Manifest:     result.Manifest,
-				Report:       result.Report,
-				KAGData:      result.KAGData,
-				AdapterError: result.AdapterError,
+				Manifest: result.Manifest, BundleManifest: result.BundleManifest,
+				Report: result.Report, KAGData: result.KAGData, AdapterError: result.AdapterError,
 			}, nil
 		},
 	}
@@ -388,19 +386,24 @@ type checkoutArgs struct {
 }
 
 type buildResult struct {
-	Manifest     protocol.ArtifactManifest `json:"manifest"`
-	Report       string                    `json:"report,omitempty"`
-	KAGData      map[string]any            `json:"kag_data,omitempty"`
-	AdapterError string                    `json:"adapter_error,omitempty"`
+	Manifest       protocol.ArtifactManifest       `json:"manifest"`
+	BundleManifest protocol.ArtifactBundleManifest `json:"bundle_manifest"`
+	Report         string                          `json:"report,omitempty"`
+	KAGData        map[string]any                  `json:"kag_data,omitempty"`
+	AdapterError   string                          `json:"adapter_error,omitempty"`
 }
 
 type answerResult struct {
-	Answer       string         `json:"answer"`
-	Evidence     []string       `json:"evidence,omitempty"`
-	Uncertainty  string         `json:"uncertainty,omitempty"`
-	Mode         string         `json:"mode,omitempty"`
-	Data         map[string]any `json:"data,omitempty"`
-	AdapterError string         `json:"adapter_error,omitempty"`
+	Answer               string         `json:"answer"`
+	Evidence             []string       `json:"evidence,omitempty"`
+	Uncertainty          string         `json:"uncertainty,omitempty"`
+	Mode                 string         `json:"mode,omitempty"`
+	Data                 map[string]any `json:"data,omitempty"`
+	ProjectionVersion    string         `json:"projection_version,omitempty"`
+	Namespace            string         `json:"namespace,omitempty"`
+	AuthorizationObject  string         `json:"authz_object,omitempty"`
+	AuthorizationVersion string         `json:"authz_version,omitempty"`
+	AdapterError         string         `json:"adapter_error,omitempty"`
 }
 
 type evalReportResult struct {

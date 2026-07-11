@@ -1,0 +1,361 @@
+package local
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"reflect"
+	"sort"
+
+	"github.com/zzqDeco/knote/internal/protocol"
+	"github.com/zzqDeco/knote/internal/repository"
+)
+
+const bundleManifestName = "manifest.json"
+
+func (s Store) writeArtifactBundle(set repository.ArtifactSet) error {
+	if set.BundleManifest.Version == 0 {
+		payloads, err := repository.CanonicalArtifactFiles(set)
+		if err != nil {
+			return err
+		}
+		artifactsDir := filepath.Join(s.workspace, "artifacts")
+		if err := os.MkdirAll(artifactsDir, 0o755); err != nil {
+			return err
+		}
+		return writeCompatibilityExports(artifactsDir, set.Manifest, payloads)
+	}
+	if err := s.StageArtifacts(context.Background(), set); err != nil {
+		return err
+	}
+	return s.PublishArtifacts(context.Background(), set.BundleManifest)
+}
+
+// StageArtifacts writes and verifies an immutable candidate bundle and the v1
+// compatibility exports without changing the serving pointer.
+func (s Store) StageArtifacts(ctx context.Context, set repository.ArtifactSet) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := set.BundleManifest.Validate(); err != nil {
+		return fmt.Errorf("validate artifact bundle manifest: %w", err)
+	}
+	if !reflect.DeepEqual(set.Manifest, set.BundleManifest.Compatibility) {
+		return fmt.Errorf("v1 compatibility manifest does not match the bundle contract")
+	}
+	payloads, err := repository.CanonicalArtifactFiles(set)
+	if err != nil {
+		return err
+	}
+	if got := repository.ArtifactFileDescriptors(payloads); !reflect.DeepEqual(got, set.BundleManifest.Files) {
+		return fmt.Errorf("artifact payloads do not match bundle manifest file descriptors")
+	}
+	manifestData, err := marshalIndentedJSON(set.BundleManifest)
+	if err != nil {
+		return fmt.Errorf("marshal artifact bundle manifest: %w", err)
+	}
+	artifactsDir := filepath.Join(s.workspace, "artifacts")
+	bundlesDir := filepath.Join(artifactsDir, "bundles")
+	if err := os.MkdirAll(bundlesDir, 0o755); err != nil {
+		return err
+	}
+	bundleDir := filepath.Join(bundlesDir, set.BundleManifest.ProjectionID)
+	if err := ensureImmutableBundle(bundleDir, payloads, manifestData); err != nil {
+		return err
+	}
+	// Compatibility exports are deliberately completed before the serving
+	// pointer moves. They are never consulted when a v2 pointer exists.
+	if err := writeCompatibilityExports(artifactsDir, set.Manifest, payloads); err != nil {
+		return err
+	}
+	return nil
+}
+
+// PublishArtifacts atomically selects a fully staged immutable bundle. The
+// caller must only invoke this after the canonical ProjectionStore CAS has
+// published the same projection version.
+func (s Store) PublishArtifacts(ctx context.Context, manifest protocol.ArtifactBundleManifest) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := manifest.Validate(); err != nil {
+		return err
+	}
+	manifestData, err := marshalIndentedJSON(manifest)
+	if err != nil {
+		return err
+	}
+	manifestSum := sha256.Sum256(manifestData)
+	pointer := protocol.ArtifactCurrentPointer{
+		Version: protocol.ArtifactBundleManifestVersion, ProjectionID: manifest.ProjectionID,
+		ProjectionVersion: manifest.ProjectionVersion, ManifestSHA256: hex.EncodeToString(manifestSum[:]),
+	}
+	if err := pointer.Validate(); err != nil {
+		return err
+	}
+	bundleDir := filepath.Join(s.workspace, "artifacts", "bundles", manifest.ProjectionID)
+	if err := validateArtifactBundleDirectory(bundleDir); err != nil {
+		return err
+	}
+	if s.beforePointerWrite != nil {
+		if err := s.beforePointerWrite(pointer); err != nil {
+			return err
+		}
+	}
+	return atomicWriteArtifactJSON(filepath.Join(s.workspace, "artifacts", "current.json"), pointer)
+}
+
+func (s Store) ReadCurrentArtifactManifest(ctx context.Context) (protocol.ArtifactBundleManifest, error) {
+	if err := ctx.Err(); err != nil {
+		return protocol.ArtifactBundleManifest{}, err
+	}
+	artifactsDir := filepath.Join(s.workspace, "artifacts")
+	pointerData, err := os.ReadFile(filepath.Join(artifactsDir, "current.json"))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return protocol.ArtifactBundleManifest{}, repository.ErrArtifactCurrentNotFound
+		}
+		return protocol.ArtifactBundleManifest{}, err
+	}
+	var pointer protocol.ArtifactCurrentPointer
+	if err := json.Unmarshal(pointerData, &pointer); err != nil {
+		return protocol.ArtifactBundleManifest{}, fmt.Errorf("decode artifact current pointer: %w", err)
+	}
+	if err := pointer.Validate(); err != nil {
+		return protocol.ArtifactBundleManifest{}, fmt.Errorf("validate artifact current pointer: %w", err)
+	}
+	manifestPath := filepath.Join(artifactsDir, "bundles", pointer.ProjectionID, bundleManifestName)
+	if err := validateArtifactBundleDirectory(filepath.Dir(manifestPath)); err != nil {
+		return protocol.ArtifactBundleManifest{}, err
+	}
+	manifestData, err := os.ReadFile(manifestPath)
+	if err != nil {
+		return protocol.ArtifactBundleManifest{}, err
+	}
+	manifestSum := sha256.Sum256(manifestData)
+	if got := hex.EncodeToString(manifestSum[:]); got != pointer.ManifestSHA256 {
+		return protocol.ArtifactBundleManifest{}, fmt.Errorf("artifact bundle manifest digest does not match current pointer")
+	}
+	var manifest protocol.ArtifactBundleManifest
+	if err := json.Unmarshal(manifestData, &manifest); err != nil {
+		return protocol.ArtifactBundleManifest{}, fmt.Errorf("decode artifact bundle manifest: %w", err)
+	}
+	if err := manifest.Validate(); err != nil {
+		return protocol.ArtifactBundleManifest{}, fmt.Errorf("validate artifact bundle manifest: %w", err)
+	}
+	if manifest.ProjectionID != pointer.ProjectionID || manifest.ProjectionVersion != pointer.ProjectionVersion {
+		return protocol.ArtifactBundleManifest{}, fmt.Errorf("artifact bundle manifest does not match current pointer projection")
+	}
+	for _, file := range manifest.Files {
+		data, err := os.ReadFile(filepath.Join(filepath.Dir(manifestPath), file.Path))
+		if err != nil {
+			return protocol.ArtifactBundleManifest{}, err
+		}
+		sum := sha256.Sum256(data)
+		if got := hex.EncodeToString(sum[:]); got != file.SHA256 || int64(len(data)) != file.SizeBytes {
+			return protocol.ArtifactBundleManifest{}, fmt.Errorf("artifact bundle file %q does not match manifest", file.Path)
+		}
+		if file.Path == "projection.json" {
+			var projection struct {
+				Version string `json:"version"`
+			}
+			if err := json.Unmarshal(data, &projection); err != nil {
+				return protocol.ArtifactBundleManifest{}, fmt.Errorf("decode artifact projection: %w", err)
+			}
+			if projection.Version != manifest.ProjectionVersion {
+				return protocol.ArtifactBundleManifest{}, fmt.Errorf("artifact projection does not match bundle manifest")
+			}
+		}
+	}
+	return manifest, nil
+}
+
+func (s Store) ReadCurrentProjection(ctx context.Context) ([]byte, error) {
+	manifest, err := s.ReadCurrentArtifactManifest(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return os.ReadFile(filepath.Join(s.workspace, "artifacts", "bundles", manifest.ProjectionID, "projection.json"))
+}
+
+func ensureImmutableBundle(bundleDir string, payloads []repository.ArtifactFilePayload, manifestData []byte) error {
+	if err := validateArtifactBundleDirectory(bundleDir); err == nil {
+		if err := verifyImmutableBundle(bundleDir, payloads, manifestData); err != nil {
+			return err
+		}
+		return syncArtifactDirectory(bundleDir)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	parent := filepath.Dir(bundleDir)
+	tmpDir, err := os.MkdirTemp(parent, ".bundle-"+filepath.Base(bundleDir)+"-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmpDir)
+	for _, payload := range payloads {
+		if err := writeArtifactFileDurably(filepath.Join(tmpDir, payload.Descriptor.Path), payload.Data); err != nil {
+			return err
+		}
+	}
+	if err := writeArtifactFileDurably(filepath.Join(tmpDir, bundleManifestName), manifestData); err != nil {
+		return err
+	}
+	if err := syncArtifactDirectory(tmpDir); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpDir, bundleDir); err != nil {
+		if _, statErr := os.Stat(bundleDir); statErr == nil {
+			return verifyImmutableBundle(bundleDir, payloads, manifestData)
+		}
+		return err
+	}
+	return syncArtifactDirectory(parent)
+}
+
+func validateArtifactBundleDirectory(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return fmt.Errorf("artifact bundle path is not a real directory: %s", path)
+	}
+	return nil
+}
+
+func verifyImmutableBundle(bundleDir string, payloads []repository.ArtifactFilePayload, manifestData []byte) error {
+	expected := map[string][]byte{bundleManifestName: manifestData}
+	for _, payload := range payloads {
+		expected[payload.Descriptor.Path] = payload.Data
+	}
+	entries, err := os.ReadDir(bundleDir)
+	if err != nil {
+		return err
+	}
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() {
+			return fmt.Errorf("immutable artifact bundle contains unexpected directory %q", entry.Name())
+		}
+		names = append(names, entry.Name())
+	}
+	sort.Strings(names)
+	expectedNames := make([]string, 0, len(expected))
+	for name := range expected {
+		expectedNames = append(expectedNames, name)
+	}
+	sort.Strings(expectedNames)
+	if !reflect.DeepEqual(names, expectedNames) {
+		return fmt.Errorf("immutable artifact bundle contents differ from projection %s", filepath.Base(bundleDir))
+	}
+	for _, name := range expectedNames {
+		data, err := os.ReadFile(filepath.Join(bundleDir, name))
+		if err != nil {
+			return err
+		}
+		if !bytes.Equal(data, expected[name]) {
+			return fmt.Errorf("immutable artifact bundle file %q differs from projection %s", name, filepath.Base(bundleDir))
+		}
+	}
+	return nil
+}
+
+func writeCompatibilityExports(artifactsDir string, manifest protocol.ArtifactManifest, payloads []repository.ArtifactFilePayload) error {
+	for _, payload := range payloads {
+		if payload.Descriptor.Path == "projection.json" {
+			continue
+		}
+		if err := atomicWriteBytes(filepath.Join(artifactsDir, payload.Descriptor.Path), payload.Data); err != nil {
+			return err
+		}
+	}
+	return writeJSON(filepath.Join(artifactsDir, "manifest.json"), manifest)
+}
+
+func marshalIndentedJSON(value any) ([]byte, error) {
+	data, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	return append(data, '\n'), nil
+}
+
+func atomicWriteBytes(path string, data []byte) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+"-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if err := tmp.Chmod(0o644); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return replaceArtifactFile(tmpPath, path)
+}
+
+func writeArtifactFileDurably(path string, data []byte) error {
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := file.Write(data); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return err
+	}
+	return file.Close()
+}
+
+func atomicWriteArtifactJSON(path string, value any) error {
+	data, err := marshalIndentedJSON(value)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+"-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Remove(tmpPath); err != nil {
+		return err
+	}
+	defer os.Remove(tmpPath)
+	if err := writeArtifactFileDurably(tmpPath, data); err != nil {
+		return err
+	}
+	if err := replaceArtifactFile(tmpPath, path); err != nil {
+		return err
+	}
+	return syncArtifactDirectory(filepath.Dir(path))
+}

@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -96,12 +97,36 @@ func (c Client) Build(ctx context.Context) (Response, error) {
 	return c.call(ctx, "kag.build", c.params(nil))
 }
 
+func (c Client) BuildInNamespace(ctx context.Context, namespace string) (Response, error) {
+	return c.call(ctx, "kag.build", c.projectionParams(namespace, nil))
+}
+
 func (c Client) Query(ctx context.Context, query string) (Response, error) {
 	return c.call(ctx, "kag.query", c.params(map[string]any{"query": query}))
 }
 
+func (c Client) QueryInNamespace(ctx context.Context, namespace, query string) (Response, error) {
+	return c.call(ctx, "kag.query", c.projectionParams(namespace, map[string]any{"query": query}))
+}
+
 func (c Client) Explain(ctx context.Context, query string) (Response, error) {
 	return c.call(ctx, "kag.explain", c.params(map[string]any{"query": query}))
+}
+
+func (c Client) ExplainInNamespace(ctx context.Context, namespace, query string) (Response, error) {
+	return c.call(ctx, "kag.explain", c.projectionParams(namespace, map[string]any{"query": query}))
+}
+
+func (c Client) projectionParams(namespace string, extra map[string]any) map[string]any {
+	namespace = strings.TrimSpace(namespace)
+	params := c.params(extra)
+	params["namespace"] = namespace
+	runtimeDir := strings.TrimSpace(c.RuntimeDir)
+	if runtimeDir == "" {
+		runtimeDir = filepath.Join(".knote", "kag-runtime")
+	}
+	params["runtime_dir"] = filepath.Join(runtimeDir, "projections", namespace)
+	return params
 }
 
 func (c Client) params(extra map[string]any) map[string]any {
