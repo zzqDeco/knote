@@ -10,7 +10,6 @@ import (
 	"reflect"
 	"sort"
 	"strings"
-	"syscall"
 )
 
 var (
@@ -251,13 +250,22 @@ func (s *ProjectionStore) Execute(
 			return err
 		}
 
+		persistedResults := make(map[string]OperationResult, len(plan.Operations))
 		operationFailed := false
 		for _, operation := range plan.Operations {
-			if persisted, readErr := s.readResultLocked(plan.Run.RunID, operation.OperationID); readErr == nil {
+			persisted, readErr := s.readResultLocked(plan.Run.RunID, operation.OperationID)
+			if readErr == nil {
+				persistedResults[operation.OperationID] = persisted
 				operationFailed = operationFailed || persisted.Outcome == OperationFailed
 				continue
-			} else if !errors.Is(readErr, os.ErrNotExist) {
+			}
+			if !errors.Is(readErr, os.ErrNotExist) {
 				return readErr
+			}
+		}
+		for _, operation := range plan.Operations {
+			if _, persisted := persistedResults[operation.OperationID]; persisted {
+				continue
 			}
 			result := OperationResult{
 				OperationID: operation.OperationID, Outcome: OperationFailed,
@@ -763,25 +771,20 @@ func validateJournalToken(name, value string) error {
 	return nil
 }
 
-func (s *ProjectionStore) withLock(fn func() error) error {
+func (s *ProjectionStore) withLock(fn func() error) (err error) {
 	lockPath := filepath.Join(s.root, ".lock")
 	if info, err := os.Lstat(lockPath); err == nil && (info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular()) {
 		return fmt.Errorf("projection store lock is not a regular file")
 	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	file, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0o600)
+	lock, err := acquireProjectionFileLock(lockPath)
 	if err != nil {
 		return fmt.Errorf("open projection store lock: %w", err)
 	}
-	defer file.Close()
-	if err := file.Chmod(0o600); err != nil {
-		return fmt.Errorf("secure projection store lock: %w", err)
-	}
-	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX); err != nil {
-		return fmt.Errorf("lock projection store: %w", err)
-	}
-	defer syscall.Flock(int(file.Fd()), syscall.LOCK_UN) //nolint:errcheck
+	defer func() {
+		err = errors.Join(err, lock.Close())
+	}()
 	return fn()
 }
 

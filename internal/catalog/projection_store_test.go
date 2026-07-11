@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/zzqDeco/knote/internal/protocol"
 )
@@ -129,6 +130,96 @@ func TestProjectionStoreFailedOperationNeverAdvancesServingPointer(t *testing.T)
 		return nil
 	})
 	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestProjectionStorePersistedLaterFailureBlocksAllMissingOperations(t *testing.T) {
+	store, current, plan := testProjectionStorePlan(t, t.TempDir(), "projection-v2")
+	if err := store.Stage(plan); err != nil {
+		t.Fatal(err)
+	}
+	failed := plan.Operations[len(plan.Operations)-1]
+	if err := store.RecordResult(plan, OperationResult{
+		OperationID: failed.OperationID,
+		Outcome:     OperationFailed,
+		ErrorCode:   "projector_failed",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var calls atomic.Int64
+	execution, err := store.Execute(
+		context.Background(), plan, current, successfulCountingExecutor(&calls),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("executor ran %d operations despite a persisted later failure", calls.Load())
+	}
+	if execution.Projection.State != StateFailed || execution.Report.RunState != RunFailed {
+		t.Fatalf("persisted failure did not produce a failed run: %+v", execution)
+	}
+	for _, operation := range plan.Operations[:len(plan.Operations)-1] {
+		result, readErr := store.readResultLocked(plan.Run.RunID, operation.OperationID)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if result.Outcome != OperationFailed || result.ErrorCode != "operation_blocked" {
+			t.Fatalf("missing operation was not deterministically blocked: %+v", result)
+		}
+	}
+	assertServingVersion(t, store, current.Version)
+}
+
+func TestProjectionStoreLockSerializesIndependentInstances(t *testing.T) {
+	root := t.TempDir()
+	first, err := NewProjectionStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := NewProjectionStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- first.withLock(func() error {
+			close(firstEntered)
+			<-releaseFirst
+			return nil
+		})
+	}()
+	<-firstEntered
+
+	secondStarted := make(chan struct{})
+	secondEntered := make(chan struct{})
+	secondDone := make(chan error, 1)
+	go func() {
+		close(secondStarted)
+		secondDone <- second.withLock(func() error {
+			close(secondEntered)
+			return nil
+		})
+	}()
+	<-secondStarted
+	select {
+	case <-secondEntered:
+		t.Fatal("second store entered the exclusive lock before the first released it")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(releaseFirst)
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-secondEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("second store did not acquire the lock after release")
+	}
+	if err := <-secondDone; err != nil {
 		t.Fatal(err)
 	}
 }
