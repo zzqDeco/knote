@@ -654,6 +654,9 @@ func (s *ProjectionStore) completeResultsLocked(plan ProjectionPlan) ([]Operatio
 		}
 		results = append(results, result)
 	}
+	if err := s.syncDirectory(s.resultsDir(plan.Run.RunID)); err != nil {
+		return nil, fmt.Errorf("sync projection result receipts: %w", err)
+	}
 	return results, nil
 }
 
@@ -846,6 +849,11 @@ func createDirectoriesDurably(path string, syncDir func(string) error) error {
 		}
 		current = parent
 	}
+	if parent := filepath.Dir(current); parent != current {
+		if err := syncDir(parent); err != nil {
+			return fmt.Errorf("sync parent of projection journal directory: %w", err)
+		}
+	}
 	for index := len(missing) - 1; index >= 0; index-- {
 		directory := missing[index]
 		if err := os.Mkdir(directory, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
@@ -875,7 +883,7 @@ func (s *ProjectionStore) writeJSONOnce(path string, value any) error {
 	}
 	if existing, err := s.readFile(path); err == nil {
 		if string(existing) == string(data) {
-			return nil
+			return s.syncDirectory(filepath.Dir(path))
 		}
 		return ErrJournalConflict
 	} else if !errors.Is(err, os.ErrNotExist) {

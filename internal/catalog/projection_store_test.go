@@ -409,6 +409,106 @@ func TestProjectionStoreResultConflictsAreRejected(t *testing.T) {
 	}
 }
 
+func TestProjectionStoreIdempotentWriteRetriesParentSync(t *testing.T) {
+	store, _, plan := testProjectionStorePlan(t, t.TempDir(), "projection-v2")
+	path := store.resultPath(plan.Run.RunID, plan.Operations[0].OperationID)
+	parent := filepath.Dir(path)
+	injected := errors.New("injected directory sync failure")
+	syncCalls := 0
+	store.syncDirectory = func(path string) error {
+		if path == parent {
+			syncCalls++
+			if syncCalls == 1 {
+				return injected
+			}
+		}
+		return nil
+	}
+	result := SuccessfulResults(plan)[0]
+	if err := store.writeJSONOnce(path, result); !errors.Is(err, injected) {
+		t.Fatalf("first write error = %v, want injected sync failure", err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("renamed immutable record is not visible after sync failure: %v", err)
+	}
+	if err := store.writeJSONOnce(path, result); err != nil {
+		t.Fatalf("idempotent retry did not repair parent sync: %v", err)
+	}
+	if syncCalls != 2 {
+		t.Fatalf("parent sync calls = %d, want 2", syncCalls)
+	}
+}
+
+func TestProjectionStoreExecuteRetryResyncsPersistedReceipts(t *testing.T) {
+	store, current, plan := testProjectionStorePlan(t, t.TempDir(), "projection-v2")
+	if err := store.Stage(plan); err != nil {
+		t.Fatal(err)
+	}
+	resultsDir := store.resultsDir(plan.Run.RunID)
+	injected := errors.New("injected receipt directory sync failure")
+	syncCalls := 0
+	store.syncDirectory = func(path string) error {
+		if path == resultsDir {
+			syncCalls++
+			if syncCalls == 1 {
+				return injected
+			}
+		}
+		return syncDirectory(path)
+	}
+	var executorCalls atomic.Int64
+	executor := successfulCountingExecutor(&executorCalls)
+	if _, err := store.Execute(context.Background(), plan, current, executor); !errors.Is(err, injected) {
+		t.Fatalf("first Execute error = %v, want injected sync failure", err)
+	}
+	if _, err := os.Stat(store.resultPath(plan.Run.RunID, plan.Operations[0].OperationID)); err != nil {
+		t.Fatalf("receipt is not visible after sync failure: %v", err)
+	}
+	execution, err := store.Execute(context.Background(), plan, current, executor)
+	if err != nil {
+		t.Fatalf("Execute retry: %v", err)
+	}
+	if !execution.PointerAdvanced {
+		t.Fatal("Execute retry did not advance the serving pointer")
+	}
+	if executorCalls.Load() != int64(len(plan.Operations)) {
+		t.Fatalf("executor calls = %d, want %d", executorCalls.Load(), len(plan.Operations))
+	}
+	if syncCalls < 2 {
+		t.Fatalf("receipt directory sync calls = %d, want at least 2", syncCalls)
+	}
+}
+
+func TestCreateDirectoriesDurablyRetriesExistingParentSync(t *testing.T) {
+	parent := t.TempDir()
+	target := filepath.Join(parent, "journal")
+	injected := errors.New("injected parent sync failure")
+	if err := createDirectoriesDurably(target, func(path string) error {
+		if path == parent {
+			return injected
+		}
+		return nil
+	}); !errors.Is(err, injected) {
+		t.Fatalf("first create error = %v, want injected sync failure", err)
+	}
+	if info, err := os.Lstat(target); err != nil || !info.IsDir() {
+		t.Fatalf("created directory is not visible after sync failure: info=%v err=%v", info, err)
+	}
+	syncCalls := 0
+	if err := createDirectoriesDurably(target, func(path string) error {
+		syncCalls++
+		if path != parent {
+			t.Fatalf("retry synced parent = %s, want %s", path, parent)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("directory retry: %v", err)
+	}
+	if syncCalls != 1 {
+		t.Fatalf("retry parent sync calls = %d, want 1", syncCalls)
+	}
+}
+
 func TestProjectionStoreWritesDeterministicPrivateJournalRecords(t *testing.T) {
 	store, current, plan := testProjectionStorePlan(t, t.TempDir(), "projection-v2")
 	if err := store.Stage(plan); err != nil {
@@ -470,7 +570,7 @@ func TestProjectionStoreSyncsEveryNewJournalDirectoryEntry(t *testing.T) {
 	if err := store.Stage(plan); err != nil {
 		t.Fatal(err)
 	}
-	wantParents := []string{store.runsDir(), store.runDir(plan.Run.RunID)}
+	wantParents := []string{store.Root(), store.runsDir(), store.runsDir(), store.runDir(plan.Run.RunID)}
 	if len(synced) < len(wantParents) || !reflect.DeepEqual(synced[:len(wantParents)], wantParents) {
 		t.Fatalf("directory creation sync order = %v, want prefix %v", synced, wantParents)
 	}
