@@ -64,8 +64,11 @@ func TestProjectionStoreUsesProtectedOwnerOnlyACLs(t *testing.T) {
 				!(*windows.SID)(unsafe.Pointer(&ace.SidStart)).Equals(user.User.Sid) {
 				t.Fatalf("DACL for %s is not restricted to the current user", path)
 			}
-			if ace.Mask != windows.GENERIC_ALL {
-				t.Fatalf("DACL permissions for %s = %#x, want GENERIC_ALL", path, ace.Mask)
+			wantPermissions := windows.ACCESS_MASK(
+				windows.STANDARD_RIGHTS_REQUIRED | windows.SYNCHRONIZE | 0x1ff,
+			)
+			if ace.Mask != wantPermissions {
+				t.Fatalf("DACL permissions for %s = %#x, want FILE_ALL_ACCESS", path, ace.Mask)
 			}
 			if ace.Header.AceFlags&windows.INHERITED_ACE != 0 {
 				t.Fatalf("DACL for %s contains inherited parent access", path)
