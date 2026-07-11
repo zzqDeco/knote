@@ -252,6 +252,9 @@ func (s *ProjectionStore) Execute(
 		if err := s.verifyBaseProjectionLocked(current, plan); err != nil {
 			return err
 		}
+		if err := validateReplayPlan(plan, current); err != nil {
+			return fmt.Errorf("preflight projection plan: %w", err)
+		}
 		journalRun.State = RunRunning
 		if err := s.writeJSON(s.runPath(plan.Run.RunID), journalRun); err != nil {
 			return err

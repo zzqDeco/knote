@@ -195,6 +195,61 @@ func TestProjectionStoreCancelledContextDoesNotReportExecutedOperations(t *testi
 	assertServingVersion(t, store, current.Version)
 }
 
+func TestProjectionStoreRejectsInapplicablePlanBeforeSideEffects(t *testing.T) {
+	scope := testScope()
+	baseSnapshot := testSnapshot(t, scope, "source-v1", "sources/current.md")
+	currentResource := published(testMetadata(
+		t, scope, protocol.ResourceDocument, "sources/current.md", "current",
+		"source-v1", "content-current", "projection-v1", "", "doc:current",
+	))
+	current := testProjection(t, scope, "projection-v1", baseSnapshot.Ref(), []ResourceMetadata{currentResource})
+	store, err := NewProjectionStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InitializeServing(current); err != nil {
+		t.Fatal(err)
+	}
+
+	foreignResource := published(testMetadata(
+		t, scope, protocol.ResourceDocument, "sources/foreign.md", "foreign-v1",
+		"source-v1", "content-foreign-v1", "projection-v1", "", "doc:foreign",
+	))
+	foreign := testProjection(t, scope, "projection-v1", baseSnapshot.Ref(), []ResourceMetadata{foreignResource})
+	nextSnapshot := testSnapshot(t, scope, "source-v2", "sources/foreign.md")
+	run := testRun(scope, foreign.Version, "projection-v2", nextSnapshot.Ref())
+	desired := testMetadata(
+		t, scope, protocol.ResourceDocument, "sources/foreign.md", "foreign-v2",
+		"source-v2", "content-foreign-v2", "projection-v2", "", "doc:foreign",
+	)
+	plan, err := PlanResources(run, foreign, []ResourceMetadata{desired})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var calls atomic.Int64
+	if _, err := store.Execute(
+		context.Background(), plan, current, successfulCountingExecutor(&calls),
+	); err == nil {
+		t.Fatal("Execute accepted a plan for another base resource set")
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("executor calls = %d, want 0 for an inapplicable plan", calls.Load())
+	}
+	persistedRun, err := store.readRunLocked(plan.Run.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persistedRun.State != RunStaged {
+		t.Fatalf("inapplicable plan run state = %q, want staged", persistedRun.State)
+	}
+	for _, operation := range plan.Operations {
+		if _, err := store.readResultLocked(plan.Run.RunID, operation.OperationID); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("inapplicable operation %s persisted a receipt: %v", operation.OperationID, err)
+		}
+	}
+}
+
 func TestIgnoreUnsupportedDirectoryFlushError(t *testing.T) {
 	unsupportedInvalidHandle := errors.New("invalid handle")
 	unsupportedFilesystem := errors.New("not supported")
