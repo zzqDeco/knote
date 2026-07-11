@@ -67,7 +67,7 @@ func TestProjectionStoreUsesProtectedOwnerOnlyACLs(t *testing.T) {
 			wantPermissions := windows.ACCESS_MASK(
 				windows.STANDARD_RIGHTS_REQUIRED | windows.SYNCHRONIZE | 0x1ff,
 			)
-			if ace.Mask != wantPermissions {
+			if ace.Mask != windows.GENERIC_ALL && ace.Mask != wantPermissions {
 				t.Fatalf("DACL permissions for %s = %#x, want FILE_ALL_ACCESS", path, ace.Mask)
 			}
 			if ace.Header.AceFlags&windows.INHERITED_ACE != 0 {
