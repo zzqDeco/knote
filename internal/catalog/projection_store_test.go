@@ -409,6 +409,20 @@ func TestProjectionStoreResultConflictsAreRejected(t *testing.T) {
 	}
 }
 
+func TestProjectionStoreStageUsesCanonicalPlanBytes(t *testing.T) {
+	store, _, plan := testProjectionStorePlan(t, t.TempDir(), "projection-v2")
+	plan.Operations[0].Resource.Dependencies = make([]protocol.ResourceID, 0)
+	if err := plan.Validate(); err != nil {
+		t.Fatalf("plan with an empty non-nil dependency list is invalid: %v", err)
+	}
+	if err := store.Stage(plan); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Stage(plan); err != nil {
+		t.Fatalf("canonical plan retry: %v", err)
+	}
+}
+
 func TestProjectionStoreIdempotentWriteRetriesParentSync(t *testing.T) {
 	store, _, plan := testProjectionStorePlan(t, t.TempDir(), "projection-v2")
 	path := store.resultPath(plan.Run.RunID, plan.Operations[0].OperationID)
@@ -654,6 +668,45 @@ func TestProjectionStoreCrashAfterPointerThenSuccessorReconcilesPredecessor(t *t
 		t.Fatalf("pointer-bound predecessor was not reconciled as succeeded: %+v", recovered)
 	}
 	assertServingVersion(t, reopened, successor.Run.ProjectionVersion)
+}
+
+func TestProjectionStoreRetryResyncsRecoveredServingPointer(t *testing.T) {
+	store, current, plan := testProjectionStorePlan(t, t.TempDir(), "projection-v2")
+	injected := errors.New("injected serving pointer sync failure")
+	candidatePersisted := false
+	store.afterCandidatePersisted = func(ProjectionPlan) error {
+		candidatePersisted = true
+		return nil
+	}
+	rootSyncCalls := 0
+	store.syncDirectory = func(path string) error {
+		if candidatePersisted && path == store.Root() {
+			rootSyncCalls++
+			if rootSyncCalls == 1 {
+				return injected
+			}
+		}
+		return syncDirectory(path)
+	}
+	var executorCalls atomic.Int64
+	executor := successfulCountingExecutor(&executorCalls)
+	if _, err := store.Execute(context.Background(), plan, current, executor); !errors.Is(err, injected) {
+		t.Fatalf("first Execute error = %v, want injected pointer sync failure", err)
+	}
+	assertServingVersion(t, store, plan.Run.ProjectionVersion)
+	recovered, err := store.Execute(context.Background(), plan, current, executor)
+	if err != nil {
+		t.Fatalf("Execute recovery: %v", err)
+	}
+	if recovered.Projection.State != StatePublished || recovered.Report.RunState != RunSucceeded {
+		t.Fatalf("recovered execution = %+v", recovered)
+	}
+	if rootSyncCalls != 2 {
+		t.Fatalf("serving pointer root sync calls = %d, want 2", rootSyncCalls)
+	}
+	if executorCalls.Load() != int64(len(plan.Operations)) {
+		t.Fatalf("executor calls = %d, want %d", executorCalls.Load(), len(plan.Operations))
+	}
 }
 
 func TestProjectionStoreRejectsUnsafeRoot(t *testing.T) {

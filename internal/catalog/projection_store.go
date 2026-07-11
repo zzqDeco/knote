@@ -332,15 +332,7 @@ func (s *ProjectionStore) stageLocked(plan ProjectionPlan) error {
 	if err := s.ensureDir(s.resultsDir(plan.Run.RunID)); err != nil {
 		return err
 	}
-	if persisted, err := s.readPlanLocked(plan.Run.RunID); err == nil {
-		if !reflect.DeepEqual(persisted, plan) {
-			return ErrJournalConflict
-		}
-	} else if errors.Is(err, os.ErrNotExist) {
-		if err := s.writeJSONOnce(s.planPath(plan.Run.RunID), plan); err != nil {
-			return err
-		}
-	} else {
+	if err := s.writeJSONOnce(s.planPath(plan.Run.RunID), plan); err != nil {
 		return err
 	}
 	if persisted, err := s.readRunLocked(plan.Run.RunID); err == nil {
@@ -518,6 +510,9 @@ func (s *ProjectionStore) finalizeLocked(plan ProjectionPlan, current Projection
 func (s *ProjectionStore) reconcilePointerOwnerLocked(pointer ServingPointer) error {
 	if pointer.RunID == "" {
 		return nil
+	}
+	if err := s.syncDirectory(filepath.Dir(s.pointerPath())); err != nil {
+		return fmt.Errorf("sync serving pointer directory: %w", err)
 	}
 	plan, err := s.readPlanLocked(pointer.RunID)
 	if err != nil {
