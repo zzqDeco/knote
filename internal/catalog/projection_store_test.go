@@ -630,6 +630,31 @@ func TestProjectionStoreIdempotentWriteRetriesParentSync(t *testing.T) {
 	}
 }
 
+func TestReplaceProjectionFileReplacesExistingTarget(t *testing.T) {
+	directory := t.TempDir()
+	target := filepath.Join(directory, "target.json")
+	replacement := filepath.Join(directory, "replacement.json")
+	if err := os.WriteFile(target, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(replacement, []byte("new"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := replaceProjectionFile(replacement, target); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "new" {
+		t.Fatalf("replacement contents = %q, want new", data)
+	}
+	if _, err := os.Stat(replacement); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("replacement source still exists: %v", err)
+	}
+}
+
 func TestProjectionStoreExecuteRetryResyncsPersistedReceipts(t *testing.T) {
 	store, current, plan := testProjectionStorePlan(t, t.TempDir(), "projection-v2")
 	if err := store.Stage(plan); err != nil {
@@ -700,6 +725,29 @@ func TestCreateDirectoriesDurablyRetriesExistingParentSync(t *testing.T) {
 	}
 }
 
+func TestCreateDirectoriesDurablyDoesNotSyncUnchangedAncestorParent(t *testing.T) {
+	ancestor := filepath.Join(t.TempDir(), "existing")
+	if err := os.Mkdir(ancestor, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(ancestor, "runs", "run-1")
+	forbidden := filepath.Dir(ancestor)
+	var synced []string
+	if err := createDirectoriesDurably(target, func(path string) error {
+		if path == forbidden {
+			return errors.New("unchanged ancestor parent was synced")
+		}
+		synced = append(synced, path)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{ancestor, filepath.Join(ancestor, "runs")}
+	if !reflect.DeepEqual(synced, want) {
+		t.Fatalf("created directory parent syncs = %v, want %v", synced, want)
+	}
+}
+
 func TestProjectionStoreWritesDeterministicPrivateJournalRecords(t *testing.T) {
 	store, current, plan := testProjectionStorePlan(t, t.TempDir(), "projection-v2")
 	if err := store.Stage(plan); err != nil {
@@ -764,7 +812,7 @@ func TestProjectionStoreSyncsEveryNewJournalDirectoryEntry(t *testing.T) {
 	if err := store.Stage(plan); err != nil {
 		t.Fatal(err)
 	}
-	wantParents := []string{store.Root(), store.runsDir(), store.runsDir(), store.runDir(plan.Run.RunID)}
+	wantParents := []string{store.runsDir(), store.runDir(plan.Run.RunID)}
 	if len(synced) < len(wantParents) || !reflect.DeepEqual(synced[:len(wantParents)], wantParents) {
 		t.Fatalf("directory creation sync order = %v, want prefix %v", synced, wantParents)
 	}

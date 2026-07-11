@@ -881,7 +881,11 @@ func createDirectoriesDurably(path string, syncDir func(string) error) error {
 		}
 		current = parent
 	}
-	if parent := filepath.Dir(current); parent != current {
+	if len(missing) == 0 {
+		parent := filepath.Dir(current)
+		if parent == current {
+			return nil
+		}
 		if err := syncDir(parent); err != nil {
 			return fmt.Errorf("sync parent of projection journal directory: %w", err)
 		}
@@ -973,7 +977,7 @@ func (s *ProjectionStore) atomicWrite(path string, data []byte) error {
 	if err := temp.Close(); err != nil {
 		return err
 	}
-	if err := os.Rename(tempPath, path); err != nil {
+	if err := replaceProjectionFile(tempPath, path); err != nil {
 		return err
 	}
 	return s.syncDirectory(filepath.Dir(path))
