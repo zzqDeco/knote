@@ -459,6 +459,41 @@ func TestProjectionStoreUsesCanonicalProjectionEquality(t *testing.T) {
 	}
 }
 
+func TestProjectionStoreInitializeServingRetryResyncsVisiblePointer(t *testing.T) {
+	scope := testScope()
+	snapshot := testSnapshot(t, scope, "source-v1")
+	projection := testProjection(t, scope, "projection-v1", snapshot.Ref(), nil)
+	store, err := NewProjectionStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	injected := errors.New("injected serving pointer sync failure")
+	visiblePointerSyncs := 0
+	store.syncDirectory = func(path string) error {
+		if path == store.Root() {
+			if _, statErr := os.Stat(store.pointerPath()); statErr == nil {
+				visiblePointerSyncs++
+				if visiblePointerSyncs == 1 {
+					return injected
+				}
+			}
+		}
+		return syncDirectory(path)
+	}
+	if err := store.InitializeServing(projection); !errors.Is(err, injected) {
+		t.Fatalf("first InitializeServing error = %v, want injected sync failure", err)
+	}
+	if _, err := os.Stat(store.pointerPath()); err != nil {
+		t.Fatalf("serving pointer is not visible after sync failure: %v", err)
+	}
+	if err := store.InitializeServing(projection); err != nil {
+		t.Fatalf("InitializeServing retry: %v", err)
+	}
+	if visiblePointerSyncs != 2 {
+		t.Fatalf("visible serving pointer syncs = %d, want 2", visiblePointerSyncs)
+	}
+}
+
 func TestProjectionStoreAllowsNonPathSnapshotVersions(t *testing.T) {
 	versions := []string{
 		"2026-07-10T22:40:38Z",
@@ -754,6 +789,49 @@ func TestProjectionStoreCrashAfterPointerThenSuccessorReconcilesPredecessor(t *t
 		t.Fatalf("pointer-bound predecessor was not reconciled as succeeded: %+v", recovered)
 	}
 	assertServingVersion(t, reopened, successor.Run.ProjectionVersion)
+}
+
+func TestProjectionStoreSuccessorResyncsTerminalOwnerRun(t *testing.T) {
+	store, current, predecessor := testProjectionStorePlan(t, t.TempDir(), "projection-v2")
+	predecessorProjection, _, err := Replay(predecessor, current, SuccessfulResults(predecessor))
+	if err != nil {
+		t.Fatal(err)
+	}
+	successor := testProjectionStorePlanFromCurrent(t, predecessorProjection, "projection-v3")
+	firstFailure := errors.New("injected predecessor terminal sync failure")
+	recoveryFailure := errors.New("injected predecessor recovery sync failure")
+	terminalSyncs := 0
+	predecessorRunDir := store.runDir(predecessor.Run.RunID)
+	store.syncDirectory = func(path string) error {
+		if path == predecessorRunDir {
+			run, readErr := store.readRunLocked(predecessor.Run.RunID)
+			if readErr == nil && run.State == RunSucceeded {
+				terminalSyncs++
+				switch terminalSyncs {
+				case 1:
+					return firstFailure
+				case 2:
+					return recoveryFailure
+				}
+			}
+		}
+		return syncDirectory(path)
+	}
+	if _, err := store.Execute(context.Background(), predecessor, current, successfulCountingExecutor(nil)); !errors.Is(err, firstFailure) {
+		t.Fatalf("predecessor Execute error = %v, want first sync failure", err)
+	}
+	assertServingVersion(t, store, predecessor.Run.ProjectionVersion)
+	if _, err := store.Execute(context.Background(), successor, predecessorProjection, successfulCountingExecutor(nil)); !errors.Is(err, recoveryFailure) {
+		t.Fatalf("successor reconciliation error = %v, want recovery sync failure", err)
+	}
+	assertServingVersion(t, store, predecessor.Run.ProjectionVersion)
+	if _, err := store.Execute(context.Background(), successor, predecessorProjection, successfulCountingExecutor(nil)); err != nil {
+		t.Fatalf("successor retry: %v", err)
+	}
+	if terminalSyncs < 3 {
+		t.Fatalf("predecessor terminal run syncs = %d, want at least 3", terminalSyncs)
+	}
+	assertServingVersion(t, store, successor.Run.ProjectionVersion)
 }
 
 func TestProjectionStoreRetryResyncsRecoveredServingPointer(t *testing.T) {

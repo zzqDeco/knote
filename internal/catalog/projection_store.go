@@ -139,6 +139,9 @@ func (s *ProjectionStore) InitializeServing(projection Projection) error {
 			if !equal {
 				return ErrJournalConflict
 			}
+			if err := s.syncDirectory(filepath.Dir(s.pointerPath())); err != nil {
+				return fmt.Errorf("sync serving pointer directory: %w", err)
+			}
 			return nil
 		}
 		if !errors.Is(err, os.ErrNotExist) {
@@ -537,6 +540,9 @@ func (s *ProjectionStore) reconcilePointerOwnerLocked(pointer ServingPointer) er
 		return fmt.Errorf("failed run %s owns the serving pointer: %w", run.RunID, ErrJournalConflict)
 	}
 	if run.State == RunSucceeded {
+		if err := s.syncDirectory(s.runDir(run.RunID)); err != nil {
+			return fmt.Errorf("sync serving pointer owner run directory: %w", err)
+		}
 		persisted, readErr := s.readProjectionFile(s.runProjectionPath(run.RunID))
 		if readErr != nil {
 			return readErr
