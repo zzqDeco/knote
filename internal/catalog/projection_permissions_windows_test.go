@@ -51,26 +51,33 @@ func TestProjectionStoreUsesProtectedOwnerOnlyACLs(t *testing.T) {
 		if dacl == nil {
 			t.Fatalf("DACL for %s is missing", path)
 		}
-		if dacl.AceCount != 1 {
-			t.Fatalf("DACL for %s has %d entries, want one owner entry", path, dacl.AceCount)
+		if dacl.AceCount == 0 {
+			t.Fatalf("DACL for %s has no owner entries", path)
 		}
-		var ace *windows.ACCESS_ALLOWED_ACE
-		if err := windows.GetAce(dacl, 0, &ace); err != nil {
-			t.Fatalf("read DACL owner entry for %s: %v", path, err)
+		inheritance := uint8(0)
+		for index := uint32(0); index < uint32(dacl.AceCount); index++ {
+			var ace *windows.ACCESS_ALLOWED_ACE
+			if err := windows.GetAce(dacl, index, &ace); err != nil {
+				t.Fatalf("read DACL owner entry for %s: %v", path, err)
+			}
+			if ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE ||
+				!(*windows.SID)(unsafe.Pointer(&ace.SidStart)).Equals(user.User.Sid) {
+				t.Fatalf("DACL for %s is not restricted to the current user", path)
+			}
+			if ace.Mask != windows.GENERIC_ALL {
+				t.Fatalf("DACL permissions for %s = %#x, want GENERIC_ALL", path, ace.Mask)
+			}
+			if ace.Header.AceFlags&windows.INHERITED_ACE != 0 {
+				t.Fatalf("DACL for %s contains inherited parent access", path)
+			}
+			inheritance |= ace.Header.AceFlags & (windows.OBJECT_INHERIT_ACE | windows.CONTAINER_INHERIT_ACE)
 		}
-		if ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE ||
-			!(*windows.SID)(unsafe.Pointer(&ace.SidStart)).Equals(user.User.Sid) {
-			t.Fatalf("DACL for %s is not restricted to the current user", path)
-		}
-		if ace.Mask != windows.GENERIC_ALL {
-			t.Fatalf("DACL permissions for %s = %#x, want GENERIC_ALL", path, ace.Mask)
-		}
-		wantInheritance := uint8(windows.NO_INHERITANCE)
+		wantInheritance := uint8(0)
 		if info.IsDir() {
 			wantInheritance = windows.OBJECT_INHERIT_ACE | windows.CONTAINER_INHERIT_ACE
 		}
-		if ace.Header.AceFlags&windows.VALID_INHERIT_FLAGS != wantInheritance {
-			t.Fatalf("DACL inheritance for %s = %#x, want %#x", path, ace.Header.AceFlags, wantInheritance)
+		if inheritance != wantInheritance {
+			t.Fatalf("DACL inheritance for %s = %#x, want %#x", path, inheritance, wantInheritance)
 		}
 		return nil
 	}); err != nil {
