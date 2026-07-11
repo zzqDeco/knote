@@ -762,8 +762,25 @@ func validateJournalToken(name, value string) error {
 	if err := validateToken(name, value); err != nil {
 		return err
 	}
-	if value == "." || value == ".." || strings.ContainsAny(value, `/\\`) {
+	if value == "." || value == ".." || strings.ContainsAny(value, `<>:"/\\|?*`) {
 		return fmt.Errorf("%s is not safe for journal paths", name)
+	}
+	if strings.HasSuffix(value, ".") || strings.HasSuffix(value, " ") {
+		return fmt.Errorf("%s has a non-portable trailing character", name)
+	}
+	base := value
+	if extension := strings.IndexByte(base, '.'); extension >= 0 {
+		base = base[:extension]
+	}
+	upperBase := strings.ToUpper(base)
+	reserved := upperBase == "CON" || upperBase == "PRN" || upperBase == "AUX" ||
+		upperBase == "NUL" || upperBase == "CLOCK$"
+	if len(upperBase) == 4 && (strings.HasPrefix(upperBase, "COM") || strings.HasPrefix(upperBase, "LPT")) &&
+		upperBase[3] >= '1' && upperBase[3] <= '9' {
+		reserved = true
+	}
+	if reserved {
+		return fmt.Errorf("%s uses a reserved DOS device basename", name)
 	}
 	if len(value) > 200 {
 		return fmt.Errorf("%s is too long for journal paths", name)
@@ -847,15 +864,6 @@ func createDirectoriesDurably(path string, syncDir func(string) error) error {
 		}
 	}
 	return nil
-}
-
-func syncDirectory(path string) error {
-	directory, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer directory.Close()
-	return directory.Sync()
 }
 
 func (s *ProjectionStore) writeJSONOnce(path string, value any) error {

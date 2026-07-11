@@ -534,6 +534,49 @@ func TestProjectionStoreRejectsPathLikeProjectionVersion(t *testing.T) {
 	}
 }
 
+func TestValidateJournalTokenUsesPortableFilenameComponents(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   string
+		wantErr bool
+	}{
+		{name: "canonical projection", value: "projection-v2"},
+		{name: "canonical operation id", value: "op_0123456789abcdef"},
+		{name: "canonical compact time", value: "2026-07-10T224038Z"},
+		{name: "RFC3339 colon", value: "2026-07-10T22:40:38Z", wantErr: true},
+		{name: "less than", value: "version<2", wantErr: true},
+		{name: "greater than", value: "version>2", wantErr: true},
+		{name: "quote", value: `version"2`, wantErr: true},
+		{name: "pipe", value: "version|2", wantErr: true},
+		{name: "question", value: "version?2", wantErr: true},
+		{name: "asterisk", value: "version*2", wantErr: true},
+		{name: "slash", value: "version/2", wantErr: true},
+		{name: "backslash", value: `version\2`, wantErr: true},
+		{name: "trailing dot", value: "projection-v2.", wantErr: true},
+		{name: "trailing space", value: "projection-v2 ", wantErr: true},
+		{name: "CON", value: "CON", wantErr: true},
+		{name: "CON extension", value: "con.json", wantErr: true},
+		{name: "PRN", value: "PrN", wantErr: true},
+		{name: "AUX extension", value: "aux.log", wantErr: true},
+		{name: "NUL", value: "NUL", wantErr: true},
+		{name: "CLOCK extension", value: "clock$.json", wantErr: true},
+		{name: "COM1", value: "COM1", wantErr: true},
+		{name: "COM9 extension", value: "com9.txt", wantErr: true},
+		{name: "LPT1", value: "lpt1", wantErr: true},
+		{name: "LPT9 extension", value: "LPT9.log", wantErr: true},
+		{name: "COM10 allowed", value: "COM10"},
+		{name: "LPT0 allowed", value: "LPT0"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateJournalToken("version", test.value)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("validateJournalToken(%q) error = %v, wantErr=%t", test.value, err, test.wantErr)
+			}
+		})
+	}
+}
+
 func testProjectionStorePlan(t *testing.T, root, projectionVersion string) (*ProjectionStore, Projection, ProjectionPlan) {
 	t.Helper()
 	scope := testScope()
