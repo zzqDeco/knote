@@ -20,7 +20,7 @@ func acquireProjectionFileLock(path string) (*projectionFileLock, error) {
 	}
 	handle, err := windows.CreateFile(
 		pathPointer,
-		windows.GENERIC_READ|windows.GENERIC_WRITE,
+		windows.GENERIC_READ|windows.GENERIC_WRITE|windows.WRITE_DAC,
 		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
 		nil,
 		windows.OPEN_ALWAYS,
@@ -39,6 +39,10 @@ func acquireProjectionFileLock(path string) (*projectionFileLock, error) {
 	if information.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
 		windows.CloseHandle(handle)
 		return nil, fmt.Errorf("lock file is a reparse point")
+	}
+	if err := secureProjectionHandle(handle, false); err != nil {
+		windows.CloseHandle(handle)
+		return nil, fmt.Errorf("secure lock file: %w", err)
 	}
 	if err := windows.LockFileEx(
 		handle, windows.LOCKFILE_EXCLUSIVE_LOCK, 0, 1, 0, &lock.overlapped,

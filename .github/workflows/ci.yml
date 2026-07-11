@@ -54,3 +54,17 @@ jobs:
             exit 0
           fi
           scripts/smoke_fake_mvp.sh
+
+  windows-catalog:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Projection store tests
+        run: go test ./internal/catalog/...

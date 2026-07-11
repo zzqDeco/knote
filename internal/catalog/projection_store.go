@@ -98,7 +98,7 @@ func NewProjectionStore(root string) (*ProjectionStore, error) {
 	} else if err := createDirectoriesDurably(root, syncDirectory); err != nil {
 		return nil, fmt.Errorf("create projection store root: %w", err)
 	}
-	if err := os.Chmod(root, 0o700); err != nil {
+	if err := secureProjectionDirectory(root); err != nil {
 		return nil, fmt.Errorf("secure projection store root: %w", err)
 	}
 	store := &ProjectionStore{root: root, syncDirectory: syncDirectory}
@@ -853,7 +853,7 @@ func (s *ProjectionStore) ensureDir(path string) error {
 	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
 		return fmt.Errorf("projection journal directory is not a real directory: %s", path)
 	}
-	return os.Chmod(path, 0o700)
+	return secureProjectionDirectory(path)
 }
 
 func createDirectoriesDurably(path string, syncDir func(string) error) error {
@@ -885,7 +885,7 @@ func createDirectoriesDurably(path string, syncDir func(string) error) error {
 	}
 	for index := len(missing) - 1; index >= 0; index-- {
 		directory := missing[index]
-		if err := os.Mkdir(directory, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+		if err := createProjectionDirectory(directory); err != nil && !errors.Is(err, os.ErrExist) {
 			return err
 		}
 		info, err := os.Lstat(directory)
@@ -895,7 +895,7 @@ func createDirectoriesDurably(path string, syncDir func(string) error) error {
 		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
 			return fmt.Errorf("projection journal directory is not a real directory: %s", directory)
 		}
-		if err := os.Chmod(directory, 0o700); err != nil {
+		if err := secureProjectionDirectory(directory); err != nil {
 			return err
 		}
 		if err := syncDir(filepath.Dir(directory)); err != nil {
@@ -955,7 +955,7 @@ func (s *ProjectionStore) atomicWrite(path string, data []byte) error {
 	}
 	tempPath := temp.Name()
 	defer os.Remove(tempPath)
-	if err := temp.Chmod(0o600); err != nil {
+	if err := secureProjectionFile(temp); err != nil {
 		temp.Close()
 		return err
 	}

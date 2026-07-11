@@ -17,7 +17,7 @@ func acquireProjectionFileLock(path string) (*projectionFileLock, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := file.Chmod(0o600); err != nil {
+	if err := secureProjectionFile(file); err != nil {
 		file.Close()
 		return nil, fmt.Errorf("secure lock file: %w", err)
 	}

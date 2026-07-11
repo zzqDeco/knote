@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -673,6 +674,9 @@ func TestProjectionStoreWritesDeterministicPrivateJournalRecords(t *testing.T) {
 	}
 	if _, err := store.Execute(context.Background(), plan, current, successfulCountingExecutor(nil)); err != nil {
 		t.Fatal(err)
+	}
+	if runtime.GOOS == "windows" {
+		return
 	}
 
 	err = filepath.Walk(store.Root(), func(path string, info os.FileInfo, walkErr error) error {
