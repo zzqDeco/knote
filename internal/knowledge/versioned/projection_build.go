@@ -35,15 +35,6 @@ type projectionBuild struct {
 	noop    bool
 }
 
-type artifactPublisher interface {
-	StageArtifacts(context.Context, repository.ArtifactSet) error
-	PublishArtifacts(context.Context, protocol.ArtifactBundleManifest) error
-}
-
-type currentProjectionReader interface {
-	ReadCurrentProjection(context.Context) ([]byte, error)
-}
-
 type projectionRootProvider interface {
 	ProjectionStoreRoot() string
 }
@@ -317,30 +308,31 @@ func (s service) prepareArtifactProjection(ctx context.Context) (repository.Arti
 }
 
 func (s service) selectedBaseProjection(ctx context.Context, scope catalog.Scope) (catalog.Projection, error) {
-	if reader, ok := s.repo.(currentProjectionReader); ok {
-		data, err := reader.ReadCurrentProjection(ctx)
-		if err == nil {
-			var projection catalog.Projection
-			if err := json.Unmarshal(data, &projection); err != nil {
-				return catalog.Projection{}, fmt.Errorf("decode selected artifact projection: %w", err)
-			}
-			if err := projection.Validate(); err != nil {
-				return catalog.Projection{}, fmt.Errorf("validate selected artifact projection: %w", err)
-			}
-			if projection.Scope != scope {
-				return catalog.Projection{}, fmt.Errorf("selected artifact projection scope does not match workspace")
-			}
+	data, err := s.repo.ReadCurrentProjection(ctx)
+	if err == nil {
+		var projection catalog.Projection
+		if err := json.Unmarshal(data, &projection); err != nil {
+			return catalog.Projection{}, fmt.Errorf("decode selected artifact projection: %w", err)
+		}
+		if err := projection.Validate(); err != nil {
+			return catalog.Projection{}, fmt.Errorf("validate selected artifact projection: %w", err)
+		}
+		if projection.Scope == scope {
 			return projection, nil
 		}
-		if !errors.Is(err, repository.ErrArtifactCurrentNotFound) {
-			return catalog.Projection{}, err
-		}
+	} else if !errors.Is(err, repository.ErrArtifactCurrentNotFound) {
+		return catalog.Projection{}, err
 	}
+	return emptyBaseProjection(scope)
+}
+
+func emptyBaseProjection(scope catalog.Scope) (catalog.Projection, error) {
 	emptySnapshot, err := catalog.NewSourceSnapshot(scope, "workspace", "source-empty", localSecurityDomain, nil)
 	if err != nil {
 		return catalog.Projection{}, err
 	}
-	return catalog.NewProjection(scope, "projection-empty", emptySnapshot.Ref(), catalog.StatePublished, nil)
+	emptyVersion := "projection-empty-" + fullHash([]byte(scope.TenantID + "\x00" + scope.KnowledgeBaseID))[:24]
+	return catalog.NewProjection(scope, emptyVersion, emptySnapshot.Ref(), catalog.StatePublished, nil)
 }
 
 func sourceSnapshotVersion(scope catalog.Scope, sources []loadedSource) (string, error) {
@@ -424,11 +416,13 @@ func kagBuildConfigVersion(workspace string, cfg repository.Config) (string, err
 		ProjectID    string                             `json:"project_id"`
 		Namespace    string                             `json:"namespace"`
 		Language     string                             `json:"language"`
+		RuntimeDir   string                             `json:"runtime_dir"`
 		ConfigDigest string                             `json:"config_digest"`
 		Models       map[string]repository.ModelProfile `json:"models"`
 	}{
 		Host: cfg.KAG.Host, Fake: cfg.KAG.Fake, ProjectID: cfg.KAG.ProjectID,
 		Namespace: cfg.KAG.Namespace, Language: cfg.KAG.Language,
+		RuntimeDir:   canonicalKAGRuntimeDir(workspace, cfg.KAG.RuntimeDir),
 		ConfigDigest: configDigest, Models: cfg.Models,
 	}
 	data, err := json.Marshal(payload)
@@ -436,6 +430,25 @@ func kagBuildConfigVersion(workspace string, cfg repository.Config) (string, err
 		return "", err
 	}
 	return "build_" + fullHash(data)[:24], nil
+}
+
+func canonicalKAGRuntimeDir(workspace, runtimeDir string) string {
+	runtimeDir = strings.TrimSpace(runtimeDir)
+	if runtimeDir == "" {
+		runtimeDir = filepath.Join(".knote", "kag-runtime")
+	}
+	runtimeDir = filepath.Clean(runtimeDir)
+	if !filepath.IsAbs(runtimeDir) {
+		return filepath.ToSlash(runtimeDir)
+	}
+	workspace = filepath.Clean(workspace)
+	if filepath.IsAbs(workspace) {
+		if relative, err := filepath.Rel(workspace, runtimeDir); err == nil &&
+			relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+			return filepath.ToSlash(relative)
+		}
+	}
+	return filepath.ToSlash(runtimeDir)
 }
 
 func nextProjectionRunIdentity(store *catalog.ProjectionStore, projectionVersion string) (string, string, error) {
@@ -472,22 +485,14 @@ func canonicalACLVersion(scope catalog.Scope) string {
 }
 
 func (s service) executeProjectionBuild(ctx context.Context, artifacts repository.ArtifactSet, build projectionBuild) (map[string]any, error) {
-	publisher, ok := s.repo.(artifactPublisher)
-	if !ok {
-		return nil, fmt.Errorf("v2 artifact repository does not support staged publication")
-	}
 	if build.noop {
-		if err := publisher.StageArtifacts(ctx, artifacts); err != nil {
+		if err := s.repo.StageArtifacts(ctx, artifacts); err != nil {
 			return nil, err
 		}
-		if err := publisher.PublishArtifacts(ctx, artifacts.BundleManifest); err != nil {
+		if err := s.repo.PublishArtifacts(ctx, artifacts.BundleManifest); err != nil {
 			return nil, err
 		}
 		return map[string]any{"projection_version": artifacts.BundleManifest.ProjectionVersion, "idempotent_noop": true}, nil
-	}
-	backend, ok := s.backend.(namespacedBackend)
-	if !ok {
-		return nil, fmt.Errorf("v2 build requires a backend that implements BuildInNamespace")
 	}
 	var buildData map[string]any
 	var operationErr error
@@ -500,7 +505,7 @@ func (s service) executeProjectionBuild(ctx context.Context, artifacts repositor
 		switch operation.Kind {
 		case catalog.OperationProjectIndex:
 			if !kagBuilt {
-				response, err := backend.BuildInNamespace(ctx, artifacts.BundleManifest.Namespace)
+				response, err := s.backend.BuildInNamespace(ctx, artifacts.BundleManifest.Namespace, operation.IdempotencyKey)
 				if err != nil {
 					operationErr = fmt.Errorf("KAG build failed: %w", err)
 					return catalog.OperationResult{}, operationErr
@@ -510,7 +515,7 @@ func (s service) executeProjectionBuild(ctx context.Context, artifacts repositor
 			}
 		case catalog.OperationProjectArtifact:
 			if !artifactsStaged {
-				if err := publisher.StageArtifacts(ctx, artifacts); err != nil {
+				if err := s.repo.StageArtifacts(ctx, artifacts); err != nil {
 					operationErr = err
 					return catalog.OperationResult{}, err
 				}
@@ -529,7 +534,7 @@ func (s service) executeProjectionBuild(ctx context.Context, artifacts repositor
 		}
 		return nil, fmt.Errorf("projection build did not reach a successful serving state")
 	}
-	if err := publisher.PublishArtifacts(ctx, artifacts.BundleManifest); err != nil {
+	if err := s.repo.PublishArtifacts(ctx, artifacts.BundleManifest); err != nil {
 		return nil, fmt.Errorf("publish artifact serving pointer: %w", err)
 	}
 	return buildData, nil

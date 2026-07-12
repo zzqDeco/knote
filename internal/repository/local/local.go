@@ -16,8 +16,9 @@ import (
 )
 
 type Store struct {
-	workspace          string
-	beforePointerWrite func(protocol.ArtifactCurrentPointer) error
+	workspace                  string
+	beforePointerWrite         func(protocol.ArtifactCurrentPointer) error
+	beforeCompatibilityPublish func() error
 }
 
 func New(workspace string) Store {

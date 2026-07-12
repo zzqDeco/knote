@@ -316,7 +316,7 @@ func (fakeBackend) Explain(context.Context, string) (kag.Response, error) {
 	return kag.Response{Data: map[string]any{"answer": "Fake KAG answer", "explanation": "because", "mode": "fake"}}, nil
 }
 
-func (b fakeBackend) BuildInNamespace(ctx context.Context, _ string) (kag.Response, error) {
+func (b fakeBackend) BuildInNamespace(ctx context.Context, _, _ string) (kag.Response, error) {
 	return b.Build(ctx)
 }
 func (b fakeBackend) QueryInNamespace(ctx context.Context, _ string, query string) (kag.Response, error) {
@@ -340,7 +340,7 @@ func (failingBackend) Explain(context.Context, string) (kag.Response, error) {
 	return kag.Response{}, errFakeUnavailable
 }
 
-func (b failingBackend) BuildInNamespace(ctx context.Context, _ string) (kag.Response, error) {
+func (b failingBackend) BuildInNamespace(ctx context.Context, _, _ string) (kag.Response, error) {
 	return b.Build(ctx)
 }
 func (b failingBackend) QueryInNamespace(ctx context.Context, _ string, query string) (kag.Response, error) {
@@ -366,7 +366,7 @@ func (buildFailingBackend) Explain(context.Context, string) (kag.Response, error
 	return kag.Response{}, errFakeUnavailable
 }
 
-func (b buildFailingBackend) BuildInNamespace(ctx context.Context, _ string) (kag.Response, error) {
+func (b buildFailingBackend) BuildInNamespace(ctx context.Context, _, _ string) (kag.Response, error) {
 	return b.Build(ctx)
 }
 func (b buildFailingBackend) QueryInNamespace(ctx context.Context, _ string, query string) (kag.Response, error) {

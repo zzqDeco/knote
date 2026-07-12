@@ -221,6 +221,7 @@ func TestProjectionIdentityExcludesAbsoluteWorkspacePaths(t *testing.T) {
 		repo := newMemoryRepo()
 		repo.config.Workspace = workspace
 		repo.config.KAG.Namespace = "PortableKB"
+		repo.config.KAG.RuntimeDir = filepath.Join(workspace, ".knote", "kag-runtime")
 		repo.sources["sources/intro.md"] = "portable\n"
 		result, err := New(Options{Workspace: workspace, Repo: repo, Backend: fakeBackend{}, Mode: ModeFake}).Build(ctx)
 		if err != nil {
@@ -260,7 +261,11 @@ func TestServiceFailedProjectionLeavesCatalogAndArtifactPointersServingPriorVers
 		t.Fatalf("failed projection replaced artifact pointer: got=%s want=%s",
 			repo.artifacts.BundleManifest.ProjectionVersion, first.BundleManifest.ProjectionVersion)
 	}
-	store, err := catalog.NewProjectionStore(filepath.Join(repo.projectionRoot, "by-base", "projection-empty"))
+	empty, err := emptyBaseProjection(catalog.Scope{TenantID: localTenantID, KnowledgeBaseID: canonicalNamespace(repo.config.KAG.Namespace)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := catalog.NewProjectionStore(filepath.Join(repo.projectionRoot, "by-base", empty.Version))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -326,6 +331,86 @@ func TestServiceKAGConfigurationChangeCreatesNewProjection(t *testing.T) {
 	}
 	if backend.buildCalls != 2 {
 		t.Fatalf("KAG build calls = %d, want 2 after configuration change", backend.buildCalls)
+	}
+}
+
+func TestServiceKAGNamespaceChangeStartsNewProjectionScope(t *testing.T) {
+	ctx := context.Background()
+	repo := newMemoryRepo()
+	repo.config.KAG.Namespace = "NamespaceA"
+	repo.sources["sources/intro.md"] = "stable\n"
+	backend := &recordingNamespacedBackend{}
+	svc := New(Options{Workspace: repo.config.Workspace, Repo: repo, Backend: backend, Mode: ModeFake})
+
+	first, err := svc.Build(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo.config.KAG.Namespace = "NamespaceB"
+	second, err := svc.Build(ctx)
+	if err != nil {
+		t.Fatalf("build after KAG namespace change: %v", err)
+	}
+	if first.BundleManifest.Namespace == second.BundleManifest.Namespace ||
+		first.BundleManifest.ProjectionVersion == second.BundleManifest.ProjectionVersion {
+		t.Fatalf("namespace change reused projection identity: first=%+v second=%+v", first.BundleManifest, second.BundleManifest)
+	}
+	if second.Manifest.Workspace != "NamespaceB" || backend.buildCalls != 2 {
+		t.Fatalf("namespace change did not build the new scope: manifest=%+v calls=%d", second.Manifest, backend.buildCalls)
+	}
+}
+
+func TestServiceKAGRuntimeDirChangeCreatesNewProjection(t *testing.T) {
+	ctx := context.Background()
+	repo := newMemoryRepo()
+	repo.config.KAG.Namespace = "RuntimeTest"
+	repo.config.KAG.RuntimeDir = filepath.Join(".knote", "runtime-a")
+	repo.sources["sources/intro.md"] = "stable\n"
+	backend := &recordingNamespacedBackend{}
+	svc := New(Options{Workspace: repo.config.Workspace, Repo: repo, Backend: backend, Mode: ModeFake})
+
+	first, err := svc.Build(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo.config.KAG.RuntimeDir = filepath.Join(".knote", "runtime-b")
+	second, err := svc.Build(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.BundleManifest.ProjectionVersion == second.BundleManifest.ProjectionVersion || backend.buildCalls != 2 {
+		t.Fatalf("runtime_dir change did not rebuild: first=%s second=%s calls=%d",
+			first.BundleManifest.ProjectionVersion, second.BundleManifest.ProjectionVersion, backend.buildCalls)
+	}
+}
+
+func TestServiceBuildPassesProjectionOperationIdempotencyKey(t *testing.T) {
+	ctx := context.Background()
+	repo := newMemoryRepo()
+	repo.config.KAG.Namespace = "IdempotencyTest"
+	repo.sources["sources/intro.md"] = "stable\n"
+	backend := &recordingNamespacedBackend{}
+	svc := service{workspace: repo.config.Workspace, repo: repo, backend: backend, mode: ModeFake}
+
+	artifacts, build, err := svc.prepareArtifactProjection(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := ""
+	for _, operation := range build.plan.Operations {
+		if operation.Kind == catalog.OperationProjectIndex {
+			want = operation.IdempotencyKey
+			break
+		}
+	}
+	if want == "" {
+		t.Fatal("projection plan has no index operation idempotency key")
+	}
+	if _, err := svc.executeProjectionBuild(ctx, artifacts, build); err != nil {
+		t.Fatal(err)
+	}
+	if backend.buildIdempotencyKey != want {
+		t.Fatalf("KAG build idempotency key = %q, want operation key %q", backend.buildIdempotencyKey, want)
 	}
 }
 
@@ -623,7 +708,7 @@ func (fakeBackend) Explain(context.Context, string) (kag.Response, error) {
 	return kag.Response{Data: map[string]any{"answer": "Fake KAG answer", "explanation": "because", "mode": "fake"}}, nil
 }
 
-func (b fakeBackend) BuildInNamespace(ctx context.Context, _ string) (kag.Response, error) {
+func (b fakeBackend) BuildInNamespace(ctx context.Context, _, _ string) (kag.Response, error) {
 	return b.Build(ctx)
 }
 
@@ -636,11 +721,12 @@ func (b fakeBackend) ExplainInNamespace(ctx context.Context, _ string, query str
 }
 
 type recordingNamespacedBackend struct {
-	buildNamespace   string
-	queryNamespace   string
-	explainNamespace string
-	buildErr         error
-	buildCalls       int
+	buildNamespace      string
+	buildIdempotencyKey string
+	queryNamespace      string
+	explainNamespace    string
+	buildErr            error
+	buildCalls          int
 }
 
 func (b *recordingNamespacedBackend) Build(context.Context) (kag.Response, error) {
@@ -655,8 +741,9 @@ func (b *recordingNamespacedBackend) Explain(context.Context, string) (kag.Respo
 	return kag.Response{Data: map[string]any{"answer": "legacy"}}, nil
 }
 
-func (b *recordingNamespacedBackend) BuildInNamespace(_ context.Context, namespace string) (kag.Response, error) {
+func (b *recordingNamespacedBackend) BuildInNamespace(_ context.Context, namespace, idempotencyKey string) (kag.Response, error) {
 	b.buildNamespace = namespace
+	b.buildIdempotencyKey = idempotencyKey
 	b.buildCalls++
 	if b.buildErr != nil {
 		return kag.Response{}, b.buildErr
@@ -688,7 +775,7 @@ func (failingBackend) Explain(context.Context, string) (kag.Response, error) {
 	return kag.Response{}, errFakeUnavailable
 }
 
-func (b failingBackend) BuildInNamespace(ctx context.Context, _ string) (kag.Response, error) {
+func (b failingBackend) BuildInNamespace(ctx context.Context, _, _ string) (kag.Response, error) {
 	return b.Build(ctx)
 }
 
@@ -716,7 +803,7 @@ func (buildFailingBackend) Explain(context.Context, string) (kag.Response, error
 	return kag.Response{}, errFakeUnavailable
 }
 
-func (b buildFailingBackend) BuildInNamespace(ctx context.Context, _ string) (kag.Response, error) {
+func (b buildFailingBackend) BuildInNamespace(ctx context.Context, _, _ string) (kag.Response, error) {
 	return b.Build(ctx)
 }
 

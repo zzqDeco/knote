@@ -85,8 +85,11 @@ func IsUnsupportedPrimitive(err error) bool {
 type Backend interface {
 	Health(ctx context.Context) (Response, error)
 	Build(ctx context.Context) (Response, error)
+	BuildInNamespace(ctx context.Context, namespace, idempotencyKey string) (Response, error)
 	Query(ctx context.Context, query string) (Response, error)
+	QueryInNamespace(ctx context.Context, namespace, query string) (Response, error)
 	Explain(ctx context.Context, query string) (Response, error)
+	ExplainInNamespace(ctx context.Context, namespace, query string) (Response, error)
 }
 
 func (c Client) Health(ctx context.Context) (Response, error) {
@@ -97,8 +100,12 @@ func (c Client) Build(ctx context.Context) (Response, error) {
 	return c.call(ctx, "kag.build", c.params(nil))
 }
 
-func (c Client) BuildInNamespace(ctx context.Context, namespace string) (Response, error) {
-	return c.call(ctx, "kag.build", c.projectionParams(namespace, nil))
+// BuildInNamespace sends idempotency_key as a durable adapter request token.
+// The adapter must return the same logical result when that token is replayed.
+func (c Client) BuildInNamespace(ctx context.Context, namespace, idempotencyKey string) (Response, error) {
+	return c.call(ctx, "kag.build", c.projectionParams(namespace, map[string]any{
+		"idempotency_key": idempotencyKey,
+	}))
 }
 
 func (c Client) Query(ctx context.Context, query string) (Response, error) {

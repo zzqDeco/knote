@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 )
 
 const ArtifactBundleManifestVersion = 2
@@ -62,9 +63,12 @@ func (m ArtifactBundleManifest) Validate() error {
 	if m.ProjectionVersion != m.ProjectionID {
 		return fmt.Errorf("artifact projection version must match projection id")
 	}
+	if err := validatePathToken("namespace", m.Namespace); err != nil {
+		return err
+	}
 	for name, value := range map[string]string{
-		"namespace": m.Namespace, "authz_object": m.AuthorizationObject,
-		"authz_version": m.AuthorizationVersion, "source_snapshot_version": m.SourceSnapshot.Version,
+		"authz_object": m.AuthorizationObject, "authz_version": m.AuthorizationVersion,
+		"source_snapshot_version": m.SourceSnapshot.Version,
 	} {
 		if err := validateToken(name, value); err != nil {
 			return err
@@ -158,6 +162,18 @@ func validateSHA256(name, value string) error {
 	}
 	if _, err := hex.DecodeString(value); err != nil {
 		return fmt.Errorf("%s must be hexadecimal: %w", name, err)
+	}
+	return nil
+}
+
+func validatePathToken(name, value string) error {
+	if err := validateToken(name, value); err != nil {
+		return err
+	}
+	for _, r := range value {
+		if !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '-' && r != '_' {
+			return fmt.Errorf("%s is not a path-safe token", name)
+		}
 	}
 	return nil
 }

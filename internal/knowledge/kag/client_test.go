@@ -54,7 +54,7 @@ func TestClientProjectionNamespaceOverridesConfiguredNamespace(t *testing.T) {
 	script := `import json
 import sys
 req = json.loads(sys.stdin.readline())
-print(json.dumps({"id":req["id"],"type":"result","data":{"namespace":req["params"]["namespace"],"runtime_dir":req["params"]["runtime_dir"]}}))
+print(json.dumps({"id":req["id"],"type":"result","data":{"namespace":req["params"]["namespace"],"runtime_dir":req["params"]["runtime_dir"],"idempotency_key":req["params"].get("idempotency_key", "")}}))
 `
 	if err := os.WriteFile(adapter, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
@@ -63,7 +63,7 @@ print(json.dumps({"id":req["id"],"type":"result","data":{"namespace":req["params
 	client := Client{AdapterPath: adapter, Workspace: workspace, Namespace: "legacy"}
 	for name, call := range map[string]func() (Response, error){
 		"build": func() (Response, error) {
-			return client.BuildInNamespace(context.Background(), "projection-one")
+			return client.BuildInNamespace(context.Background(), "projection-one", "idem-build-one")
 		},
 		"query": func() (Response, error) {
 			return client.QueryInNamespace(context.Background(), "projection-two", "question")
@@ -82,6 +82,11 @@ print(json.dumps({"id":req["id"],"type":"result","data":{"namespace":req["params
 			}
 			if got := response.Data["runtime_dir"]; !strings.Contains(got.(string), filepath.Join("projections", response.Data["namespace"].(string))) {
 				t.Fatalf("projection runtime was not isolated: %v", got)
+			}
+			if got := response.Data["idempotency_key"]; name == "build" && got != "idem-build-one" {
+				t.Fatalf("build idempotency key = %v, want idem-build-one", got)
+			} else if name != "build" && got != "" {
+				t.Fatalf("%s unexpectedly sent build idempotency key %v", name, got)
 			}
 		})
 	}

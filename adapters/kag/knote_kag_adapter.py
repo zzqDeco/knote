@@ -17,7 +17,7 @@ import re
 import sys
 import time
 from ipaddress import ip_address
-from contextlib import redirect_stdout
+from contextlib import contextmanager, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from typing import Any
@@ -328,6 +328,87 @@ def atomic_write_text(path: Path, text: str) -> None:
     tmp.replace(path)
 
 
+def configured_source_path(params: dict[str, Any]) -> Path | None:
+    workspace = workspace_path(params)
+    explicit = params.get("config_path")
+    if explicit:
+        path = Path(explicit)
+        candidate = path if path.is_absolute() else workspace / path
+        if candidate.exists():
+            return candidate.resolve()
+        return None
+    for candidate in (workspace / ".knote" / "kag_config.yaml", workspace / "kag_config.yaml"):
+        if candidate.exists():
+            return candidate.resolve()
+    return None
+
+
+def config_resource_dir(params: dict[str, Any], config_path: Path) -> Path:
+    source = configured_source_path(params)
+    return source.parent if source is not None else config_path.parent
+
+
+@contextmanager
+def working_directory(path: Path) -> Any:
+    previous = Path.cwd()
+    os.chdir(path)
+    try:
+        yield
+    finally:
+        os.chdir(previous)
+
+
+def build_idempotency_key(params: dict[str, Any]) -> str:
+    value = params.get("idempotency_key")
+    if value is None:
+        return ""
+    if not isinstance(value, str) or not value.strip():
+        raise AdapterRequestError("idempotency_key must be a non-empty string")
+    if value != value.strip() or any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise AdapterRequestError("idempotency_key contains invalid whitespace or control characters")
+    return value
+
+
+def build_checkpoint_path(out_dir: Path, params: dict[str, Any]) -> Path:
+    key = build_idempotency_key(params)
+    if not key:
+        return out_dir / "ckpt"
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    return out_dir / "ckpt" / "runs" / digest
+
+
+def build_receipt_path(out_dir: Path, idempotency_key: str) -> Path:
+    digest = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
+    return out_dir / "idempotency" / f"{digest}.json"
+
+
+def load_build_receipt(out_dir: Path, idempotency_key: str) -> dict[str, Any] | None:
+    if not idempotency_key:
+        return None
+    path = build_receipt_path(out_dir, idempotency_key)
+    if not path.exists():
+        return None
+    try:
+        receipt = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"invalid KAG build idempotency receipt: {path}: {exc}") from exc
+    if not isinstance(receipt, dict) or receipt.get("version") != 1:
+        raise RuntimeError(f"invalid KAG build idempotency receipt: {path}")
+    if receipt.get("idempotency_key") != idempotency_key or not isinstance(receipt.get("data"), dict):
+        raise RuntimeError(f"KAG build idempotency receipt does not match request: {path}")
+    return dict(receipt["data"])
+
+
+def store_build_receipt(out_dir: Path, idempotency_key: str, data: dict[str, Any]) -> None:
+    if not idempotency_key:
+        return
+    receipt = {"version": 1, "idempotency_key": idempotency_key, "data": data}
+    atomic_write_text(
+        build_receipt_path(out_dir, idempotency_key),
+        json.dumps(receipt, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+    )
+
+
 def select_config(params: dict[str, Any], out_dir: Path, *, generate: bool = True) -> Path:
     workspace = workspace_path(params)
     explicit = params.get("config_path")
@@ -360,6 +441,8 @@ def select_projection_config(base: Path, out_dir: Path, params: dict[str, Any], 
         return base
     target = out_dir / "kag_config.yaml"
     if target.exists():
+        if generate and build_idempotency_key(params):
+            return projection_config(base, out_dir, params)
         return target.resolve()
     if not generate:
         raise FileNotFoundError(f"projection KAG config not found; run /build first: {target}")
@@ -392,7 +475,7 @@ def projection_config(base: Path, out_dir: Path, params: dict[str, Any]) -> Path
             lines[index] = f"  namespace: {quoted_config(namespace)}"
             namespace_written = True
         elif stripped.startswith("checkpoint_path:"):
-            lines[index] = f"  checkpoint_path: {quoted_config(str(out_dir / 'ckpt'))}"
+            lines[index] = f"  checkpoint_path: {quoted_config(str(build_checkpoint_path(out_dir, params)))}"
             checkpoint_written = True
     if project_index is None:
         raise RuntimeError(f"KAG config has no top-level project section: {base}")
@@ -400,7 +483,7 @@ def projection_config(base: Path, out_dir: Path, params: dict[str, Any]) -> Path
     if not namespace_written:
         additions.append(f"  namespace: {quoted_config(namespace)}")
     if not checkpoint_written:
-        additions.append(f"  checkpoint_path: {quoted_config(str(out_dir / 'ckpt'))}")
+        additions.append(f"  checkpoint_path: {quoted_config(str(build_checkpoint_path(out_dir, params)))}")
     if additions:
         lines[project_end:project_end] = additions
     ensure_runtime_excluded(workspace_path(params), out_dir)
@@ -572,7 +655,7 @@ def generate_kag_config(path: Path, params: dict[str, Any]) -> None:
     project_id = str(params.get("project_id") or os.environ.get("KNOTE_KAG_PROJECT_ID") or "1")
     namespace = str(params.get("namespace") or os.environ.get("KNOTE_KAG_NAMESPACE") or "KnoteKB")
     language = str(params.get("language") or os.environ.get("KNOTE_KAG_LANGUAGE") or "en")
-    checkpoint_path = json.dumps(str(runtime_dir(params) / "ckpt"))
+    checkpoint_path = json.dumps(str(build_checkpoint_path(runtime_dir(params), params)))
     openie_llm_type = quoted_config(config_setting(params, "openie_llm_type", "KNOTE_OPENIE_LLM_TYPE", "openai"))
     openie_llm_base_url = quoted_config(
         config_setting(params, "openie_llm_base_url", "KNOTE_OPENIE_LLM_BASE_URL", "http://localhost:11434/v1")
@@ -1062,20 +1145,29 @@ def fake_response(req: dict[str, Any]) -> None:
     elif method == "kag.build":
         workspace = workspace_path(params)
         out_dir = runtime_dir(params)
+        idempotency_key = build_idempotency_key(params)
+        replay = load_build_receipt(out_dir, idempotency_key)
+        if replay is not None:
+            result(req_id, replay, "fake KAG build complete")
+            return
         corpus_path, records = prepare_corpus(workspace, out_dir, params)
         progress(req_id, "scanning sources", 1, 3)
         progress(req_id, "extracting graph", 2, 3)
+        data = {
+            "status": "ok",
+            "mode": "fake",
+            "corpus_path": str(corpus_path),
+            "documents": len(records),
+            "entities": len(records),
+            "relations": 0,
+            "claims": len(records),
+        }
+        if idempotency_key:
+            data["idempotency_key"] = idempotency_key
+        store_build_receipt(out_dir, idempotency_key, data)
         result(
             req_id,
-            {
-                "status": "ok",
-                "mode": "fake",
-                "corpus_path": str(corpus_path),
-                "documents": len(records),
-                "entities": len(records),
-                "relations": 0,
-                "claims": len(records),
-            },
+            data,
             "fake KAG build complete",
         )
     elif method in {"kag.query", "kag.explain"}:
@@ -1140,26 +1232,32 @@ def run_kag_build(req: dict[str, Any]) -> dict[str, Any]:
     params = req.get("params") or {}
     workspace = workspace_path(params)
     out_dir = runtime_dir(params)
+    idempotency_key = build_idempotency_key(params)
+    replay = load_build_receipt(out_dir, idempotency_key)
+    if replay is not None:
+        return replay
     corpus_path, records = prepare_corpus(workspace, out_dir, params)
     if not records:
         raise RuntimeError(f"no Markdown or text sources found under {workspace / 'sources'}")
     config_path = select_config(params, out_dir)
     ensure_local_no_proxy(params, config_path)
-    init_kag_config(config_path)
+    resource_dir = config_resource_dir(params, config_path)
+    with working_directory(resource_dir):
+        init_kag_config(config_path)
 
-    from kag.builder.runner import BuilderChainRunner  # type: ignore
-    from kag.common.conf import KAG_CONFIG  # type: ignore
-    from kag.common.registry import import_modules_from_path  # type: ignore
+        from kag.builder.runner import BuilderChainRunner  # type: ignore
+        from kag.common.conf import KAG_CONFIG  # type: ignore
+        from kag.common.registry import import_modules_from_path  # type: ignore
 
-    import_modules_from_path(str(config_path.parent))
-    pipeline = KAG_CONFIG.all_config.get("kag_builder_pipeline")
-    if not pipeline:
-        raise RuntimeError(f"kag_builder_pipeline missing in {config_path}")
-    runner = BuilderChainRunner.from_config(pipeline)
-    _, build_output = capture_stdout(runner.invoke, str(corpus_path))
+        import_modules_from_path(str(resource_dir))
+        pipeline = KAG_CONFIG.all_config.get("kag_builder_pipeline")
+        if not pipeline:
+            raise RuntimeError(f"kag_builder_pipeline missing in {config_path}")
+        runner = BuilderChainRunner.from_config(pipeline)
+        _, build_output = capture_stdout(runner.invoke, str(corpus_path))
     build_summary = parse_build_summary(build_output)
     ensure_successful_build_summary(build_summary)
-    return {
+    data = {
         "status": "ok",
         "mode": "real",
         "config_path": str(config_path),
@@ -1167,6 +1265,10 @@ def run_kag_build(req: dict[str, Any]) -> dict[str, Any]:
         "documents": len(records),
         "build_summary": build_summary or {},
     }
+    if idempotency_key:
+        data["idempotency_key"] = idempotency_key
+    store_build_receipt(out_dir, idempotency_key, data)
+    return data
 
 
 def normalize_solver_output(value: Any) -> tuple[str, str]:
@@ -1222,18 +1324,20 @@ def run_kag_query(req: dict[str, Any], explain: bool = False) -> dict[str, Any]:
     out_dir = runtime_dir(params)
     config_path = select_config(params, out_dir, generate=False)
     ensure_local_no_proxy(params, config_path)
-    init_kag_config(config_path)
+    resource_dir = config_resource_dir(params, config_path)
+    with working_directory(resource_dir):
+        init_kag_config(config_path)
 
-    from kag.common.conf import KAG_CONFIG  # type: ignore
-    from kag.common.registry import import_modules_from_path  # type: ignore
-    from kag.interface import SolverPipelineABC  # type: ignore
+        from kag.common.conf import KAG_CONFIG  # type: ignore
+        from kag.common.registry import import_modules_from_path  # type: ignore
+        from kag.interface import SolverPipelineABC  # type: ignore
 
-    import_modules_from_path(str(config_path.parent))
-    pipeline_conf = KAG_CONFIG.all_config.get("kag_solver_pipeline")
-    if not pipeline_conf:
-        raise RuntimeError(f"kag_solver_pipeline missing in {config_path}")
-    pipeline = SolverPipelineABC.from_config(pipeline_conf)
-    raw = run_solver_pipeline(pipeline, SolverPipelineABC, query)
+        import_modules_from_path(str(resource_dir))
+        pipeline_conf = KAG_CONFIG.all_config.get("kag_solver_pipeline")
+        if not pipeline_conf:
+            raise RuntimeError(f"kag_solver_pipeline missing in {config_path}")
+        pipeline = SolverPipelineABC.from_config(pipeline_conf)
+        raw = run_solver_pipeline(pipeline, SolverPipelineABC, query)
     answer, trace = normalize_solver_output(raw)
     data = {
         "answer": answer,

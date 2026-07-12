@@ -27,16 +27,9 @@ type Backend interface {
 	Build(ctx context.Context) (kag.Response, error)
 	Query(ctx context.Context, query string) (kag.Response, error)
 	Explain(ctx context.Context, query string) (kag.Response, error)
-}
-
-type namespacedBackend interface {
-	BuildInNamespace(ctx context.Context, namespace string) (kag.Response, error)
+	BuildInNamespace(ctx context.Context, namespace, idempotencyKey string) (kag.Response, error)
 	QueryInNamespace(ctx context.Context, namespace, query string) (kag.Response, error)
 	ExplainInNamespace(ctx context.Context, namespace, query string) (kag.Response, error)
-}
-
-type currentBundleReader interface {
-	ReadCurrentArtifactManifest(context.Context) (protocol.ArtifactBundleManifest, error)
 }
 
 type Service interface {
@@ -55,7 +48,7 @@ type Service interface {
 
 type Options struct {
 	Workspace string
-	Repo      repository.Workspace
+	Repo      repository.ProjectionWorkspace
 	Versions  repository.Versions
 	Backend   Backend
 	Mode      Mode
@@ -86,7 +79,7 @@ type Explanation = Answer
 
 type service struct {
 	workspace string
-	repo      repository.Workspace
+	repo      repository.ProjectionWorkspace
 	versions  repository.Versions
 	backend   Backend
 	mode      Mode
@@ -340,32 +333,20 @@ func (s service) fallbackAnswer(ctx context.Context) (Answer, error) {
 
 func (s service) queryBackend(ctx context.Context, manifest protocol.ArtifactBundleManifest, hasManifest bool, question string) (kag.Response, error) {
 	if hasManifest {
-		backend, ok := s.backend.(namespacedBackend)
-		if !ok {
-			return kag.Response{}, fmt.Errorf("v2 query requires a projection-namespaced backend")
-		}
-		return backend.QueryInNamespace(ctx, manifest.Namespace, question)
+		return s.backend.QueryInNamespace(ctx, manifest.Namespace, question)
 	}
 	return s.backend.Query(ctx, question)
 }
 
 func (s service) explainBackend(ctx context.Context, manifest protocol.ArtifactBundleManifest, hasManifest bool, question string) (kag.Response, error) {
 	if hasManifest {
-		backend, ok := s.backend.(namespacedBackend)
-		if !ok {
-			return kag.Response{}, fmt.Errorf("v2 explain requires a projection-namespaced backend")
-		}
-		return backend.ExplainInNamespace(ctx, manifest.Namespace, question)
+		return s.backend.ExplainInNamespace(ctx, manifest.Namespace, question)
 	}
 	return s.backend.Explain(ctx, question)
 }
 
 func (s service) currentBundleManifest(ctx context.Context) (protocol.ArtifactBundleManifest, bool, error) {
-	reader, ok := s.repo.(currentBundleReader)
-	if !ok {
-		return protocol.ArtifactBundleManifest{}, false, nil
-	}
-	manifest, err := reader.ReadCurrentArtifactManifest(ctx)
+	manifest, err := s.repo.ReadCurrentArtifactManifest(ctx)
 	if errors.Is(err, repository.ErrArtifactCurrentNotFound) {
 		return protocol.ArtifactBundleManifest{}, false, nil
 	}

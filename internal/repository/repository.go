@@ -26,6 +26,16 @@ type Workspace interface {
 	EvalGate(ctx context.Context) error
 }
 
+// ProjectionWorkspace is a workspace that can stage an immutable artifact
+// bundle and atomically select it for serving.
+type ProjectionWorkspace interface {
+	Workspace
+	StageArtifacts(ctx context.Context, set ArtifactSet) error
+	PublishArtifacts(ctx context.Context, manifest protocol.ArtifactBundleManifest) error
+	ReadCurrentArtifactManifest(ctx context.Context) (protocol.ArtifactBundleManifest, error)
+	ReadCurrentProjection(ctx context.Context) ([]byte, error)
+}
+
 type Sessions interface {
 	Append(ctx context.Context, event protocol.Event) error
 	Load(ctx context.Context, sessionID string) ([]protocol.Event, error)

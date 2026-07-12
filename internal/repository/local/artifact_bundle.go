@@ -26,7 +26,7 @@ func (s Store) writeArtifactBundle(set repository.ArtifactSet) error {
 			return err
 		}
 		artifactsDir := filepath.Join(s.workspace, "artifacts")
-		if err := os.MkdirAll(artifactsDir, 0o755); err != nil {
+		if err := ensureRealArtifactDirectory(artifactsDir); err != nil {
 			return err
 		}
 		return writeCompatibilityExports(artifactsDir, set.Manifest, payloads)
@@ -62,7 +62,10 @@ func (s Store) StageArtifacts(ctx context.Context, set repository.ArtifactSet) e
 	}
 	artifactsDir := filepath.Join(s.workspace, "artifacts")
 	bundlesDir := filepath.Join(artifactsDir, "bundles")
-	if err := os.MkdirAll(bundlesDir, 0o755); err != nil {
+	if err := ensureRealArtifactDirectory(artifactsDir); err != nil {
+		return err
+	}
+	if err := ensureRealArtifactDirectory(bundlesDir); err != nil {
 		return err
 	}
 	bundleDir := filepath.Join(bundlesDir, set.BundleManifest.ProjectionID)
@@ -94,20 +97,57 @@ func (s Store) PublishArtifacts(ctx context.Context, manifest protocol.ArtifactB
 	if err := pointer.Validate(); err != nil {
 		return err
 	}
-	bundleDir := filepath.Join(s.workspace, "artifacts", "bundles", manifest.ProjectionID)
+	artifactsDir := filepath.Join(s.workspace, "artifacts")
+	bundlesDir := filepath.Join(artifactsDir, "bundles")
+	if err := validateArtifactBundleDirectory(artifactsDir); err != nil {
+		return err
+	}
+	if err := validateArtifactBundleDirectory(bundlesDir); err != nil {
+		return err
+	}
+	bundleDir := filepath.Join(bundlesDir, manifest.ProjectionID)
 	if err := validateArtifactBundleDirectory(bundleDir); err != nil {
 		return err
 	}
+	compatibility, err := stageCompatibilityExportsFromBundle(artifactsDir, manifest)
+	if err != nil {
+		return err
+	}
+	defer compatibility.cleanup()
+	currentPath := filepath.Join(artifactsDir, "current.json")
+	if err := validateArtifactFileDestination(currentPath); err != nil {
+		return err
+	}
+	pointerData, err := marshalIndentedJSON(pointer)
+	if err != nil {
+		return err
+	}
+	pointerTemporary, err := stageArtifactBytes(currentPath, pointerData)
+	if err != nil {
+		return err
+	}
+	defer os.Remove(pointerTemporary)
 	if s.beforePointerWrite != nil {
 		if err := s.beforePointerWrite(pointer); err != nil {
 			return err
 		}
 	}
-	artifactsDir := filepath.Join(s.workspace, "artifacts")
-	if err := atomicWriteArtifactJSON(filepath.Join(artifactsDir, "current.json"), pointer); err != nil {
+	if err := replaceArtifactFile(pointerTemporary, currentPath); err != nil {
 		return err
 	}
-	return writeCompatibilityExportsFromBundle(artifactsDir, manifest)
+	if err := syncArtifactDirectory(artifactsDir); err != nil {
+		return err
+	}
+	// current.json is the serving commit point. Compatibility exports are
+	// best-effort after it advances so a partial legacy refresh cannot turn a
+	// successfully selected bundle into a failed build.
+	if s.beforeCompatibilityPublish != nil {
+		if err := s.beforeCompatibilityPublish(); err != nil {
+			return nil
+		}
+	}
+	_ = compatibility.publish()
+	return nil
 }
 
 func (s Store) ReadCurrentArtifactManifest(ctx context.Context) (protocol.ArtifactBundleManifest, error) {
@@ -115,6 +155,12 @@ func (s Store) ReadCurrentArtifactManifest(ctx context.Context) (protocol.Artifa
 		return protocol.ArtifactBundleManifest{}, err
 	}
 	artifactsDir := filepath.Join(s.workspace, "artifacts")
+	if err := validateArtifactBundleDirectory(artifactsDir); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return protocol.ArtifactBundleManifest{}, repository.ErrArtifactCurrentNotFound
+		}
+		return protocol.ArtifactBundleManifest{}, err
+	}
 	pointerData, err := os.ReadFile(filepath.Join(artifactsDir, "current.json"))
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -129,7 +175,11 @@ func (s Store) ReadCurrentArtifactManifest(ctx context.Context) (protocol.Artifa
 	if err := pointer.Validate(); err != nil {
 		return protocol.ArtifactBundleManifest{}, fmt.Errorf("validate artifact current pointer: %w", err)
 	}
-	manifestPath := filepath.Join(artifactsDir, "bundles", pointer.ProjectionID, bundleManifestName)
+	bundlesDir := filepath.Join(artifactsDir, "bundles")
+	if err := validateArtifactBundleDirectory(bundlesDir); err != nil {
+		return protocol.ArtifactBundleManifest{}, err
+	}
+	manifestPath := filepath.Join(bundlesDir, pointer.ProjectionID, bundleManifestName)
 	if err := validateArtifactBundleDirectory(filepath.Dir(manifestPath)); err != nil {
 		return protocol.ArtifactBundleManifest{}, err
 	}
@@ -229,6 +279,18 @@ func validateArtifactBundleDirectory(path string) error {
 	return nil
 }
 
+func ensureRealArtifactDirectory(path string) error {
+	if err := validateArtifactBundleDirectory(path); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := os.Mkdir(path, 0o755); err != nil && !errors.Is(err, os.ErrExist) {
+		return err
+	}
+	return validateArtifactBundleDirectory(path)
+}
+
 func verifyImmutableBundle(bundleDir string, payloads []repository.ArtifactFilePayload, manifestData []byte) error {
 	expected := map[string][]byte{bundleManifestName: manifestData}
 	for _, payload := range payloads {
@@ -278,23 +340,87 @@ func writeCompatibilityExports(artifactsDir string, manifest protocol.ArtifactMa
 	return writeJSON(filepath.Join(artifactsDir, "manifest.json"), manifest)
 }
 
-func writeCompatibilityExportsFromBundle(
+type stagedArtifactFile struct {
+	destination string
+	temporary   string
+}
+
+type stagedCompatibilityExports struct {
+	files []stagedArtifactFile
+}
+
+func stageCompatibilityExportsFromBundle(
 	artifactsDir string,
 	manifest protocol.ArtifactBundleManifest,
-) error {
+) (stagedCompatibilityExports, error) {
 	bundleDir := filepath.Join(artifactsDir, "bundles", manifest.ProjectionID)
-	payloads := make([]repository.ArtifactFilePayload, 0, len(manifest.Files))
+	exports := make([]repository.ArtifactFilePayload, 0, len(manifest.Files))
 	for _, descriptor := range manifest.Files {
 		if descriptor.Path == "projection.json" {
 			continue
 		}
 		data, err := os.ReadFile(filepath.Join(bundleDir, descriptor.Path))
 		if err != nil {
+			return stagedCompatibilityExports{}, err
+		}
+		exports = append(exports, repository.ArtifactFilePayload{Descriptor: descriptor, Data: data})
+	}
+	manifestData, err := marshalIndentedJSON(manifest.Compatibility)
+	if err != nil {
+		return stagedCompatibilityExports{}, err
+	}
+	exports = append(exports, repository.ArtifactFilePayload{
+		Descriptor: protocol.ArtifactBundleFile{Path: bundleManifestName},
+		Data:       manifestData,
+	})
+
+	staged := stagedCompatibilityExports{files: make([]stagedArtifactFile, 0, len(exports))}
+	for _, export := range exports {
+		destination := filepath.Join(artifactsDir, export.Descriptor.Path)
+		if err := validateArtifactFileDestination(destination); err != nil {
+			staged.cleanup()
+			return stagedCompatibilityExports{}, err
+		}
+		temporary, err := stageArtifactBytes(destination, export.Data)
+		if err != nil {
+			staged.cleanup()
+			return stagedCompatibilityExports{}, err
+		}
+		staged.files = append(staged.files, stagedArtifactFile{destination: destination, temporary: temporary})
+	}
+	return staged, nil
+}
+
+func (s stagedCompatibilityExports) publish() error {
+	for _, file := range s.files {
+		if err := replaceArtifactFile(file.temporary, file.destination); err != nil {
 			return err
 		}
-		payloads = append(payloads, repository.ArtifactFilePayload{Descriptor: descriptor, Data: data})
 	}
-	return writeCompatibilityExports(artifactsDir, manifest.Compatibility, payloads)
+	if len(s.files) == 0 {
+		return nil
+	}
+	return syncArtifactDirectory(filepath.Dir(s.files[0].destination))
+}
+
+func (s stagedCompatibilityExports) cleanup() {
+	for _, file := range s.files {
+		_ = os.Remove(file.temporary)
+	}
+}
+
+func validateArtifactFileDestination(path string) error {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return fmt.Errorf("artifact compatibility export is not a regular file: %s", path)
+	}
+	return nil
 }
 
 func marshalIndentedJSON(value any) ([]byte, error) {
@@ -309,28 +435,40 @@ func atomicWriteBytes(path string, data []byte) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+"-*.tmp")
+	tmpPath, err := stageArtifactBytes(path, data)
 	if err != nil {
 		return err
 	}
-	tmpPath := tmp.Name()
 	defer os.Remove(tmpPath)
+	return replaceArtifactFile(tmpPath, path)
+}
+
+func stageArtifactBytes(path string, data []byte) (string, error) {
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+"-*.tmp")
+	if err != nil {
+		return "", err
+	}
+	tmpPath := tmp.Name()
 	if err := tmp.Chmod(0o644); err != nil {
 		_ = tmp.Close()
-		return err
+		_ = os.Remove(tmpPath)
+		return "", err
 	}
 	if _, err := tmp.Write(data); err != nil {
 		_ = tmp.Close()
-		return err
+		_ = os.Remove(tmpPath)
+		return "", err
 	}
 	if err := tmp.Sync(); err != nil {
 		_ = tmp.Close()
-		return err
+		_ = os.Remove(tmpPath)
+		return "", err
 	}
 	if err := tmp.Close(); err != nil {
-		return err
+		_ = os.Remove(tmpPath)
+		return "", err
 	}
-	return replaceArtifactFile(tmpPath, path)
+	return tmpPath, nil
 }
 
 func writeArtifactFileDurably(path string, data []byte) error {
@@ -347,33 +485,4 @@ func writeArtifactFileDurably(path string, data []byte) error {
 		return err
 	}
 	return file.Close()
-}
-
-func atomicWriteArtifactJSON(path string, value any) error {
-	data, err := marshalIndentedJSON(value)
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+"-*.tmp")
-	if err != nil {
-		return err
-	}
-	tmpPath := tmp.Name()
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Remove(tmpPath); err != nil {
-		return err
-	}
-	defer os.Remove(tmpPath)
-	if err := writeArtifactFileDurably(tmpPath, data); err != nil {
-		return err
-	}
-	if err := replaceArtifactFile(tmpPath, path); err != nil {
-		return err
-	}
-	return syncArtifactDirectory(filepath.Dir(path))
 }

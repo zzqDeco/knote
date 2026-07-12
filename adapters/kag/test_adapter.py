@@ -784,6 +784,193 @@ class AdapterTest(unittest.TestCase):
             self.assertIn(f'checkpoint_path: "{out_dir / "ckpt"}"', text)
             self.assertIn("namespace: shared", base.read_text(encoding="utf-8"))
 
+    def test_projection_build_scopes_checkpoint_to_idempotency_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            base = workspace / ".knote" / "kag_config.yaml"
+            base.parent.mkdir(parents=True)
+            base.write_text(
+                "project:\n  namespace: shared\n  checkpoint_path: shared/ckpt\n",
+                encoding="utf-8",
+            )
+            out_dir = workspace / ".knote" / "kag-runtime" / "projections" / "projection-one"
+            key = "sync-projection-one"
+            params = {
+                "workspace": str(workspace),
+                "config_path": str(base),
+                "namespace": "projection-one",
+                "idempotency_key": key,
+            }
+
+            selected = adapter.select_config(params, out_dir, generate=True)
+            digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+            expected_checkpoint = out_dir / "ckpt" / "runs" / digest
+            self.assertIn(f'checkpoint_path: "{expected_checkpoint}"', selected.read_text(encoding="utf-8"))
+
+            before = selected.read_bytes()
+            self.assertEqual(adapter.select_config(params, out_dir, generate=False).read_bytes(), before)
+
+    def test_projection_build_uses_source_config_directory_for_imports_and_resources(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            config_dir = workspace / "kag_project"
+            config_dir.mkdir()
+            config_dir = config_dir.resolve()
+            base = config_dir / "kag_config.yaml"
+            base.write_text(
+                "project:\n  namespace: shared\n"
+                "kag_builder_pipeline:\n  type: custom_builder\n",
+                encoding="utf-8",
+            )
+            (config_dir / "prompt.txt").write_text("source-relative prompt", encoding="utf-8")
+            (workspace / "sources").mkdir()
+            (workspace / "sources" / "intro.md").write_text("# Intro", encoding="utf-8")
+            out_dir = workspace / ".knote" / "kag-runtime" / "projections" / "projection-one"
+            params = {
+                "workspace": str(workspace),
+                "runtime_dir": str(out_dir),
+                "config_path": str(base),
+                "namespace": "projection-one",
+                "idempotency_key": "sync-projection-one",
+            }
+            seen: dict[str, object] = {}
+
+            class FakeBuilderChainRunner:
+                @classmethod
+                def from_config(cls, pipeline: object) -> "FakeBuilderChainRunner":
+                    seen["builder_cwd"] = Path.cwd()
+                    seen["prompt"] = Path("prompt.txt").read_text(encoding="utf-8")
+                    return cls()
+
+                def invoke(self, corpus_path: str) -> None:
+                    seen["invoke_cwd"] = Path.cwd()
+                    seen["invoke_calls"] = int(seen.get("invoke_calls", 0)) + 1
+                    print("Done process 1 records, with 1 successfully processed and 0 failures encountered")
+
+            def fake_import_modules(path: str) -> None:
+                seen["import_path"] = Path(path)
+                seen["import_cwd"] = Path.cwd()
+
+            def fake_init(config_path: Path) -> None:
+                seen["config_path"] = config_path
+                seen["init_cwd"] = Path.cwd()
+
+            kag_config = types.SimpleNamespace(all_config={"kag_builder_pipeline": {"type": "custom_builder"}})
+            runner_module = types.ModuleType("kag.builder.runner")
+            runner_module.BuilderChainRunner = FakeBuilderChainRunner
+            conf_module = types.ModuleType("kag.common.conf")
+            conf_module.KAG_CONFIG = kag_config
+            registry_module = types.ModuleType("kag.common.registry")
+            registry_module.import_modules_from_path = fake_import_modules
+            modules = {
+                "kag": types.ModuleType("kag"),
+                "kag.builder": types.ModuleType("kag.builder"),
+                "kag.builder.runner": runner_module,
+                "kag.common": types.ModuleType("kag.common"),
+                "kag.common.conf": conf_module,
+                "kag.common.registry": registry_module,
+            }
+            original_cwd = Path.cwd()
+
+            with (
+                patch.dict(sys.modules, modules),
+                patch.object(adapter, "init_kag_config", fake_init),
+                patch.object(adapter, "ensure_local_no_proxy"),
+            ):
+                data = adapter.run_kag_build({"id": "build", "method": "kag.build", "params": params})
+                (workspace / "sources" / "intro.md").unlink()
+                replay = adapter.run_kag_build({"id": "build-replay", "method": "kag.build", "params": params})
+
+            projected = (out_dir / "kag_config.yaml").resolve()
+            self.assertEqual(Path.cwd(), original_cwd)
+            self.assertEqual(seen["config_path"], projected)
+            self.assertEqual(seen["import_path"], config_dir)
+            self.assertEqual(seen["init_cwd"], config_dir)
+            self.assertEqual(seen["import_cwd"], config_dir)
+            self.assertEqual(seen["builder_cwd"], config_dir)
+            self.assertEqual(seen["invoke_cwd"], config_dir)
+            self.assertEqual(seen["invoke_calls"], 1)
+            self.assertEqual(seen["prompt"], "source-relative prompt")
+            self.assertEqual(data["config_path"], str(projected))
+            self.assertEqual(data["idempotency_key"], "sync-projection-one")
+            self.assertEqual(replay, data)
+            self.assertTrue(adapter.build_receipt_path(out_dir.resolve(), "sync-projection-one").exists())
+
+    def test_projection_query_uses_source_config_directory_without_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            config_dir = workspace / "kag_project"
+            config_dir.mkdir()
+            config_dir = config_dir.resolve()
+            base = config_dir / "kag_config.yaml"
+            base.write_text(
+                "project:\n  namespace: shared\n"
+                "kag_solver_pipeline:\n  type: custom_solver\n",
+                encoding="utf-8",
+            )
+            (config_dir / "prompt.txt").write_text("source-relative prompt", encoding="utf-8")
+            out_dir = workspace / ".knote" / "kag-runtime" / "projections" / "projection-one"
+            params = {
+                "workspace": str(workspace),
+                "runtime_dir": str(out_dir),
+                "config_path": str(base),
+                "namespace": "projection-one",
+                "query": "hello",
+            }
+            projected = adapter.select_config(params, out_dir, generate=True)
+            before = projected.read_bytes()
+            seen: dict[str, object] = {}
+
+            class FakeSolver:
+                def run(self, query: str) -> str:
+                    seen["run_cwd"] = Path.cwd()
+                    return "answer: " + query
+
+            class FakeSolverPipelineABC:
+                @classmethod
+                def from_config(cls, pipeline: object) -> FakeSolver:
+                    seen["solver_cwd"] = Path.cwd()
+                    seen["prompt"] = Path("prompt.txt").read_text(encoding="utf-8")
+                    return FakeSolver()
+
+            def fake_import_modules(path: str) -> None:
+                seen["import_path"] = Path(path)
+
+            def fake_init(config_path: Path) -> None:
+                seen["config_path"] = config_path
+                seen["init_cwd"] = Path.cwd()
+
+            kag_config = types.SimpleNamespace(all_config={"kag_solver_pipeline": {"type": "custom_solver"}})
+            conf_module = types.ModuleType("kag.common.conf")
+            conf_module.KAG_CONFIG = kag_config
+            registry_module = types.ModuleType("kag.common.registry")
+            registry_module.import_modules_from_path = fake_import_modules
+            interface_module = types.ModuleType("kag.interface")
+            interface_module.SolverPipelineABC = FakeSolverPipelineABC
+            modules = {
+                "kag": types.ModuleType("kag"),
+                "kag.common": types.ModuleType("kag.common"),
+                "kag.common.conf": conf_module,
+                "kag.common.registry": registry_module,
+                "kag.interface": interface_module,
+            }
+
+            with (
+                patch.dict(sys.modules, modules),
+                patch.object(adapter, "init_kag_config", fake_init),
+                patch.object(adapter, "ensure_local_no_proxy"),
+            ):
+                data = adapter.run_kag_query({"id": "query", "method": "kag.query", "params": params})
+
+            self.assertEqual(seen["config_path"], projected)
+            self.assertEqual(seen["import_path"], config_dir)
+            self.assertEqual(seen["init_cwd"], config_dir)
+            self.assertEqual(seen["solver_cwd"], config_dir)
+            self.assertEqual(seen["run_cwd"], config_dir)
+            self.assertEqual(seen["prompt"], "source-relative prompt")
+            self.assertEqual(data["answer"], "answer: hello")
+            self.assertEqual(projected.read_bytes(), before)
+
     def test_projection_query_requires_prebuilt_config_without_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
