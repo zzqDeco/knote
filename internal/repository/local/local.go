@@ -103,7 +103,7 @@ func (s Store) WriteArtifacts(ctx context.Context, set repository.ArtifactSet) e
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return s.writeArtifactBundle(set)
+	return s.writeArtifactBundle(ctx, set)
 }
 
 func (s Store) ReadManifest(ctx context.Context) (protocol.ArtifactManifest, error) {

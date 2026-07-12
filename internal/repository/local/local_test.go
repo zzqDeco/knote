@@ -335,6 +335,148 @@ func TestArtifactCompatibilityPublishFailureIsNonFatalAfterPointerAdvance(t *tes
 	}
 }
 
+func TestPublishArtifactsInitialBaseAllowsExactlyOneCompetingSuccessor(t *testing.T) {
+	ctx := context.Background()
+	workspace := t.TempDir()
+	store := New(workspace)
+	first := testBundleArtifactSet(t, "prj_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "first")
+	second := testBundleArtifactSet(t, "prj_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "second")
+	if err := store.StageArtifacts(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.StageArtifacts(ctx, second); err != nil {
+		t.Fatal(err)
+	}
+
+	expected := repository.ArtifactPublicationBase{Absent: true}
+	assertOneArtifactPublicationSucceeds(t, workspace, expected, first, second)
+}
+
+func TestPublishArtifactsSameBaseAllowsExactlyOneDivergentSuccessor(t *testing.T) {
+	ctx := context.Background()
+	workspace := t.TempDir()
+	store := New(workspace)
+	base := testBundleArtifactSet(t, "prj_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "base")
+	first := testBundleArtifactSet(t, "prj_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "first")
+	second := testBundleArtifactSet(t, "prj_cccccccccccccccccccccccccccccccc", "second")
+	if err := store.WriteArtifacts(ctx, base); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.StageArtifacts(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.StageArtifacts(ctx, second); err != nil {
+		t.Fatal(err)
+	}
+
+	expected := repository.ArtifactPublicationBase{ProjectionVersion: base.BundleManifest.ProjectionVersion}
+	assertOneArtifactPublicationSucceeds(t, workspace, expected, first, second)
+}
+
+func TestPublishArtifactsLockWaitHonorsContextCancellation(t *testing.T) {
+	workspace := t.TempDir()
+	store := New(workspace)
+	candidate := testBundleArtifactSet(t, "prj_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "candidate")
+	if err := store.StageArtifacts(context.Background(), candidate); err != nil {
+		t.Fatal(err)
+	}
+	lockPath := filepath.Join(workspace, "artifacts", artifactPublicationLockName)
+	mustWrite(t, lockPath, `{"token":"active","created_at":"2026-01-01T00:00:00Z"}`)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	err := store.PublishArtifacts(
+		ctx,
+		repository.ArtifactPublicationBase{Absent: true},
+		candidate.BundleManifest,
+	)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("publication waiting on lock returned %v, want context deadline", err)
+	}
+	if _, err := os.Stat(filepath.Join(workspace, "artifacts", "current.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("canceled publication changed current pointer: %v", err)
+	}
+}
+
+func TestPublishArtifactsRecoversStaleLock(t *testing.T) {
+	ctx := context.Background()
+	workspace := t.TempDir()
+	store := New(workspace)
+	candidate := testBundleArtifactSet(t, "prj_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "candidate")
+	if err := store.StageArtifacts(ctx, candidate); err != nil {
+		t.Fatal(err)
+	}
+	lockPath := filepath.Join(workspace, "artifacts", artifactPublicationLockName)
+	mustWrite(t, lockPath, `{"token":"abandoned","created_at":"2026-01-01T00:00:00Z"}`)
+	staleTime := time.Now().Add(-2 * artifactPublicationLockStale)
+	if err := os.Chtimes(lockPath, staleTime, staleTime); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.PublishArtifacts(
+		ctx,
+		repository.ArtifactPublicationBase{Absent: true},
+		candidate.BundleManifest,
+	); err != nil {
+		t.Fatalf("publish after stale lock recovery: %v", err)
+	}
+	if _, err := os.Stat(lockPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("publication lock remained after success: %v", err)
+	}
+}
+
+func assertOneArtifactPublicationSucceeds(
+	t *testing.T,
+	workspace string,
+	expected repository.ArtifactPublicationBase,
+	first repository.ArtifactSet,
+	second repository.ArtifactSet,
+) {
+	t.Helper()
+	type result struct {
+		projectionID string
+		err          error
+	}
+	start := make(chan struct{})
+	results := make(chan result, 2)
+	for _, candidate := range []repository.ArtifactSet{first, second} {
+		candidate := candidate
+		go func() {
+			<-start
+			err := New(workspace).PublishArtifacts(context.Background(), expected, candidate.BundleManifest)
+			results <- result{projectionID: candidate.BundleManifest.ProjectionID, err: err}
+		}()
+	}
+	close(start)
+
+	var winner string
+	staleFailures := 0
+	for range 2 {
+		result := <-results
+		switch {
+		case result.err == nil:
+			if winner != "" {
+				t.Fatalf("both competing publications succeeded: %s and %s", winner, result.projectionID)
+			}
+			winner = result.projectionID
+		case errors.Is(result.err, repository.ErrArtifactPublicationStaleBase):
+			staleFailures++
+		default:
+			t.Fatalf("competing publication %s failed with unexpected error: %v", result.projectionID, result.err)
+		}
+	}
+	if winner == "" || staleFailures != 1 {
+		t.Fatalf("publication results winner=%q stale_failures=%d, want one each", winner, staleFailures)
+	}
+	current, err := New(workspace).ReadCurrentArtifactManifest(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.ProjectionID != winner {
+		t.Fatalf("current projection = %s, want successful publication %s", current.ProjectionID, winner)
+	}
+}
+
 func TestPublishArtifactsRejectsDamagedStagedBundleAndRecovers(t *testing.T) {
 	for _, mutation := range []struct {
 		name   string
@@ -394,6 +536,10 @@ func TestPublishArtifactsRejectsDamagedStagedBundleAndRecovers(t *testing.T) {
 				if err := store.StageArtifacts(ctx, candidate); err != nil {
 					t.Fatal(err)
 				}
+				base, err := store.currentArtifactPublicationBase(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
 				pointerBefore := mustRead(t, filepath.Join(workspace, "artifacts", "current.json"))
 				bundleDir := filepath.Join(workspace, "artifacts", "bundles", candidate.BundleManifest.ProjectionID)
 				publishing := Store{
@@ -404,7 +550,7 @@ func TestPublishArtifactsRejectsDamagedStagedBundleAndRecovers(t *testing.T) {
 					},
 				}
 
-				if err := publishing.PublishArtifacts(ctx, candidate.BundleManifest); err == nil {
+				if err := publishing.PublishArtifacts(ctx, base, candidate.BundleManifest); err == nil {
 					t.Fatalf("published bundle with %s %s", mutation.name, file)
 				}
 				if pointerAfter := mustRead(t, filepath.Join(workspace, "artifacts", "current.json")); pointerAfter != pointerBefore {
@@ -417,7 +563,7 @@ func TestPublishArtifactsRejectsDamagedStagedBundleAndRecovers(t *testing.T) {
 				if err := store.StageArtifacts(ctx, candidate); err != nil {
 					t.Fatalf("restage repaired candidate: %v", err)
 				}
-				if err := store.PublishArtifacts(ctx, candidate.BundleManifest); err != nil {
+				if err := store.PublishArtifacts(ctx, base, candidate.BundleManifest); err != nil {
 					t.Fatalf("publish repaired candidate: %v", err)
 				}
 				current, err := store.ReadCurrentArtifactManifest(ctx)

@@ -29,6 +29,24 @@ const (
 	maxKAGResourceBytes     = 64 << 20
 )
 
+// Keep this allowlist aligned with the non-secret environment fallbacks used by
+// adapters/kag/knote_kag_adapter.py:generate_kag_config.
+var generatedKAGSemanticEnvVars = []string{
+	"KNOTE_CHAT_LLM_BASE_URL",
+	"KNOTE_CHAT_LLM_MODEL",
+	"KNOTE_CHAT_LLM_TYPE",
+	"KNOTE_KAG_LANGUAGE",
+	"KNOTE_KAG_NAMESPACE",
+	"KNOTE_KAG_PROJECT_ID",
+	"KNOTE_OPENIE_LLM_BASE_URL",
+	"KNOTE_OPENIE_LLM_MODEL",
+	"KNOTE_OPENIE_LLM_TYPE",
+	"KNOTE_VECTOR_BASE_URL",
+	"KNOTE_VECTOR_DIMENSIONS",
+	"KNOTE_VECTOR_MODEL",
+	"KNOTE_VECTOR_TYPE",
+}
+
 type loadedSource struct {
 	source repository.Source
 	data   []byte
@@ -36,12 +54,13 @@ type loadedSource struct {
 }
 
 type projectionBuild struct {
-	store   *catalog.ProjectionStore
-	base    catalog.Projection
-	current catalog.Projection
-	plan    catalog.ProjectionPlan
-	corpus  []kag.CorpusRecord
-	noop    bool
+	store           *catalog.ProjectionStore
+	base            catalog.Projection
+	publicationBase repository.ArtifactPublicationBase
+	current         catalog.Projection
+	plan            catalog.ProjectionPlan
+	corpus          []kag.CorpusRecord
+	noop            bool
 }
 
 type projectionRootProvider interface {
@@ -72,9 +91,15 @@ func (s service) prepareArtifactProjection(ctx context.Context) (repository.Arti
 	corpus := make([]kag.CorpusRecord, 0, len(loaded))
 	for _, item := range loaded {
 		content := string(item.data)
+		if strings.TrimSpace(content) == "" {
+			continue
+		}
 		corpus = append(corpus, kag.CorpusRecord{
 			ID: item.source.Path, Name: titleFromContent(content), Content: content, SourcePath: item.source.Path,
 		})
+	}
+	if len(corpus) == 0 {
+		return repository.ArtifactSet{}, projectionBuild{}, fmt.Errorf("KAG corpus contains no non-blank sources")
 	}
 
 	namespaceBase := canonicalNamespace(firstNonEmpty(cfg.KAG.Namespace, "KnoteKB"))
@@ -279,12 +304,14 @@ func (s service) prepareArtifactProjection(ctx context.Context) (repository.Arti
 		return repository.ArtifactSet{}, projectionBuild{}, err
 	}
 
-	current, err := s.selectedBaseProjection(ctx, scope)
+	current, publicationBase, err := s.selectedBaseProjectionForPublication(ctx, scope)
 	if err != nil {
 		return repository.ArtifactSet{}, projectionBuild{}, err
 	}
 	if current.Version == projectionVersion {
-		return set, projectionBuild{base: current, current: current, corpus: corpus, noop: true}, nil
+		return set, projectionBuild{
+			base: current, publicationBase: publicationBase, current: current, corpus: corpus, noop: true,
+		}, nil
 	}
 	projectionRoot := filepath.Join(s.workspace, ".knote", "projections")
 	if provider, ok := s.repo.(projectionRootProvider); ok {
@@ -304,10 +331,13 @@ func (s service) prepareArtifactProjection(ctx context.Context) (repository.Arti
 			return repository.ArtifactSet{}, projectionBuild{}, err
 		}
 		return set, projectionBuild{
-			store: store, base: current, current: serving, corpus: corpus, noop: true,
+			store: store, base: current, publicationBase: publicationBase,
+			current: serving, corpus: corpus, noop: true,
 		}, nil
 	}
-	build := projectionBuild{store: store, base: current, current: current, corpus: corpus}
+	build := projectionBuild{
+		store: store, base: current, publicationBase: publicationBase, current: current, corpus: corpus,
+	}
 	runID, idempotencyKey, err := nextProjectionRunIdentity(store, projectionVersion)
 	if err != nil {
 		return repository.ArtifactSet{}, projectionBuild{}, err
@@ -330,22 +360,34 @@ func projectionJournalRoot(root, baseVersion, projectionVersion string) string {
 }
 
 func (s service) selectedBaseProjection(ctx context.Context, scope catalog.Scope) (catalog.Projection, error) {
+	projection, _, err := s.selectedBaseProjectionForPublication(ctx, scope)
+	return projection, err
+}
+
+func (s service) selectedBaseProjectionForPublication(
+	ctx context.Context,
+	scope catalog.Scope,
+) (catalog.Projection, repository.ArtifactPublicationBase, error) {
 	data, err := s.repo.ReadCurrentProjection(ctx)
 	if err == nil {
 		var projection catalog.Projection
 		if err := json.Unmarshal(data, &projection); err != nil {
-			return catalog.Projection{}, fmt.Errorf("decode selected artifact projection: %w", err)
+			return catalog.Projection{}, repository.ArtifactPublicationBase{}, fmt.Errorf("decode selected artifact projection: %w", err)
 		}
 		if err := projection.Validate(); err != nil {
-			return catalog.Projection{}, fmt.Errorf("validate selected artifact projection: %w", err)
+			return catalog.Projection{}, repository.ArtifactPublicationBase{}, fmt.Errorf("validate selected artifact projection: %w", err)
 		}
+		publicationBase := repository.ArtifactPublicationBase{ProjectionVersion: projection.Version}
 		if projection.Scope == scope {
-			return projection, nil
+			return projection, publicationBase, nil
 		}
+		empty, emptyErr := emptyBaseProjection(scope)
+		return empty, publicationBase, emptyErr
 	} else if !errors.Is(err, repository.ErrArtifactCurrentNotFound) {
-		return catalog.Projection{}, err
+		return catalog.Projection{}, repository.ArtifactPublicationBase{}, err
 	}
-	return emptyBaseProjection(scope)
+	empty, err := emptyBaseProjection(scope)
+	return empty, repository.ArtifactPublicationBase{Absent: true}, err
 }
 
 func emptyBaseProjection(scope catalog.Scope) (catalog.Projection, error) {
@@ -405,7 +447,10 @@ func canonicalProjectionVersion(
 }
 
 func kagBuildConfigVersion(workspace string, cfg repository.Config) (string, error) {
-	configDigest := "generated-config-v1"
+	configDigest, err := generatedKAGConfigDigest()
+	if err != nil {
+		return "", err
+	}
 	configIdentity := "generated"
 	resourceDigest := "generated-resources-v1"
 	var configPath string
@@ -461,6 +506,25 @@ func kagBuildConfigVersion(workspace string, cfg repository.Config) (string, err
 		return "", err
 	}
 	return "build_" + fullHash(data)[:24], nil
+}
+
+func generatedKAGConfigDigest() (string, error) {
+	type environmentEntry struct {
+		Name  string `json:"name"`
+		Value string `json:"value"`
+	}
+	payload := struct {
+		Schema      string             `json:"schema"`
+		Environment []environmentEntry `json:"environment"`
+	}{Schema: "generated-kag-config-v2"}
+	for _, name := range generatedKAGSemanticEnvVars {
+		payload.Environment = append(payload.Environment, environmentEntry{Name: name, Value: os.Getenv(name)})
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("digest generated KAG config: %w", err)
+	}
+	return fullHash(data), nil
 }
 
 type kagResourceDigestEntry struct {
@@ -706,7 +770,7 @@ func (s service) executeProjectionBuild(ctx context.Context, artifacts repositor
 		if err := s.verifySelectedBaseProjection(ctx, build.base); err != nil {
 			return nil, err
 		}
-		if err := s.repo.PublishArtifacts(ctx, artifacts.BundleManifest); err != nil {
+		if err := s.repo.PublishArtifacts(ctx, build.publicationBase, artifacts.BundleManifest); err != nil {
 			return nil, err
 		}
 		data := cloneMap(response.Data)
@@ -760,7 +824,7 @@ func (s service) executeProjectionBuild(ctx context.Context, artifacts repositor
 	if err := s.verifySelectedBaseProjection(ctx, build.base); err != nil {
 		return nil, err
 	}
-	if err := s.repo.PublishArtifacts(ctx, artifacts.BundleManifest); err != nil {
+	if err := s.repo.PublishArtifacts(ctx, build.publicationBase, artifacts.BundleManifest); err != nil {
 		return nil, fmt.Errorf("publish artifact serving pointer: %w", err)
 	}
 	return buildData, nil

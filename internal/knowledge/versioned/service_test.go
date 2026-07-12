@@ -355,6 +355,94 @@ func TestServiceKAGConfigurationChangeCreatesNewProjection(t *testing.T) {
 	}
 }
 
+func TestKAGBuildConfigVersionTracksGeneratedConfigSemanticEnvironment(t *testing.T) {
+	workspace := t.TempDir()
+	cfg := newMemoryRepo().config
+	secretEnvVars := []string{
+		"KNOTE_CHAT_LLM_API_KEY",
+		"KNOTE_OPENIE_LLM_API_KEY",
+		"KNOTE_VECTOR_API_KEY",
+	}
+	for _, name := range append(append([]string(nil), generatedKAGSemanticEnvVars...), secretEnvVars...) {
+		t.Setenv(name, "")
+	}
+
+	baseline, err := kagBuildConfigVersion(workspace, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	semanticValues := map[string]string{
+		"KNOTE_CHAT_LLM_BASE_URL":   "https://chat.example/v1",
+		"KNOTE_CHAT_LLM_MODEL":      "chat-v2",
+		"KNOTE_CHAT_LLM_TYPE":       "custom-chat",
+		"KNOTE_KAG_LANGUAGE":        "zh",
+		"KNOTE_KAG_NAMESPACE":       "GeneratedEnvKB",
+		"KNOTE_KAG_PROJECT_ID":      "42",
+		"KNOTE_OPENIE_LLM_BASE_URL": "https://openie.example/v1",
+		"KNOTE_OPENIE_LLM_MODEL":    "openie-v2",
+		"KNOTE_OPENIE_LLM_TYPE":     "custom-openie",
+		"KNOTE_VECTOR_BASE_URL":     "https://vector.example/v1",
+		"KNOTE_VECTOR_DIMENSIONS":   "2048",
+		"KNOTE_VECTOR_MODEL":        "embed-v2",
+		"KNOTE_VECTOR_TYPE":         "custom-vector",
+	}
+	if len(semanticValues) != len(generatedKAGSemanticEnvVars) {
+		t.Fatalf("semantic environment test covers %d variables, allowlist has %d", len(semanticValues), len(generatedKAGSemanticEnvVars))
+	}
+	for _, name := range generatedKAGSemanticEnvVars {
+		name := name
+		t.Run(name, func(t *testing.T) {
+			t.Setenv(name, semanticValues[name])
+			changed, err := kagBuildConfigVersion(workspace, cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if changed == baseline {
+				t.Fatalf("semantic environment change %s did not change build config version", name)
+			}
+			repeated, err := kagBuildConfigVersion(workspace, cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if repeated != changed {
+				t.Fatalf("unchanged semantic environment was unstable: first=%s second=%s", changed, repeated)
+			}
+		})
+	}
+
+	for _, name := range secretEnvVars {
+		t.Setenv(name, "rotated-secret")
+	}
+	t.Setenv("KNOTE_UNRELATED_SETTING", "ignored")
+	withCredentials, err := kagBuildConfigVersion(workspace, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if withCredentials != baseline {
+		t.Fatalf("credentials or unrelated environment changed generated config identity: baseline=%s changed=%s", baseline, withCredentials)
+	}
+}
+
+func TestKAGBuildConfigVersionIgnoresGeneratedEnvironmentWithCheckedInConfig(t *testing.T) {
+	workspace := t.TempDir()
+	writeKAGTestFile(t, filepath.Join(workspace, "kag_config.yaml"), "project:\n  namespace: checked-in\n")
+	cfg := newMemoryRepo().config
+
+	t.Setenv("KNOTE_OPENIE_LLM_MODEL", "first")
+	first, err := kagBuildConfigVersion(workspace, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("KNOTE_OPENIE_LLM_MODEL", "second")
+	second, err := kagBuildConfigVersion(workspace, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second != first {
+		t.Fatalf("generated-config environment changed checked-in config identity: first=%s second=%s", first, second)
+	}
+}
+
 func TestKAGBuildConfigVersionTracksResourceTreeAndExcludesGeneratedState(t *testing.T) {
 	workspace := t.TempDir()
 	writeKAGTestFile(t, filepath.Join(workspace, "kag_config.yaml"), "project:\n  namespace: resource-test\n")
@@ -580,6 +668,51 @@ func TestServiceBuildUsesPreparedSourceBytesAfterSourceMutation(t *testing.T) {
 	got := backend.buildCorpora[0][0]
 	if got.Content != "# Original\n\nprepared bytes\n" || got.SourcePath != "sources/intro.md" || got.Name != "Original" {
 		t.Fatalf("KAG corpus was not pinned to prepared bytes: %+v", got)
+	}
+}
+
+func TestServiceBuildSkipsBlankSourcesOnlyFromKAGCorpus(t *testing.T) {
+	ctx := context.Background()
+	repo := newMemoryRepo()
+	repo.config.KAG.Namespace = "BlankCorpusTest"
+	repo.sources["sources/blank.md"] = " \n\t\r\n"
+	repo.sources["sources/content.md"] = "# Content\n\nindexed bytes\n"
+	backend := &recordingNamespacedBackend{}
+	svc := New(Options{Workspace: repo.config.Workspace, Repo: repo, Backend: backend, Mode: ModeFake})
+
+	result, err := svc.Build(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Manifest.SourceCount != 2 || result.Manifest.DocumentCount != 2 {
+		t.Fatalf("blank source was not represented in artifacts: %+v", result.Manifest)
+	}
+	if len(backend.buildCorpora) != 1 || len(backend.buildCorpora[0]) != 1 {
+		t.Fatalf("KAG corpus = %+v, want only the non-blank source", backend.buildCorpora)
+	}
+	got := backend.buildCorpora[0][0]
+	if got.SourcePath != "sources/content.md" || got.Content != repo.sources["sources/content.md"] {
+		t.Fatalf("KAG corpus record = %+v, want content source", got)
+	}
+}
+
+func TestServiceBuildFailsClosedWhenKAGCorpusHasOnlyBlankSources(t *testing.T) {
+	ctx := context.Background()
+	repo := newMemoryRepo()
+	repo.sources["sources/blank.md"] = " \n\t\r\n"
+	repo.sources["sources/also-blank.txt"] = "\n\n"
+	backend := &recordingNamespacedBackend{}
+	svc := New(Options{Workspace: repo.config.Workspace, Repo: repo, Backend: backend, Mode: ModeFake})
+
+	_, err := svc.Build(ctx)
+	if err == nil || !strings.Contains(err.Error(), "KAG corpus contains no non-blank sources") {
+		t.Fatalf("all-blank KAG corpus error = %v", err)
+	}
+	if backend.buildCalls != 0 {
+		t.Fatalf("all-blank KAG corpus invoked backend %d time(s)", backend.buildCalls)
+	}
+	if repo.writeArtifactsCalls != 0 {
+		t.Fatalf("all-blank KAG corpus staged artifacts %d time(s)", repo.writeArtifactsCalls)
 	}
 }
 
@@ -962,7 +1095,11 @@ func (r *memoryRepo) StageArtifacts(_ context.Context, set repository.ArtifactSe
 	return nil
 }
 
-func (r *memoryRepo) PublishArtifacts(context.Context, protocol.ArtifactBundleManifest) error {
+func (r *memoryRepo) PublishArtifacts(
+	context.Context,
+	repository.ArtifactPublicationBase,
+	protocol.ArtifactBundleManifest,
+) error {
 	if r.publishErr != nil {
 		return r.publishErr
 	}

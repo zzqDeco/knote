@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"time"
 
 	"github.com/zzqDeco/knote/internal/protocol"
 	"github.com/zzqDeco/knote/internal/repository"
@@ -19,7 +20,13 @@ import (
 
 const bundleManifestName = "manifest.json"
 
-func (s Store) writeArtifactBundle(set repository.ArtifactSet) error {
+const (
+	artifactPublicationLockName  = ".current.json.lock"
+	artifactPublicationLockStale = time.Minute
+	artifactPublicationLockPoll  = 10 * time.Millisecond
+)
+
+func (s Store) writeArtifactBundle(ctx context.Context, set repository.ArtifactSet) error {
 	if set.BundleManifest.Version == 0 {
 		payloads, err := repository.CanonicalArtifactFiles(set)
 		if err != nil {
@@ -31,10 +38,14 @@ func (s Store) writeArtifactBundle(set repository.ArtifactSet) error {
 		}
 		return writeCompatibilityExports(artifactsDir, set.Manifest, payloads)
 	}
-	if err := s.StageArtifacts(context.Background(), set); err != nil {
+	base, err := s.currentArtifactPublicationBase(ctx)
+	if err != nil {
 		return err
 	}
-	return s.PublishArtifacts(context.Background(), set.BundleManifest)
+	if err := s.StageArtifacts(ctx, set); err != nil {
+		return err
+	}
+	return s.PublishArtifacts(ctx, base, set.BundleManifest)
 }
 
 // StageArtifacts writes and verifies an immutable candidate bundle and the v1
@@ -78,9 +89,16 @@ func (s Store) StageArtifacts(ctx context.Context, set repository.ArtifactSet) e
 // PublishArtifacts atomically selects a fully staged immutable bundle. The
 // caller must only invoke this after the canonical ProjectionStore CAS has
 // published the same projection version.
-func (s Store) PublishArtifacts(ctx context.Context, manifest protocol.ArtifactBundleManifest) error {
+func (s Store) PublishArtifacts(
+	ctx context.Context,
+	base repository.ArtifactPublicationBase,
+	manifest protocol.ArtifactBundleManifest,
+) error {
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if err := base.Validate(); err != nil {
+		return fmt.Errorf("validate artifact publication base: %w", err)
 	}
 	if err := manifest.Validate(); err != nil {
 		return err
@@ -135,12 +153,27 @@ func (s Store) PublishArtifacts(ctx context.Context, manifest protocol.ArtifactB
 	if err := verifyStagedArtifactBundle(bundleDir, manifest, manifestData); err != nil {
 		return err
 	}
+	publicationLock, err := acquireArtifactPublicationLock(ctx, artifactsDir)
+	if err != nil {
+		return err
+	}
+	defer publicationLock.release()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := compareArtifactPublicationBase(currentPath, base); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := replaceArtifactFile(pointerTemporary, currentPath); err != nil {
 		return err
 	}
 	if err := syncArtifactDirectory(artifactsDir); err != nil {
 		return err
 	}
+	publicationLock.release()
 	// current.json is the serving commit point. Compatibility exports are
 	// best-effort after it advances so a partial legacy refresh cannot turn a
 	// successfully selected bundle into a failed build.
@@ -151,6 +184,64 @@ func (s Store) PublishArtifacts(ctx context.Context, manifest protocol.ArtifactB
 	}
 	_ = compatibility.publish()
 	return nil
+}
+
+func (s Store) currentArtifactPublicationBase(ctx context.Context) (repository.ArtifactPublicationBase, error) {
+	if err := ctx.Err(); err != nil {
+		return repository.ArtifactPublicationBase{}, err
+	}
+	pointer, err := readArtifactCurrentPointer(filepath.Join(s.workspace, "artifacts", "current.json"))
+	if errors.Is(err, os.ErrNotExist) {
+		return repository.ArtifactPublicationBase{Absent: true}, nil
+	}
+	if err != nil {
+		return repository.ArtifactPublicationBase{}, err
+	}
+	return repository.ArtifactPublicationBase{ProjectionVersion: pointer.ProjectionVersion}, nil
+}
+
+func compareArtifactPublicationBase(path string, expected repository.ArtifactPublicationBase) error {
+	pointer, err := readArtifactCurrentPointer(path)
+	if errors.Is(err, os.ErrNotExist) {
+		if expected.Absent {
+			return nil
+		}
+		return fmt.Errorf(
+			"artifact publication expected base %s but current pointer is absent: %w",
+			expected.ProjectionVersion, repository.ErrArtifactPublicationStaleBase,
+		)
+	}
+	if err != nil {
+		return err
+	}
+	if expected.Absent {
+		return fmt.Errorf(
+			"artifact publication expected no current pointer but found %s: %w",
+			pointer.ProjectionVersion, repository.ErrArtifactPublicationStaleBase,
+		)
+	}
+	if pointer.ProjectionVersion != expected.ProjectionVersion {
+		return fmt.Errorf(
+			"artifact publication expected base %s but found %s: %w",
+			expected.ProjectionVersion, pointer.ProjectionVersion, repository.ErrArtifactPublicationStaleBase,
+		)
+	}
+	return nil
+}
+
+func readArtifactCurrentPointer(path string) (protocol.ArtifactCurrentPointer, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return protocol.ArtifactCurrentPointer{}, err
+	}
+	var pointer protocol.ArtifactCurrentPointer
+	if err := json.Unmarshal(data, &pointer); err != nil {
+		return protocol.ArtifactCurrentPointer{}, fmt.Errorf("decode artifact current pointer: %w", err)
+	}
+	if err := pointer.Validate(); err != nil {
+		return protocol.ArtifactCurrentPointer{}, fmt.Errorf("validate artifact current pointer: %w", err)
+	}
+	return pointer, nil
 }
 
 func (s Store) ReadCurrentArtifactManifest(ctx context.Context) (protocol.ArtifactBundleManifest, error) {

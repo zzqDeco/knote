@@ -259,7 +259,11 @@ func (r *memoryRepo) StageArtifacts(_ context.Context, set repository.ArtifactSe
 	return nil
 }
 
-func (r *memoryRepo) PublishArtifacts(_ context.Context, manifest protocol.ArtifactBundleManifest) error {
+func (r *memoryRepo) PublishArtifacts(
+	_ context.Context,
+	_ repository.ArtifactPublicationBase,
+	manifest protocol.ArtifactBundleManifest,
+) error {
 	if r.stagedArtifacts.BundleManifest.ProjectionVersion != manifest.ProjectionVersion {
 		return fmt.Errorf("staged projection does not match published manifest")
 	}
