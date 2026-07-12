@@ -75,7 +75,20 @@ func invokeTool(ctx context.Context, tools map[string]einotool.InvokableTool, se
 	events = append(events, versionEventsForTool(sessionID, toolName, decoded)...)
 	if toolName == einotools.NameBuild {
 		if manifest, ok := decodedMap(decoded)["manifest"]; ok {
-			events = append(events, protocol.NewEvent(protocol.EventBuildComplete, sessionID, "Build complete", manifest))
+			buildPayload := make(map[string]any)
+			for key, value := range decodedMap(manifest) {
+				buildPayload[key] = value
+			}
+			if bundle, exists := decodedMap(decoded)["bundle_manifest"]; exists {
+				buildPayload["bundle_manifest"] = bundle
+				if bundleMap := decodedMap(bundle); len(bundleMap) != 0 {
+					buildPayload["projection_version"] = bundleMap["projection_version"]
+					buildPayload["namespace"] = bundleMap["namespace"]
+					buildPayload["authz_object"] = bundleMap["authz_object"]
+					buildPayload["authz_version"] = bundleMap["authz_version"]
+				}
+			}
+			events = append(events, protocol.NewEvent(protocol.EventBuildComplete, sessionID, "Build complete", buildPayload))
 		}
 	}
 	if toolName == einotools.NameEval {

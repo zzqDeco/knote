@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -15,11 +16,17 @@ import (
 )
 
 type Store struct {
-	workspace string
+	workspace                  string
+	beforePointerWrite         func(protocol.ArtifactCurrentPointer) error
+	beforeCompatibilityPublish func() error
 }
 
 func New(workspace string) Store {
 	return Store{workspace: workspace}
+}
+
+func (s Store) ProjectionStoreRoot() string {
+	return filepath.Join(s.workspace, ".knote", "projections")
 }
 
 func (s Store) Config(ctx context.Context) (repository.Config, error) {
@@ -96,57 +103,16 @@ func (s Store) WriteArtifacts(ctx context.Context, set repository.ArtifactSet) e
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	dir := filepath.Join(s.workspace, "artifacts")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
-	}
-
-	documents := append([]protocol.Document(nil), set.Documents...)
-	chunks := append([]protocol.Chunk(nil), set.Chunks...)
-	entities := append([]protocol.Entity(nil), set.Entities...)
-	relations := append([]protocol.Relation(nil), set.Relations...)
-	claims := append([]protocol.Claim(nil), set.Claims...)
-	summaries := append([]protocol.Summary(nil), set.Summaries...)
-	sort.Slice(documents, func(i, j int) bool {
-		if documents[i].DocumentID != documents[j].DocumentID {
-			return documents[i].DocumentID < documents[j].DocumentID
-		}
-		return documents[i].Path < documents[j].Path
-	})
-	sort.Slice(chunks, func(i, j int) bool { return chunks[i].ChunkID < chunks[j].ChunkID })
-	sort.Slice(entities, func(i, j int) bool { return entities[i].EntityID < entities[j].EntityID })
-	sort.Slice(relations, func(i, j int) bool { return relations[i].RelationID < relations[j].RelationID })
-	sort.Slice(claims, func(i, j int) bool { return claims[i].ClaimID < claims[j].ClaimID })
-	sort.Slice(summaries, func(i, j int) bool { return summaries[i].SummaryID < summaries[j].SummaryID })
-
-	writes := []struct {
-		name  string
-		value any
-	}{
-		{name: "documents.jsonl", value: documents},
-		{name: "chunks.jsonl", value: chunks},
-		{name: "entities.jsonl", value: entities},
-		{name: "relations.jsonl", value: relations},
-		{name: "claims.jsonl", value: claims},
-		{name: "summaries.jsonl", value: summaries},
-	}
-	for _, write := range writes {
-		if err := writeJSONL(filepath.Join(dir, write.name), write.value); err != nil {
-			return err
-		}
-	}
-	if err := writeJSON(filepath.Join(dir, "manifest.json"), set.Manifest); err != nil {
-		return err
-	}
-	schema := firstNonEmpty(set.SchemaYAML, defaultSchemaYAML)
-	if err := atomicWriteText(filepath.Join(dir, "schema.yaml"), schema); err != nil {
-		return err
-	}
-	return atomicWriteText(filepath.Join(dir, "build_report.md"), set.BuildReport)
+	return s.writeArtifactBundle(ctx, set)
 }
 
 func (s Store) ReadManifest(ctx context.Context) (protocol.ArtifactManifest, error) {
 	if err := ctx.Err(); err != nil {
+		return protocol.ArtifactManifest{}, err
+	}
+	if manifest, err := s.ReadCurrentArtifactManifest(ctx); err == nil {
+		return manifest.Compatibility, nil
+	} else if !errors.Is(err, repository.ErrArtifactCurrentNotFound) {
 		return protocol.ArtifactManifest{}, err
 	}
 	data, err := os.ReadFile(filepath.Join(s.workspace, "artifacts", "manifest.json"))
@@ -164,8 +130,14 @@ func (s Store) ReadSummaries(ctx context.Context) ([]protocol.Summary, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	path := filepath.Join(s.workspace, "artifacts", "summaries.jsonl")
+	if manifest, err := s.ReadCurrentArtifactManifest(ctx); err == nil {
+		path = filepath.Join(s.workspace, "artifacts", "bundles", manifest.ProjectionID, "summaries.jsonl")
+	} else if !errors.Is(err, repository.ErrArtifactCurrentNotFound) {
+		return nil, err
+	}
 	var summaries []protocol.Summary
-	if err := readJSONL(filepath.Join(s.workspace, "artifacts", "summaries.jsonl"), func(data []byte) error {
+	if err := readJSONL(path, func(data []byte) error {
 		var summary protocol.Summary
 		if err := json.Unmarshal(data, &summary); err != nil {
 			return err

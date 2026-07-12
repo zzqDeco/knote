@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -42,6 +43,13 @@ type Response struct {
 	Data    map[string]any `json:"data,omitempty"`
 	Error   string         `json:"error,omitempty"`
 	raw     json.RawMessage
+}
+
+type CorpusRecord struct {
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	Content    string `json:"content"`
+	SourcePath string `json:"source_path"`
 }
 
 func (r *Response) UnmarshalJSON(data []byte) error {
@@ -84,8 +92,11 @@ func IsUnsupportedPrimitive(err error) bool {
 type Backend interface {
 	Health(ctx context.Context) (Response, error)
 	Build(ctx context.Context) (Response, error)
+	BuildInNamespace(ctx context.Context, namespace, idempotencyKey string) (Response, error)
 	Query(ctx context.Context, query string) (Response, error)
+	QueryInNamespace(ctx context.Context, namespace, query string) (Response, error)
 	Explain(ctx context.Context, query string) (Response, error)
+	ExplainInNamespace(ctx context.Context, namespace, query string) (Response, error)
 }
 
 func (c Client) Health(ctx context.Context) (Response, error) {
@@ -96,12 +107,49 @@ func (c Client) Build(ctx context.Context) (Response, error) {
 	return c.call(ctx, "kag.build", c.params(nil))
 }
 
+// BuildInNamespace sends idempotency_key as a durable adapter request token.
+// The adapter must return the same logical result when that token is replayed.
+func (c Client) BuildInNamespace(ctx context.Context, namespace, idempotencyKey string) (Response, error) {
+	return c.call(ctx, "kag.build", c.projectionParams(namespace, map[string]any{
+		"idempotency_key": idempotencyKey,
+	}))
+}
+
+// BuildInNamespaceWithCorpus pins the build to caller-prepared source bytes.
+func (c Client) BuildInNamespaceWithCorpus(ctx context.Context, namespace, idempotencyKey string, corpus []CorpusRecord) (Response, error) {
+	return c.call(ctx, "kag.build", c.projectionParams(namespace, map[string]any{
+		"idempotency_key": idempotencyKey,
+		"corpus":          append([]CorpusRecord(nil), corpus...),
+	}))
+}
+
 func (c Client) Query(ctx context.Context, query string) (Response, error) {
 	return c.call(ctx, "kag.query", c.params(map[string]any{"query": query}))
 }
 
+func (c Client) QueryInNamespace(ctx context.Context, namespace, query string) (Response, error) {
+	return c.call(ctx, "kag.query", c.projectionParams(namespace, map[string]any{"query": query}))
+}
+
 func (c Client) Explain(ctx context.Context, query string) (Response, error) {
 	return c.call(ctx, "kag.explain", c.params(map[string]any{"query": query}))
+}
+
+func (c Client) ExplainInNamespace(ctx context.Context, namespace, query string) (Response, error) {
+	return c.call(ctx, "kag.explain", c.projectionParams(namespace, map[string]any{"query": query}))
+}
+
+func (c Client) projectionParams(namespace string, extra map[string]any) map[string]any {
+	namespace = strings.TrimSpace(namespace)
+	params := c.params(extra)
+	params["namespace"] = namespace
+	params["projection_isolated"] = true
+	runtimeDir := strings.TrimSpace(c.RuntimeDir)
+	if runtimeDir == "" {
+		runtimeDir = filepath.Join(".knote", "kag-runtime")
+	}
+	params["runtime_dir"] = filepath.Join(runtimeDir, "projections", namespace)
+	return params
 }
 
 func (c Client) params(extra map[string]any) map[string]any {

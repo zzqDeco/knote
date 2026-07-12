@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -60,6 +61,60 @@ def candidate_resource_id(candidate: dict[str, object]) -> str:
 
 def fake_resource_handle(resource_id: str) -> dict[str, object]:
     return adapter.copy_fake_candidate(resource_id)["resource"]
+
+
+def initialize_checkout_projection(
+    workspace: Path, namespace: str = "projection-one"
+) -> tuple[Path, Path, str]:
+    projection_id = "prj_" + "a" * 32
+    base = workspace / ".knote" / "kag_config.yaml"
+    base.parent.mkdir(parents=True)
+    base.write_text(
+        "project:\n  namespace: shared\n  checkpoint_path: shared/ckpt\n"
+        "kag_solver_pipeline:\n  type: custom_solver\n",
+        encoding="utf-8",
+    )
+    manifest = {
+        "version": 2,
+        "projection_id": projection_id,
+        "projection_version": projection_id,
+        "namespace": namespace,
+    }
+    manifest_path = workspace / "artifacts" / "bundles" / projection_id / "manifest.json"
+    manifest_path.parent.mkdir(parents=True)
+    manifest_data = json.dumps(manifest, sort_keys=True, indent=2).encode("utf-8") + b"\n"
+    manifest_path.write_bytes(manifest_data)
+    current = {
+        "version": 2,
+        "projection_id": projection_id,
+        "projection_version": projection_id,
+        "manifest_sha256": hashlib.sha256(manifest_data).hexdigest(),
+    }
+    (workspace / "artifacts" / "current.json").write_text(
+        json.dumps(current, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    (workspace / ".gitignore").write_text(".knote/kag-runtime/\n", encoding="utf-8")
+    subprocess.run(["git", "init"], cwd=workspace, text=True, capture_output=True, check=True)
+    subprocess.run(["git", "add", "."], cwd=workspace, text=True, capture_output=True, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=knote-test",
+            "-c",
+            "user.email=knote-test@example.invalid",
+            "commit",
+            "-m",
+            "checkout fixture",
+        ],
+        cwd=workspace,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    runtime = (workspace / ".knote" / "kag-runtime" / "projections" / namespace).resolve()
+    return base, runtime, projection_id
 
 
 class AdapterTest(unittest.TestCase):
@@ -760,6 +815,488 @@ class AdapterTest(unittest.TestCase):
             with self.assertRaisesRegex(FileNotFoundError, "explicit KAG config not found"):
                 adapter.select_config(params, workspace / ".knote" / "kag-runtime")
 
+    def test_projection_namespace_materializes_isolated_explicit_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            base = workspace / ".knote" / "kag_config.yaml"
+            base.parent.mkdir(parents=True)
+            base.write_text(
+                "project:\n  host_addr: http://127.0.0.1:8887\n  namespace: shared\n  checkpoint_path: shared/ckpt\n",
+                encoding="utf-8",
+            )
+            out_dir = workspace / ".knote" / "kag-runtime" / "projections" / "projection-one"
+            selected = adapter.select_config(
+                {
+                    "workspace": str(workspace),
+                    "config_path": str(base),
+                    "namespace": "projection-one",
+                },
+                out_dir,
+            )
+            text = selected.read_text(encoding="utf-8")
+            self.assertEqual(selected, (out_dir / "kag_config.yaml").resolve())
+            self.assertIn('namespace: "projection-one"', text)
+            self.assertIn(f'checkpoint_path: "{out_dir / "ckpt"}"', text)
+            self.assertIn("namespace: shared", base.read_text(encoding="utf-8"))
+
+    def test_projection_build_scopes_checkpoint_to_idempotency_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            base = workspace / ".knote" / "kag_config.yaml"
+            base.parent.mkdir(parents=True)
+            base.write_text(
+                "project:\n  namespace: shared\n  checkpoint_path: shared/ckpt\n",
+                encoding="utf-8",
+            )
+            out_dir = workspace / ".knote" / "kag-runtime" / "projections" / "projection-one"
+            key = "sync-projection-one"
+            params = {
+                "workspace": str(workspace),
+                "config_path": str(base),
+                "namespace": "projection-one",
+                "idempotency_key": key,
+            }
+
+            selected = adapter.select_config(params, out_dir, generate=True)
+            digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+            expected_checkpoint = out_dir / "ckpt" / "runs" / digest
+            self.assertIn(f'checkpoint_path: "{expected_checkpoint}"', selected.read_text(encoding="utf-8"))
+
+            before = selected.read_bytes()
+            self.assertEqual(adapter.select_config(params, out_dir, generate=False).read_bytes(), before)
+
+    def test_projection_config_accepts_inline_comment_and_anchor_project_mappings(self) -> None:
+        cases = {
+            "inline": (
+                "project: {host_addr: http://127.0.0.1:8887, namespace: shared, checkpoint_path: shared/ckpt}\n"
+                "openie_llm:\n  api_key: !ENV KNOTE_OPENIE_LLM_API_KEY\n"
+                "kag_builder_pipeline:\n  type: custom_builder\n"
+            ),
+            "comment": (
+                "project: # shared project settings\n"
+                "  host_addr: http://127.0.0.1:8887\n"
+                "  namespace: shared\n"
+                "kag_builder_pipeline:\n  type: custom_builder\n"
+            ),
+            "anchor": (
+                "project: &shared_project\n"
+                "  host_addr: http://127.0.0.1:8887\n"
+                "  namespace: shared\n"
+                "project_copy: *shared_project\n"
+                "kag_builder_pipeline:\n  type: custom_builder\n"
+            ),
+        }
+        for name, config in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                workspace = Path(tmp)
+                base = workspace / ".knote" / "kag_config.yaml"
+                base.parent.mkdir(parents=True)
+                base.write_text(config, encoding="utf-8")
+                out_dir = workspace / ".knote" / "kag-runtime" / "projections" / "projection-one"
+                key = f"sync-{name}"
+
+                selected = adapter.select_config(
+                    {
+                        "workspace": str(workspace),
+                        "config_path": str(base),
+                        "namespace": "projection-one",
+                        "idempotency_key": key,
+                    },
+                    out_dir,
+                )
+
+                digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+                text = selected.read_text(encoding="utf-8")
+                self.assertIn('namespace: "projection-one"', text)
+                self.assertIn(f'checkpoint_path: "{out_dir / "ckpt" / "runs" / digest}"', text)
+                if name == "inline":
+                    self.assertIn("api_key: !ENV KNOTE_OPENIE_LLM_API_KEY", text)
+                self.assertIn("kag_builder_pipeline:\n  type: custom_builder", text)
+                self.assertEqual(base.read_text(encoding="utf-8"), config)
+                if name == "inline":
+                    self.assertIn("project: {host_addr:", text)
+                    self.assertNotIn("namespace: shared", text)
+                    self.assertNotIn("checkpoint_path: shared/ckpt", text)
+                elif name == "comment":
+                    self.assertIn("project: # shared project settings", text)
+                else:
+                    self.assertIn("project: &shared_project", text)
+                    self.assertIn("project_copy: *shared_project", text)
+
+    def test_projection_config_rejects_malformed_project_mapping(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            base = workspace / "kag_config.yaml"
+            base.write_text("project: {host_addr: http://127.0.0.1:8887\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(RuntimeError, "invalid KAG config YAML"):
+                adapter.projection_config(
+                    base,
+                    workspace / ".knote" / "kag-runtime" / "projections" / "projection-one",
+                    {"workspace": str(workspace), "namespace": "projection-one"},
+                )
+
+    def test_projection_config_rejects_non_mapping_project(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            base = workspace / "kag_config.yaml"
+            base.write_text("project: not-a-mapping\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(RuntimeError, "project section must be a mapping"):
+                adapter.projection_config(
+                    base,
+                    workspace / ".knote" / "kag-runtime" / "projections" / "projection-one",
+                    {"workspace": str(workspace), "namespace": "projection-one"},
+                )
+
+    def test_projection_build_uses_source_config_directory_for_imports_and_resources(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            config_dir = workspace / "kag_project"
+            config_dir.mkdir()
+            config_dir = config_dir.resolve()
+            base = config_dir / "kag_config.yaml"
+            base.write_text(
+                "project:\n  namespace: shared\n"
+                "kag_builder_pipeline:\n  type: custom_builder\n",
+                encoding="utf-8",
+            )
+            (config_dir / "prompt.txt").write_text("source-relative prompt", encoding="utf-8")
+            (workspace / "sources").mkdir()
+            (workspace / "sources" / "intro.md").write_text("# Intro", encoding="utf-8")
+            out_dir = workspace / ".knote" / "kag-runtime" / "projections" / "projection-one"
+            params = {
+                "workspace": str(workspace),
+                "runtime_dir": str(out_dir),
+                "config_path": str(base),
+                "namespace": "projection-one",
+                "idempotency_key": "sync-projection-one",
+            }
+            seen: dict[str, object] = {}
+
+            class FakeBuilderChainRunner:
+                @classmethod
+                def from_config(cls, pipeline: object) -> "FakeBuilderChainRunner":
+                    seen["builder_cwd"] = Path.cwd()
+                    seen["prompt"] = Path("prompt.txt").read_text(encoding="utf-8")
+                    return cls()
+
+                def invoke(self, corpus_path: str) -> None:
+                    seen["invoke_cwd"] = Path.cwd()
+                    seen["invoke_calls"] = int(seen.get("invoke_calls", 0)) + 1
+                    adapter.build_checkpoint_path(out_dir, params).mkdir(parents=True, exist_ok=True)
+                    print("Done process 1 records, with 1 successfully processed and 0 failures encountered")
+
+            def fake_import_modules(path: str) -> None:
+                seen["import_path"] = Path(path)
+                seen["import_cwd"] = Path.cwd()
+
+            def fake_init(config_path: Path) -> None:
+                seen["config_path"] = config_path
+                seen["init_cwd"] = Path.cwd()
+
+            kag_config = types.SimpleNamespace(all_config={"kag_builder_pipeline": {"type": "custom_builder"}})
+            runner_module = types.ModuleType("kag.builder.runner")
+            runner_module.BuilderChainRunner = FakeBuilderChainRunner
+            conf_module = types.ModuleType("kag.common.conf")
+            conf_module.KAG_CONFIG = kag_config
+            registry_module = types.ModuleType("kag.common.registry")
+            registry_module.import_modules_from_path = fake_import_modules
+            modules = {
+                "kag": types.ModuleType("kag"),
+                "kag.builder": types.ModuleType("kag.builder"),
+                "kag.builder.runner": runner_module,
+                "kag.common": types.ModuleType("kag.common"),
+                "kag.common.conf": conf_module,
+                "kag.common.registry": registry_module,
+            }
+            original_cwd = Path.cwd()
+
+            with (
+                patch.dict(sys.modules, modules),
+                patch.object(adapter, "init_kag_config", fake_init),
+                patch.object(adapter, "ensure_local_no_proxy"),
+            ):
+                data = adapter.run_kag_build({"id": "build", "method": "kag.build", "params": params})
+                (workspace / "sources" / "intro.md").unlink()
+                replay = adapter.run_kag_build({"id": "build-replay", "method": "kag.build", "params": params})
+                (workspace / "sources" / "intro.md").write_text("# Intro", encoding="utf-8")
+                adapter.build_checkpoint_path(out_dir, params).rmdir()
+                rebuilt = adapter.run_kag_build({"id": "build-repair", "method": "kag.build", "params": params})
+
+            projected = (out_dir / "kag_config.yaml").resolve()
+            self.assertEqual(Path.cwd(), original_cwd)
+            self.assertEqual(seen["config_path"], projected)
+            self.assertEqual(seen["import_path"], config_dir)
+            self.assertEqual(seen["init_cwd"], config_dir)
+            self.assertEqual(seen["import_cwd"], config_dir)
+            self.assertEqual(seen["builder_cwd"], config_dir)
+            self.assertEqual(seen["invoke_cwd"], config_dir)
+            self.assertEqual(seen["invoke_calls"], 2)
+            self.assertEqual(seen["prompt"], "source-relative prompt")
+            self.assertEqual(data["config_path"], str(projected))
+            self.assertEqual(data["idempotency_key"], "sync-projection-one")
+            self.assertEqual(replay, data)
+            self.assertEqual(rebuilt, data)
+            self.assertTrue(adapter.build_receipt_path(out_dir.resolve(), "sync-projection-one").exists())
+
+    def test_projection_query_uses_source_config_directory_without_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            config_dir = workspace / "kag_project"
+            config_dir.mkdir()
+            config_dir = config_dir.resolve()
+            base = config_dir / "kag_config.yaml"
+            base.write_text(
+                "project:\n  namespace: shared\n"
+                "kag_solver_pipeline:\n  type: custom_solver\n",
+                encoding="utf-8",
+            )
+            (config_dir / "prompt.txt").write_text("source-relative prompt", encoding="utf-8")
+            out_dir = workspace / ".knote" / "kag-runtime" / "projections" / "projection-one"
+            params = {
+                "workspace": str(workspace),
+                "runtime_dir": str(out_dir),
+                "config_path": str(base),
+                "namespace": "projection-one",
+                "query": "hello",
+            }
+            projected = adapter.select_config(params, out_dir, generate=True)
+            before = projected.read_bytes()
+            seen: dict[str, object] = {}
+
+            class FakeSolver:
+                def run(self, query: str) -> str:
+                    seen["run_cwd"] = Path.cwd()
+                    return "answer: " + query
+
+            class FakeSolverPipelineABC:
+                @classmethod
+                def from_config(cls, pipeline: object) -> FakeSolver:
+                    seen["solver_cwd"] = Path.cwd()
+                    seen["prompt"] = Path("prompt.txt").read_text(encoding="utf-8")
+                    return FakeSolver()
+
+            def fake_import_modules(path: str) -> None:
+                seen["import_path"] = Path(path)
+
+            def fake_init(config_path: Path) -> None:
+                seen["config_path"] = config_path
+                seen["init_cwd"] = Path.cwd()
+
+            kag_config = types.SimpleNamespace(all_config={"kag_solver_pipeline": {"type": "custom_solver"}})
+            conf_module = types.ModuleType("kag.common.conf")
+            conf_module.KAG_CONFIG = kag_config
+            registry_module = types.ModuleType("kag.common.registry")
+            registry_module.import_modules_from_path = fake_import_modules
+            interface_module = types.ModuleType("kag.interface")
+            interface_module.SolverPipelineABC = FakeSolverPipelineABC
+            modules = {
+                "kag": types.ModuleType("kag"),
+                "kag.common": types.ModuleType("kag.common"),
+                "kag.common.conf": conf_module,
+                "kag.common.registry": registry_module,
+                "kag.interface": interface_module,
+            }
+
+            with (
+                patch.dict(sys.modules, modules),
+                patch.object(adapter, "init_kag_config", fake_init),
+                patch.object(adapter, "ensure_local_no_proxy"),
+            ):
+                data = adapter.run_kag_query({"id": "query", "method": "kag.query", "params": params})
+
+            self.assertEqual(seen["config_path"], projected)
+            self.assertEqual(seen["import_path"], config_dir)
+            self.assertEqual(seen["init_cwd"], config_dir)
+            self.assertEqual(seen["solver_cwd"], config_dir)
+            self.assertEqual(seen["run_cwd"], config_dir)
+            self.assertEqual(seen["prompt"], "source-relative prompt")
+            self.assertEqual(data["answer"], "answer: hello")
+            self.assertEqual(projected.read_bytes(), before)
+
+    def test_projection_query_and_explain_regenerate_checkout_runtime_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            base, runtime, projection_id = initialize_checkout_projection(workspace)
+            original = base.read_bytes()
+            params = {
+                "workspace": str(workspace),
+                "runtime_dir": str(runtime),
+                "namespace": "projection-one",
+                "projection_isolated": True,
+                "query": "hello",
+            }
+
+            class FakeSolver:
+                def run(self, query: str) -> dict[str, str]:
+                    return {"answer": "answer: " + query, "trace": "checkout trace"}
+
+            class FakeSolverPipelineABC:
+                @classmethod
+                def from_config(cls, pipeline: object) -> FakeSolver:
+                    return FakeSolver()
+
+            kag_config = types.SimpleNamespace(
+                all_config={"kag_solver_pipeline": {"type": "custom_solver"}}
+            )
+            conf_module = types.ModuleType("kag.common.conf")
+            conf_module.KAG_CONFIG = kag_config
+            registry_module = types.ModuleType("kag.common.registry")
+            registry_module.import_modules_from_path = lambda path: None
+            interface_module = types.ModuleType("kag.interface")
+            interface_module.SolverPipelineABC = FakeSolverPipelineABC
+            modules = {
+                "kag": types.ModuleType("kag"),
+                "kag.common": types.ModuleType("kag.common"),
+                "kag.common.conf": conf_module,
+                "kag.common.registry": registry_module,
+                "kag.interface": interface_module,
+            }
+
+            for method in ("kag.query", "kag.explain"):
+                with self.subTest(method=method):
+                    shutil.rmtree(runtime, ignore_errors=True)
+                    stdout = StringIO()
+                    with (
+                        patch.dict(sys.modules, modules),
+                        patch.object(adapter, "init_kag_config"),
+                        patch.object(adapter, "check_real_health", return_value=({"status": "ok"}, None)) as health,
+                        redirect_stdout(stdout),
+                    ):
+                        adapter.real_response({"id": method, "method": method, "params": params})
+
+                    response = json.loads(stdout.getvalue().splitlines()[-1])
+                    self.assertEqual(response["type"], "result")
+                    self.assertEqual(response["data"]["answer"], "answer: hello")
+                    if method == "kag.explain":
+                        self.assertEqual(response["data"]["explanation"], "checkout trace")
+                    health.assert_called_once()
+                    projected = runtime / "kag_config.yaml"
+                    text = projected.read_text(encoding="utf-8")
+                    key = "kag-build-" + projection_id
+                    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+                    self.assertIn('namespace: "projection-one"', text)
+                    self.assertIn(
+                        f'checkpoint_path: "{runtime / "ckpt" / "runs" / digest}"',
+                        text,
+                    )
+                    self.assertEqual(response["data"]["config_path"], str(projected.resolve()))
+                    self.assertEqual(base.read_bytes(), original)
+
+    def test_projection_checkout_regeneration_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            base, runtime, _ = initialize_checkout_projection(workspace)
+            params = {
+                "workspace": str(workspace),
+                "runtime_dir": str(runtime),
+                "namespace": "projection-other",
+                "projection_isolated": True,
+            }
+
+            with self.assertRaisesRegex(FileNotFoundError, "projection KAG config not found"):
+                adapter.select_config(params, runtime, generate=False)
+
+            params["namespace"] = "projection-one"
+            base.write_text(base.read_text(encoding="utf-8") + "# dirty\n", encoding="utf-8")
+            with self.assertRaisesRegex(FileNotFoundError, "projection KAG config not found"):
+                adapter.select_config(params, runtime, generate=False)
+            self.assertFalse(runtime.exists())
+
+    def test_projection_checkout_regeneration_does_not_bypass_health(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            _, runtime, _ = initialize_checkout_projection(workspace)
+            params = {
+                "workspace": str(workspace),
+                "runtime_dir": str(runtime),
+                "namespace": "projection-one",
+                "projection_isolated": True,
+                "query": "hello",
+            }
+            stdout = StringIO()
+
+            with (
+                patch.object(adapter, "check_real_health", return_value=(None, "health denied")) as health,
+                patch.object(adapter, "run_kag_query") as query,
+                redirect_stdout(stdout),
+            ):
+                adapter.real_response({"id": "query", "method": "kag.query", "params": params})
+
+            response = json.loads(stdout.getvalue())
+            self.assertEqual(response["type"], "error")
+            self.assertEqual(response["error"], "health denied")
+            health.assert_called_once()
+            query.assert_not_called()
+            self.assertTrue((runtime / "kag_config.yaml").is_file())
+
+    def test_projection_query_requires_prebuilt_config_without_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            base = workspace / ".knote" / "kag_config.yaml"
+            base.parent.mkdir(parents=True)
+            original = "project:\n  host_addr: http://127.0.0.1:8887\n  namespace: shared\n"
+            base.write_text(original, encoding="utf-8")
+            out_dir = workspace / ".knote" / "kag-runtime" / "projections" / "projection-one"
+            params = {
+                "workspace": str(workspace),
+                "config_path": str(base),
+                "namespace": "projection-one",
+            }
+
+            with self.assertRaisesRegex(FileNotFoundError, "projection KAG config not found"):
+                adapter.select_config(params, out_dir, generate=False)
+
+            self.assertFalse(out_dir.exists())
+            self.assertEqual(base.read_text(encoding="utf-8"), original)
+
+            built = adapter.select_config(params, out_dir, generate=True)
+            before = built.read_bytes()
+            selected = adapter.select_config(params, out_dir, generate=False)
+            self.assertEqual(selected, built)
+            self.assertEqual(selected.read_bytes(), before)
+
+    def test_legacy_namespace_queries_use_base_config_without_projection_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            base = workspace / ".knote" / "kag_config.yaml"
+            base.parent.mkdir(parents=True)
+            base.write_text("project:\n  namespace: legacy\n", encoding="utf-8")
+            runtime = workspace / ".knote" / "kag-runtime"
+            params = {
+                "workspace": str(workspace),
+                "config_path": str(base),
+                "namespace": "legacy",
+                "runtime_dir": str(runtime),
+            }
+
+            for method in ("kag.query", "kag.explain"):
+                with self.subTest(method=method):
+                    selected = adapter.select_config(params, runtime, generate=False)
+                    self.assertEqual(selected, base.resolve())
+
+            self.assertFalse((runtime / "kag_config.yaml").exists())
+
+    def test_projection_runtime_marker_still_requires_prebuilt_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            base = workspace / ".knote" / "kag_config.yaml"
+            base.parent.mkdir(parents=True)
+            base.write_text("project:\n  namespace: shared\n", encoding="utf-8")
+            runtime = workspace / ".knote" / "kag-runtime" / "projections" / "projection-one"
+            params = {
+                "workspace": str(workspace),
+                "config_path": str(base),
+                "namespace": "projection-one",
+                "runtime_dir": str(runtime),
+            }
+
+            with self.assertRaisesRegex(FileNotFoundError, "projection KAG config not found"):
+                adapter.select_config(params, runtime, generate=False)
+
+            self.assertFalse(runtime.exists())
+
     def test_select_config_excludes_generated_config_from_git_status(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
@@ -812,6 +1349,138 @@ class AdapterTest(unittest.TestCase):
             status = subprocess.run(["git", "status", "--short"], cwd=workspace, text=True, capture_output=True, check=True)
             self.assertEqual(status.stdout, "")
             self.assertFalse((workspace / ".knote").exists())
+
+    def test_real_build_replays_receipt_before_config_and_health(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            runtime = workspace / ".knote" / "kag-runtime" / "projections" / "projection-one"
+            params = {
+                "workspace": str(workspace),
+                "runtime_dir": str(runtime),
+                "namespace": "projection-one",
+                "idempotency_key": "sync-projection-one",
+            }
+            config_path = runtime / "kag_config.yaml"
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text("project:\n  namespace: projection-one\n", encoding="utf-8")
+            adapter.build_checkpoint_path(runtime, params).mkdir(parents=True)
+            receipt = {
+                "status": "ok",
+                "mode": "real",
+                "documents": 1,
+                "config_path": str(config_path.resolve()),
+            }
+            adapter.store_build_receipt(runtime, params["idempotency_key"], receipt)
+            stdout = StringIO()
+
+            with (
+                patch.object(adapter, "select_config") as select_config_mock,
+                patch.object(adapter, "check_real_health") as health_mock,
+                redirect_stdout(stdout),
+            ):
+                adapter.real_response({"id": "build-replay", "method": "kag.build", "params": params})
+
+            response = json.loads(stdout.getvalue())
+            self.assertEqual(response["type"], "result")
+            self.assertEqual(response["data"], receipt)
+            select_config_mock.assert_not_called()
+            health_mock.assert_not_called()
+
+    def test_real_build_repairs_incomplete_projection_runtime_instead_of_replaying(self) -> None:
+        for missing in ("config", "checkpoint"):
+            with self.subTest(missing=missing), tempfile.TemporaryDirectory() as tmp:
+                workspace = Path(tmp)
+                base = workspace / ".knote" / "kag_config.yaml"
+                base.parent.mkdir(parents=True)
+                base.write_text("project:\n  namespace: shared\n", encoding="utf-8")
+                runtime = workspace / ".knote" / "kag-runtime" / "projections" / "projection-one"
+                params = {
+                    "workspace": str(workspace),
+                    "runtime_dir": str(runtime),
+                    "config_path": str(base),
+                    "namespace": "projection-one",
+                    "idempotency_key": "sync-projection-one",
+                }
+                projected = adapter.select_config(params, runtime)
+                adapter.build_checkpoint_path(runtime, params).mkdir(parents=True)
+                receipt = {
+                    "status": "ok",
+                    "mode": "real",
+                    "documents": 1,
+                    "config_path": str(projected),
+                }
+                adapter.store_build_receipt(runtime, params["idempotency_key"], receipt)
+                if missing == "config":
+                    projected.unlink()
+                else:
+                    adapter.build_checkpoint_path(runtime, params).rmdir()
+
+                stdout = StringIO()
+                rebuilt = {"status": "ok", "mode": "real", "documents": 1, "repaired": True}
+                with (
+                    patch.object(adapter, "check_real_health", return_value=({"status": "ok"}, None)),
+                    patch.object(adapter, "run_kag_build", return_value=rebuilt) as build_mock,
+                    redirect_stdout(stdout),
+                ):
+                    adapter.real_response({"id": "build-repair", "method": "kag.build", "params": params})
+
+                response = json.loads(stdout.getvalue().splitlines()[-1])
+                self.assertEqual(response["type"], "result")
+                self.assertTrue(response["data"]["repaired"])
+                build_mock.assert_called_once()
+
+    def test_real_build_rejects_invalid_receipt_before_config_and_health(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            runtime = workspace / ".knote" / "kag-runtime"
+            key = "sync-invalid-receipt"
+            path = adapter.build_receipt_path(runtime, key)
+            path.parent.mkdir(parents=True)
+            path.write_text("{not-json", encoding="utf-8")
+            stdout = StringIO()
+            req = {
+                "id": "build-invalid-receipt",
+                "method": "kag.build",
+                "params": {
+                    "workspace": str(workspace),
+                    "runtime_dir": str(runtime),
+                    "idempotency_key": key,
+                },
+            }
+
+            with (
+                patch.object(adapter, "select_config") as select_config_mock,
+                patch.object(adapter, "check_real_health") as health_mock,
+                redirect_stdout(stdout),
+            ):
+                adapter.real_response(req)
+
+            response = json.loads(stdout.getvalue())
+            self.assertEqual(response["type"], "error")
+            self.assertIn("invalid KAG build idempotency receipt", response["error"])
+            select_config_mock.assert_not_called()
+            health_mock.assert_not_called()
+
+    def test_real_build_validates_idempotency_key_before_config_and_health(self) -> None:
+        stdout = StringIO()
+        req = {
+            "id": "build-invalid-key",
+            "method": "kag.build",
+            "params": {"workspace": str(Path.cwd()), "idempotency_key": " sync-invalid "},
+        }
+
+        with (
+            patch.object(adapter, "select_config") as select_config_mock,
+            patch.object(adapter, "check_real_health") as health_mock,
+            redirect_stdout(stdout),
+        ):
+            adapter.real_response(req)
+
+        response = json.loads(stdout.getvalue())
+        self.assertEqual(response["type"], "error")
+        self.assertIn("idempotency_key contains invalid whitespace", response["error"])
+        select_config_mock.assert_not_called()
+        health_mock.assert_not_called()
 
     def test_config_host_reads_literal_and_env_values(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

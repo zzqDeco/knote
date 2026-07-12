@@ -176,6 +176,37 @@ func (s *ProjectionStore) ServingPointer() (ServingPointer, error) {
 	return pointer, err
 }
 
+// ServingProjection returns the canonical projection selected by the private
+// control-plane pointer. Callers use this value to bind external serving
+// mirrors to the same projection version.
+func (s *ProjectionStore) ServingProjection() (Projection, error) {
+	var projection Projection
+	err := s.withLock(func() error {
+		pointer, err := s.readServingPointerLocked()
+		if err != nil {
+			return err
+		}
+		projection, err = s.readProjectionFile(s.projectionPath(pointer.ProjectionVersion))
+		return err
+	})
+	return projection, err
+}
+
+// Run returns one durable sync-run record so callers can select a new retry
+// identity after a terminal failure without deleting the audit journal.
+func (s *ProjectionStore) Run(runID string) (SyncRun, error) {
+	if err := validateJournalToken("run_id", runID); err != nil {
+		return SyncRun{}, err
+	}
+	var run SyncRun
+	err := s.withLock(func() error {
+		var err error
+		run, err = s.readRunLocked(runID)
+		return err
+	})
+	return run, err
+}
+
 func (s *ProjectionStore) Stage(plan ProjectionPlan) error {
 	return s.withLock(func() error { return s.stageLocked(plan) })
 }

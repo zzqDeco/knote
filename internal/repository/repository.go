@@ -8,7 +8,31 @@ import (
 	"github.com/zzqDeco/knote/internal/protocol"
 )
 
-var ErrRemoteNotImplemented = errors.New("remote repository is not implemented")
+var (
+	ErrRemoteNotImplemented         = errors.New("remote repository is not implemented")
+	ErrArtifactPublicationStaleBase = errors.New("artifact publication base is stale")
+)
+
+// ArtifactPublicationBase identifies the public artifact pointer that a
+// candidate was built from. Absent is explicit so an initial publication
+// cannot accidentally match an arbitrary current pointer.
+type ArtifactPublicationBase struct {
+	ProjectionVersion string
+	Absent            bool
+}
+
+func (b ArtifactPublicationBase) Validate() error {
+	if b.Absent {
+		if b.ProjectionVersion != "" {
+			return errors.New("absent artifact publication base cannot have a projection version")
+		}
+		return nil
+	}
+	if b.ProjectionVersion == "" {
+		return errors.New("artifact publication base projection version is required")
+	}
+	return nil
+}
 
 type Workspace interface {
 	Config(ctx context.Context) (Config, error)
@@ -24,6 +48,16 @@ type Workspace interface {
 	LoadQuestions(ctx context.Context) ([]EvalQuestion, error)
 	WriteEval(ctx context.Context, report EvalReport) error
 	EvalGate(ctx context.Context) error
+}
+
+// ProjectionWorkspace is a workspace that can stage an immutable artifact
+// bundle and atomically select it for serving.
+type ProjectionWorkspace interface {
+	Workspace
+	StageArtifacts(ctx context.Context, set ArtifactSet) error
+	PublishArtifacts(ctx context.Context, base ArtifactPublicationBase, manifest protocol.ArtifactBundleManifest) error
+	ReadCurrentArtifactManifest(ctx context.Context) (protocol.ArtifactBundleManifest, error)
+	ReadCurrentProjection(ctx context.Context) ([]byte, error)
 }
 
 type Sessions interface {
@@ -77,15 +111,18 @@ type Source struct {
 }
 
 type ArtifactSet struct {
-	Manifest    protocol.ArtifactManifest
-	Documents   []protocol.Document
-	Chunks      []protocol.Chunk
-	Entities    []protocol.Entity
-	Relations   []protocol.Relation
-	Claims      []protocol.Claim
-	Summaries   []protocol.Summary
-	SchemaYAML  string
-	BuildReport string
+	Manifest                protocol.ArtifactManifest
+	BundleManifest          protocol.ArtifactBundleManifest
+	ProjectionJSON          []byte
+	ProjectionResourceCount int
+	Documents               []protocol.Document
+	Chunks                  []protocol.Chunk
+	Entities                []protocol.Entity
+	Relations               []protocol.Relation
+	Claims                  []protocol.Claim
+	Summaries               []protocol.Summary
+	SchemaYAML              string
+	BuildReport             string
 }
 
 type EvalQuestion struct {

@@ -10,14 +10,16 @@ an explicit fake mode for deterministic local tests:
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 import math
 import os
 import re
+import subprocess
 import sys
 import time
 from ipaddress import ip_address
-from contextlib import redirect_stdout
+from contextlib import contextmanager, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from typing import Any
@@ -328,6 +330,107 @@ def atomic_write_text(path: Path, text: str) -> None:
     tmp.replace(path)
 
 
+def configured_source_path(params: dict[str, Any]) -> Path | None:
+    workspace = workspace_path(params)
+    explicit = params.get("config_path")
+    if explicit:
+        path = Path(explicit)
+        candidate = path if path.is_absolute() else workspace / path
+        if candidate.exists():
+            return candidate.resolve()
+        return None
+    for candidate in (workspace / ".knote" / "kag_config.yaml", workspace / "kag_config.yaml"):
+        if candidate.exists():
+            return candidate.resolve()
+    return None
+
+
+def config_resource_dir(params: dict[str, Any], config_path: Path) -> Path:
+    source = configured_source_path(params)
+    return source.parent if source is not None else config_path.parent
+
+
+@contextmanager
+def working_directory(path: Path) -> Any:
+    previous = Path.cwd()
+    os.chdir(path)
+    try:
+        yield
+    finally:
+        os.chdir(previous)
+
+
+def build_idempotency_key(params: dict[str, Any]) -> str:
+    value = params.get("idempotency_key")
+    if value is None:
+        return ""
+    if not isinstance(value, str) or not value.strip():
+        raise AdapterRequestError("idempotency_key must be a non-empty string")
+    if value != value.strip() or any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise AdapterRequestError("idempotency_key contains invalid whitespace or control characters")
+    return value
+
+
+def build_checkpoint_path(out_dir: Path, params: dict[str, Any]) -> Path:
+    key = build_idempotency_key(params)
+    if not key:
+        return out_dir / "ckpt"
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    return out_dir / "ckpt" / "runs" / digest
+
+
+def build_receipt_path(out_dir: Path, idempotency_key: str) -> Path:
+    digest = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
+    return out_dir / "idempotency" / f"{digest}.json"
+
+
+def load_build_receipt(out_dir: Path, idempotency_key: str) -> dict[str, Any] | None:
+    if not idempotency_key:
+        return None
+    path = build_receipt_path(out_dir, idempotency_key)
+    if not path.exists():
+        return None
+    try:
+        receipt = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"invalid KAG build idempotency receipt: {path}: {exc}") from exc
+    if not isinstance(receipt, dict) or receipt.get("version") != 1:
+        raise RuntimeError(f"invalid KAG build idempotency receipt: {path}")
+    if receipt.get("idempotency_key") != idempotency_key or not isinstance(receipt.get("data"), dict):
+        raise RuntimeError(f"KAG build idempotency receipt does not match request: {path}")
+    return dict(receipt["data"])
+
+
+def load_replayable_build_receipt(
+    params: dict[str, Any], out_dir: Path, idempotency_key: str
+) -> dict[str, Any] | None:
+    receipt = load_build_receipt(out_dir, idempotency_key)
+    if receipt is None:
+        return None
+    namespace = str(params.get("namespace") or "").strip()
+    if not projection_isolation_requested(params, out_dir, namespace):
+        return receipt
+    config_path = receipt.get("config_path")
+    if not isinstance(config_path, str) or not config_path:
+        return None
+    expected_config = out_dir / "kag_config.yaml"
+    if not expected_config.is_file() or Path(config_path).resolve() != expected_config.resolve():
+        return None
+    if not build_checkpoint_path(out_dir, params).is_dir():
+        return None
+    return receipt
+
+
+def store_build_receipt(out_dir: Path, idempotency_key: str, data: dict[str, Any]) -> None:
+    if not idempotency_key:
+        return
+    receipt = {"version": 1, "idempotency_key": idempotency_key, "data": data}
+    atomic_write_text(
+        build_receipt_path(out_dir, idempotency_key),
+        json.dumps(receipt, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+    )
+
+
 def select_config(params: dict[str, Any], out_dir: Path, *, generate: bool = True) -> Path:
     workspace = workspace_path(params)
     explicit = params.get("config_path")
@@ -336,11 +439,11 @@ def select_config(params: dict[str, Any], out_dir: Path, *, generate: bool = Tru
         candidate = path if path.is_absolute() else workspace / path
         if not candidate.exists():
             raise FileNotFoundError(f"explicit KAG config not found: {candidate}")
-        return candidate.resolve()
+        return select_projection_config(candidate.resolve(), out_dir, params, generate=generate)
     candidates = [workspace / ".knote" / "kag_config.yaml", workspace / "kag_config.yaml"]
     for candidate in candidates:
         if candidate.exists():
-            return candidate.resolve()
+            return select_projection_config(candidate.resolve(), out_dir, params, generate=generate)
     generated = out_dir / "kag_config.yaml"
     if generated.exists():
         if generate:
@@ -352,6 +455,324 @@ def select_config(params: dict[str, Any], out_dir: Path, *, generate: bool = Tru
     ensure_runtime_excluded(workspace, out_dir)
     generate_kag_config(generated, params)
     return generated
+
+
+def select_projection_config(base: Path, out_dir: Path, params: dict[str, Any], *, generate: bool) -> Path:
+    namespace = str(params.get("namespace") or "").strip()
+    if not projection_isolation_requested(params, out_dir, namespace):
+        return base
+    target = out_dir / "kag_config.yaml"
+    if target.exists():
+        if generate and build_idempotency_key(params):
+            return projection_config(base, out_dir, params)
+        return target.resolve()
+    if not generate:
+        idempotency_key = checkout_projection_idempotency_key(params, base, namespace)
+        if idempotency_key:
+            repair_params = dict(params)
+            repair_params["idempotency_key"] = idempotency_key
+            return projection_config(base, out_dir, repair_params)
+        raise FileNotFoundError(f"projection KAG config not found; run /build first: {target}")
+    return projection_config(base, out_dir, params)
+
+
+def checkout_projection_idempotency_key(
+    params: dict[str, Any], base: Path, namespace: str
+) -> str:
+    workspace = workspace_path(params)
+    if not clean_tracked_workspace_file(workspace, base):
+        return ""
+    artifacts_dir = workspace / "artifacts"
+    current_path = artifacts_dir / "current.json"
+    if not clean_tracked_workspace_file(workspace, current_path):
+        return ""
+    try:
+        current_data = current_path.read_bytes()
+        current = json.loads(current_data)
+    except (OSError, json.JSONDecodeError):
+        return ""
+    if not isinstance(current, dict) or current.get("version") != 2:
+        return ""
+    projection_id = current.get("projection_id")
+    projection_version = current.get("projection_version")
+    manifest_digest = current.get("manifest_sha256")
+    if (
+        not isinstance(projection_id, str)
+        or re.fullmatch(r"prj_[0-9a-f]{32}", projection_id) is None
+        or projection_version != projection_id
+        or not isinstance(manifest_digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", manifest_digest) is None
+    ):
+        return ""
+    manifest_path = artifacts_dir / "bundles" / projection_id / "manifest.json"
+    if not clean_tracked_workspace_file(workspace, manifest_path):
+        return ""
+    try:
+        manifest_data = manifest_path.read_bytes()
+        manifest = json.loads(manifest_data)
+    except (OSError, json.JSONDecodeError):
+        return ""
+    if hashlib.sha256(manifest_data).hexdigest() != manifest_digest:
+        return ""
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("version") != 2
+        or manifest.get("projection_id") != projection_id
+        or manifest.get("projection_version") != projection_version
+        or manifest.get("namespace") != namespace
+    ):
+        return ""
+    return f"kag-build-{projection_version}"
+
+
+def clean_tracked_workspace_file(workspace: Path, path: Path) -> bool:
+    try:
+        relative = path.resolve().relative_to(workspace.resolve())
+    except (OSError, ValueError):
+        return False
+    if not path.is_file() or path.is_symlink():
+        return False
+    relative_name = relative.as_posix()
+    tracked = subprocess.run(
+        ["git", "-C", str(workspace), "ls-files", "--error-unmatch", "--", relative_name],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if tracked.returncode != 0:
+        return False
+    unchanged = subprocess.run(
+        ["git", "-C", str(workspace), "diff", "--quiet", "HEAD", "--", relative_name],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    return unchanged.returncode == 0
+
+
+def projection_isolation_requested(params: dict[str, Any], out_dir: Path, namespace: str) -> bool:
+    marker = params.get("projection_isolated")
+    if marker is not None:
+        return marker is True and bool(namespace)
+    return bool(namespace) and out_dir.name == namespace and out_dir.parent.name == "projections"
+
+
+def fallback_project_line(lines: list[str], base: Path) -> int:
+    project_lines = [
+        index
+        for index, line in enumerate(lines)
+        if not line.startswith((" ", "\t"))
+        and re.match(r"^(?:project|'project'|\"project\")\s*:", line)
+    ]
+    if not project_lines:
+        raise RuntimeError(f"KAG config has no top-level project section: {base}")
+    if len(project_lines) != 1:
+        raise RuntimeError(f"KAG config has duplicate top-level project sections: {base}")
+    index = project_lines[0]
+    line = lines[index]
+    remainder = line[line.index(":") + 1 :].strip()
+    if remainder.startswith("&"):
+        parts = remainder.split(maxsplit=1)
+        remainder = parts[1].strip() if len(parts) == 2 else ""
+    if remainder.startswith("{"):
+        if flow_mapping_end(remainder) is None:
+            raise RuntimeError(f"invalid KAG config YAML project mapping: {base}")
+        return index
+    if remainder and not remainder.startswith("#"):
+        raise RuntimeError(f"KAG config project section must be a mapping: {base}")
+    for child in lines[index + 1 :]:
+        if not child.strip() or child.lstrip().startswith("#"):
+            continue
+        if not child.startswith((" ", "\t")) or child.lstrip().startswith("-"):
+            break
+        if ":" in child:
+            return index
+        break
+    raise RuntimeError(f"KAG config project section must be a mapping: {base}")
+
+
+def structured_project_line(text: str, lines: list[str], base: Path) -> int:
+    try:
+        yaml = importlib.import_module("yaml")
+    except ModuleNotFoundError:
+        return fallback_project_line(lines, base)
+    # Compose nodes without constructing KAG-specific tags such as !ENV.
+    try:
+        root = yaml.compose(text)
+    except yaml.YAMLError as exc:
+        raise RuntimeError(f"invalid KAG config YAML: {base}: {exc}") from exc
+    if not isinstance(root, yaml.MappingNode):
+        raise RuntimeError(f"KAG config must be a top-level mapping: {base}")
+    projects = [
+        (key, value)
+        for key, value in root.value
+        if isinstance(key, yaml.ScalarNode) and key.value == "project"
+    ]
+    if not projects:
+        raise RuntimeError(f"KAG config has no top-level project section: {base}")
+    if len(projects) != 1:
+        raise RuntimeError(f"KAG config has duplicate top-level project sections: {base}")
+    key, project = projects[0]
+    if not isinstance(project, yaml.MappingNode):
+        raise RuntimeError(f"KAG config project section must be a mapping: {base}")
+    return key.start_mark.line
+
+
+def flow_mapping_end(value: str) -> int | None:
+    depth = 0
+    quote = ""
+    escaped = False
+    for index, char in enumerate(value):
+        if quote:
+            if quote == '"' and char == "\\" and not escaped:
+                escaped = True
+                continue
+            if char == quote and not escaped:
+                quote = ""
+            escaped = False
+            continue
+        if char in {"'", '"'}:
+            quote = char
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                trailing = value[index + 1 :].strip()
+                return index if not trailing or trailing.startswith("#") else None
+            if depth < 0:
+                return None
+    return None
+
+
+def split_flow_mapping_entries(value: str) -> list[str]:
+    entries: list[str] = []
+    start = 0
+    depth = 0
+    quote = ""
+    escaped = False
+    for index, char in enumerate(value):
+        if quote:
+            if quote == '"' and char == "\\" and not escaped:
+                escaped = True
+                continue
+            if char == quote and not escaped:
+                quote = ""
+            escaped = False
+            continue
+        if char in {"'", '"'}:
+            quote = char
+        elif char in "[{":
+            depth += 1
+        elif char in "]}":
+            depth -= 1
+        elif char == "," and depth == 0:
+            entries.append(value[start:index].strip())
+            start = index + 1
+    tail = value[start:].strip()
+    if tail:
+        entries.append(tail)
+    return entries
+
+
+def rewrite_flow_project(
+    lines: list[str], project_index: int, namespace: str, checkpoint_path: Path
+) -> bool:
+    line = lines[project_index]
+    colon = line.index(":")
+    remainder = line[colon + 1 :].strip()
+    anchor = ""
+    if remainder.startswith("&"):
+        parts = remainder.split(maxsplit=1)
+        anchor = parts[0]
+        remainder = parts[1].strip() if len(parts) == 2 else ""
+    if not remainder.startswith("{"):
+        return False
+    end = flow_mapping_end(remainder)
+    if end is None:
+        return False
+    entries = [
+        entry
+        for entry in split_flow_mapping_entries(remainder[1:end])
+        if not re.match(
+            r"^(?:namespace|checkpoint_path|'namespace'|'checkpoint_path'|\"namespace\"|\"checkpoint_path\")\s*:",
+            entry,
+        )
+    ]
+    entries.extend(
+        [
+            f"namespace: {quoted_config(namespace)}",
+            f"checkpoint_path: {quoted_config(str(checkpoint_path))}",
+        ]
+    )
+    mapping = "{" + ", ".join(entries) + "}"
+    comment = remainder[end + 1 :].strip()
+    project_line = line[: colon + 1]
+    if anchor:
+        project_line += f" {anchor}"
+    project_line += f" {mapping}"
+    if comment:
+        project_line += f" {comment}"
+    lines[project_index] = project_line
+    return True
+
+
+def projection_config(base: Path, out_dir: Path, params: dict[str, Any]) -> Path:
+    namespace = str(params.get("namespace") or "").strip()
+    if not namespace:
+        return base
+    target = out_dir / "kag_config.yaml"
+    if base.resolve() == target.resolve():
+        return base
+    text = base.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    project_index = structured_project_line(text, lines, base)
+    checkpoint_path = build_checkpoint_path(out_dir, params)
+    if rewrite_flow_project(lines, project_index, namespace, checkpoint_path):
+        ensure_runtime_excluded(workspace_path(params), out_dir)
+        atomic_write_text(target, "\n".join(lines) + "\n")
+        return target.resolve()
+    project_end = len(lines)
+    namespace_written = False
+    checkpoint_written = False
+    project_indent: int | None = None
+    for index, line in enumerate(lines[project_index + 1 :], start=project_index + 1):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip())
+        if indent == 0:
+            project_end = index
+            break
+        if project_indent is None or indent < project_indent:
+            project_indent = indent
+    if project_indent is None:
+        project_indent = 2
+    for index in range(project_index + 1, project_end):
+        line = lines[index]
+        indent = len(line) - len(line.lstrip())
+        if indent != project_indent:
+            continue
+        stripped = line.strip()
+        if re.match(r"^namespace\s*:", stripped):
+            lines[index] = " " * project_indent + f"namespace: {quoted_config(namespace)}"
+            namespace_written = True
+        elif re.match(r"^checkpoint_path\s*:", stripped):
+            lines[index] = (
+                " " * project_indent + f"checkpoint_path: {quoted_config(str(checkpoint_path))}"
+            )
+            checkpoint_written = True
+    additions: list[str] = []
+    if not namespace_written:
+        additions.append(" " * project_indent + f"namespace: {quoted_config(namespace)}")
+    if not checkpoint_written:
+        additions.append(
+            " " * project_indent + f"checkpoint_path: {quoted_config(str(checkpoint_path))}"
+        )
+    if additions:
+        lines[project_end:project_end] = additions
+    ensure_runtime_excluded(workspace_path(params), out_dir)
+    atomic_write_text(target, "\n".join(lines) + "\n")
+    return target.resolve()
 
 
 def config_host(config_path: Path) -> str:
@@ -518,7 +939,7 @@ def generate_kag_config(path: Path, params: dict[str, Any]) -> None:
     project_id = str(params.get("project_id") or os.environ.get("KNOTE_KAG_PROJECT_ID") or "1")
     namespace = str(params.get("namespace") or os.environ.get("KNOTE_KAG_NAMESPACE") or "KnoteKB")
     language = str(params.get("language") or os.environ.get("KNOTE_KAG_LANGUAGE") or "en")
-    checkpoint_path = json.dumps(str(runtime_dir(params) / "ckpt"))
+    checkpoint_path = json.dumps(str(build_checkpoint_path(runtime_dir(params), params)))
     openie_llm_type = quoted_config(config_setting(params, "openie_llm_type", "KNOTE_OPENIE_LLM_TYPE", "openai"))
     openie_llm_base_url = quoted_config(
         config_setting(params, "openie_llm_base_url", "KNOTE_OPENIE_LLM_BASE_URL", "http://localhost:11434/v1")
@@ -1008,20 +1429,29 @@ def fake_response(req: dict[str, Any]) -> None:
     elif method == "kag.build":
         workspace = workspace_path(params)
         out_dir = runtime_dir(params)
+        idempotency_key = build_idempotency_key(params)
+        replay = load_build_receipt(out_dir, idempotency_key)
+        if replay is not None:
+            result(req_id, replay, "fake KAG build complete")
+            return
         corpus_path, records = prepare_corpus(workspace, out_dir, params)
         progress(req_id, "scanning sources", 1, 3)
         progress(req_id, "extracting graph", 2, 3)
+        data = {
+            "status": "ok",
+            "mode": "fake",
+            "corpus_path": str(corpus_path),
+            "documents": len(records),
+            "entities": len(records),
+            "relations": 0,
+            "claims": len(records),
+        }
+        if idempotency_key:
+            data["idempotency_key"] = idempotency_key
+        store_build_receipt(out_dir, idempotency_key, data)
         result(
             req_id,
-            {
-                "status": "ok",
-                "mode": "fake",
-                "corpus_path": str(corpus_path),
-                "documents": len(records),
-                "entities": len(records),
-                "relations": 0,
-                "claims": len(records),
-            },
+            data,
             "fake KAG build complete",
         )
     elif method in {"kag.query", "kag.explain"}:
@@ -1086,26 +1516,32 @@ def run_kag_build(req: dict[str, Any]) -> dict[str, Any]:
     params = req.get("params") or {}
     workspace = workspace_path(params)
     out_dir = runtime_dir(params)
+    idempotency_key = build_idempotency_key(params)
+    replay = load_replayable_build_receipt(params, out_dir, idempotency_key)
+    if replay is not None:
+        return replay
     corpus_path, records = prepare_corpus(workspace, out_dir, params)
     if not records:
         raise RuntimeError(f"no Markdown or text sources found under {workspace / 'sources'}")
     config_path = select_config(params, out_dir)
     ensure_local_no_proxy(params, config_path)
-    init_kag_config(config_path)
+    resource_dir = config_resource_dir(params, config_path)
+    with working_directory(resource_dir):
+        init_kag_config(config_path)
 
-    from kag.builder.runner import BuilderChainRunner  # type: ignore
-    from kag.common.conf import KAG_CONFIG  # type: ignore
-    from kag.common.registry import import_modules_from_path  # type: ignore
+        from kag.builder.runner import BuilderChainRunner  # type: ignore
+        from kag.common.conf import KAG_CONFIG  # type: ignore
+        from kag.common.registry import import_modules_from_path  # type: ignore
 
-    import_modules_from_path(str(config_path.parent))
-    pipeline = KAG_CONFIG.all_config.get("kag_builder_pipeline")
-    if not pipeline:
-        raise RuntimeError(f"kag_builder_pipeline missing in {config_path}")
-    runner = BuilderChainRunner.from_config(pipeline)
-    _, build_output = capture_stdout(runner.invoke, str(corpus_path))
+        import_modules_from_path(str(resource_dir))
+        pipeline = KAG_CONFIG.all_config.get("kag_builder_pipeline")
+        if not pipeline:
+            raise RuntimeError(f"kag_builder_pipeline missing in {config_path}")
+        runner = BuilderChainRunner.from_config(pipeline)
+        _, build_output = capture_stdout(runner.invoke, str(corpus_path))
     build_summary = parse_build_summary(build_output)
     ensure_successful_build_summary(build_summary)
-    return {
+    data = {
         "status": "ok",
         "mode": "real",
         "config_path": str(config_path),
@@ -1113,6 +1549,10 @@ def run_kag_build(req: dict[str, Any]) -> dict[str, Any]:
         "documents": len(records),
         "build_summary": build_summary or {},
     }
+    if idempotency_key:
+        data["idempotency_key"] = idempotency_key
+    store_build_receipt(out_dir, idempotency_key, data)
+    return data
 
 
 def normalize_solver_output(value: Any) -> tuple[str, str]:
@@ -1168,18 +1608,20 @@ def run_kag_query(req: dict[str, Any], explain: bool = False) -> dict[str, Any]:
     out_dir = runtime_dir(params)
     config_path = select_config(params, out_dir, generate=False)
     ensure_local_no_proxy(params, config_path)
-    init_kag_config(config_path)
+    resource_dir = config_resource_dir(params, config_path)
+    with working_directory(resource_dir):
+        init_kag_config(config_path)
 
-    from kag.common.conf import KAG_CONFIG  # type: ignore
-    from kag.common.registry import import_modules_from_path  # type: ignore
-    from kag.interface import SolverPipelineABC  # type: ignore
+        from kag.common.conf import KAG_CONFIG  # type: ignore
+        from kag.common.registry import import_modules_from_path  # type: ignore
+        from kag.interface import SolverPipelineABC  # type: ignore
 
-    import_modules_from_path(str(config_path.parent))
-    pipeline_conf = KAG_CONFIG.all_config.get("kag_solver_pipeline")
-    if not pipeline_conf:
-        raise RuntimeError(f"kag_solver_pipeline missing in {config_path}")
-    pipeline = SolverPipelineABC.from_config(pipeline_conf)
-    raw = run_solver_pipeline(pipeline, SolverPipelineABC, query)
+        import_modules_from_path(str(resource_dir))
+        pipeline_conf = KAG_CONFIG.all_config.get("kag_solver_pipeline")
+        if not pipeline_conf:
+            raise RuntimeError(f"kag_solver_pipeline missing in {config_path}")
+        pipeline = SolverPipelineABC.from_config(pipeline_conf)
+        raw = run_solver_pipeline(pipeline, SolverPipelineABC, query)
     answer, trace = normalize_solver_output(raw)
     data = {
         "answer": answer,
@@ -1213,6 +1655,17 @@ def real_response(req: dict[str, Any]) -> None:
         error(req_id, f"unknown method: {method}")
         return
     params = req.get("params") or {}
+    if method == "kag.build":
+        try:
+            idempotency_key = build_idempotency_key(params)
+            out_dir = runtime_dir(params)
+            replay = load_replayable_build_receipt(params, out_dir, idempotency_key)
+        except Exception as exc:
+            error(req_id, str(exc))
+            return
+        if replay is not None:
+            result(req_id, replay, "KAG build complete")
+            return
     try:
         config_path = select_config(params, runtime_dir(params), generate=method == "kag.build")
     except Exception as exc:

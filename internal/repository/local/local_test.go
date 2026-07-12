@@ -2,6 +2,9 @@ package local
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -168,6 +171,587 @@ func TestArtifactsEvalAndGate(t *testing.T) {
 	if err := store.EvalGate(ctx); err == nil || !strings.Contains(err.Error(), "stale") {
 		t.Fatalf("stale eval should block release gate, got %v", err)
 	}
+}
+
+func TestArtifactBundleCutoverIsImmutableDeterministicAndKeepsV1Exports(t *testing.T) {
+	ctx := context.Background()
+	workspace := t.TempDir()
+	store := New(workspace)
+	set := testBundleArtifactSet(t, "prj_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "first")
+	if err := store.WriteArtifacts(ctx, set); err != nil {
+		t.Fatal(err)
+	}
+	bundleDir := filepath.Join(workspace, "artifacts", "bundles", set.BundleManifest.ProjectionID)
+	manifestBefore := mustRead(t, filepath.Join(bundleDir, "manifest.json"))
+	pointerBefore := mustRead(t, filepath.Join(workspace, "artifacts", "current.json"))
+	if err := store.WriteArtifacts(ctx, set); err != nil {
+		t.Fatal(err)
+	}
+	if got := mustRead(t, filepath.Join(bundleDir, "manifest.json")); got != manifestBefore {
+		t.Fatal("no-op build changed immutable v2 manifest")
+	}
+	if got := mustRead(t, filepath.Join(workspace, "artifacts", "current.json")); got != pointerBefore {
+		t.Fatal("no-op build changed serving pointer")
+	}
+
+	current, err := store.ReadCurrentArtifactManifest(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Version != 2 || current.ProjectionVersion != set.BundleManifest.ProjectionVersion ||
+		current.Namespace != set.BundleManifest.Namespace || current.AuthorizationObject != set.BundleManifest.AuthorizationObject {
+		t.Fatalf("unexpected current bundle manifest: %+v", current)
+	}
+	var compatibility protocol.ArtifactManifest
+	if err := json.Unmarshal([]byte(mustRead(t, filepath.Join(workspace, "artifacts", "manifest.json"))), &compatibility); err != nil {
+		t.Fatal(err)
+	}
+	if compatibility.Version != 1 || compatibility.SummaryCount != 1 {
+		t.Fatalf("v1 compatibility manifest changed contract: %+v", compatibility)
+	}
+	if got := mustRead(t, filepath.Join(workspace, "artifacts", "summaries.jsonl")); !strings.Contains(got, "first") {
+		t.Fatalf("v1 summary compatibility export missing: %s", got)
+	}
+
+	// Flat compatibility files are not the serving source of truth.
+	mustWrite(t, filepath.Join(workspace, "artifacts", "summaries.jsonl"), "{\"summary_id\":\"flat\",\"text\":\"wrong\",\"evidence_chunk_ids\":[]}\n")
+	summaries, err := store.ReadSummaries(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summaries) != 1 || summaries[0].Text != "first" {
+		t.Fatalf("retrieval read flat compatibility export instead of bundle: %+v", summaries)
+	}
+
+	mustWrite(t, filepath.Join(bundleDir, "summaries.jsonl"), "tampered\n")
+	if err := store.WriteArtifacts(ctx, set); err == nil || !strings.Contains(err.Error(), "immutable artifact bundle") {
+		t.Fatalf("tampered immutable bundle was accepted: %v", err)
+	}
+}
+
+func TestArtifactPointerFailurePreservesPreviouslyServingBundle(t *testing.T) {
+	ctx := context.Background()
+	workspace := t.TempDir()
+	first := testBundleArtifactSet(t, "prj_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "first")
+	second := testBundleArtifactSet(t, "prj_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "second")
+	store := New(workspace)
+	if err := store.WriteArtifacts(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	legacyBefore := mustRead(t, filepath.Join(workspace, "artifacts", "summaries.jsonl"))
+	failing := Store{
+		workspace: workspace,
+		beforePointerWrite: func(protocol.ArtifactCurrentPointer) error {
+			return errors.New("injected pointer failure")
+		},
+	}
+	if err := failing.WriteArtifacts(ctx, second); err == nil || !strings.Contains(err.Error(), "injected pointer failure") {
+		t.Fatalf("expected pointer failure, got %v", err)
+	}
+	current, err := store.ReadCurrentArtifactManifest(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.ProjectionID != first.BundleManifest.ProjectionID {
+		t.Fatalf("failed build advanced current pointer: %+v", current)
+	}
+	summaries, err := store.ReadSummaries(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summaries) != 1 || summaries[0].Text != "first" {
+		t.Fatalf("failed build changed serving bundle: %+v", summaries)
+	}
+	if legacyAfter := mustRead(t, filepath.Join(workspace, "artifacts", "summaries.jsonl")); legacyAfter != legacyBefore {
+		t.Fatalf("failed pointer publication changed v1 compatibility export:\nbefore=%s\nafter=%s", legacyBefore, legacyAfter)
+	}
+	if _, err := os.Stat(filepath.Join(workspace, "artifacts", "bundles", second.BundleManifest.ProjectionID)); err != nil {
+		t.Fatalf("fully written failed candidate may remain immutable for retry: %v", err)
+	}
+}
+
+func TestArtifactCompatibilityPreparationFailurePreservesCurrentPointer(t *testing.T) {
+	ctx := context.Background()
+	workspace := t.TempDir()
+	store := New(workspace)
+	first := testBundleArtifactSet(t, "prj_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "first")
+	second := testBundleArtifactSet(t, "prj_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "second")
+	if err := store.WriteArtifacts(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	pointerBefore := mustRead(t, filepath.Join(workspace, "artifacts", "current.json"))
+	summariesPath := filepath.Join(workspace, "artifacts", "summaries.jsonl")
+	if err := os.Remove(summariesPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(summariesPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	err := store.WriteArtifacts(ctx, second)
+	if err == nil || !strings.Contains(err.Error(), "not a regular file") {
+		t.Fatalf("expected compatibility preparation failure, got %v", err)
+	}
+	if pointerAfter := mustRead(t, filepath.Join(workspace, "artifacts", "current.json")); pointerAfter != pointerBefore {
+		t.Fatalf("compatibility preparation failure advanced current pointer:\nbefore=%s\nafter=%s", pointerBefore, pointerAfter)
+	}
+	current, err := store.ReadCurrentArtifactManifest(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.ProjectionID != first.BundleManifest.ProjectionID {
+		t.Fatalf("compatibility preparation failure selected candidate bundle: %+v", current)
+	}
+}
+
+func TestArtifactCompatibilityPublishFailureIsNonFatalAfterPointerAdvance(t *testing.T) {
+	ctx := context.Background()
+	workspace := t.TempDir()
+	store := New(workspace)
+	first := testBundleArtifactSet(t, "prj_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "first")
+	second := testBundleArtifactSet(t, "prj_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "second")
+	if err := store.WriteArtifacts(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	legacyBefore := mustRead(t, filepath.Join(workspace, "artifacts", "summaries.jsonl"))
+	failing := Store{
+		workspace: workspace,
+		beforeCompatibilityPublish: func() error {
+			return errors.New("injected compatibility failure")
+		},
+	}
+	if err := failing.WriteArtifacts(ctx, second); err != nil {
+		t.Fatalf("post-pointer compatibility failure failed build: %v", err)
+	}
+	current, err := store.ReadCurrentArtifactManifest(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.ProjectionID != second.BundleManifest.ProjectionID {
+		t.Fatalf("successful build did not advance current pointer: %+v", current)
+	}
+	if legacyAfter := mustRead(t, filepath.Join(workspace, "artifacts", "summaries.jsonl")); legacyAfter != legacyBefore {
+		t.Fatalf("injected compatibility failure changed legacy export:\nbefore=%s\nafter=%s", legacyBefore, legacyAfter)
+	}
+}
+
+func TestPublishArtifactsInitialBaseAllowsExactlyOneCompetingSuccessor(t *testing.T) {
+	ctx := context.Background()
+	workspace := t.TempDir()
+	store := New(workspace)
+	first := testBundleArtifactSet(t, "prj_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "first")
+	second := testBundleArtifactSet(t, "prj_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "second")
+	if err := store.StageArtifacts(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.StageArtifacts(ctx, second); err != nil {
+		t.Fatal(err)
+	}
+
+	expected := repository.ArtifactPublicationBase{Absent: true}
+	assertOneArtifactPublicationSucceeds(t, workspace, expected, first, second)
+}
+
+func TestPublishArtifactsSameBaseAllowsExactlyOneDivergentSuccessor(t *testing.T) {
+	ctx := context.Background()
+	workspace := t.TempDir()
+	store := New(workspace)
+	base := testBundleArtifactSet(t, "prj_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "base")
+	first := testBundleArtifactSet(t, "prj_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "first")
+	second := testBundleArtifactSet(t, "prj_cccccccccccccccccccccccccccccccc", "second")
+	if err := store.WriteArtifacts(ctx, base); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.StageArtifacts(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.StageArtifacts(ctx, second); err != nil {
+		t.Fatal(err)
+	}
+
+	expected := repository.ArtifactPublicationBase{ProjectionVersion: base.BundleManifest.ProjectionVersion}
+	assertOneArtifactPublicationSucceeds(t, workspace, expected, first, second)
+}
+
+func TestPublishArtifactsLockWaitHonorsContextCancellation(t *testing.T) {
+	workspace := t.TempDir()
+	store := New(workspace)
+	candidate := testBundleArtifactSet(t, "prj_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "candidate")
+	if err := store.StageArtifacts(context.Background(), candidate); err != nil {
+		t.Fatal(err)
+	}
+	lockPath := filepath.Join(workspace, "artifacts", artifactPublicationLockName)
+	mustWrite(t, lockPath, `{"token":"active","created_at":"2026-01-01T00:00:00Z"}`)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	err := store.PublishArtifacts(
+		ctx,
+		repository.ArtifactPublicationBase{Absent: true},
+		candidate.BundleManifest,
+	)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("publication waiting on lock returned %v, want context deadline", err)
+	}
+	if _, err := os.Stat(filepath.Join(workspace, "artifacts", "current.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("canceled publication changed current pointer: %v", err)
+	}
+}
+
+func TestPublishArtifactsRecoversStaleLock(t *testing.T) {
+	ctx := context.Background()
+	workspace := t.TempDir()
+	store := New(workspace)
+	candidate := testBundleArtifactSet(t, "prj_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "candidate")
+	if err := store.StageArtifacts(ctx, candidate); err != nil {
+		t.Fatal(err)
+	}
+	lockPath := filepath.Join(workspace, "artifacts", artifactPublicationLockName)
+	mustWrite(t, lockPath, `{"token":"abandoned","created_at":"2026-01-01T00:00:00Z"}`)
+	staleTime := time.Now().Add(-2 * artifactPublicationLockStale)
+	if err := os.Chtimes(lockPath, staleTime, staleTime); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.PublishArtifacts(
+		ctx,
+		repository.ArtifactPublicationBase{Absent: true},
+		candidate.BundleManifest,
+	); err != nil {
+		t.Fatalf("publish after stale lock recovery: %v", err)
+	}
+	if _, err := os.Stat(lockPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("publication lock remained after success: %v", err)
+	}
+}
+
+func assertOneArtifactPublicationSucceeds(
+	t *testing.T,
+	workspace string,
+	expected repository.ArtifactPublicationBase,
+	first repository.ArtifactSet,
+	second repository.ArtifactSet,
+) {
+	t.Helper()
+	type result struct {
+		projectionID string
+		err          error
+	}
+	start := make(chan struct{})
+	results := make(chan result, 2)
+	for _, candidate := range []repository.ArtifactSet{first, second} {
+		candidate := candidate
+		go func() {
+			<-start
+			err := New(workspace).PublishArtifacts(context.Background(), expected, candidate.BundleManifest)
+			results <- result{projectionID: candidate.BundleManifest.ProjectionID, err: err}
+		}()
+	}
+	close(start)
+
+	var winner string
+	staleFailures := 0
+	for range 2 {
+		result := <-results
+		switch {
+		case result.err == nil:
+			if winner != "" {
+				t.Fatalf("both competing publications succeeded: %s and %s", winner, result.projectionID)
+			}
+			winner = result.projectionID
+		case errors.Is(result.err, repository.ErrArtifactPublicationStaleBase):
+			staleFailures++
+		default:
+			t.Fatalf("competing publication %s failed with unexpected error: %v", result.projectionID, result.err)
+		}
+	}
+	if winner == "" || staleFailures != 1 {
+		t.Fatalf("publication results winner=%q stale_failures=%d, want one each", winner, staleFailures)
+	}
+	current, err := New(workspace).ReadCurrentArtifactManifest(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.ProjectionID != winner {
+		t.Fatalf("current projection = %s, want successful publication %s", current.ProjectionID, winner)
+	}
+}
+
+func TestPublishArtifactsRejectsDamagedStagedBundleAndRecovers(t *testing.T) {
+	for _, mutation := range []struct {
+		name   string
+		change func(t *testing.T, path string)
+	}{
+		{
+			name: "corrupted",
+			change: func(t *testing.T, path string) {
+				t.Helper()
+				data, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				mustWrite(t, path, string(append(data, []byte("corrupted\n")...)))
+			},
+		},
+		{
+			name: "deleted",
+			change: func(t *testing.T, path string) {
+				t.Helper()
+				if err := os.Remove(path); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "symlinked",
+			change: func(t *testing.T, path string) {
+				t.Helper()
+				data, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				target := filepath.Join(t.TempDir(), filepath.Base(path))
+				if err := os.WriteFile(target, data, 0o644); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Remove(path); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(target, path); err != nil {
+					t.Skipf("symlink unavailable: %v", err)
+				}
+			},
+		},
+	} {
+		for _, file := range []string{bundleManifestName, "summaries.jsonl", "projection.json"} {
+			t.Run(mutation.name+"/"+file, func(t *testing.T) {
+				ctx := context.Background()
+				workspace := t.TempDir()
+				store := New(workspace)
+				first := testBundleArtifactSet(t, "prj_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "first")
+				candidate := testBundleArtifactSet(t, "prj_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "second")
+				if err := store.WriteArtifacts(ctx, first); err != nil {
+					t.Fatal(err)
+				}
+				if err := store.StageArtifacts(ctx, candidate); err != nil {
+					t.Fatal(err)
+				}
+				base, err := store.currentArtifactPublicationBase(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				pointerBefore := mustRead(t, filepath.Join(workspace, "artifacts", "current.json"))
+				bundleDir := filepath.Join(workspace, "artifacts", "bundles", candidate.BundleManifest.ProjectionID)
+				publishing := Store{
+					workspace: workspace,
+					beforePointerWrite: func(protocol.ArtifactCurrentPointer) error {
+						mutation.change(t, filepath.Join(bundleDir, file))
+						return nil
+					},
+				}
+
+				if err := publishing.PublishArtifacts(ctx, base, candidate.BundleManifest); err == nil {
+					t.Fatalf("published bundle with %s %s", mutation.name, file)
+				}
+				if pointerAfter := mustRead(t, filepath.Join(workspace, "artifacts", "current.json")); pointerAfter != pointerBefore {
+					t.Fatalf("damaged candidate advanced current pointer:\nbefore=%s\nafter=%s", pointerBefore, pointerAfter)
+				}
+
+				if err := os.RemoveAll(bundleDir); err != nil {
+					t.Fatal(err)
+				}
+				if err := store.StageArtifacts(ctx, candidate); err != nil {
+					t.Fatalf("restage repaired candidate: %v", err)
+				}
+				if err := store.PublishArtifacts(ctx, base, candidate.BundleManifest); err != nil {
+					t.Fatalf("publish repaired candidate: %v", err)
+				}
+				current, err := store.ReadCurrentArtifactManifest(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if current.ProjectionID != candidate.BundleManifest.ProjectionID {
+					t.Fatalf("repaired candidate was not selected: %+v", current)
+				}
+			})
+		}
+	}
+}
+
+func TestKnowledgeHashUsesOnlyCurrentPointerAndSelectedBundle(t *testing.T) {
+	ctx := context.Background()
+	workspace := t.TempDir()
+	store := New(workspace)
+	mustWrite(t, filepath.Join(workspace, ".knote", "config.yaml"), "workspace: test\n")
+	mustWrite(t, filepath.Join(workspace, "sources", "intro.md"), "stable\n")
+	set := testBundleArtifactSet(t, "prj_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "first")
+	if err := store.WriteArtifacts(ctx, set); err != nil {
+		t.Fatal(err)
+	}
+	before, err := store.KnowledgeHash(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(workspace, "artifacts", "bundles", "prj_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "orphan"), "ignored\n")
+	mustWrite(t, filepath.Join(workspace, "artifacts", "summaries.jsonl"), "legacy compatibility changed\n")
+	after, err := store.KnowledgeHash(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after != before {
+		t.Fatalf("orphan bundle or v1 compatibility export changed serving knowledge hash: before=%s after=%s", before, after)
+	}
+}
+
+func TestArtifactReadsFailClosedWhenCurrentPointerIsMalformed(t *testing.T) {
+	ctx := context.Background()
+	workspace := t.TempDir()
+	store := New(workspace)
+	set := testBundleArtifactSet(t, "prj_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "first")
+	if err := store.WriteArtifacts(ctx, set); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(workspace, "artifacts", "current.json"), "{}\n")
+	if _, err := store.ReadManifest(ctx); err == nil {
+		t.Fatal("malformed v2 current pointer fell back to flat v1 manifest")
+	}
+	if _, err := store.ReadSummaries(ctx); err == nil {
+		t.Fatal("malformed v2 current pointer fell back to flat v1 summaries")
+	}
+}
+
+func TestArtifactReadsFailClosedWhenSelectedBundleIsMissing(t *testing.T) {
+	ctx := context.Background()
+	workspace := t.TempDir()
+	store := New(workspace)
+	set := testBundleArtifactSet(t, "prj_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "first")
+	if err := store.WriteArtifacts(ctx, set); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(
+		workspace, "artifacts", "bundles", set.BundleManifest.ProjectionID, "manifest.json",
+	)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ReadManifest(ctx); err == nil {
+		t.Fatal("missing selected bundle fell back to flat v1 manifest")
+	}
+	if _, err := store.ReadSummaries(ctx); err == nil {
+		t.Fatal("missing selected bundle fell back to flat v1 summaries")
+	}
+	if _, err := store.KnowledgeHash(ctx); err == nil {
+		t.Fatal("missing selected bundle produced a legacy knowledge hash")
+	}
+}
+
+func TestArtifactBundleRejectsSymlinkedProjectionDirectory(t *testing.T) {
+	ctx := context.Background()
+	workspace := t.TempDir()
+	set := testBundleArtifactSet(t, "prj_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "first")
+	bundlesDir := filepath.Join(workspace, "artifacts", "bundles")
+	if err := os.MkdirAll(bundlesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	outside := t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(bundlesDir, set.BundleManifest.ProjectionID)); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	if err := New(workspace).WriteArtifacts(ctx, set); err == nil || !strings.Contains(err.Error(), "real directory") {
+		t.Fatalf("symlinked bundle directory was accepted: %v", err)
+	}
+}
+
+func TestArtifactBundleRejectsSymlinkedParents(t *testing.T) {
+	for _, parent := range []string{"artifacts", "bundles"} {
+		t.Run(parent, func(t *testing.T) {
+			ctx := context.Background()
+			workspace := t.TempDir()
+			outside := t.TempDir()
+			link := filepath.Join(workspace, "artifacts")
+			if parent == "bundles" {
+				if err := os.Mkdir(link, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				link = filepath.Join(link, "bundles")
+			}
+			if err := os.Symlink(outside, link); err != nil {
+				t.Skipf("symlink unavailable: %v", err)
+			}
+			set := testBundleArtifactSet(t, "prj_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "first")
+			if err := New(workspace).WriteArtifacts(ctx, set); err == nil || !strings.Contains(err.Error(), "real directory") {
+				t.Fatalf("symlinked %s directory was accepted: %v", parent, err)
+			}
+			escapedBundle := filepath.Join(outside, set.BundleManifest.ProjectionID)
+			if parent == "artifacts" {
+				escapedBundle = filepath.Join(outside, "bundles", set.BundleManifest.ProjectionID)
+			}
+			if _, err := os.Stat(escapedBundle); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("bundle escaped through symlinked %s directory: %v", parent, err)
+			}
+		})
+	}
+}
+
+func TestArtifactBundleReadRejectsSymlinkedBundlesParent(t *testing.T) {
+	ctx := context.Background()
+	workspace := t.TempDir()
+	store := New(workspace)
+	set := testBundleArtifactSet(t, "prj_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "first")
+	if err := store.WriteArtifacts(ctx, set); err != nil {
+		t.Fatal(err)
+	}
+	bundlesDir := filepath.Join(workspace, "artifacts", "bundles")
+	outside := filepath.Join(t.TempDir(), "bundles")
+	if err := os.Rename(bundlesDir, outside); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, bundlesDir); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	if _, err := store.ReadCurrentArtifactManifest(ctx); err == nil || !strings.Contains(err.Error(), "real directory") {
+		t.Fatalf("read accepted symlinked bundles directory: %v", err)
+	}
+}
+
+func testBundleArtifactSet(t *testing.T, projectionID, summary string) repository.ArtifactSet {
+	t.Helper()
+	generatedAt := time.Unix(42, 0).UTC()
+	manifest := protocol.ArtifactManifest{
+		Version: 1, Workspace: "test", GeneratedAt: generatedAt, SourceCount: 1, SummaryCount: 1,
+	}
+	set := repository.ArtifactSet{
+		Manifest:   manifest,
+		Summaries:  []protocol.Summary{{SummaryID: "summary", Text: summary, EvidenceChunkIDs: []string{}}},
+		SchemaYAML: "version: 1\n", BuildReport: "# report\n",
+		BundleManifest: protocol.ArtifactBundleManifest{
+			Version: 2, ProjectionID: projectionID, ProjectionVersion: projectionID,
+			Namespace:            "KnoteKB__" + projectionID,
+			AuthorizationObject:  "knowledge-base:test:" + projectionID,
+			AuthorizationVersion: "authz_0123456789abcdef01234567",
+			SourceSnapshot: protocol.ArtifactSourceSnapshot{
+				Version: "src_0123456789abcdef01234567",
+				Digest:  strings.Repeat("1", 64), DocumentCount: 1,
+			},
+			GeneratedAt: generatedAt, Compatibility: manifest,
+		},
+	}
+	set.ProjectionJSON = []byte(fmt.Sprintf("{\"version\":%q}\n", projectionID))
+	set.ProjectionResourceCount = 1
+	payloads, err := repository.CanonicalArtifactFiles(set)
+	if err != nil {
+		t.Fatal(err)
+	}
+	set.BundleManifest.Files = repository.ArtifactFileDescriptors(payloads)
+	return set
+}
+
+func mustRead(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
 }
 
 func TestEvalQuestionsFallbackAndSorting(t *testing.T) {

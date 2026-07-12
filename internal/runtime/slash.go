@@ -202,6 +202,7 @@ func (m *Manager) details(ctx context.Context, sessionID string) []protocol.Even
 	manifestPath := filepath.Join(m.deps.Workspace, "artifacts", "manifest.json")
 	manifestStatus := "missing"
 	var manifest protocol.ArtifactManifest
+	var bundleManifest protocol.ArtifactBundleManifest
 	if m.deps.WorkspaceRepo != nil {
 		if readManifest, err := m.deps.WorkspaceRepo.ReadManifest(ctx); err == nil {
 			manifest = readManifest
@@ -215,6 +216,19 @@ func (m *Manager) details(ctx context.Context, sessionID string) []protocol.Even
 				manifest.SummaryCount,
 			)
 		}
+		if reader, ok := m.deps.WorkspaceRepo.(interface {
+			ReadCurrentArtifactManifest(context.Context) (protocol.ArtifactBundleManifest, error)
+		}); ok {
+			bundleManifest, _ = reader.ReadCurrentArtifactManifest(ctx)
+		}
+	}
+	if bundleManifest.Version == protocol.ArtifactBundleManifestVersion {
+		manifestPath = filepath.Join(
+			m.deps.Workspace, "artifacts", "bundles", bundleManifest.ProjectionID, "manifest.json",
+		)
+		manifestStatus += fmt.Sprintf(" projection=%s namespace=%s authz=%s@%s",
+			bundleManifest.ProjectionVersion, bundleManifest.Namespace,
+			bundleManifest.AuthorizationObject, bundleManifest.AuthorizationVersion)
 	}
 	text := strings.Join([]string{
 		"Workspace details",
@@ -223,6 +237,7 @@ func (m *Manager) details(ctx context.Context, sessionID string) []protocol.Even
 		"branch: " + firstNonEmpty(status.Branch, "unknown"),
 		fmt.Sprintf("dirty: %t", status.Dirty),
 		"artifact_manifest: " + relDisplay(m.deps.Workspace, manifestPath),
+		"artifact_pointer: " + relDisplay(m.deps.Workspace, filepath.Join(m.deps.Workspace, "artifacts", "current.json")),
 		"artifact_manifest_status: " + manifestStatus,
 		"kag_mode: " + m.kagMode(),
 		"kag_host: " + firstNonEmpty(m.deps.Config.KAG.Host, "unset"),
@@ -237,6 +252,7 @@ func (m *Manager) details(ctx context.Context, sessionID string) []protocol.Even
 		"dirty":             status.Dirty,
 		"kag_mode":          m.kagMode(),
 		"artifact_manifest": manifest,
+		"bundle_manifest":   bundleManifest,
 	}
 	return []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, sessionID, text, payload)}
 }
