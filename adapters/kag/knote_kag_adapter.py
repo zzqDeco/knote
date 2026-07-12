@@ -336,11 +336,11 @@ def select_config(params: dict[str, Any], out_dir: Path, *, generate: bool = Tru
         candidate = path if path.is_absolute() else workspace / path
         if not candidate.exists():
             raise FileNotFoundError(f"explicit KAG config not found: {candidate}")
-        return projection_config(candidate.resolve(), out_dir, params)
+        return select_projection_config(candidate.resolve(), out_dir, params, generate=generate)
     candidates = [workspace / ".knote" / "kag_config.yaml", workspace / "kag_config.yaml"]
     for candidate in candidates:
         if candidate.exists():
-            return projection_config(candidate.resolve(), out_dir, params)
+            return select_projection_config(candidate.resolve(), out_dir, params, generate=generate)
     generated = out_dir / "kag_config.yaml"
     if generated.exists():
         if generate:
@@ -352,6 +352,18 @@ def select_config(params: dict[str, Any], out_dir: Path, *, generate: bool = Tru
     ensure_runtime_excluded(workspace, out_dir)
     generate_kag_config(generated, params)
     return generated
+
+
+def select_projection_config(base: Path, out_dir: Path, params: dict[str, Any], *, generate: bool) -> Path:
+    namespace = str(params.get("namespace") or "").strip()
+    if not namespace:
+        return base
+    target = out_dir / "kag_config.yaml"
+    if target.exists():
+        return target.resolve()
+    if not generate:
+        raise FileNotFoundError(f"projection KAG config not found; run /build first: {target}")
+    return projection_config(base, out_dir, params)
 
 
 def projection_config(base: Path, out_dir: Path, params: dict[str, Any]) -> Path:

@@ -238,6 +238,7 @@ func TestArtifactPointerFailurePreservesPreviouslyServingBundle(t *testing.T) {
 	if err := store.WriteArtifacts(ctx, first); err != nil {
 		t.Fatal(err)
 	}
+	legacyBefore := mustRead(t, filepath.Join(workspace, "artifacts", "summaries.jsonl"))
 	failing := Store{
 		workspace: workspace,
 		beforePointerWrite: func(protocol.ArtifactCurrentPointer) error {
@@ -260,6 +261,9 @@ func TestArtifactPointerFailurePreservesPreviouslyServingBundle(t *testing.T) {
 	}
 	if len(summaries) != 1 || summaries[0].Text != "first" {
 		t.Fatalf("failed build changed serving bundle: %+v", summaries)
+	}
+	if legacyAfter := mustRead(t, filepath.Join(workspace, "artifacts", "summaries.jsonl")); legacyAfter != legacyBefore {
+		t.Fatalf("failed pointer publication changed v1 compatibility export:\nbefore=%s\nafter=%s", legacyBefore, legacyAfter)
 	}
 	if _, err := os.Stat(filepath.Join(workspace, "artifacts", "bundles", second.BundleManifest.ProjectionID)); err != nil {
 		t.Fatalf("fully written failed candidate may remain immutable for retry: %v", err)

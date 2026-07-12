@@ -784,6 +784,32 @@ class AdapterTest(unittest.TestCase):
             self.assertIn(f'checkpoint_path: "{out_dir / "ckpt"}"', text)
             self.assertIn("namespace: shared", base.read_text(encoding="utf-8"))
 
+    def test_projection_query_requires_prebuilt_config_without_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            base = workspace / ".knote" / "kag_config.yaml"
+            base.parent.mkdir(parents=True)
+            original = "project:\n  host_addr: http://127.0.0.1:8887\n  namespace: shared\n"
+            base.write_text(original, encoding="utf-8")
+            out_dir = workspace / ".knote" / "kag-runtime" / "projections" / "projection-one"
+            params = {
+                "workspace": str(workspace),
+                "config_path": str(base),
+                "namespace": "projection-one",
+            }
+
+            with self.assertRaisesRegex(FileNotFoundError, "projection KAG config not found"):
+                adapter.select_config(params, out_dir, generate=False)
+
+            self.assertFalse(out_dir.exists())
+            self.assertEqual(base.read_text(encoding="utf-8"), original)
+
+            built = adapter.select_config(params, out_dir, generate=True)
+            before = built.read_bytes()
+            selected = adapter.select_config(params, out_dir, generate=False)
+            self.assertEqual(selected, built)
+            self.assertEqual(selected.read_bytes(), before)
+
     def test_select_config_excludes_generated_config_from_git_status(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)

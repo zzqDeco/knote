@@ -69,11 +69,6 @@ func (s Store) StageArtifacts(ctx context.Context, set repository.ArtifactSet) e
 	if err := ensureImmutableBundle(bundleDir, payloads, manifestData); err != nil {
 		return err
 	}
-	// Compatibility exports are deliberately completed before the serving
-	// pointer moves. They are never consulted when a v2 pointer exists.
-	if err := writeCompatibilityExports(artifactsDir, set.Manifest, payloads); err != nil {
-		return err
-	}
 	return nil
 }
 
@@ -108,7 +103,11 @@ func (s Store) PublishArtifacts(ctx context.Context, manifest protocol.ArtifactB
 			return err
 		}
 	}
-	return atomicWriteArtifactJSON(filepath.Join(s.workspace, "artifacts", "current.json"), pointer)
+	artifactsDir := filepath.Join(s.workspace, "artifacts")
+	if err := atomicWriteArtifactJSON(filepath.Join(artifactsDir, "current.json"), pointer); err != nil {
+		return err
+	}
+	return writeCompatibilityExportsFromBundle(artifactsDir, manifest)
 }
 
 func (s Store) ReadCurrentArtifactManifest(ctx context.Context) (protocol.ArtifactBundleManifest, error) {
@@ -277,6 +276,25 @@ func writeCompatibilityExports(artifactsDir string, manifest protocol.ArtifactMa
 		}
 	}
 	return writeJSON(filepath.Join(artifactsDir, "manifest.json"), manifest)
+}
+
+func writeCompatibilityExportsFromBundle(
+	artifactsDir string,
+	manifest protocol.ArtifactBundleManifest,
+) error {
+	bundleDir := filepath.Join(artifactsDir, "bundles", manifest.ProjectionID)
+	payloads := make([]repository.ArtifactFilePayload, 0, len(manifest.Files))
+	for _, descriptor := range manifest.Files {
+		if descriptor.Path == "projection.json" {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(bundleDir, descriptor.Path))
+		if err != nil {
+			return err
+		}
+		payloads = append(payloads, repository.ArtifactFilePayload{Descriptor: descriptor, Data: data})
+	}
+	return writeCompatibilityExports(artifactsDir, manifest.Compatibility, payloads)
 }
 
 func marshalIndentedJSON(value any) ([]byte, error) {

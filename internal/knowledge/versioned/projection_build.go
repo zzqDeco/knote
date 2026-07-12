@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -76,6 +77,10 @@ func (s service) prepareArtifactProjection(ctx context.Context) (repository.Arti
 		return repository.ArtifactSet{}, projectionBuild{}, err
 	}
 	aclVersion := canonicalACLVersion(scope)
+	buildConfigVersion, err := kagBuildConfigVersion(s.workspace, cfg)
+	if err != nil {
+		return repository.ArtifactSet{}, projectionBuild{}, err
+	}
 	snapshotDocuments := make([]catalog.SourceDocumentSnapshot, 0, len(loaded))
 	documentIDs := make(map[string]protocol.ResourceID, len(loaded))
 	for _, item := range loaded {
@@ -94,7 +99,7 @@ func (s service) prepareArtifactProjection(ctx context.Context) (repository.Arti
 	if err != nil {
 		return repository.ArtifactSet{}, projectionBuild{}, err
 	}
-	projectionVersion, err := canonicalProjectionVersion(scope, snapshot.Ref(), aclVersion)
+	projectionVersion, err := canonicalProjectionVersion(scope, snapshot.Ref(), aclVersion, buildConfigVersion)
 	if err != nil {
 		return repository.ArtifactSet{}, projectionBuild{}, err
 	}
@@ -294,10 +299,14 @@ func (s service) prepareArtifactProjection(ctx context.Context) (repository.Arti
 		return set, projectionBuild{store: store, current: serving, noop: true}, nil
 	}
 	build := projectionBuild{store: store, current: current}
+	runID, idempotencyKey, err := nextProjectionRunIdentity(store, projectionVersion)
+	if err != nil {
+		return repository.ArtifactSet{}, projectionBuild{}, err
+	}
 	run := catalog.SyncRun{
-		RunID: "run-" + projectionVersion, Scope: scope, SourceSnapshot: snapshot.Ref(),
+		RunID: runID, Scope: scope, SourceSnapshot: snapshot.Ref(),
 		BaseProjectionVersion: current.Version, ProjectionVersion: projectionVersion,
-		IdempotencyKey: "sync-" + projectionVersion, Reconciliation: catalog.ReconciliationFull,
+		IdempotencyKey: idempotencyKey, Reconciliation: catalog.ReconciliationFull,
 		State: catalog.RunStaged,
 	}
 	build.plan, err = catalog.PlanResources(run, current, resources)
@@ -356,23 +365,99 @@ func sourceSnapshotVersion(scope catalog.Scope, sources []loadedSource) (string,
 	return "source-" + fullHash(data)[:24], nil
 }
 
-func canonicalProjectionVersion(scope catalog.Scope, snapshot catalog.SourceSnapshotRef, aclVersion string) (string, error) {
+func canonicalProjectionVersion(
+	scope catalog.Scope,
+	snapshot catalog.SourceSnapshotRef,
+	aclVersion string,
+	buildConfigVersion string,
+) (string, error) {
 	payload := struct {
-		Schema   string                    `json:"schema"`
-		Scope    catalog.Scope             `json:"scope"`
-		Snapshot catalog.SourceSnapshotRef `json:"source_snapshot"`
-		ACL      string                    `json:"acl_version"`
-		Index    string                    `json:"index_version"`
-		Graph    string                    `json:"graph_version"`
+		Schema      string                    `json:"schema"`
+		Scope       catalog.Scope             `json:"scope"`
+		Snapshot    catalog.SourceSnapshotRef `json:"source_snapshot"`
+		ACL         string                    `json:"acl_version"`
+		BuildConfig string                    `json:"build_config_version"`
+		Index       string                    `json:"index_version"`
+		Graph       string                    `json:"graph_version"`
 	}{
 		Schema: projectionSchema, Scope: scope, Snapshot: snapshot, ACL: aclVersion,
-		Index: "index-v1", Graph: "graph-v1",
+		BuildConfig: buildConfigVersion, Index: "index-v1", Graph: "graph-v1",
 	}
 	data, err := json.Marshal(payload)
 	if err != nil {
 		return "", err
 	}
 	return "prj_" + fullHash(data)[:32], nil
+}
+
+func kagBuildConfigVersion(workspace string, cfg repository.Config) (string, error) {
+	configDigest := "generated-config-v1"
+	var configPath string
+	if strings.TrimSpace(cfg.KAG.ConfigPath) != "" {
+		configPath = cfg.KAG.ConfigPath
+		if !filepath.IsAbs(configPath) {
+			configPath = filepath.Join(workspace, configPath)
+		}
+	} else {
+		for _, candidate := range []string{
+			filepath.Join(workspace, ".knote", "kag_config.yaml"),
+			filepath.Join(workspace, "kag_config.yaml"),
+		} {
+			if _, err := os.Stat(candidate); err == nil {
+				configPath = candidate
+				break
+			} else if !errors.Is(err, os.ErrNotExist) {
+				return "", err
+			}
+		}
+	}
+	if configPath != "" {
+		data, err := os.ReadFile(configPath)
+		if err != nil {
+			return "", fmt.Errorf("read KAG build config: %w", err)
+		}
+		configDigest = fullHash(data)
+	}
+	payload := struct {
+		Host         string                             `json:"host"`
+		Fake         bool                               `json:"fake"`
+		ProjectID    string                             `json:"project_id"`
+		Namespace    string                             `json:"namespace"`
+		Language     string                             `json:"language"`
+		ConfigDigest string                             `json:"config_digest"`
+		Models       map[string]repository.ModelProfile `json:"models"`
+	}{
+		Host: cfg.KAG.Host, Fake: cfg.KAG.Fake, ProjectID: cfg.KAG.ProjectID,
+		Namespace: cfg.KAG.Namespace, Language: cfg.KAG.Language,
+		ConfigDigest: configDigest, Models: cfg.Models,
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+	return "build_" + fullHash(data)[:24], nil
+}
+
+func nextProjectionRunIdentity(store *catalog.ProjectionStore, projectionVersion string) (string, string, error) {
+	for attempt := 0; attempt < 10_000; attempt++ {
+		suffix := ""
+		if attempt > 0 {
+			suffix = fmt.Sprintf("-retry-%d", attempt)
+		}
+		runID := "run-" + projectionVersion + suffix
+		idempotencyKey := "sync-" + projectionVersion + suffix
+		run, err := store.Run(runID)
+		if errors.Is(err, os.ErrNotExist) {
+			return runID, idempotencyKey, nil
+		}
+		if err != nil {
+			return "", "", err
+		}
+		if run.State != catalog.RunFailed {
+			return runID, idempotencyKey, nil
+		}
+	}
+	return "", "", fmt.Errorf("projection %s exceeded retry limit", projectionVersion)
 }
 
 func canonicalACLVersion(scope catalog.Scope) string {

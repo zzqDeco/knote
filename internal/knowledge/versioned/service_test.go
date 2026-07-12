@@ -273,6 +273,62 @@ func TestServiceFailedProjectionLeavesCatalogAndArtifactPointersServingPriorVers
 	}
 }
 
+func TestServiceRetriesFailedProjectionWithoutSourceChanges(t *testing.T) {
+	ctx := context.Background()
+	repo := newMemoryRepo()
+	repo.config.KAG.Namespace = "RetryTest"
+	repo.sources["sources/intro.md"] = "stable\n"
+	backend := &recordingNamespacedBackend{buildErr: errFakeUnavailable}
+	svc := New(Options{Workspace: repo.config.Workspace, Repo: repo, Backend: backend, Mode: ModeFake})
+
+	failed, err := svc.Build(ctx)
+	if err == nil || failed.AdapterError == "" {
+		t.Fatalf("expected initial KAG failure, result=%+v err=%v", failed, err)
+	}
+	backend.buildErr = nil
+	recovered, err := svc.Build(ctx)
+	if err != nil {
+		t.Fatalf("retry unchanged failed projection: %v", err)
+	}
+	if backend.buildCalls != 2 {
+		t.Fatalf("KAG build calls = %d, want 2 across failed attempt and retry", backend.buildCalls)
+	}
+	if recovered.BundleManifest.ProjectionVersion != failed.BundleManifest.ProjectionVersion ||
+		repo.artifacts.BundleManifest.ProjectionVersion != failed.BundleManifest.ProjectionVersion {
+		t.Fatalf("retry did not publish the failed projection identity: failed=%s recovered=%s current=%s",
+			failed.BundleManifest.ProjectionVersion, recovered.BundleManifest.ProjectionVersion,
+			repo.artifacts.BundleManifest.ProjectionVersion)
+	}
+}
+
+func TestServiceKAGConfigurationChangeCreatesNewProjection(t *testing.T) {
+	ctx := context.Background()
+	repo := newMemoryRepo()
+	repo.config.KAG.Namespace = "ConfigTest"
+	repo.config.KAG.Language = "en"
+	repo.sources["sources/intro.md"] = "stable\n"
+	backend := &recordingNamespacedBackend{}
+	svc := New(Options{Workspace: repo.config.Workspace, Repo: repo, Backend: backend, Mode: ModeFake})
+
+	first, err := svc.Build(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo.config.KAG.Language = "zh"
+	second, err := svc.Build(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.BundleManifest.ProjectionVersion == first.BundleManifest.ProjectionVersion ||
+		second.BundleManifest.Namespace == first.BundleManifest.Namespace {
+		t.Fatalf("KAG configuration change reused projection identity: first=%+v second=%+v",
+			first.BundleManifest, second.BundleManifest)
+	}
+	if backend.buildCalls != 2 {
+		t.Fatalf("KAG build calls = %d, want 2 after configuration change", backend.buildCalls)
+	}
+}
+
 func TestServiceRetryRecoversArtifactPointerAfterCatalogCAS(t *testing.T) {
 	ctx := context.Background()
 	repo := newMemoryRepo()
