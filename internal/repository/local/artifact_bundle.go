@@ -332,6 +332,106 @@ func (s Store) ReadCurrentProjection(ctx context.Context) ([]byte, error) {
 	return os.ReadFile(filepath.Join(s.workspace, "artifacts", "bundles", manifest.ProjectionID, "projection.json"))
 }
 
+// committableArtifactPaths returns the exact selected serving snapshot. Other
+// immutable bundles are runtime state and must not be added to Git.
+func (s Store) committableArtifactPaths(ctx context.Context) ([]string, bool, error) {
+	artifactsDir := filepath.Join(s.workspace, "artifacts")
+	bundlesDir := filepath.Join(artifactsDir, "bundles")
+	if _, err := os.Lstat(bundlesDir); errors.Is(err, os.ErrNotExist) {
+		return nil, false, nil
+	} else if err != nil {
+		return nil, true, err
+	}
+	if err := validateArtifactBundleDirectory(artifactsDir); err != nil {
+		return nil, true, err
+	}
+	if err := validateArtifactBundleDirectory(bundlesDir); err != nil {
+		return nil, true, err
+	}
+	manifest, err := s.ReadCurrentArtifactManifest(ctx)
+	if errors.Is(err, repository.ErrArtifactCurrentNotFound) {
+		return nil, true, nil
+	}
+	if err != nil {
+		return nil, true, fmt.Errorf("validate selected artifacts for commit: %w", err)
+	}
+
+	paths := []string{
+		"artifacts/current.json",
+		filepath.ToSlash(filepath.Join("artifacts", "bundles", manifest.ProjectionID, bundleManifestName)),
+		"artifacts/manifest.json",
+	}
+	bundleDir := filepath.Join(bundlesDir, manifest.ProjectionID)
+	compatibilityManifest, err := marshalIndentedJSON(manifest.Compatibility)
+	if err != nil {
+		return nil, true, err
+	}
+	if err := requireArtifactExport(filepath.Join(artifactsDir, bundleManifestName), compatibilityManifest); err != nil {
+		return nil, true, err
+	}
+	for _, descriptor := range manifest.Files {
+		bundlePath := filepath.Join(bundleDir, descriptor.Path)
+		paths = append(paths, filepath.ToSlash(filepath.Join("artifacts", "bundles", manifest.ProjectionID, descriptor.Path)))
+		if descriptor.Path == "projection.json" {
+			continue
+		}
+		data, err := os.ReadFile(bundlePath)
+		if err != nil {
+			return nil, true, err
+		}
+		if err := requireArtifactExport(filepath.Join(artifactsDir, descriptor.Path), data); err != nil {
+			return nil, true, err
+		}
+		paths = append(paths, filepath.ToSlash(filepath.Join("artifacts", descriptor.Path)))
+	}
+	sort.Strings(paths)
+	return paths, true, nil
+}
+
+func (s Store) pruneUnselectedArtifactBundles(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	artifactsDir := filepath.Join(s.workspace, "artifacts")
+	bundlesDir := filepath.Join(artifactsDir, "bundles")
+	if _, err := os.Lstat(bundlesDir); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	manifest, err := s.ReadCurrentArtifactManifest(ctx)
+	if err != nil {
+		return fmt.Errorf("validate selected artifacts before pruning: %w", err)
+	}
+	entries, err := os.ReadDir(bundlesDir)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.Name() == manifest.ProjectionID {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(bundlesDir, entry.Name())); err != nil {
+			return fmt.Errorf("remove unselected artifact bundle %q: %w", entry.Name(), err)
+		}
+	}
+	return syncArtifactDirectory(bundlesDir)
+}
+
+func requireArtifactExport(path string, expected []byte) error {
+	if err := validateArtifactFileDestination(path); err != nil {
+		return fmt.Errorf("validate selected artifact export for commit: %w", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read selected artifact export for commit: %w", err)
+	}
+	if !bytes.Equal(data, expected) {
+		return fmt.Errorf("selected artifact export %q does not match current bundle", filepath.Base(path))
+	}
+	return nil
+}
+
 func ensureImmutableBundle(bundleDir string, payloads []repository.ArtifactFilePayload, manifestData []byte) error {
 	if err := validateArtifactBundleDirectory(bundleDir); err == nil {
 		if err := verifyImmutableBundle(bundleDir, payloads, manifestData); err != nil {

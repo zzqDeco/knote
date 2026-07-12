@@ -3,10 +3,12 @@ package local
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -97,25 +99,132 @@ func (c gitClient) Versions(ctx context.Context, limit int) ([]repository.Versio
 	return versions, nil
 }
 
-func (c gitClient) Commit(ctx context.Context, message string) (string, error) {
+func (c gitClient) Commit(ctx context.Context, message string) (output string, resultErr error) {
 	if strings.TrimSpace(message) == "" {
 		message = "knowledge: build " + time.Now().UTC().Format("20060102T150405Z")
 	}
+	publicationLock, err := c.lockArtifactPublicationForCommit(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer publicationLock.release()
 	paths, err := c.committableKnowledgePaths(ctx)
 	if err != nil {
 		return "", err
 	}
-	if len(paths) == 0 {
-		return "", fmt.Errorf("nothing to commit")
-	}
-	if _, err := c.git(ctx, append([]string{"add", "--"}, paths...)...); err != nil {
+	unrelated, err := c.shelveUnrelatedStagedChanges(ctx)
+	if err != nil {
 		return "", err
 	}
-	if _, err := c.git(ctx, append([]string{"diff", "--cached", "--quiet", "--"}, paths...)...); err == nil {
+	defer func() {
+		if err := c.restoreStagedChanges(context.Background(), unrelated); err != nil {
+			resultErr = errors.Join(resultErr, fmt.Errorf("restore unrelated staged changes: %w", err))
+		}
+	}()
+	if err := New(c.workspace).pruneUnselectedArtifactBundles(ctx); err != nil {
+		return "", err
+	}
+	if _, err := c.git(ctx, "rm", "-r", "--cached", "--ignore-unmatch", "--", "artifacts"); err != nil {
+		return "", err
+	}
+	addPaths := make([]string, 0, len(paths))
+	for _, path := range paths {
+		if path == "artifacts" {
+			if _, err := os.Stat(filepath.Join(c.workspace, path)); errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+		}
+		addPaths = append(addPaths, path)
+	}
+	if len(addPaths) > 0 {
+		if _, err := c.git(ctx, append([]string{"add", "-A", "--"}, addPaths...)...); err != nil {
+			return "", err
+		}
+	}
+	if _, err := c.git(ctx, "diff", "--cached", "--quiet"); err == nil {
 		return "", fmt.Errorf("nothing to commit")
 	}
-	args := append([]string{"commit", "-m", message, "--"}, paths...)
-	return c.git(ctx, args...)
+	return c.git(ctx, "commit", "-m", message)
+}
+
+func (c gitClient) lockArtifactPublicationForCommit(ctx context.Context) (*artifactPublicationLock, error) {
+	artifactsDir := filepath.Join(c.workspace, "artifacts")
+	bundlesDir := filepath.Join(artifactsDir, "bundles")
+	if _, err := os.Lstat(bundlesDir); errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	} else if err != nil {
+		return nil, err
+	}
+	if err := validateArtifactBundleDirectory(artifactsDir); err != nil {
+		return nil, err
+	}
+	if err := validateArtifactBundleDirectory(bundlesDir); err != nil {
+		return nil, err
+	}
+	return acquireArtifactPublicationLock(ctx, artifactsDir)
+}
+
+type stagedIndexEntry struct {
+	path   string
+	mode   string
+	object string
+}
+
+func (c gitClient) shelveUnrelatedStagedChanges(ctx context.Context) ([]stagedIndexEntry, error) {
+	out, err := c.git(ctx, "diff", "--cached", "--name-only", "-z")
+	if err != nil {
+		return nil, err
+	}
+	var entries []stagedIndexEntry
+	var paths []string
+	for _, path := range strings.Split(out, "\x00") {
+		if path == "" || knowledgePath(path) {
+			continue
+		}
+		entry := stagedIndexEntry{path: path}
+		staged, err := c.git(ctx, "ls-files", "--stage", "--", path)
+		if err != nil {
+			return nil, err
+		}
+		fields := strings.Fields(staged)
+		if len(fields) >= 3 && fields[2] == "0" {
+			entry.mode = fields[0]
+			entry.object = fields[1]
+		}
+		entries = append(entries, entry)
+		paths = append(paths, path)
+	}
+	if len(paths) > 0 {
+		if _, err := c.git(ctx, append([]string{"reset", "-q", "HEAD", "--"}, paths...)...); err != nil {
+			return nil, err
+		}
+	}
+	return entries, nil
+}
+
+func (c gitClient) restoreStagedChanges(ctx context.Context, entries []stagedIndexEntry) error {
+	for _, entry := range entries {
+		if entry.object == "" {
+			if _, err := c.git(ctx, "update-index", "--force-remove", "--", entry.path); err != nil {
+				return err
+			}
+			continue
+		}
+		if _, err := c.git(ctx, "update-index", "--add", "--cacheinfo", entry.mode, entry.object, entry.path); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func knowledgePath(path string) bool {
+	path = filepath.ToSlash(path)
+	for _, prefix := range knowledgePaths {
+		if path == prefix || strings.HasPrefix(path, prefix+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 func (c gitClient) Tag(ctx context.Context, tag string) error {
@@ -216,6 +325,16 @@ func existingKnowledgePaths(workspace string) []string {
 func (c gitClient) committableKnowledgePaths(ctx context.Context) ([]string, error) {
 	var paths []string
 	for _, path := range knowledgePaths {
+		if path == "artifacts" {
+			selected, protected, err := New(c.workspace).committableArtifactPaths(ctx)
+			if err != nil {
+				return nil, err
+			}
+			if protected {
+				paths = append(paths, selected...)
+				continue
+			}
+		}
 		if _, err := os.Stat(filepath.Join(c.workspace, path)); err == nil {
 			paths = append(paths, path)
 			continue
@@ -226,6 +345,7 @@ func (c gitClient) committableKnowledgePaths(ctx context.Context) ([]string, err
 			paths = append(paths, path)
 		}
 	}
+	sort.Strings(paths)
 	return paths, nil
 }
 

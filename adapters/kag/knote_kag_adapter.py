@@ -15,6 +15,7 @@ import json
 import math
 import os
 import re
+import subprocess
 import sys
 import time
 from ipaddress import ip_address
@@ -466,8 +467,87 @@ def select_projection_config(base: Path, out_dir: Path, params: dict[str, Any], 
             return projection_config(base, out_dir, params)
         return target.resolve()
     if not generate:
+        idempotency_key = checkout_projection_idempotency_key(params, base, namespace)
+        if idempotency_key:
+            repair_params = dict(params)
+            repair_params["idempotency_key"] = idempotency_key
+            return projection_config(base, out_dir, repair_params)
         raise FileNotFoundError(f"projection KAG config not found; run /build first: {target}")
     return projection_config(base, out_dir, params)
+
+
+def checkout_projection_idempotency_key(
+    params: dict[str, Any], base: Path, namespace: str
+) -> str:
+    workspace = workspace_path(params)
+    if not clean_tracked_workspace_file(workspace, base):
+        return ""
+    artifacts_dir = workspace / "artifacts"
+    current_path = artifacts_dir / "current.json"
+    if not clean_tracked_workspace_file(workspace, current_path):
+        return ""
+    try:
+        current_data = current_path.read_bytes()
+        current = json.loads(current_data)
+    except (OSError, json.JSONDecodeError):
+        return ""
+    if not isinstance(current, dict) or current.get("version") != 2:
+        return ""
+    projection_id = current.get("projection_id")
+    projection_version = current.get("projection_version")
+    manifest_digest = current.get("manifest_sha256")
+    if (
+        not isinstance(projection_id, str)
+        or re.fullmatch(r"prj_[0-9a-f]{32}", projection_id) is None
+        or projection_version != projection_id
+        or not isinstance(manifest_digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", manifest_digest) is None
+    ):
+        return ""
+    manifest_path = artifacts_dir / "bundles" / projection_id / "manifest.json"
+    if not clean_tracked_workspace_file(workspace, manifest_path):
+        return ""
+    try:
+        manifest_data = manifest_path.read_bytes()
+        manifest = json.loads(manifest_data)
+    except (OSError, json.JSONDecodeError):
+        return ""
+    if hashlib.sha256(manifest_data).hexdigest() != manifest_digest:
+        return ""
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("version") != 2
+        or manifest.get("projection_id") != projection_id
+        or manifest.get("projection_version") != projection_version
+        or manifest.get("namespace") != namespace
+    ):
+        return ""
+    return f"kag-build-{projection_version}"
+
+
+def clean_tracked_workspace_file(workspace: Path, path: Path) -> bool:
+    try:
+        relative = path.resolve().relative_to(workspace.resolve())
+    except (OSError, ValueError):
+        return False
+    if not path.is_file() or path.is_symlink():
+        return False
+    relative_name = relative.as_posix()
+    tracked = subprocess.run(
+        ["git", "-C", str(workspace), "ls-files", "--error-unmatch", "--", relative_name],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if tracked.returncode != 0:
+        return False
+    unchanged = subprocess.run(
+        ["git", "-C", str(workspace), "diff", "--quiet", "HEAD", "--", relative_name],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    return unchanged.returncode == 0
 
 
 def projection_isolation_requested(params: dict[str, Any], out_dir: Path, namespace: str) -> bool:

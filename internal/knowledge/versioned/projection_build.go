@@ -9,9 +9,12 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
+
+	"gopkg.in/yaml.v3"
 
 	"github.com/zzqDeco/knote/internal/catalog"
 	"github.com/zzqDeco/knote/internal/knowledge/kag"
@@ -27,7 +30,10 @@ const (
 	maxKAGResourceFiles     = 4_096
 	maxKAGResourceFileBytes = 8 << 20
 	maxKAGResourceBytes     = 64 << 20
+	defaultKAGNamespace     = "KnoteKB"
 )
+
+var kagConfigTemplatePattern = regexp.MustCompile(`^\{\{\s*([A-Za-z_][A-Za-z0-9_]*)(?:\s*\|\s*default\(\s*([^)]*)\s*\))?\s*\}\}$`)
 
 // Keep this allowlist aligned with the non-secret environment fallbacks used by
 // adapters/kag/knote_kag_adapter.py:generate_kag_config.
@@ -102,7 +108,11 @@ func (s service) prepareArtifactProjection(ctx context.Context) (repository.Arti
 		return repository.ArtifactSet{}, projectionBuild{}, fmt.Errorf("KAG corpus contains no non-blank sources")
 	}
 
-	namespaceBase := canonicalNamespace(firstNonEmpty(cfg.KAG.Namespace, "KnoteKB"))
+	namespace, err := effectiveKAGNamespace(s.workspace, cfg)
+	if err != nil {
+		return repository.ArtifactSet{}, projectionBuild{}, err
+	}
+	namespaceBase := canonicalNamespace(namespace)
 	scope := catalog.Scope{TenantID: localTenantID, KnowledgeBaseID: namespaceBase}
 	snapshotVersion, err := sourceSnapshotVersion(scope, loaded)
 	if err != nil {
@@ -515,6 +525,112 @@ func kagBuildConfigVersion(workspace string, cfg repository.Config) (string, err
 		return "", err
 	}
 	return "build_" + fullHash(data)[:24], nil
+}
+
+func effectiveKAGNamespace(workspace string, cfg repository.Config) (string, error) {
+	configured := strings.TrimSpace(cfg.KAG.Namespace)
+	if configured != "" && configured != defaultKAGNamespace {
+		return configured, nil
+	}
+
+	configPath, err := resolveKAGConfigPath(workspace, cfg.KAG.ConfigPath)
+	if err != nil || configPath == "" {
+		return firstNonEmpty(configured, defaultKAGNamespace), err
+	}
+	data, err := readBoundedFile(configPath, maxKAGResourceFileBytes)
+	if err != nil {
+		return "", fmt.Errorf("read KAG namespace config: %w", err)
+	}
+	namespace, ok, err := checkedInKAGNamespace(data)
+	if err != nil {
+		return "", fmt.Errorf("read KAG project namespace: %w", err)
+	}
+	if !ok || strings.TrimSpace(namespace) == "" {
+		return defaultKAGNamespace, nil
+	}
+	return namespace, nil
+}
+
+func checkedInKAGNamespace(data []byte) (string, bool, error) {
+	var root yaml.Node
+	if err := yaml.Unmarshal(data, &root); err != nil {
+		return "", false, fmt.Errorf("decode KAG config YAML: %w", err)
+	}
+	project, ok, err := yamlMappingValue(&root, "project")
+	if err != nil || !ok {
+		return "", false, err
+	}
+	namespace, ok, err := yamlMappingValue(project, "namespace")
+	if err != nil || !ok {
+		return "", false, err
+	}
+	namespace = yamlResolvedNode(namespace)
+	if namespace.Kind != yaml.ScalarNode {
+		return "", false, fmt.Errorf("KAG project namespace must be a scalar")
+	}
+	value := strings.TrimSpace(namespace.Value)
+	if namespace.Tag == "!ENV" {
+		return os.Getenv(value), true, nil
+	}
+	if match := kagConfigTemplatePattern.FindStringSubmatch(value); match != nil {
+		if environment := os.Getenv(match[1]); environment != "" {
+			return environment, true, nil
+		}
+		if match[2] != "" {
+			return strings.Trim(strings.TrimSpace(match[2]), `'"`), true, nil
+		}
+		return "", true, nil
+	}
+	return value, true, nil
+}
+
+func yamlMappingValue(node *yaml.Node, key string) (*yaml.Node, bool, error) {
+	node = yamlResolvedNode(node)
+	if node.Kind == yaml.DocumentNode && len(node.Content) == 1 {
+		node = yamlResolvedNode(node.Content[0])
+	}
+	if node.Kind != yaml.MappingNode {
+		return nil, false, fmt.Errorf("YAML section containing %q must be a mapping", key)
+	}
+	var value *yaml.Node
+	for index := 0; index+1 < len(node.Content); index += 2 {
+		candidate := yamlResolvedNode(node.Content[index])
+		if candidate.Kind != yaml.ScalarNode || candidate.Value != key {
+			continue
+		}
+		if value != nil {
+			return nil, false, fmt.Errorf("duplicate YAML key %q", key)
+		}
+		value = node.Content[index+1]
+	}
+	return value, value != nil, nil
+}
+
+func yamlResolvedNode(node *yaml.Node) *yaml.Node {
+	for node != nil && node.Kind == yaml.AliasNode && node.Alias != nil {
+		node = node.Alias
+	}
+	return node
+}
+
+func resolveKAGConfigPath(workspace, configuredPath string) (string, error) {
+	if strings.TrimSpace(configuredPath) != "" {
+		if filepath.IsAbs(configuredPath) {
+			return configuredPath, nil
+		}
+		return filepath.Join(workspace, configuredPath), nil
+	}
+	for _, candidate := range []string{
+		filepath.Join(workspace, ".knote", "kag_config.yaml"),
+		filepath.Join(workspace, "kag_config.yaml"),
+	} {
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate, nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
+	}
+	return "", nil
 }
 
 func kagAdapterDigest(workspace, adapterPath string) (string, error) {

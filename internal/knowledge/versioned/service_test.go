@@ -661,6 +661,80 @@ func TestKAGBuildConfigVersionBoundsIndividualResources(t *testing.T) {
 	}
 }
 
+func TestServiceBuildUsesCheckedInKAGNamespaceWhenKnoteNamespaceIsImplicit(t *testing.T) {
+	ctx := context.Background()
+	workspace := t.TempDir()
+	// Runtime startup persists normalized defaults, including KnoteKB, even when
+	// the user did not explicitly configure a namespace.
+	writeKAGTestFile(t, filepath.Join(workspace, ".knote", "config.yaml"), "kag: {host: http://127.0.0.1:8887, namespace: KnoteKB}\n")
+	writeKAGTestFile(t, filepath.Join(workspace, "kag_config.yaml"), `project: {namespace: "Checked In Knowledge"}`+"\n")
+	repo := newMemoryRepo()
+	repo.config.KAG.Namespace = defaultKAGNamespace
+	repo.sources["sources/intro.md"] = "stable\n"
+	backend := &recordingNamespacedBackend{}
+	svc := New(Options{Workspace: workspace, Repo: repo, Backend: backend, Mode: ModeFake})
+
+	artifacts, err := svc.Build(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if artifacts.Manifest.Workspace != "Checked_In_Knowledge" {
+		t.Fatalf("workspace namespace = %q, want checked-in namespace", artifacts.Manifest.Workspace)
+	}
+	if !strings.HasPrefix(artifacts.BundleManifest.Namespace, "Checked_In_Knowledge__prj_") {
+		t.Fatalf("projection namespace = %q, want checked-in namespace prefix", artifacts.BundleManifest.Namespace)
+	}
+}
+
+func TestServiceBuildHonorsNonDefaultKnoteKAGNamespaceOverCheckedInConfig(t *testing.T) {
+	ctx := context.Background()
+	workspace := t.TempDir()
+	writeKAGTestFile(t, filepath.Join(workspace, "kag_config.yaml"), "project:\n  namespace: checked-in\n")
+	repo := newMemoryRepo()
+	repo.config.KAG.Namespace = "ExplicitKB"
+	repo.sources["sources/intro.md"] = "stable\n"
+	backend := &recordingNamespacedBackend{}
+	svc := New(Options{Workspace: workspace, Repo: repo, Backend: backend, Mode: ModeFake})
+
+	artifacts, err := svc.Build(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if artifacts.Manifest.Workspace != "ExplicitKB" {
+		t.Fatalf("workspace namespace = %q, want explicit knote namespace", artifacts.Manifest.Workspace)
+	}
+	if !strings.HasPrefix(artifacts.BundleManifest.Namespace, "ExplicitKB__prj_") {
+		t.Fatalf("projection namespace = %q, want explicit knote namespace prefix", artifacts.BundleManifest.Namespace)
+	}
+}
+
+func TestCheckedInKAGNamespaceSupportsStructuredYAMLForms(t *testing.T) {
+	t.Setenv("CUSTOM_KAG_NAMESPACE", "Environment Namespace")
+	tests := []struct {
+		name   string
+		config string
+		want   string
+	}{
+		{name: "block mapping", config: "project:\n  namespace: Block Namespace\n", want: "Block Namespace"},
+		{name: "flow mapping", config: `project: {namespace: "Flow Namespace"}` + "\n", want: "Flow Namespace"},
+		{name: "mapping alias", config: "shared: &project\n  namespace: Alias Namespace\nproject: *project\n", want: "Alias Namespace"},
+		{name: "environment tag", config: "project:\n  namespace: !ENV CUSTOM_KAG_NAMESPACE\n", want: "Environment Namespace"},
+		{name: "environment template", config: "project:\n  namespace: '{{ CUSTOM_KAG_NAMESPACE }}'\n", want: "Environment Namespace"},
+		{name: "template default", config: "project:\n  namespace: \"{{ MISSING_KAG_NAMESPACE | default('Default Namespace') }}\"\n", want: "Default Namespace"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, ok, err := checkedInKAGNamespace([]byte(test.config))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !ok || got != test.want {
+				t.Fatalf("namespace = %q, %v, want %q, true", got, ok, test.want)
+			}
+		})
+	}
+}
+
 func TestServiceKAGNamespaceChangeStartsNewProjectionScope(t *testing.T) {
 	ctx := context.Background()
 	repo := newMemoryRepo()
