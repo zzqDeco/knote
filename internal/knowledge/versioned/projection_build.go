@@ -447,6 +447,10 @@ func canonicalProjectionVersion(
 }
 
 func kagBuildConfigVersion(workspace string, cfg repository.Config) (string, error) {
+	adapterDigest, err := kagAdapterDigest(workspace, cfg.KAG.AdapterPath)
+	if err != nil {
+		return "", err
+	}
 	configDigest, err := generatedKAGConfigDigest()
 	if err != nil {
 		return "", err
@@ -487,6 +491,7 @@ func kagBuildConfigVersion(workspace string, cfg repository.Config) (string, err
 		}
 	}
 	payload := struct {
+		AdapterDigest  string                             `json:"adapter_digest"`
 		Host           string                             `json:"host"`
 		Fake           bool                               `json:"fake"`
 		ProjectID      string                             `json:"project_id"`
@@ -498,7 +503,8 @@ func kagBuildConfigVersion(workspace string, cfg repository.Config) (string, err
 		ResourceDigest string                             `json:"resource_digest"`
 		Models         map[string]repository.ModelProfile `json:"models"`
 	}{
-		Host: cfg.KAG.Host, Fake: cfg.KAG.Fake, ProjectID: cfg.KAG.ProjectID,
+		AdapterDigest: adapterDigest,
+		Host:          cfg.KAG.Host, Fake: cfg.KAG.Fake, ProjectID: cfg.KAG.ProjectID,
 		Namespace: cfg.KAG.Namespace, Language: cfg.KAG.Language,
 		RuntimeDir:     canonicalKAGRuntimeDir(workspace, cfg.KAG.RuntimeDir),
 		ConfigIdentity: configIdentity, ConfigDigest: configDigest,
@@ -509,6 +515,70 @@ func kagBuildConfigVersion(workspace string, cfg repository.Config) (string, err
 		return "", err
 	}
 	return "build_" + fullHash(data)[:24], nil
+}
+
+func kagAdapterDigest(workspace, adapterPath string) (string, error) {
+	adapterPath = strings.TrimSpace(adapterPath)
+	if adapterPath == "" {
+		return "kag-adapter-unconfigured-v1", nil
+	}
+	resolved, err := resolveKAGAdapterPath(workspace, adapterPath)
+	if err != nil {
+		return "", err
+	}
+	data, err := readBoundedFile(resolved, maxKAGResourceFileBytes)
+	if err != nil {
+		return "", fmt.Errorf("read KAG adapter: %w", err)
+	}
+	payload, err := json.Marshal(struct {
+		Schema string `json:"schema"`
+		Digest string `json:"digest"`
+	}{Schema: "kag-adapter-content-v1", Digest: fullHash(data)})
+	if err != nil {
+		return "", fmt.Errorf("digest KAG adapter: %w", err)
+	}
+	return fullHash(payload), nil
+}
+
+func resolveKAGAdapterPath(workspace, adapterPath string) (string, error) {
+	if filepath.IsAbs(adapterPath) {
+		return adapterPath, nil
+	}
+	candidates := []string{filepath.Join(workspace, adapterPath)}
+	if executable, err := os.Executable(); err == nil {
+		candidates = append(candidates, kagAdapterParentCandidates(filepath.Dir(executable), adapterPath)...)
+	}
+	if workingDirectory, err := os.Getwd(); err == nil {
+		candidates = append(candidates, kagAdapterParentCandidates(workingDirectory, adapterPath)...)
+	}
+	seen := make(map[string]struct{}, len(candidates))
+	for _, candidate := range candidates {
+		candidate = filepath.Clean(candidate)
+		if _, ok := seen[candidate]; ok {
+			continue
+		}
+		seen[candidate] = struct{}{}
+		info, err := os.Stat(candidate)
+		if err == nil && info.Mode().IsRegular() {
+			return candidate, nil
+		}
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return "", fmt.Errorf("resolve KAG adapter %s: %w", adapterPath, err)
+		}
+	}
+	return "", fmt.Errorf("resolve KAG adapter %s: file not found", adapterPath)
+}
+
+func kagAdapterParentCandidates(directory, adapterPath string) []string {
+	var candidates []string
+	for {
+		candidates = append(candidates, filepath.Join(directory, adapterPath))
+		parent := filepath.Dir(directory)
+		if parent == directory {
+			return candidates
+		}
+		directory = parent
+	}
 }
 
 func generatedKAGConfigDigest() (string, error) {
@@ -537,23 +607,21 @@ func checkedInKAGConfigDigest(data []byte) (string, error) {
 }
 
 func referencedKAGSemanticEnvVars(config string) []string {
-	referenced := make([]string, 0)
-	for _, name := range generatedKAGSemanticEnvVars {
-		if kagConfigReferencesEnvironment(config, name) {
-			referenced = append(referenced, name)
-		}
-	}
-	return referenced
-}
-
-func kagConfigReferencesEnvironment(config, name string) bool {
+	referenced := make(map[string]struct{})
 	for _, line := range strings.Split(config, "\n") {
 		trimmed := strings.TrimSpace(line)
 		if strings.HasPrefix(trimmed, "#") {
 			continue
 		}
-		if marker := strings.Index(line, "!ENV"); marker >= 0 && containsEnvironmentIdentifier(line[marker+len("!ENV"):], name) {
-			return true
+		for remaining := line; ; {
+			marker := strings.Index(remaining, "!ENV")
+			if marker < 0 {
+				break
+			}
+			remaining = remaining[marker+len("!ENV"):]
+			if name := firstKAGEnvironmentIdentifier(remaining); name != "" && !isSecretLikeEnvironmentName(name) {
+				referenced[name] = struct{}{}
+			}
 		}
 		for remaining := line; ; {
 			start := strings.Index(remaining, "{{")
@@ -565,30 +633,67 @@ func kagConfigReferencesEnvironment(config, name string) bool {
 			if end < 0 {
 				break
 			}
-			if containsEnvironmentIdentifier(remaining[:end], name) {
-				return true
+			for _, name := range kagEnvironmentIdentifiers(remaining[:end]) {
+				if !isSecretLikeEnvironmentName(name) {
+					referenced[name] = struct{}{}
+				}
 			}
 			remaining = remaining[end+2:]
+		}
+	}
+	names := make([]string, 0, len(referenced))
+	for name := range referenced {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func firstKAGEnvironmentIdentifier(value string) string {
+	names := kagEnvironmentIdentifiers(value)
+	if len(names) == 0 {
+		return ""
+	}
+	return names[0]
+}
+
+func kagEnvironmentIdentifiers(value string) []string {
+	var names []string
+	for start := 0; start < len(value); {
+		if !isEnvironmentIdentifierStart(value[start]) {
+			start++
+			continue
+		}
+		end := start + 1
+		for end < len(value) && isEnvironmentIdentifierByte(value[end]) {
+			end++
+		}
+		names = append(names, value[start:end])
+		start = end
+	}
+	return names
+}
+
+func isSecretLikeEnvironmentName(name string) bool {
+	upper := strings.ToUpper(name)
+	for _, segment := range strings.Split(upper, "_") {
+		if segment == "KEY" {
+			return true
+		}
+	}
+	for _, marker := range []string{
+		"API_KEY", "APIKEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD",
+		"PRIVATE_KEY", "ACCESS_KEY", "CREDENTIAL",
+	} {
+		if strings.Contains(upper, marker) {
+			return true
 		}
 	}
 	return false
 }
 
-func containsEnvironmentIdentifier(value, name string) bool {
-	for offset := 0; ; {
-		index := strings.Index(value[offset:], name)
-		if index < 0 {
-			return false
-		}
-		index += offset
-		beforeValid := index == 0 || !isEnvironmentIdentifierByte(value[index-1])
-		after := index + len(name)
-		afterValid := after == len(value) || !isEnvironmentIdentifierByte(value[after])
-		if beforeValid && afterValid {
-			return true
-		}
-		offset = index + len(name)
-	}
+func isEnvironmentIdentifierStart(value byte) bool {
+	return value == '_' || value >= 'A' && value <= 'Z'
 }
 
 func isEnvironmentIdentifierByte(value byte) bool {

@@ -173,10 +173,11 @@ func (s Store) PublishArtifacts(
 	if err := syncArtifactDirectory(artifactsDir); err != nil {
 		return err
 	}
-	publicationLock.release()
 	// current.json is the serving commit point. Compatibility exports are
 	// best-effort after it advances so a partial legacy refresh cannot turn a
-	// successfully selected bundle into a failed build.
+	// successfully selected bundle into a failed build. Keep publication
+	// serialized through the legacy refresh so an older publisher cannot
+	// overwrite exports produced by a newer current pointer.
 	if s.beforeCompatibilityPublish != nil {
 		if err := s.beforeCompatibilityPublish(); err != nil {
 			return nil

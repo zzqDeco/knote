@@ -423,6 +423,40 @@ func TestKAGBuildConfigVersionTracksGeneratedConfigSemanticEnvironment(t *testin
 	}
 }
 
+func TestKAGBuildConfigVersionTracksAdapterContentPortably(t *testing.T) {
+	firstWorkspace := t.TempDir()
+	secondWorkspace := t.TempDir()
+	firstAdapter := filepath.Join(firstWorkspace, "adapters", "kag", "custom.py")
+	secondAdapter := filepath.Join(secondWorkspace, "adapters", "kag", "custom.py")
+	writeKAGTestFile(t, firstAdapter, "ADAPTER_VERSION = 1\n")
+	writeKAGTestFile(t, secondAdapter, "ADAPTER_VERSION = 1\n")
+
+	firstConfig := newMemoryRepo().config
+	firstConfig.KAG.AdapterPath = firstAdapter
+	secondConfig := newMemoryRepo().config
+	secondConfig.KAG.AdapterPath = secondAdapter
+	first, err := kagBuildConfigVersion(firstWorkspace, firstConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := kagBuildConfigVersion(secondWorkspace, secondConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second != first {
+		t.Fatalf("identical adapter content changed identity across checkout roots: first=%s second=%s", first, second)
+	}
+
+	writeKAGTestFile(t, secondAdapter, "ADAPTER_VERSION = 2\n")
+	upgraded, err := kagBuildConfigVersion(secondWorkspace, secondConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if upgraded == second {
+		t.Fatal("adapter content upgrade did not change build config identity")
+	}
+}
+
 func TestKAGBuildConfigVersionIgnoresGeneratedEnvironmentWithCheckedInConfig(t *testing.T) {
 	workspace := t.TempDir()
 	writeKAGTestFile(t, filepath.Join(workspace, "kag_config.yaml"), "project:\n  namespace: checked-in\n")
@@ -446,21 +480,21 @@ func TestKAGBuildConfigVersionIgnoresGeneratedEnvironmentWithCheckedInConfig(t *
 func TestKAGBuildConfigVersionTracksReferencedEnvironmentWithCheckedInConfig(t *testing.T) {
 	workspace := t.TempDir()
 	writeKAGTestFile(t, filepath.Join(workspace, "kag_config.yaml"), `openie_llm:
-  model: !ENV KNOTE_OPENIE_LLM_MODEL
-  api_key: !ENV KNOTE_OPENIE_LLM_API_KEY
+  model: !ENV CUSTOM_OPENIE_MODEL
+  api_key: !ENV CUSTOM_OPENIE_API_KEY
 project:
-  namespace: "{{ KNOTE_KAG_NAMESPACE }}"
+  namespace: "{{ CUSTOM_KAG_NAMESPACE }}"
 `)
 	cfg := newMemoryRepo().config
-	t.Setenv("KNOTE_OPENIE_LLM_MODEL", "model-a")
-	t.Setenv("KNOTE_KAG_NAMESPACE", "namespace-a")
-	t.Setenv("KNOTE_OPENIE_LLM_API_KEY", "secret-a")
+	t.Setenv("CUSTOM_OPENIE_MODEL", "model-a")
+	t.Setenv("CUSTOM_KAG_NAMESPACE", "namespace-a")
+	t.Setenv("CUSTOM_OPENIE_API_KEY", "secret-a")
 
 	first, err := kagBuildConfigVersion(workspace, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("KNOTE_OPENIE_LLM_MODEL", "model-b")
+	t.Setenv("CUSTOM_OPENIE_MODEL", "model-b")
 	withModelChange, err := kagBuildConfigVersion(workspace, cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -468,7 +502,7 @@ project:
 	if withModelChange == first {
 		t.Fatal("referenced !ENV semantic environment change did not change checked-in config identity")
 	}
-	t.Setenv("KNOTE_KAG_NAMESPACE", "namespace-b")
+	t.Setenv("CUSTOM_KAG_NAMESPACE", "namespace-b")
 	withTemplateChange, err := kagBuildConfigVersion(workspace, cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -476,7 +510,7 @@ project:
 	if withTemplateChange == withModelChange {
 		t.Fatal("referenced template semantic environment change did not change checked-in config identity")
 	}
-	t.Setenv("KNOTE_OPENIE_LLM_API_KEY", "secret-b")
+	t.Setenv("CUSTOM_OPENIE_API_KEY", "secret-b")
 	withSecretChange, err := kagBuildConfigVersion(workspace, cfg)
 	if err != nil {
 		t.Fatal(err)
