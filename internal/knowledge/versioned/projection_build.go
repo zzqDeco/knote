@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/zzqDeco/knote/internal/catalog"
+	"github.com/zzqDeco/knote/internal/knowledge/kag"
 	"github.com/zzqDeco/knote/internal/protocol"
 	"github.com/zzqDeco/knote/internal/repository"
 )
@@ -36,8 +37,10 @@ type loadedSource struct {
 
 type projectionBuild struct {
 	store   *catalog.ProjectionStore
+	base    catalog.Projection
 	current catalog.Projection
 	plan    catalog.ProjectionPlan
+	corpus  []kag.CorpusRecord
 	noop    bool
 }
 
@@ -65,6 +68,13 @@ func (s service) prepareArtifactProjection(ctx context.Context) (repository.Arti
 			return repository.ArtifactSet{}, projectionBuild{}, err
 		}
 		loaded = append(loaded, loadedSource{source: source, data: data, digest: protocol.NewContentDigest(string(data))})
+	}
+	corpus := make([]kag.CorpusRecord, 0, len(loaded))
+	for _, item := range loaded {
+		content := string(item.data)
+		corpus = append(corpus, kag.CorpusRecord{
+			ID: item.source.Path, Name: titleFromContent(content), Content: content, SourcePath: item.source.Path,
+		})
 	}
 
 	namespaceBase := canonicalNamespace(firstNonEmpty(cfg.KAG.Namespace, "KnoteKB"))
@@ -274,13 +284,13 @@ func (s service) prepareArtifactProjection(ctx context.Context) (repository.Arti
 		return repository.ArtifactSet{}, projectionBuild{}, err
 	}
 	if current.Version == projectionVersion {
-		return set, projectionBuild{current: current, noop: true}, nil
+		return set, projectionBuild{base: current, current: current, corpus: corpus, noop: true}, nil
 	}
 	projectionRoot := filepath.Join(s.workspace, ".knote", "projections")
 	if provider, ok := s.repo.(projectionRootProvider); ok {
 		projectionRoot = provider.ProjectionStoreRoot()
 	}
-	storeRoot := filepath.Join(projectionRoot, "by-base", current.Version)
+	storeRoot := projectionJournalRoot(projectionRoot, current.Version, projectionVersion)
 	store, err := catalog.NewProjectionStore(storeRoot)
 	if err != nil {
 		return repository.ArtifactSet{}, projectionBuild{}, err
@@ -293,9 +303,11 @@ func (s service) prepareArtifactProjection(ctx context.Context) (repository.Arti
 		if servingErr != nil || serving.Version != projectionVersion {
 			return repository.ArtifactSet{}, projectionBuild{}, err
 		}
-		return set, projectionBuild{store: store, current: serving, noop: true}, nil
+		return set, projectionBuild{
+			store: store, base: current, current: serving, corpus: corpus, noop: true,
+		}, nil
 	}
-	build := projectionBuild{store: store, current: current}
+	build := projectionBuild{store: store, base: current, current: current, corpus: corpus}
 	runID, idempotencyKey, err := nextProjectionRunIdentity(store, projectionVersion)
 	if err != nil {
 		return repository.ArtifactSet{}, projectionBuild{}, err
@@ -311,6 +323,10 @@ func (s service) prepareArtifactProjection(ctx context.Context) (repository.Arti
 		return repository.ArtifactSet{}, projectionBuild{}, err
 	}
 	return set, build, nil
+}
+
+func projectionJournalRoot(root, baseVersion, projectionVersion string) string {
+	return filepath.Join(root, "by-base", baseVersion, "successors", projectionVersion)
 }
 
 func (s service) selectedBaseProjection(ctx context.Context, scope catalog.Scope) (catalog.Projection, error) {
@@ -587,6 +603,8 @@ func kagGeneratedResourceRoots(workspace, runtimeDir string) ([]string, error) {
 		filepath.Join(workspace, ".knote", "sessions"),
 		filepath.Join(workspace, ".knote", "cache"),
 		filepath.Join(workspace, ".knote", "checkpoints"),
+		filepath.Join(workspace, "evals", "report.md"),
+		filepath.Join(workspace, "evals", "results.jsonl"),
 		runtimeDir,
 	}
 	sort.Strings(roots)
@@ -671,17 +689,33 @@ func projectionKAGBuildIdempotencyKey(projectionVersion string) string {
 }
 
 func (s service) executeProjectionBuild(ctx context.Context, artifacts repository.ArtifactSet, build projectionBuild) (map[string]any, error) {
+	if s.backend == nil {
+		return nil, fmt.Errorf("KAG build failed: KAG backend is not configured")
+	}
+	if err := s.verifySelectedBaseProjection(ctx, build.base); err != nil {
+		return nil, err
+	}
 	if build.noop {
+		response, err := s.buildPreparedKAGCorpus(ctx, artifacts, build.corpus)
+		if err != nil {
+			return nil, err
+		}
 		if err := s.repo.StageArtifacts(ctx, artifacts); err != nil {
+			return nil, err
+		}
+		if err := s.verifySelectedBaseProjection(ctx, build.base); err != nil {
 			return nil, err
 		}
 		if err := s.repo.PublishArtifacts(ctx, artifacts.BundleManifest); err != nil {
 			return nil, err
 		}
-		return map[string]any{"projection_version": artifacts.BundleManifest.ProjectionVersion, "idempotent_noop": true}, nil
-	}
-	if s.backend == nil {
-		return nil, fmt.Errorf("KAG build failed: KAG backend is not configured")
+		data := cloneMap(response.Data)
+		if data == nil {
+			data = make(map[string]any)
+		}
+		data["projection_version"] = artifacts.BundleManifest.ProjectionVersion
+		data["idempotent_noop"] = true
+		return data, nil
 	}
 	var buildData map[string]any
 	var operationErr error
@@ -694,13 +728,9 @@ func (s service) executeProjectionBuild(ctx context.Context, artifacts repositor
 		switch operation.Kind {
 		case catalog.OperationProjectIndex:
 			if !kagBuilt {
-				response, err := s.backend.BuildInNamespace(
-					ctx,
-					artifacts.BundleManifest.Namespace,
-					projectionKAGBuildIdempotencyKey(artifacts.BundleManifest.ProjectionVersion),
-				)
+				response, err := s.buildPreparedKAGCorpus(ctx, artifacts, build.corpus)
 				if err != nil {
-					operationErr = fmt.Errorf("KAG build failed: %w", err)
+					operationErr = err
 					return catalog.OperationResult{}, operationErr
 				}
 				buildData = cloneMap(response.Data)
@@ -727,8 +757,38 @@ func (s service) executeProjectionBuild(ctx context.Context, artifacts repositor
 		}
 		return nil, fmt.Errorf("projection build did not reach a successful serving state")
 	}
+	if err := s.verifySelectedBaseProjection(ctx, build.base); err != nil {
+		return nil, err
+	}
 	if err := s.repo.PublishArtifacts(ctx, artifacts.BundleManifest); err != nil {
 		return nil, fmt.Errorf("publish artifact serving pointer: %w", err)
 	}
 	return buildData, nil
+}
+
+func (s service) buildPreparedKAGCorpus(ctx context.Context, artifacts repository.ArtifactSet, corpus []kag.CorpusRecord) (kag.Response, error) {
+	response, err := s.backend.BuildInNamespaceWithCorpus(
+		ctx,
+		artifacts.BundleManifest.Namespace,
+		projectionKAGBuildIdempotencyKey(artifacts.BundleManifest.ProjectionVersion),
+		corpus,
+	)
+	if err != nil {
+		return kag.Response{}, fmt.Errorf("KAG build failed: %w", err)
+	}
+	return response, nil
+}
+
+func (s service) verifySelectedBaseProjection(ctx context.Context, expected catalog.Projection) error {
+	selected, err := s.selectedBaseProjection(ctx, expected.Scope)
+	if err != nil {
+		return err
+	}
+	if selected.Scope != expected.Scope || selected.Version != expected.Version {
+		return fmt.Errorf(
+			"public projection base changed from %s to %s: %w",
+			expected.Version, selected.Version, catalog.ErrStaleServingPointer,
+		)
+	}
+	return nil
 }

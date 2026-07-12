@@ -3,6 +3,7 @@ package knowledge
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"strings"
@@ -196,6 +197,7 @@ type memoryRepo struct {
 	sources             map[string]string
 	sourceModTimes      map[string]time.Time
 	artifacts           repository.ArtifactSet
+	stagedArtifacts     repository.ArtifactSet
 	writeArtifactsCalls int
 	eval                repository.EvalReport
 	hash                string
@@ -253,11 +255,15 @@ func (r *memoryRepo) WriteArtifacts(_ context.Context, set repository.ArtifactSe
 
 func (r *memoryRepo) StageArtifacts(_ context.Context, set repository.ArtifactSet) error {
 	r.writeArtifactsCalls++
-	r.artifacts = set
+	r.stagedArtifacts = set
 	return nil
 }
 
-func (r *memoryRepo) PublishArtifacts(context.Context, protocol.ArtifactBundleManifest) error {
+func (r *memoryRepo) PublishArtifacts(_ context.Context, manifest protocol.ArtifactBundleManifest) error {
+	if r.stagedArtifacts.BundleManifest.ProjectionVersion != manifest.ProjectionVersion {
+		return fmt.Errorf("staged projection does not match published manifest")
+	}
+	r.artifacts = r.stagedArtifacts
 	return nil
 }
 
@@ -319,6 +325,9 @@ func (fakeBackend) Explain(context.Context, string) (kag.Response, error) {
 func (b fakeBackend) BuildInNamespace(ctx context.Context, _, _ string) (kag.Response, error) {
 	return b.Build(ctx)
 }
+func (b fakeBackend) BuildInNamespaceWithCorpus(ctx context.Context, _, _ string, _ []kag.CorpusRecord) (kag.Response, error) {
+	return b.Build(ctx)
+}
 func (b fakeBackend) QueryInNamespace(ctx context.Context, _ string, query string) (kag.Response, error) {
 	return b.Query(ctx, query)
 }
@@ -341,6 +350,9 @@ func (failingBackend) Explain(context.Context, string) (kag.Response, error) {
 }
 
 func (b failingBackend) BuildInNamespace(ctx context.Context, _, _ string) (kag.Response, error) {
+	return b.Build(ctx)
+}
+func (b failingBackend) BuildInNamespaceWithCorpus(ctx context.Context, _, _ string, _ []kag.CorpusRecord) (kag.Response, error) {
 	return b.Build(ctx)
 }
 func (b failingBackend) QueryInNamespace(ctx context.Context, _ string, query string) (kag.Response, error) {
@@ -367,6 +379,9 @@ func (buildFailingBackend) Explain(context.Context, string) (kag.Response, error
 }
 
 func (b buildFailingBackend) BuildInNamespace(ctx context.Context, _, _ string) (kag.Response, error) {
+	return b.Build(ctx)
+}
+func (b buildFailingBackend) BuildInNamespaceWithCorpus(ctx context.Context, _, _ string, _ []kag.CorpusRecord) (kag.Response, error) {
 	return b.Build(ctx)
 }
 func (b buildFailingBackend) QueryInNamespace(ctx context.Context, _ string, query string) (kag.Response, error) {

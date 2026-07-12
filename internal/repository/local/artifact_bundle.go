@@ -132,6 +132,9 @@ func (s Store) PublishArtifacts(ctx context.Context, manifest protocol.ArtifactB
 			return err
 		}
 	}
+	if err := verifyStagedArtifactBundle(bundleDir, manifest, manifestData); err != nil {
+		return err
+	}
 	if err := replaceArtifactFile(pointerTemporary, currentPath); err != nil {
 		return err
 	}
@@ -302,8 +305,12 @@ func verifyImmutableBundle(bundleDir string, payloads []repository.ArtifactFileP
 	}
 	names := make([]string, 0, len(entries))
 	for _, entry := range entries {
-		if entry.IsDir() {
-			return fmt.Errorf("immutable artifact bundle contains unexpected directory %q", entry.Name())
+		info, err := os.Lstat(filepath.Join(bundleDir, entry.Name()))
+		if err != nil {
+			return err
+		}
+		if entry.Type()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			return fmt.Errorf("immutable artifact bundle contains non-regular file %q", entry.Name())
 		}
 		names = append(names, entry.Name())
 	}
@@ -323,6 +330,63 @@ func verifyImmutableBundle(bundleDir string, payloads []repository.ArtifactFileP
 		}
 		if !bytes.Equal(data, expected[name]) {
 			return fmt.Errorf("immutable artifact bundle file %q differs from projection %s", name, filepath.Base(bundleDir))
+		}
+	}
+	return nil
+}
+
+func verifyStagedArtifactBundle(
+	bundleDir string,
+	manifest protocol.ArtifactBundleManifest,
+	manifestData []byte,
+) error {
+	expectedNames := make([]string, 0, len(manifest.Files)+1)
+	expectedNames = append(expectedNames, bundleManifestName)
+	for _, descriptor := range manifest.Files {
+		expectedNames = append(expectedNames, descriptor.Path)
+	}
+	sort.Strings(expectedNames)
+
+	entries, err := os.ReadDir(bundleDir)
+	if err != nil {
+		return err
+	}
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		info, err := os.Lstat(filepath.Join(bundleDir, entry.Name()))
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			return fmt.Errorf("immutable artifact bundle contains non-regular file %q", entry.Name())
+		}
+		names = append(names, entry.Name())
+	}
+	sort.Strings(names)
+	if !reflect.DeepEqual(names, expectedNames) {
+		return fmt.Errorf("immutable artifact bundle contents differ from projection %s", filepath.Base(bundleDir))
+	}
+
+	onDiskManifest, err := os.ReadFile(filepath.Join(bundleDir, bundleManifestName))
+	if err != nil {
+		return err
+	}
+	onDiskManifestSum := sha256.Sum256(onDiskManifest)
+	expectedManifestSum := sha256.Sum256(manifestData)
+	if onDiskManifestSum != expectedManifestSum {
+		return fmt.Errorf("immutable artifact bundle manifest digest differs from projection %s", filepath.Base(bundleDir))
+	}
+	if !bytes.Equal(onDiskManifest, manifestData) {
+		return fmt.Errorf("immutable artifact bundle file %q differs from projection %s", bundleManifestName, filepath.Base(bundleDir))
+	}
+	for _, descriptor := range manifest.Files {
+		data, err := os.ReadFile(filepath.Join(bundleDir, descriptor.Path))
+		if err != nil {
+			return err
+		}
+		sum := sha256.Sum256(data)
+		if got := hex.EncodeToString(sum[:]); got != descriptor.SHA256 || int64(len(data)) != descriptor.SizeBytes {
+			return fmt.Errorf("immutable artifact bundle file %q differs from projection %s", descriptor.Path, filepath.Base(bundleDir))
 		}
 	}
 	return nil

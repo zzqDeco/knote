@@ -2,6 +2,7 @@ package kag
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -89,6 +90,44 @@ print(json.dumps({"id":req["id"],"type":"result","data":{"namespace":req["params
 				t.Fatalf("%s unexpectedly sent build idempotency key %v", name, got)
 			}
 		})
+	}
+}
+
+func TestClientBuildInNamespaceSendsExplicitCorpus(t *testing.T) {
+	workspace := t.TempDir()
+	adapter := filepath.Join(workspace, "adapter.py")
+	script := `import json
+import sys
+req = json.loads(sys.stdin.readline())
+print(json.dumps({"id":req["id"],"type":"result","data":{"corpus":req["params"]["corpus"],"projection_isolated":req["params"]["projection_isolated"]}}))
+`
+	if err := os.WriteFile(adapter, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("KNOTE_PYTHON", pythonForTest())
+	corpus := []CorpusRecord{{
+		ID: "sources/one.md", Name: "One", Content: "# One\n\nprepared bytes", SourcePath: "sources/one.md",
+	}}
+
+	response, err := (Client{AdapterPath: adapter, Workspace: workspace}).BuildInNamespaceWithCorpus(
+		context.Background(), "projection-one", "idem-one", corpus,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(response.Data["corpus"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []CorpusRecord
+	if err := json.Unmarshal(encoded, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0] != corpus[0] {
+		t.Fatalf("explicit corpus = %+v, want %+v", got, corpus)
+	}
+	if isolated, ok := response.Data["projection_isolated"].(bool); !ok || !isolated {
+		t.Fatalf("projection isolation marker = %#v, want true", response.Data["projection_isolated"])
 	}
 }
 

@@ -28,6 +28,7 @@ type Backend interface {
 	Query(ctx context.Context, query string) (kag.Response, error)
 	Explain(ctx context.Context, query string) (kag.Response, error)
 	BuildInNamespace(ctx context.Context, namespace, idempotencyKey string) (kag.Response, error)
+	BuildInNamespaceWithCorpus(ctx context.Context, namespace, idempotencyKey string, corpus []kag.CorpusRecord) (kag.Response, error)
 	QueryInNamespace(ctx context.Context, namespace, query string) (kag.Response, error)
 	ExplainInNamespace(ctx context.Context, namespace, query string) (kag.Response, error)
 }

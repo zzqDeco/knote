@@ -1081,6 +1081,46 @@ class AdapterTest(unittest.TestCase):
             self.assertEqual(selected, built)
             self.assertEqual(selected.read_bytes(), before)
 
+    def test_legacy_namespace_queries_use_base_config_without_projection_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            base = workspace / ".knote" / "kag_config.yaml"
+            base.parent.mkdir(parents=True)
+            base.write_text("project:\n  namespace: legacy\n", encoding="utf-8")
+            runtime = workspace / ".knote" / "kag-runtime"
+            params = {
+                "workspace": str(workspace),
+                "config_path": str(base),
+                "namespace": "legacy",
+                "runtime_dir": str(runtime),
+            }
+
+            for method in ("kag.query", "kag.explain"):
+                with self.subTest(method=method):
+                    selected = adapter.select_config(params, runtime, generate=False)
+                    self.assertEqual(selected, base.resolve())
+
+            self.assertFalse((runtime / "kag_config.yaml").exists())
+
+    def test_projection_runtime_marker_still_requires_prebuilt_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            base = workspace / ".knote" / "kag_config.yaml"
+            base.parent.mkdir(parents=True)
+            base.write_text("project:\n  namespace: shared\n", encoding="utf-8")
+            runtime = workspace / ".knote" / "kag-runtime" / "projections" / "projection-one"
+            params = {
+                "workspace": str(workspace),
+                "config_path": str(base),
+                "namespace": "projection-one",
+                "runtime_dir": str(runtime),
+            }
+
+            with self.assertRaisesRegex(FileNotFoundError, "projection KAG config not found"):
+                adapter.select_config(params, runtime, generate=False)
+
+            self.assertFalse(runtime.exists())
+
     def test_select_config_excludes_generated_config_from_git_status(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
@@ -1133,6 +1173,86 @@ class AdapterTest(unittest.TestCase):
             status = subprocess.run(["git", "status", "--short"], cwd=workspace, text=True, capture_output=True, check=True)
             self.assertEqual(status.stdout, "")
             self.assertFalse((workspace / ".knote").exists())
+
+    def test_real_build_replays_receipt_before_config_and_health(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            runtime = workspace / ".knote" / "kag-runtime" / "projections" / "projection-one"
+            params = {
+                "workspace": str(workspace),
+                "runtime_dir": str(runtime),
+                "namespace": "projection-one",
+                "idempotency_key": "sync-projection-one",
+            }
+            receipt = {"status": "ok", "mode": "real", "documents": 1}
+            adapter.store_build_receipt(runtime, params["idempotency_key"], receipt)
+            stdout = StringIO()
+
+            with (
+                patch.object(adapter, "select_config") as select_config_mock,
+                patch.object(adapter, "check_real_health") as health_mock,
+                redirect_stdout(stdout),
+            ):
+                adapter.real_response({"id": "build-replay", "method": "kag.build", "params": params})
+
+            response = json.loads(stdout.getvalue())
+            self.assertEqual(response["type"], "result")
+            self.assertEqual(response["data"], receipt)
+            select_config_mock.assert_not_called()
+            health_mock.assert_not_called()
+
+    def test_real_build_rejects_invalid_receipt_before_config_and_health(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            runtime = workspace / ".knote" / "kag-runtime"
+            key = "sync-invalid-receipt"
+            path = adapter.build_receipt_path(runtime, key)
+            path.parent.mkdir(parents=True)
+            path.write_text("{not-json", encoding="utf-8")
+            stdout = StringIO()
+            req = {
+                "id": "build-invalid-receipt",
+                "method": "kag.build",
+                "params": {
+                    "workspace": str(workspace),
+                    "runtime_dir": str(runtime),
+                    "idempotency_key": key,
+                },
+            }
+
+            with (
+                patch.object(adapter, "select_config") as select_config_mock,
+                patch.object(adapter, "check_real_health") as health_mock,
+                redirect_stdout(stdout),
+            ):
+                adapter.real_response(req)
+
+            response = json.loads(stdout.getvalue())
+            self.assertEqual(response["type"], "error")
+            self.assertIn("invalid KAG build idempotency receipt", response["error"])
+            select_config_mock.assert_not_called()
+            health_mock.assert_not_called()
+
+    def test_real_build_validates_idempotency_key_before_config_and_health(self) -> None:
+        stdout = StringIO()
+        req = {
+            "id": "build-invalid-key",
+            "method": "kag.build",
+            "params": {"workspace": str(Path.cwd()), "idempotency_key": " sync-invalid "},
+        }
+
+        with (
+            patch.object(adapter, "select_config") as select_config_mock,
+            patch.object(adapter, "check_real_health") as health_mock,
+            redirect_stdout(stdout),
+        ):
+            adapter.real_response(req)
+
+        response = json.loads(stdout.getvalue())
+        self.assertEqual(response["type"], "error")
+        self.assertIn("idempotency_key contains invalid whitespace", response["error"])
+        select_config_mock.assert_not_called()
+        health_mock.assert_not_called()
 
     def test_config_host_reads_literal_and_env_values(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

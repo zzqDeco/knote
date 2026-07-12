@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -283,7 +284,9 @@ func TestServiceFailedProjectionLeavesCatalogAndArtifactPointersServingPriorVers
 	if err != nil {
 		t.Fatal(err)
 	}
-	store, err := catalog.NewProjectionStore(filepath.Join(repo.projectionRoot, "by-base", empty.Version))
+	store, err := catalog.NewProjectionStore(projectionJournalRoot(
+		repo.projectionRoot, empty.Version, first.BundleManifest.ProjectionVersion,
+	))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -367,6 +370,8 @@ func TestKAGBuildConfigVersionTracksResourceTreeAndExcludesGeneratedState(t *tes
 	}
 	writeKAGTestFile(t, filepath.Join(workspace, ".knote", "kag-runtime", "projections", "old", "receipt.json"), "generated")
 	writeKAGTestFile(t, filepath.Join(workspace, "artifacts", "current.json"), "generated")
+	writeKAGTestFile(t, filepath.Join(workspace, "evals", "report.md"), "generated report")
+	writeKAGTestFile(t, filepath.Join(workspace, "evals", "results.jsonl"), "{}\n")
 	withGeneratedState, err := kagBuildConfigVersion(workspace, cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -374,6 +379,15 @@ func TestKAGBuildConfigVersionTracksResourceTreeAndExcludesGeneratedState(t *tes
 	if withGeneratedState != first {
 		t.Fatalf("generated/runtime state changed build config version: first=%s second=%s", first, withGeneratedState)
 	}
+	writeKAGTestFile(t, filepath.Join(workspace, "evals", "questions.jsonl"), `{"id":"q1","question":"tracked input"}`+"\n")
+	withEvalInput, err := kagBuildConfigVersion(workspace, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if withEvalInput == first {
+		t.Fatal("eval input did not change build config version")
+	}
+	first = withEvalInput
 
 	writeKAGTestFile(t, filepath.Join(workspace, "prompt.txt"), "second prompt")
 	withPromptChange, err := kagBuildConfigVersion(workspace, cfg)
@@ -544,6 +558,139 @@ func TestServiceBuildPassesProjectionWideIdempotencyKey(t *testing.T) {
 	}
 }
 
+func TestServiceBuildUsesPreparedSourceBytesAfterSourceMutation(t *testing.T) {
+	ctx := context.Background()
+	repo := newMemoryRepo()
+	repo.config.KAG.Namespace = "PreparedCorpusTest"
+	repo.sources["sources/intro.md"] = "# Original\n\nprepared bytes\n"
+	backend := &recordingNamespacedBackend{}
+	svc := service{workspace: repo.config.Workspace, repo: repo, backend: backend, mode: ModeFake}
+
+	artifacts, build, err := svc.prepareArtifactProjection(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo.sources["sources/intro.md"] = "# Mutated\n\nbytes changed after prepare\n"
+	if _, err := svc.executeProjectionBuild(ctx, artifacts, build); err != nil {
+		t.Fatal(err)
+	}
+	if len(backend.buildCorpora) != 1 || len(backend.buildCorpora[0]) != 1 {
+		t.Fatalf("prepared corpus requests = %+v, want one record", backend.buildCorpora)
+	}
+	got := backend.buildCorpora[0][0]
+	if got.Content != "# Original\n\nprepared bytes\n" || got.SourcePath != "sources/intro.md" || got.Name != "Original" {
+		t.Fatalf("KAG corpus was not pinned to prepared bytes: %+v", got)
+	}
+}
+
+func TestServiceNoopRebuildRematerializesMissingKAGRuntime(t *testing.T) {
+	ctx := context.Background()
+	repo := newMemoryRepo()
+	repo.config.KAG.Namespace = "NoopRuntimeTest"
+	repo.sources["sources/intro.md"] = "stable\n"
+	runtimeRoot := t.TempDir()
+	backend := &recordingNamespacedBackend{runtimeDir: runtimeRoot}
+	svc := New(Options{Workspace: repo.config.Workspace, Repo: repo, Backend: backend, Mode: ModeFake})
+
+	first, err := svc.Build(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(runtimeRoot); err != nil {
+		t.Fatal(err)
+	}
+	second, err := svc.Build(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.BundleManifest.ProjectionVersion != second.BundleManifest.ProjectionVersion {
+		t.Fatalf("noop rebuild changed projection: first=%s second=%s",
+			first.BundleManifest.ProjectionVersion, second.BundleManifest.ProjectionVersion)
+	}
+	if backend.buildCalls != 2 || backend.wholeNamespaceBuilds != 2 {
+		t.Fatalf("KAG replay/rematerialization calls=%d builds=%d, want 2/2",
+			backend.buildCalls, backend.wholeNamespaceBuilds)
+	}
+	if noop, _ := second.KAGData["idempotent_noop"].(bool); !noop {
+		t.Fatalf("unchanged build did not report idempotent noop: %+v", second.KAGData)
+	}
+}
+
+func TestServiceDivergentSuccessorAfterCheckoutIgnoresStalePrivateJournal(t *testing.T) {
+	ctx := context.Background()
+	repo := newMemoryRepo()
+	repo.config.KAG.Namespace = "CheckoutJournalTest"
+	backend := &recordingNamespacedBackend{}
+	svc := New(Options{Workspace: repo.config.Workspace, Repo: repo, Backend: backend, Mode: ModeFake})
+
+	repo.sources["sources/intro.md"] = "base\n"
+	base, err := svc.Build(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseArtifacts := repo.artifacts
+	repo.sources["sources/intro.md"] = "branch-a\n"
+	branchA, err := svc.Build(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo.artifacts = baseArtifacts
+	repo.stagedArtifacts = repository.ArtifactSet{}
+	repo.sources["sources/intro.md"] = "branch-b\n"
+	branchB, err := svc.Build(ctx)
+	if err != nil {
+		t.Fatalf("build divergent checked-out successor: %v", err)
+	}
+	if branchB.BundleManifest.ProjectionVersion == branchA.BundleManifest.ProjectionVersion ||
+		branchB.BundleManifest.ProjectionVersion == base.BundleManifest.ProjectionVersion {
+		t.Fatalf("divergent checkout reused projection: base=%s branch-a=%s branch-b=%s",
+			base.BundleManifest.ProjectionVersion, branchA.BundleManifest.ProjectionVersion,
+			branchB.BundleManifest.ProjectionVersion)
+	}
+	for _, successor := range []string{branchA.BundleManifest.ProjectionVersion, branchB.BundleManifest.ProjectionVersion} {
+		if _, err := os.Stat(projectionJournalRoot(repo.projectionRoot, base.BundleManifest.ProjectionVersion, successor)); err != nil {
+			t.Fatalf("successor journal %s: %v", successor, err)
+		}
+	}
+}
+
+func TestServiceDivergentSuccessorRejectsChangedPublicBase(t *testing.T) {
+	ctx := context.Background()
+	repo := newMemoryRepo()
+	repo.config.KAG.Namespace = "PublicCASTest"
+	backend := &recordingNamespacedBackend{}
+	svc := service{workspace: repo.config.Workspace, repo: repo, backend: backend, mode: ModeFake}
+
+	repo.sources["sources/intro.md"] = "base\n"
+	if _, err := svc.Build(ctx); err != nil {
+		t.Fatal(err)
+	}
+	baseArtifacts := repo.artifacts
+	repo.sources["sources/intro.md"] = "branch-a\n"
+	if _, err := svc.Build(ctx); err != nil {
+		t.Fatal(err)
+	}
+	branchAArtifacts := repo.artifacts
+	repo.artifacts = baseArtifacts
+	repo.sources["sources/intro.md"] = "branch-b\n"
+	artifacts, build, err := svc.prepareArtifactProjection(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo.artifacts = branchAArtifacts
+	callsBefore := backend.buildCalls
+	if _, err := svc.executeProjectionBuild(ctx, artifacts, build); err == nil ||
+		!strings.Contains(err.Error(), "public projection base changed") {
+		t.Fatalf("changed public base error = %v, want stale-base rejection", err)
+	}
+	if backend.buildCalls != callsBefore {
+		t.Fatalf("stale successor invoked KAG: before=%d after=%d", callsBefore, backend.buildCalls)
+	}
+	if repo.artifacts.BundleManifest.ProjectionVersion != branchAArtifacts.BundleManifest.ProjectionVersion {
+		t.Fatal("stale successor replaced the changed public base")
+	}
+}
+
 func TestProjectionKAGBuildIdempotencyKeyIgnoresCatalogRetryIdentity(t *testing.T) {
 	projectionVersion := "prj_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	want := "kag-build-" + projectionVersion
@@ -579,7 +726,7 @@ func TestServiceProjectionReplayUsesOneKAGBuildKeyAfterPersistedIndexReceipt(t *
 		t.Fatalf("projection plan has %d index operations, want at least 2", len(indexOperations))
 	}
 	wantKey := projectionKAGBuildIdempotencyKey(artifacts.BundleManifest.ProjectionVersion)
-	if _, err := backend.BuildInNamespace(ctx, artifacts.BundleManifest.Namespace, wantKey); err != nil {
+	if _, err := backend.BuildInNamespaceWithCorpus(ctx, artifacts.BundleManifest.Namespace, wantKey, build.corpus); err != nil {
 		t.Fatal(err)
 	}
 	if err := build.store.Stage(build.plan); err != nil {
@@ -606,6 +753,9 @@ func TestServiceProjectionReplayUsesOneKAGBuildKeyAfterPersistedIndexReceipt(t *
 			t.Fatalf("KAG replay key = %q, want projection key %q", key, wantKey)
 		}
 	}
+	if len(backend.buildCorpora) != 2 || !reflect.DeepEqual(backend.buildCorpora[0], backend.buildCorpora[1]) {
+		t.Fatalf("crash replay changed prepared corpus: %+v", backend.buildCorpora)
+	}
 }
 
 func TestServiceRetryRecoversArtifactPointerAfterCatalogCAS(t *testing.T) {
@@ -629,6 +779,7 @@ func TestServiceRetryRecoversArtifactPointerAfterCatalogCAS(t *testing.T) {
 		t.Fatal("failed public pointer publication changed selected artifacts")
 	}
 	callsAfterCAS := backend.buildCalls
+	workAfterCAS := backend.wholeNamespaceBuilds
 	repo.publishErr = nil
 	recovered, err := svc.Build(ctx)
 	if err != nil {
@@ -640,8 +791,9 @@ func TestServiceRetryRecoversArtifactPointerAfterCatalogCAS(t *testing.T) {
 			failed.BundleManifest.ProjectionVersion, recovered.BundleManifest.ProjectionVersion,
 			repo.artifacts.BundleManifest.ProjectionVersion)
 	}
-	if backend.buildCalls != callsAfterCAS {
-		t.Fatalf("artifact pointer recovery reran KAG: before=%d after=%d", callsAfterCAS, backend.buildCalls)
+	if backend.buildCalls != callsAfterCAS+1 || backend.wholeNamespaceBuilds != workAfterCAS {
+		t.Fatalf("artifact pointer recovery did not idempotently replay KAG: calls=%d->%d work=%d->%d",
+			callsAfterCAS, backend.buildCalls, workAfterCAS, backend.wholeNamespaceBuilds)
 	}
 }
 
@@ -916,6 +1068,10 @@ func (b fakeBackend) BuildInNamespace(ctx context.Context, _, _ string) (kag.Res
 	return b.Build(ctx)
 }
 
+func (b fakeBackend) BuildInNamespaceWithCorpus(ctx context.Context, _, _ string, _ []kag.CorpusRecord) (kag.Response, error) {
+	return b.Build(ctx)
+}
+
 func (b fakeBackend) QueryInNamespace(ctx context.Context, _ string, query string) (kag.Response, error) {
 	return b.Query(ctx, query)
 }
@@ -934,6 +1090,8 @@ type recordingNamespacedBackend struct {
 	buildCalls           int
 	wholeNamespaceBuilds int
 	completedBuildKeys   map[string]struct{}
+	buildCorpora         [][]kag.CorpusRecord
+	runtimeDir           string
 }
 
 func (b *recordingNamespacedBackend) Build(context.Context) (kag.Response, error) {
@@ -956,6 +1114,21 @@ func (b *recordingNamespacedBackend) BuildInNamespace(_ context.Context, namespa
 	if b.buildErr != nil {
 		return kag.Response{}, b.buildErr
 	}
+	if b.runtimeDir != "" {
+		marker := filepath.Join(b.runtimeDir, namespace, idempotencyKey)
+		if _, err := os.Stat(marker); errors.Is(err, os.ErrNotExist) {
+			if err := os.MkdirAll(filepath.Dir(marker), 0o755); err != nil {
+				return kag.Response{}, err
+			}
+			if err := os.WriteFile(marker, []byte("complete\n"), 0o644); err != nil {
+				return kag.Response{}, err
+			}
+			b.wholeNamespaceBuilds++
+		} else if err != nil {
+			return kag.Response{}, err
+		}
+		return kag.Response{Data: map[string]any{"mode": "namespaced", "namespace": namespace}}, nil
+	}
 	if b.completedBuildKeys == nil {
 		b.completedBuildKeys = make(map[string]struct{})
 	}
@@ -964,6 +1137,11 @@ func (b *recordingNamespacedBackend) BuildInNamespace(_ context.Context, namespa
 		b.wholeNamespaceBuilds++
 	}
 	return kag.Response{Data: map[string]any{"mode": "namespaced", "namespace": namespace}}, nil
+}
+
+func (b *recordingNamespacedBackend) BuildInNamespaceWithCorpus(ctx context.Context, namespace, idempotencyKey string, corpus []kag.CorpusRecord) (kag.Response, error) {
+	b.buildCorpora = append(b.buildCorpora, append([]kag.CorpusRecord(nil), corpus...))
+	return b.BuildInNamespace(ctx, namespace, idempotencyKey)
 }
 
 func (b *recordingNamespacedBackend) QueryInNamespace(_ context.Context, namespace, _ string) (kag.Response, error) {
@@ -994,6 +1172,10 @@ func (b failingBackend) BuildInNamespace(ctx context.Context, _, _ string) (kag.
 	return b.Build(ctx)
 }
 
+func (b failingBackend) BuildInNamespaceWithCorpus(ctx context.Context, _, _ string, _ []kag.CorpusRecord) (kag.Response, error) {
+	return b.Build(ctx)
+}
+
 func (b failingBackend) QueryInNamespace(ctx context.Context, _ string, query string) (kag.Response, error) {
 	return b.Query(ctx, query)
 }
@@ -1019,6 +1201,10 @@ func (buildFailingBackend) Explain(context.Context, string) (kag.Response, error
 }
 
 func (b buildFailingBackend) BuildInNamespace(ctx context.Context, _, _ string) (kag.Response, error) {
+	return b.Build(ctx)
+}
+
+func (b buildFailingBackend) BuildInNamespaceWithCorpus(ctx context.Context, _, _ string, _ []kag.CorpusRecord) (kag.Response, error) {
 	return b.Build(ctx)
 }
 

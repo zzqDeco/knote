@@ -45,6 +45,13 @@ type Response struct {
 	raw     json.RawMessage
 }
 
+type CorpusRecord struct {
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	Content    string `json:"content"`
+	SourcePath string `json:"source_path"`
+}
+
 func (r *Response) UnmarshalJSON(data []byte) error {
 	type responseWire struct {
 		ID      string         `json:"id"`
@@ -108,6 +115,14 @@ func (c Client) BuildInNamespace(ctx context.Context, namespace, idempotencyKey 
 	}))
 }
 
+// BuildInNamespaceWithCorpus pins the build to caller-prepared source bytes.
+func (c Client) BuildInNamespaceWithCorpus(ctx context.Context, namespace, idempotencyKey string, corpus []CorpusRecord) (Response, error) {
+	return c.call(ctx, "kag.build", c.projectionParams(namespace, map[string]any{
+		"idempotency_key": idempotencyKey,
+		"corpus":          append([]CorpusRecord(nil), corpus...),
+	}))
+}
+
 func (c Client) Query(ctx context.Context, query string) (Response, error) {
 	return c.call(ctx, "kag.query", c.params(map[string]any{"query": query}))
 }
@@ -128,6 +143,7 @@ func (c Client) projectionParams(namespace string, extra map[string]any) map[str
 	namespace = strings.TrimSpace(namespace)
 	params := c.params(extra)
 	params["namespace"] = namespace
+	params["projection_isolated"] = true
 	runtimeDir := strings.TrimSpace(c.RuntimeDir)
 	if runtimeDir == "" {
 		runtimeDir = filepath.Join(".knote", "kag-runtime")

@@ -438,7 +438,7 @@ def select_config(params: dict[str, Any], out_dir: Path, *, generate: bool = Tru
 
 def select_projection_config(base: Path, out_dir: Path, params: dict[str, Any], *, generate: bool) -> Path:
     namespace = str(params.get("namespace") or "").strip()
-    if not namespace:
+    if not projection_isolation_requested(params, out_dir, namespace):
         return base
     target = out_dir / "kag_config.yaml"
     if target.exists():
@@ -448,6 +448,13 @@ def select_projection_config(base: Path, out_dir: Path, params: dict[str, Any], 
     if not generate:
         raise FileNotFoundError(f"projection KAG config not found; run /build first: {target}")
     return projection_config(base, out_dir, params)
+
+
+def projection_isolation_requested(params: dict[str, Any], out_dir: Path, namespace: str) -> bool:
+    marker = params.get("projection_isolated")
+    if marker is not None:
+        return marker is True and bool(namespace)
+    return bool(namespace) and out_dir.name == namespace and out_dir.parent.name == "projections"
 
 
 def fallback_project_line(lines: list[str], base: Path) -> int:
@@ -1548,6 +1555,16 @@ def real_response(req: dict[str, Any]) -> None:
         error(req_id, f"unknown method: {method}")
         return
     params = req.get("params") or {}
+    if method == "kag.build":
+        try:
+            idempotency_key = build_idempotency_key(params)
+            replay = load_build_receipt(runtime_dir(params), idempotency_key)
+        except Exception as exc:
+            error(req_id, str(exc))
+            return
+        if replay is not None:
+            result(req_id, replay, "KAG build complete")
+            return
     try:
         config_path = select_config(params, runtime_dir(params), generate=method == "kag.build")
     except Exception as exc:

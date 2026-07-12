@@ -335,6 +335,103 @@ func TestArtifactCompatibilityPublishFailureIsNonFatalAfterPointerAdvance(t *tes
 	}
 }
 
+func TestPublishArtifactsRejectsDamagedStagedBundleAndRecovers(t *testing.T) {
+	for _, mutation := range []struct {
+		name   string
+		change func(t *testing.T, path string)
+	}{
+		{
+			name: "corrupted",
+			change: func(t *testing.T, path string) {
+				t.Helper()
+				data, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				mustWrite(t, path, string(append(data, []byte("corrupted\n")...)))
+			},
+		},
+		{
+			name: "deleted",
+			change: func(t *testing.T, path string) {
+				t.Helper()
+				if err := os.Remove(path); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "symlinked",
+			change: func(t *testing.T, path string) {
+				t.Helper()
+				data, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				target := filepath.Join(t.TempDir(), filepath.Base(path))
+				if err := os.WriteFile(target, data, 0o644); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Remove(path); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(target, path); err != nil {
+					t.Skipf("symlink unavailable: %v", err)
+				}
+			},
+		},
+	} {
+		for _, file := range []string{bundleManifestName, "summaries.jsonl", "projection.json"} {
+			t.Run(mutation.name+"/"+file, func(t *testing.T) {
+				ctx := context.Background()
+				workspace := t.TempDir()
+				store := New(workspace)
+				first := testBundleArtifactSet(t, "prj_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "first")
+				candidate := testBundleArtifactSet(t, "prj_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "second")
+				if err := store.WriteArtifacts(ctx, first); err != nil {
+					t.Fatal(err)
+				}
+				if err := store.StageArtifacts(ctx, candidate); err != nil {
+					t.Fatal(err)
+				}
+				pointerBefore := mustRead(t, filepath.Join(workspace, "artifacts", "current.json"))
+				bundleDir := filepath.Join(workspace, "artifacts", "bundles", candidate.BundleManifest.ProjectionID)
+				publishing := Store{
+					workspace: workspace,
+					beforePointerWrite: func(protocol.ArtifactCurrentPointer) error {
+						mutation.change(t, filepath.Join(bundleDir, file))
+						return nil
+					},
+				}
+
+				if err := publishing.PublishArtifacts(ctx, candidate.BundleManifest); err == nil {
+					t.Fatalf("published bundle with %s %s", mutation.name, file)
+				}
+				if pointerAfter := mustRead(t, filepath.Join(workspace, "artifacts", "current.json")); pointerAfter != pointerBefore {
+					t.Fatalf("damaged candidate advanced current pointer:\nbefore=%s\nafter=%s", pointerBefore, pointerAfter)
+				}
+
+				if err := os.RemoveAll(bundleDir); err != nil {
+					t.Fatal(err)
+				}
+				if err := store.StageArtifacts(ctx, candidate); err != nil {
+					t.Fatalf("restage repaired candidate: %v", err)
+				}
+				if err := store.PublishArtifacts(ctx, candidate.BundleManifest); err != nil {
+					t.Fatalf("publish repaired candidate: %v", err)
+				}
+				current, err := store.ReadCurrentArtifactManifest(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if current.ProjectionID != candidate.BundleManifest.ProjectionID {
+					t.Fatalf("repaired candidate was not selected: %+v", current)
+				}
+			})
+		}
+	}
+}
+
 func TestKnowledgeHashUsesOnlyCurrentPointerAndSelectedBundle(t *testing.T) {
 	ctx := context.Background()
 	workspace := t.TempDir()
