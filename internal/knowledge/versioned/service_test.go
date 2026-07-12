@@ -443,6 +443,49 @@ func TestKAGBuildConfigVersionIgnoresGeneratedEnvironmentWithCheckedInConfig(t *
 	}
 }
 
+func TestKAGBuildConfigVersionTracksReferencedEnvironmentWithCheckedInConfig(t *testing.T) {
+	workspace := t.TempDir()
+	writeKAGTestFile(t, filepath.Join(workspace, "kag_config.yaml"), `openie_llm:
+  model: !ENV KNOTE_OPENIE_LLM_MODEL
+  api_key: !ENV KNOTE_OPENIE_LLM_API_KEY
+project:
+  namespace: "{{ KNOTE_KAG_NAMESPACE }}"
+`)
+	cfg := newMemoryRepo().config
+	t.Setenv("KNOTE_OPENIE_LLM_MODEL", "model-a")
+	t.Setenv("KNOTE_KAG_NAMESPACE", "namespace-a")
+	t.Setenv("KNOTE_OPENIE_LLM_API_KEY", "secret-a")
+
+	first, err := kagBuildConfigVersion(workspace, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("KNOTE_OPENIE_LLM_MODEL", "model-b")
+	withModelChange, err := kagBuildConfigVersion(workspace, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if withModelChange == first {
+		t.Fatal("referenced !ENV semantic environment change did not change checked-in config identity")
+	}
+	t.Setenv("KNOTE_KAG_NAMESPACE", "namespace-b")
+	withTemplateChange, err := kagBuildConfigVersion(workspace, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if withTemplateChange == withModelChange {
+		t.Fatal("referenced template semantic environment change did not change checked-in config identity")
+	}
+	t.Setenv("KNOTE_OPENIE_LLM_API_KEY", "secret-b")
+	withSecretChange, err := kagBuildConfigVersion(workspace, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if withSecretChange != withTemplateChange {
+		t.Fatal("referenced secret environment changed checked-in config identity")
+	}
+}
+
 func TestKAGBuildConfigVersionTracksResourceTreeAndExcludesGeneratedState(t *testing.T) {
 	workspace := t.TempDir()
 	writeKAGTestFile(t, filepath.Join(workspace, "kag_config.yaml"), "project:\n  namespace: resource-test\n")
@@ -458,6 +501,7 @@ func TestKAGBuildConfigVersionTracksResourceTreeAndExcludesGeneratedState(t *tes
 	}
 	writeKAGTestFile(t, filepath.Join(workspace, ".knote", "kag-runtime", "projections", "old", "receipt.json"), "generated")
 	writeKAGTestFile(t, filepath.Join(workspace, "artifacts", "current.json"), "generated")
+	writeKAGTestFile(t, filepath.Join(workspace, ".knote", "config.yaml"), "workspace: first\n")
 	writeKAGTestFile(t, filepath.Join(workspace, "evals", "report.md"), "generated report")
 	writeKAGTestFile(t, filepath.Join(workspace, "evals", "results.jsonl"), "{}\n")
 	withGeneratedState, err := kagBuildConfigVersion(workspace, cfg)
@@ -466,6 +510,14 @@ func TestKAGBuildConfigVersionTracksResourceTreeAndExcludesGeneratedState(t *tes
 	}
 	if withGeneratedState != first {
 		t.Fatalf("generated/runtime state changed build config version: first=%s second=%s", first, withGeneratedState)
+	}
+	writeKAGTestFile(t, filepath.Join(workspace, ".knote", "config.yaml"), "workspace: second\n")
+	withWorkspaceConfigChange, err := kagBuildConfigVersion(workspace, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if withWorkspaceConfigChange != first {
+		t.Fatalf("unrelated .knote/config.yaml changed build config version: first=%s second=%s", first, withWorkspaceConfigChange)
 	}
 	writeKAGTestFile(t, filepath.Join(workspace, "evals", "questions.jsonl"), `{"id":"q1","question":"tracked input"}`+"\n")
 	withEvalInput, err := kagBuildConfigVersion(workspace, cfg)

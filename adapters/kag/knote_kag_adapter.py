@@ -400,6 +400,26 @@ def load_build_receipt(out_dir: Path, idempotency_key: str) -> dict[str, Any] | 
     return dict(receipt["data"])
 
 
+def load_replayable_build_receipt(
+    params: dict[str, Any], out_dir: Path, idempotency_key: str
+) -> dict[str, Any] | None:
+    receipt = load_build_receipt(out_dir, idempotency_key)
+    if receipt is None:
+        return None
+    namespace = str(params.get("namespace") or "").strip()
+    if not projection_isolation_requested(params, out_dir, namespace):
+        return receipt
+    config_path = receipt.get("config_path")
+    if not isinstance(config_path, str) or not config_path:
+        return None
+    expected_config = out_dir / "kag_config.yaml"
+    if not expected_config.is_file() or Path(config_path).resolve() != expected_config.resolve():
+        return None
+    if not build_checkpoint_path(out_dir, params).is_dir():
+        return None
+    return receipt
+
+
 def store_build_receipt(out_dir: Path, idempotency_key: str, data: dict[str, Any]) -> None:
     if not idempotency_key:
         return
@@ -1417,7 +1437,7 @@ def run_kag_build(req: dict[str, Any]) -> dict[str, Any]:
     workspace = workspace_path(params)
     out_dir = runtime_dir(params)
     idempotency_key = build_idempotency_key(params)
-    replay = load_build_receipt(out_dir, idempotency_key)
+    replay = load_replayable_build_receipt(params, out_dir, idempotency_key)
     if replay is not None:
         return replay
     corpus_path, records = prepare_corpus(workspace, out_dir, params)
@@ -1558,7 +1578,8 @@ def real_response(req: dict[str, Any]) -> None:
     if method == "kag.build":
         try:
             idempotency_key = build_idempotency_key(params)
-            replay = load_build_receipt(runtime_dir(params), idempotency_key)
+            out_dir = runtime_dir(params)
+            replay = load_replayable_build_receipt(params, out_dir, idempotency_key)
         except Exception as exc:
             error(req_id, str(exc))
             return

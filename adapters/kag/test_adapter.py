@@ -929,6 +929,7 @@ class AdapterTest(unittest.TestCase):
                 def invoke(self, corpus_path: str) -> None:
                     seen["invoke_cwd"] = Path.cwd()
                     seen["invoke_calls"] = int(seen.get("invoke_calls", 0)) + 1
+                    adapter.build_checkpoint_path(out_dir, params).mkdir(parents=True, exist_ok=True)
                     print("Done process 1 records, with 1 successfully processed and 0 failures encountered")
 
             def fake_import_modules(path: str) -> None:
@@ -964,6 +965,9 @@ class AdapterTest(unittest.TestCase):
                 data = adapter.run_kag_build({"id": "build", "method": "kag.build", "params": params})
                 (workspace / "sources" / "intro.md").unlink()
                 replay = adapter.run_kag_build({"id": "build-replay", "method": "kag.build", "params": params})
+                (workspace / "sources" / "intro.md").write_text("# Intro", encoding="utf-8")
+                adapter.build_checkpoint_path(out_dir, params).rmdir()
+                rebuilt = adapter.run_kag_build({"id": "build-repair", "method": "kag.build", "params": params})
 
             projected = (out_dir / "kag_config.yaml").resolve()
             self.assertEqual(Path.cwd(), original_cwd)
@@ -973,11 +977,12 @@ class AdapterTest(unittest.TestCase):
             self.assertEqual(seen["import_cwd"], config_dir)
             self.assertEqual(seen["builder_cwd"], config_dir)
             self.assertEqual(seen["invoke_cwd"], config_dir)
-            self.assertEqual(seen["invoke_calls"], 1)
+            self.assertEqual(seen["invoke_calls"], 2)
             self.assertEqual(seen["prompt"], "source-relative prompt")
             self.assertEqual(data["config_path"], str(projected))
             self.assertEqual(data["idempotency_key"], "sync-projection-one")
             self.assertEqual(replay, data)
+            self.assertEqual(rebuilt, data)
             self.assertTrue(adapter.build_receipt_path(out_dir.resolve(), "sync-projection-one").exists())
 
     def test_projection_query_uses_source_config_directory_without_mutation(self) -> None:
@@ -1184,7 +1189,16 @@ class AdapterTest(unittest.TestCase):
                 "namespace": "projection-one",
                 "idempotency_key": "sync-projection-one",
             }
-            receipt = {"status": "ok", "mode": "real", "documents": 1}
+            config_path = runtime / "kag_config.yaml"
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text("project:\n  namespace: projection-one\n", encoding="utf-8")
+            adapter.build_checkpoint_path(runtime, params).mkdir(parents=True)
+            receipt = {
+                "status": "ok",
+                "mode": "real",
+                "documents": 1,
+                "config_path": str(config_path.resolve()),
+            }
             adapter.store_build_receipt(runtime, params["idempotency_key"], receipt)
             stdout = StringIO()
 
@@ -1200,6 +1214,49 @@ class AdapterTest(unittest.TestCase):
             self.assertEqual(response["data"], receipt)
             select_config_mock.assert_not_called()
             health_mock.assert_not_called()
+
+    def test_real_build_repairs_incomplete_projection_runtime_instead_of_replaying(self) -> None:
+        for missing in ("config", "checkpoint"):
+            with self.subTest(missing=missing), tempfile.TemporaryDirectory() as tmp:
+                workspace = Path(tmp)
+                base = workspace / ".knote" / "kag_config.yaml"
+                base.parent.mkdir(parents=True)
+                base.write_text("project:\n  namespace: shared\n", encoding="utf-8")
+                runtime = workspace / ".knote" / "kag-runtime" / "projections" / "projection-one"
+                params = {
+                    "workspace": str(workspace),
+                    "runtime_dir": str(runtime),
+                    "config_path": str(base),
+                    "namespace": "projection-one",
+                    "idempotency_key": "sync-projection-one",
+                }
+                projected = adapter.select_config(params, runtime)
+                adapter.build_checkpoint_path(runtime, params).mkdir(parents=True)
+                receipt = {
+                    "status": "ok",
+                    "mode": "real",
+                    "documents": 1,
+                    "config_path": str(projected),
+                }
+                adapter.store_build_receipt(runtime, params["idempotency_key"], receipt)
+                if missing == "config":
+                    projected.unlink()
+                else:
+                    adapter.build_checkpoint_path(runtime, params).rmdir()
+
+                stdout = StringIO()
+                rebuilt = {"status": "ok", "mode": "real", "documents": 1, "repaired": True}
+                with (
+                    patch.object(adapter, "check_real_health", return_value=({"status": "ok"}, None)),
+                    patch.object(adapter, "run_kag_build", return_value=rebuilt) as build_mock,
+                    redirect_stdout(stdout),
+                ):
+                    adapter.real_response({"id": "build-repair", "method": "kag.build", "params": params})
+
+                response = json.loads(stdout.getvalue().splitlines()[-1])
+                self.assertEqual(response["type"], "result")
+                self.assertTrue(response["data"]["repaired"])
+                build_mock.assert_called_once()
 
     def test_real_build_rejects_invalid_receipt_before_config_and_health(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -477,7 +477,10 @@ func kagBuildConfigVersion(workspace string, cfg repository.Config) (string, err
 		if err != nil {
 			return "", fmt.Errorf("read KAG build config: %w", err)
 		}
-		configDigest = fullHash(data)
+		configDigest, err = checkedInKAGConfigDigest(data)
+		if err != nil {
+			return "", err
+		}
 		configIdentity, resourceDigest, err = kagConfigResourceDigest(workspace, configPath, cfg.KAG.RuntimeDir)
 		if err != nil {
 			return "", err
@@ -509,6 +512,90 @@ func kagBuildConfigVersion(workspace string, cfg repository.Config) (string, err
 }
 
 func generatedKAGConfigDigest() (string, error) {
+	return kagSemanticEnvironmentDigest("generated-kag-config-v2", generatedKAGSemanticEnvVars)
+}
+
+func checkedInKAGConfigDigest(data []byte) (string, error) {
+	fileDigest := fullHash(data)
+	referenced := referencedKAGSemanticEnvVars(string(data))
+	if len(referenced) == 0 {
+		return fileDigest, nil
+	}
+	environmentDigest, err := kagSemanticEnvironmentDigest("checked-in-kag-config-env-v1", referenced)
+	if err != nil {
+		return "", err
+	}
+	payload, err := json.Marshal(struct {
+		Schema      string `json:"schema"`
+		File        string `json:"file_digest"`
+		Environment string `json:"environment_digest"`
+	}{Schema: "checked-in-kag-config-v1", File: fileDigest, Environment: environmentDigest})
+	if err != nil {
+		return "", fmt.Errorf("digest checked-in KAG config: %w", err)
+	}
+	return fullHash(payload), nil
+}
+
+func referencedKAGSemanticEnvVars(config string) []string {
+	referenced := make([]string, 0)
+	for _, name := range generatedKAGSemanticEnvVars {
+		if kagConfigReferencesEnvironment(config, name) {
+			referenced = append(referenced, name)
+		}
+	}
+	return referenced
+}
+
+func kagConfigReferencesEnvironment(config, name string) bool {
+	for _, line := range strings.Split(config, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		if marker := strings.Index(line, "!ENV"); marker >= 0 && containsEnvironmentIdentifier(line[marker+len("!ENV"):], name) {
+			return true
+		}
+		for remaining := line; ; {
+			start := strings.Index(remaining, "{{")
+			if start < 0 {
+				break
+			}
+			remaining = remaining[start+2:]
+			end := strings.Index(remaining, "}}")
+			if end < 0 {
+				break
+			}
+			if containsEnvironmentIdentifier(remaining[:end], name) {
+				return true
+			}
+			remaining = remaining[end+2:]
+		}
+	}
+	return false
+}
+
+func containsEnvironmentIdentifier(value, name string) bool {
+	for offset := 0; ; {
+		index := strings.Index(value[offset:], name)
+		if index < 0 {
+			return false
+		}
+		index += offset
+		beforeValid := index == 0 || !isEnvironmentIdentifierByte(value[index-1])
+		after := index + len(name)
+		afterValid := after == len(value) || !isEnvironmentIdentifierByte(value[after])
+		if beforeValid && afterValid {
+			return true
+		}
+		offset = index + len(name)
+	}
+}
+
+func isEnvironmentIdentifierByte(value byte) bool {
+	return value == '_' || value >= 'A' && value <= 'Z' || value >= 'a' && value <= 'z' || value >= '0' && value <= '9'
+}
+
+func kagSemanticEnvironmentDigest(schema string, names []string) (string, error) {
 	type environmentEntry struct {
 		Name  string `json:"name"`
 		Value string `json:"value"`
@@ -516,8 +603,8 @@ func generatedKAGConfigDigest() (string, error) {
 	payload := struct {
 		Schema      string             `json:"schema"`
 		Environment []environmentEntry `json:"environment"`
-	}{Schema: "generated-kag-config-v2"}
-	for _, name := range generatedKAGSemanticEnvVars {
+	}{Schema: schema}
+	for _, name := range names {
 		payload.Environment = append(payload.Environment, environmentEntry{Name: name, Value: os.Getenv(name)})
 	}
 	data, err := json.Marshal(payload)
@@ -663,6 +750,7 @@ func kagGeneratedResourceRoots(workspace, runtimeDir string) ([]string, error) {
 		filepath.Join(workspace, ".git"),
 		filepath.Join(workspace, "sources"),
 		filepath.Join(workspace, "artifacts"),
+		filepath.Join(workspace, ".knote", "config.yaml"),
 		filepath.Join(workspace, ".knote", "projections"),
 		filepath.Join(workspace, ".knote", "sessions"),
 		filepath.Join(workspace, ".knote", "cache"),
