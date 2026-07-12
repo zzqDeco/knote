@@ -10,6 +10,7 @@ an explicit fake mode for deterministic local tests:
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 import math
 import os
@@ -449,6 +450,166 @@ def select_projection_config(base: Path, out_dir: Path, params: dict[str, Any], 
     return projection_config(base, out_dir, params)
 
 
+def fallback_project_line(lines: list[str], base: Path) -> int:
+    project_lines = [
+        index
+        for index, line in enumerate(lines)
+        if not line.startswith((" ", "\t"))
+        and re.match(r"^(?:project|'project'|\"project\")\s*:", line)
+    ]
+    if not project_lines:
+        raise RuntimeError(f"KAG config has no top-level project section: {base}")
+    if len(project_lines) != 1:
+        raise RuntimeError(f"KAG config has duplicate top-level project sections: {base}")
+    index = project_lines[0]
+    line = lines[index]
+    remainder = line[line.index(":") + 1 :].strip()
+    if remainder.startswith("&"):
+        parts = remainder.split(maxsplit=1)
+        remainder = parts[1].strip() if len(parts) == 2 else ""
+    if remainder.startswith("{"):
+        if flow_mapping_end(remainder) is None:
+            raise RuntimeError(f"invalid KAG config YAML project mapping: {base}")
+        return index
+    if remainder and not remainder.startswith("#"):
+        raise RuntimeError(f"KAG config project section must be a mapping: {base}")
+    for child in lines[index + 1 :]:
+        if not child.strip() or child.lstrip().startswith("#"):
+            continue
+        if not child.startswith((" ", "\t")) or child.lstrip().startswith("-"):
+            break
+        if ":" in child:
+            return index
+        break
+    raise RuntimeError(f"KAG config project section must be a mapping: {base}")
+
+
+def structured_project_line(text: str, lines: list[str], base: Path) -> int:
+    try:
+        yaml = importlib.import_module("yaml")
+    except ModuleNotFoundError:
+        return fallback_project_line(lines, base)
+    # Compose nodes without constructing KAG-specific tags such as !ENV.
+    try:
+        root = yaml.compose(text)
+    except yaml.YAMLError as exc:
+        raise RuntimeError(f"invalid KAG config YAML: {base}: {exc}") from exc
+    if not isinstance(root, yaml.MappingNode):
+        raise RuntimeError(f"KAG config must be a top-level mapping: {base}")
+    projects = [
+        (key, value)
+        for key, value in root.value
+        if isinstance(key, yaml.ScalarNode) and key.value == "project"
+    ]
+    if not projects:
+        raise RuntimeError(f"KAG config has no top-level project section: {base}")
+    if len(projects) != 1:
+        raise RuntimeError(f"KAG config has duplicate top-level project sections: {base}")
+    key, project = projects[0]
+    if not isinstance(project, yaml.MappingNode):
+        raise RuntimeError(f"KAG config project section must be a mapping: {base}")
+    return key.start_mark.line
+
+
+def flow_mapping_end(value: str) -> int | None:
+    depth = 0
+    quote = ""
+    escaped = False
+    for index, char in enumerate(value):
+        if quote:
+            if quote == '"' and char == "\\" and not escaped:
+                escaped = True
+                continue
+            if char == quote and not escaped:
+                quote = ""
+            escaped = False
+            continue
+        if char in {"'", '"'}:
+            quote = char
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                trailing = value[index + 1 :].strip()
+                return index if not trailing or trailing.startswith("#") else None
+            if depth < 0:
+                return None
+    return None
+
+
+def split_flow_mapping_entries(value: str) -> list[str]:
+    entries: list[str] = []
+    start = 0
+    depth = 0
+    quote = ""
+    escaped = False
+    for index, char in enumerate(value):
+        if quote:
+            if quote == '"' and char == "\\" and not escaped:
+                escaped = True
+                continue
+            if char == quote and not escaped:
+                quote = ""
+            escaped = False
+            continue
+        if char in {"'", '"'}:
+            quote = char
+        elif char in "[{":
+            depth += 1
+        elif char in "]}":
+            depth -= 1
+        elif char == "," and depth == 0:
+            entries.append(value[start:index].strip())
+            start = index + 1
+    tail = value[start:].strip()
+    if tail:
+        entries.append(tail)
+    return entries
+
+
+def rewrite_flow_project(
+    lines: list[str], project_index: int, namespace: str, checkpoint_path: Path
+) -> bool:
+    line = lines[project_index]
+    colon = line.index(":")
+    remainder = line[colon + 1 :].strip()
+    anchor = ""
+    if remainder.startswith("&"):
+        parts = remainder.split(maxsplit=1)
+        anchor = parts[0]
+        remainder = parts[1].strip() if len(parts) == 2 else ""
+    if not remainder.startswith("{"):
+        return False
+    end = flow_mapping_end(remainder)
+    if end is None:
+        return False
+    entries = [
+        entry
+        for entry in split_flow_mapping_entries(remainder[1:end])
+        if not re.match(
+            r"^(?:namespace|checkpoint_path|'namespace'|'checkpoint_path'|\"namespace\"|\"checkpoint_path\")\s*:",
+            entry,
+        )
+    ]
+    entries.extend(
+        [
+            f"namespace: {quoted_config(namespace)}",
+            f"checkpoint_path: {quoted_config(str(checkpoint_path))}",
+        ]
+    )
+    mapping = "{" + ", ".join(entries) + "}"
+    comment = remainder[end + 1 :].strip()
+    project_line = line[: colon + 1]
+    if anchor:
+        project_line += f" {anchor}"
+    project_line += f" {mapping}"
+    if comment:
+        project_line += f" {comment}"
+    lines[project_index] = project_line
+    return True
+
+
 def projection_config(base: Path, out_dir: Path, params: dict[str, Any]) -> Path:
     namespace = str(params.get("namespace") or "").strip()
     if not namespace:
@@ -456,34 +617,50 @@ def projection_config(base: Path, out_dir: Path, params: dict[str, Any]) -> Path
     target = out_dir / "kag_config.yaml"
     if base.resolve() == target.resolve():
         return base
-    lines = base.read_text(encoding="utf-8").splitlines()
-    project_index: int | None = None
+    text = base.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    project_index = structured_project_line(text, lines, base)
+    checkpoint_path = build_checkpoint_path(out_dir, params)
+    if rewrite_flow_project(lines, project_index, namespace, checkpoint_path):
+        ensure_runtime_excluded(workspace_path(params), out_dir)
+        atomic_write_text(target, "\n".join(lines) + "\n")
+        return target.resolve()
     project_end = len(lines)
     namespace_written = False
     checkpoint_written = False
-    for index, line in enumerate(lines):
-        if line.strip() == "project:" and not line.startswith((" ", "\t")):
-            project_index = index
+    project_indent: int | None = None
+    for index, line in enumerate(lines[project_index + 1 :], start=project_index + 1):
+        if not line.strip() or line.lstrip().startswith("#"):
             continue
-        if project_index is None or index <= project_index:
-            continue
-        if line and not line.startswith((" ", "\t")):
+        indent = len(line) - len(line.lstrip())
+        if indent == 0:
             project_end = index
             break
+        if project_indent is None or indent < project_indent:
+            project_indent = indent
+    if project_indent is None:
+        project_indent = 2
+    for index in range(project_index + 1, project_end):
+        line = lines[index]
+        indent = len(line) - len(line.lstrip())
+        if indent != project_indent:
+            continue
         stripped = line.strip()
-        if stripped.startswith("namespace:"):
-            lines[index] = f"  namespace: {quoted_config(namespace)}"
+        if re.match(r"^namespace\s*:", stripped):
+            lines[index] = " " * project_indent + f"namespace: {quoted_config(namespace)}"
             namespace_written = True
-        elif stripped.startswith("checkpoint_path:"):
-            lines[index] = f"  checkpoint_path: {quoted_config(str(build_checkpoint_path(out_dir, params)))}"
+        elif re.match(r"^checkpoint_path\s*:", stripped):
+            lines[index] = (
+                " " * project_indent + f"checkpoint_path: {quoted_config(str(checkpoint_path))}"
+            )
             checkpoint_written = True
-    if project_index is None:
-        raise RuntimeError(f"KAG config has no top-level project section: {base}")
     additions: list[str] = []
     if not namespace_written:
-        additions.append(f"  namespace: {quoted_config(namespace)}")
+        additions.append(" " * project_indent + f"namespace: {quoted_config(namespace)}")
     if not checkpoint_written:
-        additions.append(f"  checkpoint_path: {quoted_config(str(build_checkpoint_path(out_dir, params)))}")
+        additions.append(
+            " " * project_indent + f"checkpoint_path: {quoted_config(str(checkpoint_path))}"
+        )
     if additions:
         lines[project_end:project_end] = additions
     ensure_runtime_excluded(workspace_path(params), out_dir)

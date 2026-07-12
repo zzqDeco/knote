@@ -105,6 +105,24 @@ func TestServiceBuildFailsBeforeWritingArtifactsWhenBackendFails(t *testing.T) {
 	}
 }
 
+func TestServiceBuildWithoutBackendFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	repo := newMemoryRepo()
+	repo.sources["sources/intro.md"] = "# Intro\n\nknote is local-first.\n"
+	svc := New(Options{Workspace: repo.config.Workspace, Repo: repo, Mode: ModeReal})
+
+	build, err := svc.Build(ctx)
+	if err == nil || !strings.Contains(err.Error(), "KAG backend is not configured") {
+		t.Fatalf("build without backend error = %v, want configured fail-closed error", err)
+	}
+	if build.AdapterError == "" {
+		t.Fatalf("build without backend omitted adapter error: %+v", build)
+	}
+	if repo.writeArtifactsCalls != 0 {
+		t.Fatalf("build without backend wrote artifacts %d time(s)", repo.writeArtifactsCalls)
+	}
+}
+
 func TestServiceBuildArtifactsAreStableAndEntityIsPerDocument(t *testing.T) {
 	ctx := context.Background()
 	repo := newMemoryRepo()
@@ -334,6 +352,127 @@ func TestServiceKAGConfigurationChangeCreatesNewProjection(t *testing.T) {
 	}
 }
 
+func TestKAGBuildConfigVersionTracksResourceTreeAndExcludesGeneratedState(t *testing.T) {
+	workspace := t.TempDir()
+	writeKAGTestFile(t, filepath.Join(workspace, "kag_config.yaml"), "project:\n  namespace: resource-test\n")
+	writeKAGTestFile(t, filepath.Join(workspace, "prompt.txt"), "first prompt")
+	writeKAGTestFile(t, filepath.Join(workspace, "custom_builder.py"), "VERSION = 1\n")
+	cfg := newMemoryRepo().config
+	cfg.KAG.ConfigPath = "kag_config.yaml"
+	cfg.KAG.RuntimeDir = filepath.Join(".knote", "kag-runtime")
+
+	first, err := kagBuildConfigVersion(workspace, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeKAGTestFile(t, filepath.Join(workspace, ".knote", "kag-runtime", "projections", "old", "receipt.json"), "generated")
+	writeKAGTestFile(t, filepath.Join(workspace, "artifacts", "current.json"), "generated")
+	withGeneratedState, err := kagBuildConfigVersion(workspace, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if withGeneratedState != first {
+		t.Fatalf("generated/runtime state changed build config version: first=%s second=%s", first, withGeneratedState)
+	}
+
+	writeKAGTestFile(t, filepath.Join(workspace, "prompt.txt"), "second prompt")
+	withPromptChange, err := kagBuildConfigVersion(workspace, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if withPromptChange == first {
+		t.Fatal("prompt resource change did not change build config version")
+	}
+	writeKAGTestFile(t, filepath.Join(workspace, "custom_builder.py"), "VERSION = 2\n")
+	withModuleChange, err := kagBuildConfigVersion(workspace, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if withModuleChange == withPromptChange {
+		t.Fatal("custom module change did not change build config version")
+	}
+}
+
+func TestKAGBuildConfigVersionIsPortableAndIncludesConfigDirectoryIdentity(t *testing.T) {
+	root := t.TempDir()
+	writeProject := func(workspace, projectDir string) {
+		t.Helper()
+		writeKAGTestFile(t, filepath.Join(workspace, projectDir, "kag_config.yaml"), "project:\n  namespace: portable\n")
+		writeKAGTestFile(t, filepath.Join(workspace, projectDir, "prompt.txt"), "portable prompt")
+	}
+	firstWorkspace := filepath.Join(root, "checkout-one")
+	secondWorkspace := filepath.Join(root, "checkout-two")
+	writeProject(firstWorkspace, "kag_project")
+	writeProject(secondWorkspace, "kag_project")
+	cfg := newMemoryRepo().config
+	cfg.KAG.ConfigPath = filepath.Join("kag_project", "kag_config.yaml")
+
+	first, err := kagBuildConfigVersion(firstWorkspace, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := kagBuildConfigVersion(secondWorkspace, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != second {
+		t.Fatalf("checkout path changed build config version: first=%s second=%s", first, second)
+	}
+
+	writeProject(firstWorkspace, "alternate_project")
+	cfg.KAG.ConfigPath = filepath.Join("alternate_project", "kag_config.yaml")
+	alternate, err := kagBuildConfigVersion(firstWorkspace, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if alternate == first {
+		t.Fatal("config directory identity did not change build config version")
+	}
+
+	externalOne := filepath.Join(root, "external-one", "project")
+	externalTwo := filepath.Join(root, "external-two", "project")
+	writeKAGTestFile(t, filepath.Join(externalOne, "kag_config.yaml"), "project:\n  namespace: portable\n")
+	writeKAGTestFile(t, filepath.Join(externalOne, "prompt.txt"), "portable prompt")
+	writeKAGTestFile(t, filepath.Join(externalTwo, "kag_config.yaml"), "project:\n  namespace: portable\n")
+	writeKAGTestFile(t, filepath.Join(externalTwo, "prompt.txt"), "portable prompt")
+	cfg.KAG.ConfigPath = filepath.Join(externalOne, "kag_config.yaml")
+	externalFirst, err := kagBuildConfigVersion(firstWorkspace, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.KAG.ConfigPath = filepath.Join(externalTwo, "kag_config.yaml")
+	externalSecond, err := kagBuildConfigVersion(firstWorkspace, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if externalFirst == externalSecond {
+		t.Fatal("distinct external config directories produced the same build config version")
+	}
+}
+
+func TestKAGBuildConfigVersionBoundsIndividualResources(t *testing.T) {
+	workspace := t.TempDir()
+	writeKAGTestFile(t, filepath.Join(workspace, "kag_project", "kag_config.yaml"), "project:\n  namespace: bounded\n")
+	largePath := filepath.Join(workspace, "kag_project", "large-resource.bin")
+	file, err := os.Create(largePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Truncate(maxKAGResourceFileBytes + 1); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	cfg := newMemoryRepo().config
+	cfg.KAG.ConfigPath = filepath.Join("kag_project", "kag_config.yaml")
+
+	if _, err := kagBuildConfigVersion(workspace, cfg); err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("oversized KAG resource error = %v, want bounded failure", err)
+	}
+}
+
 func TestServiceKAGNamespaceChangeStartsNewProjectionScope(t *testing.T) {
 	ctx := context.Background()
 	repo := newMemoryRepo()
@@ -384,7 +523,7 @@ func TestServiceKAGRuntimeDirChangeCreatesNewProjection(t *testing.T) {
 	}
 }
 
-func TestServiceBuildPassesProjectionOperationIdempotencyKey(t *testing.T) {
+func TestServiceBuildPassesProjectionWideIdempotencyKey(t *testing.T) {
 	ctx := context.Background()
 	repo := newMemoryRepo()
 	repo.config.KAG.Namespace = "IdempotencyTest"
@@ -396,21 +535,76 @@ func TestServiceBuildPassesProjectionOperationIdempotencyKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := ""
-	for _, operation := range build.plan.Operations {
-		if operation.Kind == catalog.OperationProjectIndex {
-			want = operation.IdempotencyKey
-			break
-		}
-	}
-	if want == "" {
-		t.Fatal("projection plan has no index operation idempotency key")
-	}
+	want := projectionKAGBuildIdempotencyKey(artifacts.BundleManifest.ProjectionVersion)
 	if _, err := svc.executeProjectionBuild(ctx, artifacts, build); err != nil {
 		t.Fatal(err)
 	}
 	if backend.buildIdempotencyKey != want {
-		t.Fatalf("KAG build idempotency key = %q, want operation key %q", backend.buildIdempotencyKey, want)
+		t.Fatalf("KAG build idempotency key = %q, want projection key %q", backend.buildIdempotencyKey, want)
+	}
+}
+
+func TestProjectionKAGBuildIdempotencyKeyIgnoresCatalogRetryIdentity(t *testing.T) {
+	projectionVersion := "prj_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	want := "kag-build-" + projectionVersion
+	if got := projectionKAGBuildIdempotencyKey(projectionVersion); got != want {
+		t.Fatalf("projection KAG key = %q, want %q", got, want)
+	}
+	for _, runKey := range []string{"sync-" + projectionVersion, "sync-" + projectionVersion + "-retry-1"} {
+		if got := projectionKAGBuildIdempotencyKey(projectionVersion); got == runKey {
+			t.Fatalf("projection KAG key unexpectedly depends on catalog run key %q", runKey)
+		}
+	}
+}
+
+func TestServiceProjectionReplayUsesOneKAGBuildKeyAfterPersistedIndexReceipt(t *testing.T) {
+	ctx := context.Background()
+	repo := newMemoryRepo()
+	repo.config.KAG.Namespace = "IdempotentReplayTest"
+	repo.sources["sources/intro.md"] = "stable\n"
+	backend := &recordingNamespacedBackend{}
+	svc := service{workspace: repo.config.Workspace, repo: repo, backend: backend, mode: ModeFake}
+
+	artifacts, build, err := svc.prepareArtifactProjection(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var indexOperations []catalog.ProjectionOperation
+	for _, operation := range build.plan.Operations {
+		if operation.Kind == catalog.OperationProjectIndex {
+			indexOperations = append(indexOperations, operation)
+		}
+	}
+	if len(indexOperations) < 2 {
+		t.Fatalf("projection plan has %d index operations, want at least 2", len(indexOperations))
+	}
+	wantKey := projectionKAGBuildIdempotencyKey(artifacts.BundleManifest.ProjectionVersion)
+	if _, err := backend.BuildInNamespace(ctx, artifacts.BundleManifest.Namespace, wantKey); err != nil {
+		t.Fatal(err)
+	}
+	if err := build.store.Stage(build.plan); err != nil {
+		t.Fatal(err)
+	}
+	if err := build.store.RecordResult(build.plan, catalog.OperationResult{
+		OperationID: indexOperations[0].OperationID,
+		Outcome:     catalog.OperationSucceeded,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := svc.executeProjectionBuild(ctx, artifacts, build); err != nil {
+		t.Fatal(err)
+	}
+	if backend.buildCalls != 2 {
+		t.Fatalf("KAG build requests = %d, want interrupted request plus one replay request", backend.buildCalls)
+	}
+	if backend.wholeNamespaceBuilds != 1 {
+		t.Fatalf("whole-namespace KAG work = %d, want one idempotent build", backend.wholeNamespaceBuilds)
+	}
+	for _, key := range backend.buildIdempotencyKeys {
+		if key != wantKey {
+			t.Fatalf("KAG replay key = %q, want projection key %q", key, wantKey)
+		}
 	}
 }
 
@@ -694,6 +888,16 @@ func (r *memoryRepo) Checkout(_ context.Context, ref string, opts repository.Che
 	return nil
 }
 
+func writeKAGTestFile(t *testing.T, path, contents string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
 type fakeBackend struct{}
 
 func (fakeBackend) Build(context.Context) (kag.Response, error) {
@@ -721,12 +925,15 @@ func (b fakeBackend) ExplainInNamespace(ctx context.Context, _ string, query str
 }
 
 type recordingNamespacedBackend struct {
-	buildNamespace      string
-	buildIdempotencyKey string
-	queryNamespace      string
-	explainNamespace    string
-	buildErr            error
-	buildCalls          int
+	buildNamespace       string
+	buildIdempotencyKey  string
+	buildIdempotencyKeys []string
+	queryNamespace       string
+	explainNamespace     string
+	buildErr             error
+	buildCalls           int
+	wholeNamespaceBuilds int
+	completedBuildKeys   map[string]struct{}
 }
 
 func (b *recordingNamespacedBackend) Build(context.Context) (kag.Response, error) {
@@ -744,9 +951,17 @@ func (b *recordingNamespacedBackend) Explain(context.Context, string) (kag.Respo
 func (b *recordingNamespacedBackend) BuildInNamespace(_ context.Context, namespace, idempotencyKey string) (kag.Response, error) {
 	b.buildNamespace = namespace
 	b.buildIdempotencyKey = idempotencyKey
+	b.buildIdempotencyKeys = append(b.buildIdempotencyKeys, idempotencyKey)
 	b.buildCalls++
 	if b.buildErr != nil {
 		return kag.Response{}, b.buildErr
+	}
+	if b.completedBuildKeys == nil {
+		b.completedBuildKeys = make(map[string]struct{})
+	}
+	if _, completed := b.completedBuildKeys[idempotencyKey]; !completed {
+		b.completedBuildKeys[idempotencyKey] = struct{}{}
+		b.wholeNamespaceBuilds++
 	}
 	return kag.Response{Data: map[string]any{"mode": "namespaced", "namespace": namespace}}, nil
 }

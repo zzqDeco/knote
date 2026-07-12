@@ -810,6 +810,90 @@ class AdapterTest(unittest.TestCase):
             before = selected.read_bytes()
             self.assertEqual(adapter.select_config(params, out_dir, generate=False).read_bytes(), before)
 
+    def test_projection_config_accepts_inline_comment_and_anchor_project_mappings(self) -> None:
+        cases = {
+            "inline": (
+                "project: {host_addr: http://127.0.0.1:8887, namespace: shared, checkpoint_path: shared/ckpt}\n"
+                "openie_llm:\n  api_key: !ENV KNOTE_OPENIE_LLM_API_KEY\n"
+                "kag_builder_pipeline:\n  type: custom_builder\n"
+            ),
+            "comment": (
+                "project: # shared project settings\n"
+                "  host_addr: http://127.0.0.1:8887\n"
+                "  namespace: shared\n"
+                "kag_builder_pipeline:\n  type: custom_builder\n"
+            ),
+            "anchor": (
+                "project: &shared_project\n"
+                "  host_addr: http://127.0.0.1:8887\n"
+                "  namespace: shared\n"
+                "project_copy: *shared_project\n"
+                "kag_builder_pipeline:\n  type: custom_builder\n"
+            ),
+        }
+        for name, config in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                workspace = Path(tmp)
+                base = workspace / ".knote" / "kag_config.yaml"
+                base.parent.mkdir(parents=True)
+                base.write_text(config, encoding="utf-8")
+                out_dir = workspace / ".knote" / "kag-runtime" / "projections" / "projection-one"
+                key = f"sync-{name}"
+
+                selected = adapter.select_config(
+                    {
+                        "workspace": str(workspace),
+                        "config_path": str(base),
+                        "namespace": "projection-one",
+                        "idempotency_key": key,
+                    },
+                    out_dir,
+                )
+
+                digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+                text = selected.read_text(encoding="utf-8")
+                self.assertIn('namespace: "projection-one"', text)
+                self.assertIn(f'checkpoint_path: "{out_dir / "ckpt" / "runs" / digest}"', text)
+                if name == "inline":
+                    self.assertIn("api_key: !ENV KNOTE_OPENIE_LLM_API_KEY", text)
+                self.assertIn("kag_builder_pipeline:\n  type: custom_builder", text)
+                self.assertEqual(base.read_text(encoding="utf-8"), config)
+                if name == "inline":
+                    self.assertIn("project: {host_addr:", text)
+                    self.assertNotIn("namespace: shared", text)
+                    self.assertNotIn("checkpoint_path: shared/ckpt", text)
+                elif name == "comment":
+                    self.assertIn("project: # shared project settings", text)
+                else:
+                    self.assertIn("project: &shared_project", text)
+                    self.assertIn("project_copy: *shared_project", text)
+
+    def test_projection_config_rejects_malformed_project_mapping(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            base = workspace / "kag_config.yaml"
+            base.write_text("project: {host_addr: http://127.0.0.1:8887\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(RuntimeError, "invalid KAG config YAML"):
+                adapter.projection_config(
+                    base,
+                    workspace / ".knote" / "kag-runtime" / "projections" / "projection-one",
+                    {"workspace": str(workspace), "namespace": "projection-one"},
+                )
+
+    def test_projection_config_rejects_non_mapping_project(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            base = workspace / "kag_config.yaml"
+            base.write_text("project: not-a-mapping\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(RuntimeError, "project section must be a mapping"):
+                adapter.projection_config(
+                    base,
+                    workspace / ".knote" / "kag-runtime" / "projections" / "projection-one",
+                    {"workspace": str(workspace), "namespace": "projection-one"},
+                )
+
     def test_projection_build_uses_source_config_directory_for_imports_and_resources(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)

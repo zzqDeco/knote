@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -20,6 +22,10 @@ const (
 	localTenantID       = "local"
 	localSecurityDomain = "local"
 	projectionSchema    = "artifact-bundle-v2"
+
+	maxKAGResourceFiles     = 4_096
+	maxKAGResourceFileBytes = 8 << 20
+	maxKAGResourceBytes     = 64 << 20
 )
 
 type loadedSource struct {
@@ -384,6 +390,8 @@ func canonicalProjectionVersion(
 
 func kagBuildConfigVersion(workspace string, cfg repository.Config) (string, error) {
 	configDigest := "generated-config-v1"
+	configIdentity := "generated"
+	resourceDigest := "generated-resources-v1"
 	var configPath string
 	if strings.TrimSpace(cfg.KAG.ConfigPath) != "" {
 		configPath = cfg.KAG.ConfigPath
@@ -404,32 +412,206 @@ func kagBuildConfigVersion(workspace string, cfg repository.Config) (string, err
 		}
 	}
 	if configPath != "" {
-		data, err := os.ReadFile(configPath)
+		data, err := readBoundedFile(configPath, maxKAGResourceFileBytes)
 		if err != nil {
 			return "", fmt.Errorf("read KAG build config: %w", err)
 		}
 		configDigest = fullHash(data)
+		configIdentity, resourceDigest, err = kagConfigResourceDigest(workspace, configPath, cfg.KAG.RuntimeDir)
+		if err != nil {
+			return "", err
+		}
 	}
 	payload := struct {
-		Host         string                             `json:"host"`
-		Fake         bool                               `json:"fake"`
-		ProjectID    string                             `json:"project_id"`
-		Namespace    string                             `json:"namespace"`
-		Language     string                             `json:"language"`
-		RuntimeDir   string                             `json:"runtime_dir"`
-		ConfigDigest string                             `json:"config_digest"`
-		Models       map[string]repository.ModelProfile `json:"models"`
+		Host           string                             `json:"host"`
+		Fake           bool                               `json:"fake"`
+		ProjectID      string                             `json:"project_id"`
+		Namespace      string                             `json:"namespace"`
+		Language       string                             `json:"language"`
+		RuntimeDir     string                             `json:"runtime_dir"`
+		ConfigIdentity string                             `json:"config_identity"`
+		ConfigDigest   string                             `json:"config_digest"`
+		ResourceDigest string                             `json:"resource_digest"`
+		Models         map[string]repository.ModelProfile `json:"models"`
 	}{
 		Host: cfg.KAG.Host, Fake: cfg.KAG.Fake, ProjectID: cfg.KAG.ProjectID,
 		Namespace: cfg.KAG.Namespace, Language: cfg.KAG.Language,
-		RuntimeDir:   canonicalKAGRuntimeDir(workspace, cfg.KAG.RuntimeDir),
-		ConfigDigest: configDigest, Models: cfg.Models,
+		RuntimeDir:     canonicalKAGRuntimeDir(workspace, cfg.KAG.RuntimeDir),
+		ConfigIdentity: configIdentity, ConfigDigest: configDigest,
+		ResourceDigest: resourceDigest, Models: cfg.Models,
 	}
 	data, err := json.Marshal(payload)
 	if err != nil {
 		return "", err
 	}
 	return "build_" + fullHash(data)[:24], nil
+}
+
+type kagResourceDigestEntry struct {
+	Path   string `json:"path"`
+	Size   int64  `json:"size"`
+	Digest string `json:"digest"`
+}
+
+func kagConfigResourceDigest(workspace, configPath, runtimeDir string) (string, string, error) {
+	configPath, err := filepath.Abs(configPath)
+	if err != nil {
+		return "", "", fmt.Errorf("resolve KAG config path: %w", err)
+	}
+	resourceRoot := filepath.Dir(configPath)
+	identity := canonicalKAGConfigIdentity(workspace, configPath)
+	excludedRoots, err := kagGeneratedResourceRoots(workspace, runtimeDir)
+	if err != nil {
+		return "", "", err
+	}
+	effectiveExclusions := make([]string, 0, len(excludedRoots))
+	sourceRoot, err := filepath.Abs(filepath.Join(workspace, "sources"))
+	if err != nil {
+		return "", "", fmt.Errorf("resolve source root: %w", err)
+	}
+	for _, root := range excludedRoots {
+		if pathWithin(root, configPath) {
+			if filepath.Clean(root) == filepath.Clean(sourceRoot) {
+				continue
+			}
+			return "", "", fmt.Errorf("KAG config must be outside generated/runtime directory %s", root)
+		}
+		if pathWithin(resourceRoot, root) {
+			effectiveExclusions = append(effectiveExclusions, root)
+		}
+	}
+
+	entries := make([]kagResourceDigestEntry, 0)
+	var totalBytes int64
+	err = filepath.WalkDir(resourceRoot, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		for _, root := range effectiveExclusions {
+			if pathWithin(root, path) {
+				if entry.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+		}
+		if entry.IsDir() {
+			switch entry.Name() {
+			case "__pycache__", ".pytest_cache", ".mypy_cache":
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			return fmt.Errorf("KAG config resource %s is a symlink", path)
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("KAG config resource %s is not a regular file", path)
+		}
+		if len(entries) >= maxKAGResourceFiles {
+			return fmt.Errorf("KAG config resources exceed %d files", maxKAGResourceFiles)
+		}
+		if info.Size() > maxKAGResourceFileBytes {
+			return fmt.Errorf("KAG config resource %s exceeds %d bytes", path, maxKAGResourceFileBytes)
+		}
+		if totalBytes+info.Size() > maxKAGResourceBytes {
+			return fmt.Errorf("KAG config resources exceed %d bytes", maxKAGResourceBytes)
+		}
+		data, err := readBoundedFile(path, maxKAGResourceFileBytes)
+		if err != nil {
+			return err
+		}
+		totalBytes += int64(len(data))
+		if totalBytes > maxKAGResourceBytes {
+			return fmt.Errorf("KAG config resources exceed %d bytes", maxKAGResourceBytes)
+		}
+		relative, err := filepath.Rel(resourceRoot, path)
+		if err != nil {
+			return err
+		}
+		entries = append(entries, kagResourceDigestEntry{
+			Path: filepath.ToSlash(relative), Size: int64(len(data)), Digest: fullHash(data),
+		})
+		return nil
+	})
+	if err != nil {
+		return "", "", fmt.Errorf("digest KAG config resources: %w", err)
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Path < entries[j].Path })
+	payload, err := json.Marshal(struct {
+		Schema  string                   `json:"schema"`
+		Entries []kagResourceDigestEntry `json:"entries"`
+	}{Schema: "kag-config-resources-v1", Entries: entries})
+	if err != nil {
+		return "", "", err
+	}
+	return identity, fullHash(payload), nil
+}
+
+func canonicalKAGConfigIdentity(workspace, configPath string) string {
+	workspace, workspaceErr := filepath.Abs(workspace)
+	configPath, configErr := filepath.Abs(configPath)
+	if workspaceErr == nil && configErr == nil {
+		if relative, err := filepath.Rel(workspace, configPath); err == nil &&
+			relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+			return filepath.ToSlash(relative)
+		}
+	}
+	return filepath.ToSlash(configPath)
+}
+
+func kagGeneratedResourceRoots(workspace, runtimeDir string) ([]string, error) {
+	workspace, err := filepath.Abs(workspace)
+	if err != nil {
+		return nil, fmt.Errorf("resolve workspace path: %w", err)
+	}
+	if strings.TrimSpace(runtimeDir) == "" {
+		runtimeDir = filepath.Join(".knote", "kag-runtime")
+	}
+	if !filepath.IsAbs(runtimeDir) {
+		runtimeDir = filepath.Join(workspace, runtimeDir)
+	}
+	runtimeDir, err = filepath.Abs(runtimeDir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve KAG runtime path: %w", err)
+	}
+	roots := []string{
+		filepath.Join(workspace, ".git"),
+		filepath.Join(workspace, "sources"),
+		filepath.Join(workspace, "artifacts"),
+		filepath.Join(workspace, ".knote", "projections"),
+		filepath.Join(workspace, ".knote", "sessions"),
+		filepath.Join(workspace, ".knote", "cache"),
+		filepath.Join(workspace, ".knote", "checkpoints"),
+		runtimeDir,
+	}
+	sort.Strings(roots)
+	return roots, nil
+}
+
+func pathWithin(root, path string) bool {
+	relative, err := filepath.Rel(filepath.Clean(root), filepath.Clean(path))
+	return err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))
+}
+
+func readBoundedFile(path string, limit int64) ([]byte, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
+		return nil, fmt.Errorf("KAG config resource %s exceeds %d bytes", path, limit)
+	}
+	return data, nil
 }
 
 func canonicalKAGRuntimeDir(workspace, runtimeDir string) string {
@@ -484,6 +666,10 @@ func canonicalACLVersion(scope catalog.Scope) string {
 	return "acl_" + fullHash([]byte(payload))[:24]
 }
 
+func projectionKAGBuildIdempotencyKey(projectionVersion string) string {
+	return "kag-build-" + projectionVersion
+}
+
 func (s service) executeProjectionBuild(ctx context.Context, artifacts repository.ArtifactSet, build projectionBuild) (map[string]any, error) {
 	if build.noop {
 		if err := s.repo.StageArtifacts(ctx, artifacts); err != nil {
@@ -493,6 +679,9 @@ func (s service) executeProjectionBuild(ctx context.Context, artifacts repositor
 			return nil, err
 		}
 		return map[string]any{"projection_version": artifacts.BundleManifest.ProjectionVersion, "idempotent_noop": true}, nil
+	}
+	if s.backend == nil {
+		return nil, fmt.Errorf("KAG build failed: KAG backend is not configured")
 	}
 	var buildData map[string]any
 	var operationErr error
@@ -505,7 +694,11 @@ func (s service) executeProjectionBuild(ctx context.Context, artifacts repositor
 		switch operation.Kind {
 		case catalog.OperationProjectIndex:
 			if !kagBuilt {
-				response, err := s.backend.BuildInNamespace(ctx, artifacts.BundleManifest.Namespace, operation.IdempotencyKey)
+				response, err := s.backend.BuildInNamespace(
+					ctx,
+					artifacts.BundleManifest.Namespace,
+					projectionKAGBuildIdempotencyKey(artifacts.BundleManifest.ProjectionVersion),
+				)
 				if err != nil {
 					operationErr = fmt.Errorf("KAG build failed: %w", err)
 					return catalog.OperationResult{}, operationErr
