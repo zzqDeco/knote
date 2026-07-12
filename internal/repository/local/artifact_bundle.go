@@ -296,8 +296,12 @@ func (s Store) ReadCurrentArtifactManifest(ctx context.Context) (protocol.Artifa
 	if manifest.ProjectionID != pointer.ProjectionID || manifest.ProjectionVersion != pointer.ProjectionVersion {
 		return protocol.ArtifactBundleManifest{}, fmt.Errorf("artifact bundle manifest does not match current pointer projection")
 	}
+	bundleDir := filepath.Dir(manifestPath)
+	if err := verifyStagedArtifactBundle(bundleDir, manifest, manifestData); err != nil {
+		return protocol.ArtifactBundleManifest{}, err
+	}
 	for _, file := range manifest.Files {
-		data, err := os.ReadFile(filepath.Join(filepath.Dir(manifestPath), file.Path))
+		data, err := os.ReadFile(filepath.Join(bundleDir, file.Path))
 		if err != nil {
 			return protocol.ArtifactBundleManifest{}, err
 		}
