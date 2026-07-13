@@ -39,6 +39,9 @@ type queryCacheKey struct {
 	consistency        protocol.ConsistencyPreference
 	retrieverVersion   string
 	promptVersion      string
+	retrieveLimit      int
+	evidenceLimit      int
+	expandLimit        int
 }
 
 type queryCacheEntry struct {
@@ -81,7 +84,14 @@ func newQueryCache(capacity int, now func() time.Time) (*QueryCache, error) {
 	}, nil
 }
 
-func newQueryCacheKey(request protocol.QueryRequest, retrieverVersion, promptVersion string) queryCacheKey {
+func newQueryCacheKey(
+	request protocol.QueryRequest,
+	retrieverVersion string,
+	promptVersion string,
+	retrieveLimit int,
+	evidenceLimit int,
+	expandLimit int,
+) queryCacheKey {
 	authorization := request.Authorization
 	return queryCacheKey{
 		questionDigest:     sha256.Sum256([]byte(request.Question)),
@@ -97,6 +107,9 @@ func newQueryCacheKey(request protocol.QueryRequest, retrieverVersion, promptVer
 		consistency:        authorization.Consistency,
 		retrieverVersion:   retrieverVersion,
 		promptVersion:      promptVersion,
+		retrieveLimit:      retrieveLimit,
+		evidenceLimit:      evidenceLimit,
+		expandLimit:        expandLimit,
 	}
 }
 

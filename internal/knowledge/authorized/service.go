@@ -114,7 +114,10 @@ func (s *Service) Query(ctx context.Context, request protocol.QueryRequest) (Que
 	}
 	var cacheKey queryCacheKey
 	if s.cache != nil {
-		cacheKey = newQueryCacheKey(request, s.retrieverVersion, s.promptVersion)
+		cacheKey = newQueryCacheKey(
+			request, s.retrieverVersion, s.promptVersion,
+			s.retrieveLimit, s.evidenceLimit, s.expandLimit,
+		)
 		if snapshot, ok := s.cache.get(cacheKey); ok {
 			if cached, valid := s.revalidateCached(ctx, request, snapshot.result); valid &&
 				s.cache.containsRevision(cacheKey, snapshot.revision) {

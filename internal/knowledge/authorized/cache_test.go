@@ -139,6 +139,56 @@ func TestQueryCacheSeparatesVisibilityAndExecutionVersions(t *testing.T) {
 	}
 }
 
+func TestQueryCacheSeparatesQueryPlanLimits(t *testing.T) {
+	request := protocol.QueryRequest{
+		Question: "same plan question", Authorization: queryTestAuthorization("alice", "request-plan"),
+	}
+	base := newQueryCacheKey(request, "retriever-v1", "prompt-v1", 10, 1, 0)
+	for name, changed := range map[string]queryCacheKey{
+		"retrieve": newQueryCacheKey(request, "retriever-v1", "prompt-v1", 11, 1, 0),
+		"evidence": newQueryCacheKey(request, "retriever-v1", "prompt-v1", 10, 2, 0),
+		"expand":   newQueryCacheKey(request, "retriever-v1", "prompt-v1", 10, 1, 1),
+	} {
+		if base == changed {
+			t.Fatalf("%s limit did not change cache key", name)
+		}
+	}
+
+	documentA := queryTestDocument(queryTestModelID, "a", "projection-v1")
+	documentB := queryTestDocument(queryTestOtherID, "b", "projection-v1")
+	backend := &queryTestKAG{retrieveResult: queryTestRetrieve(documentA, documentB)}
+	authorizer := &queryTestAuthorizer{}
+	loader := &queryTestLoader{items: map[protocol.ResourceID]protocol.EvidenceItem{
+		documentA.ResourceID: queryTestItem(documentA),
+		documentB.ResourceID: queryTestItem(documentB),
+	}}
+	cache := mustQueryCache(t, 4)
+	small := cacheTestServiceWithLimits(
+		t, backend, authorizer, loader, cache, "retriever-v1", "prompt-v1", 10, 1, 0,
+	)
+	large := cacheTestServiceWithLimits(
+		t, backend, authorizer, loader, cache, "retriever-v1", "prompt-v1", 10, 2, 0,
+	)
+	first, err := small.Query(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first.Evidence.Items) != 1 {
+		t.Fatalf("small plan evidence count = %d", len(first.Evidence.Items))
+	}
+	request.Authorization.RequestID = "request-plan-large"
+	second, err := large.Query(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if backend.retrieveCalls != 2 || backend.generateCalls != 2 {
+		t.Fatalf("larger plan reused smaller result: retrieve=%d generate=%d", backend.retrieveCalls, backend.generateCalls)
+	}
+	if len(second.Evidence.Items) != 2 {
+		t.Fatalf("large plan evidence count = %d, want 2", len(second.Evidence.Items))
+	}
+}
+
 func TestQueryCacheStaleWatermarkCannotBypassLiveRevocation(t *testing.T) {
 	document := queryTestDocument(queryTestModelID, "content", "projection-v1")
 	backend := &queryTestKAG{retrieveResult: queryTestRetrieve(document)}
@@ -169,7 +219,7 @@ func TestQueryCacheStaleWatermarkCannotBypassLiveRevocation(t *testing.T) {
 	if backend.retrieveCalls != 2 || backend.generateCalls != 1 {
 		t.Fatalf("revoked hit returned or regenerated cached evidence: retrieve=%d generate=%d", backend.retrieveCalls, backend.generateCalls)
 	}
-	if _, ok := cache.get(newQueryCacheKey(request, "retriever-v1", "prompt-v1")); ok {
+	if _, ok := cache.get(cacheTestKey(request, "retriever-v1", "prompt-v1")); ok {
 		t.Fatal("revoked cache entry was not evicted")
 	}
 }
@@ -243,13 +293,13 @@ func TestQueryCacheInvalidationMeasuresLatencyAndCoversProvenance(t *testing.T) 
 	parent := queryTestDocument(queryTestOtherID, "parent", "projection-v1")
 	chunk := queryTestChunk(queryTestModelID, parent, "chunk")
 	request := protocol.QueryRequest{Question: "sensitive question", Authorization: queryTestAuthorization("alice", "request-invalidate")}
-	cache.put(newQueryCacheKey(request, "retriever-v1", "prompt-v1"), QueryResult{
+	cache.put(cacheTestKey(request, "retriever-v1", "prompt-v1"), QueryResult{
 		Generation: kag.GenerateResult{Answer: "sensitive answer"},
 		Evidence: protocol.EvidencePackage{Items: []protocol.EvidenceItem{
 			queryTestChunkItem(chunk, parent),
 		}},
 	})
-	key := newQueryCacheKey(request, "retriever-v1", "prompt-v1")
+	key := cacheTestKey(request, "retriever-v1", "prompt-v1")
 	snapshot, ok := cache.get(key)
 	if !ok {
 		t.Fatal("cache entry missing before invalidation")
@@ -294,7 +344,7 @@ func TestQueryCacheClonesValuesAndEvictsOldestDeterministically(t *testing.T) {
 		Evidence: protocol.EvidencePackage{Items: []protocol.EvidenceItem{queryTestItem(document)}},
 	}
 	key := func(question string) queryCacheKey {
-		return newQueryCacheKey(protocol.QueryRequest{
+		return cacheTestKey(protocol.QueryRequest{
 			Question: question, Authorization: queryTestAuthorization("alice", "request-"+question),
 		}, "retriever-v1", "prompt-v1")
 	}
@@ -344,7 +394,7 @@ func TestQueryCacheConcurrentAccess(t *testing.T) {
 					Question:      fmt.Sprintf("question-%d", (worker+iteration)%20),
 					Authorization: queryTestAuthorization("alice", fmt.Sprintf("request-%d-%d", worker, iteration)),
 				}
-				key := newQueryCacheKey(request, "retriever-v1", "prompt-v1")
+				key := cacheTestKey(request, "retriever-v1", "prompt-v1")
 				cache.put(key, result)
 				cache.get(key)
 				if iteration%10 == 0 {
@@ -406,11 +456,28 @@ func cacheTestService(
 	retrieverVersion string,
 	promptVersion string,
 ) *Service {
+	return cacheTestServiceWithLimits(
+		t, backend, authorizer, loader, cache, retrieverVersion, promptVersion, 10, 4, 0,
+	)
+}
+
+func cacheTestServiceWithLimits(
+	t *testing.T,
+	backend *queryTestKAG,
+	authorizer authz.BatchChecker,
+	loader *queryTestLoader,
+	cache *QueryCache,
+	retrieverVersion string,
+	promptVersion string,
+	retrieveLimit int,
+	evidenceLimit int,
+	expandLimit int,
+) *Service {
 	t.Helper()
 	service, err := New(Options{
 		KAG: backend, Authorizer: authorizer, Loader: loader, Cache: cache,
 		RetrieverVersion: retrieverVersion, PromptVersion: promptVersion,
-		RetrieveLimit: 10, EvidenceLimit: 4,
+		RetrieveLimit: retrieveLimit, EvidenceLimit: evidenceLimit, ExpandLimit: expandLimit,
 		Now: func() time.Time { return time.Date(2026, 7, 13, 6, 0, 0, 0, time.UTC) },
 	})
 	if err != nil {
@@ -424,9 +491,13 @@ func TestQueryCacheQuestionDigestIsExact(t *testing.T) {
 	changed := base
 	changed.Question = "question "
 	if reflect.DeepEqual(
-		newQueryCacheKey(base, "retriever-v1", "prompt-v1"),
-		newQueryCacheKey(changed, "retriever-v1", "prompt-v1"),
+		cacheTestKey(base, "retriever-v1", "prompt-v1"),
+		cacheTestKey(changed, "retriever-v1", "prompt-v1"),
 	) {
 		t.Fatal("different exact questions shared a cache key")
 	}
+}
+
+func cacheTestKey(request protocol.QueryRequest, retrieverVersion, promptVersion string) queryCacheKey {
+	return newQueryCacheKey(request, retrieverVersion, promptVersion, 10, 4, 0)
 }
