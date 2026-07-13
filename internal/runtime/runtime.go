@@ -87,11 +87,12 @@ type ToolExecutor interface {
 type EventSubscriber func([]protocol.Event)
 
 type Manager struct {
-	mu          sync.Mutex
-	deps        Dependencies
-	einoSession protocol.SessionInfo
-	subscribers map[int]EventSubscriber
-	nextSubID   int
+	mu                   sync.Mutex
+	deps                 Dependencies
+	einoSession          protocol.SessionInfo
+	authorizationBinding *authorizationBinding
+	subscribers          map[int]EventSubscriber
+	nextSubID            int
 }
 
 var _ Runtime = (*Manager)(nil)
@@ -106,6 +107,10 @@ func New(deps Dependencies) *Manager {
 
 func (m *Manager) Start(ctx context.Context, opts StartOptions) ([]protocol.Event, error) {
 	m.mu.Lock()
+	if strings.TrimSpace(opts.ResumeID) != "" && m.deps.AuthorizationContextProvider != nil {
+		m.mu.Unlock()
+		return nil, permissionedResumeError()
+	}
 	if m.einoSession.ID != "" {
 		sessionID := m.einoSession.ID
 		m.mu.Unlock()
@@ -127,6 +132,7 @@ func (m *Manager) Start(ctx context.Context, opts StartOptions) ([]protocol.Even
 	}
 	info, loaded := m.newEinoSessionLocked(ctx, opts.ResumeID)
 	m.einoSession = info
+	m.authorizationBinding = nil
 	m.mu.Unlock()
 	events := []protocol.Event{
 		protocol.NewEvent(protocol.EventGatewayReady, info.ID, "knote runtime ready", nil),
@@ -166,6 +172,10 @@ func (m *Manager) SendMessage(ctx context.Context, input string) []protocol.Even
 	if err != nil {
 		events = append(events, protocol.NewEvent(protocol.EventError, einoSession.ID, err.Error(), nil))
 		return m.persistEmitAndReturn(events)
+	}
+	if err := m.bindAuthorizationContext(einoSession.ID, authorization); err != nil {
+		events = append(events, protocol.NewEvent(protocol.EventError, einoSession.ID, err.Error(), nil))
+		return m.emitAndReturn(events)
 	}
 	history := m.loadHistory(ctx, einoSession.ID)
 	if m.deps.SideEffects != nil {

@@ -87,24 +87,27 @@ func newRuntime(ctx context.Context, workspacePath string, resumeID string) (run
 		RuntimeDir:  repoCfg.KAG.RuntimeDir,
 	}
 	knowledgeService := versioned.New(versioned.Options{Workspace: workspace, Repo: repo, Versions: repo, Backend: kagClient, Mode: knowledgeMode})
-	permissionedService, err := fixture.New(kagClient)
-	if err != nil {
-		return nil, nil, err
-	}
 	principal, err := permissionedPrincipal()
 	if err != nil {
 		return nil, nil, err
 	}
-	permissionedQuery := func(ctx context.Context, request protocol.QueryRequest) (einotools.PermissionedQueryResult, error) {
-		result, err := permissionedService.Query(ctx, request)
+	var permissionedQuery einotools.PermissionedQuery
+	if repoCfg.KAG.Fake {
+		permissionedService, err := fixture.New(kagClient)
 		if err != nil {
-			return einotools.PermissionedQueryResult{}, err
+			return nil, nil, err
 		}
-		return einotools.PermissionedQueryResult{
-			Answer:          result.Generation.Answer,
-			Mode:            result.Generation.Mode,
-			EvidencePackage: result.Evidence,
-		}, nil
+		permissionedQuery = func(ctx context.Context, request protocol.QueryRequest) (einotools.PermissionedQueryResult, error) {
+			result, err := permissionedService.Query(ctx, request)
+			if err != nil {
+				return einotools.PermissionedQueryResult{}, err
+			}
+			return einotools.PermissionedQueryResult{
+				Answer:          result.Generation.Answer,
+				Mode:            result.Generation.Mode,
+				EvidencePackage: result.Evidence,
+			}, nil
+		}
 	}
 	sideEffects := runtime.NewSideEffectBridge()
 	approvedEinoTools := einotools.ByNameWithOptions(einotools.Options{
@@ -112,11 +115,13 @@ func newRuntime(ctx context.Context, workspacePath string, resumeID string) (run
 		PermissionedQuery: permissionedQuery,
 		SideEffectGate:    func(context.Context, einotools.SideEffectRequest) error { return nil },
 	})
+	approvedEinoTools = permissionedToolMap(approvedEinoTools, repoCfg.KAG.Fake)
 	einoTools := einotools.NewWithOptions(einotools.Options{
 		Service:           knowledgeService,
 		PermissionedQuery: permissionedQuery,
 		SideEffectGate:    newEinoSideEffectGate(sideEffects, approvedEinoTools),
 	})
+	einoTools = permissionedTools(einoTools, repoCfg.KAG.Fake)
 	toolExecutor := runtimeeino.NewToolExecutor(einoTools)
 	einoRunner, err := newEinoRunner(ctx, repoCfg, einoTools)
 	if err != nil {

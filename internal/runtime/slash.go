@@ -104,6 +104,7 @@ func (m *Manager) newSession(ctx context.Context) []protocol.Event {
 	m.mu.Lock()
 	info, _ := m.newEinoSessionLocked(ctx, "")
 	m.einoSession = info
+	m.authorizationBinding = nil
 	m.mu.Unlock()
 	events := []protocol.Event{
 		protocol.NewEvent(protocol.EventGatewayReady, info.ID, "knote runtime ready", nil),
@@ -115,6 +116,9 @@ func (m *Manager) newSession(ctx context.Context) []protocol.Event {
 }
 
 func (m *Manager) resumeSession(ctx context.Context, currentSessionID string, sessionID string) []protocol.Event {
+	if m.deps.AuthorizationContextProvider != nil {
+		return []protocol.Event{protocol.NewEvent(protocol.EventError, currentSessionID, permissionedResumeErrorMessage, nil)}
+	}
 	sessionID = strings.TrimSpace(sessionID)
 	if sessionID == "" {
 		return m.sessionList(ctx, currentSessionID)
@@ -145,6 +149,7 @@ func (m *Manager) resumeSession(ctx context.Context, currentSessionID string, se
 	}
 	m.mu.Lock()
 	m.einoSession = info
+	m.authorizationBinding = nil
 	m.mu.Unlock()
 	infoEvent := protocol.NewEvent(protocol.EventSessionInfo, sessionID, "session resumed", info)
 	m.persist([]protocol.Event{infoEvent})

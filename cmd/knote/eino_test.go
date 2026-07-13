@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 
+	einotools "github.com/zzqDeco/knote/internal/eino/tools"
+	"github.com/zzqDeco/knote/internal/knowledge/versioned"
 	"github.com/zzqDeco/knote/internal/repository"
 )
 
@@ -87,6 +89,33 @@ func TestPermissionedPrincipalUsesTrustedRuntimeEnvironment(t *testing.T) {
 	t.Setenv(permissionedPrincipalEnv, "mallory")
 	if _, err := permissionedPrincipal(); err == nil || !strings.Contains(err.Error(), permissionedPrincipalEnv) {
 		t.Fatalf("unknown principal should fail closed, got %v", err)
+	}
+}
+
+func TestPermissionedToolsAreNotSelectedWithoutImplementedPrimitives(t *testing.T) {
+	service := versioned.New(versioned.Options{})
+	all := einotools.New(service)
+	realMode := permissionedTools(all, false)
+	for _, candidate := range realMode {
+		info, err := candidate.Info(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Name == einotools.NameQuery || info.Name == einotools.NameExplain {
+			t.Fatalf("real mode selected unsupported permissioned tool %s", info.Name)
+		}
+	}
+	if got, want := len(realMode), len(all)-2; got != want {
+		t.Fatalf("real-mode tool count = %d, want %d", got, want)
+	}
+	if got := len(permissionedTools(all, true)); got != len(all) {
+		t.Fatalf("fake mode tool count = %d, want %d", got, len(all))
+	}
+
+	registry := einotools.ByName(service)
+	permissionedToolMap(registry, false)
+	if registry[einotools.NameQuery] != nil || registry[einotools.NameExplain] != nil {
+		t.Fatal("real-mode approved registry retained query or explain")
 	}
 }
 
