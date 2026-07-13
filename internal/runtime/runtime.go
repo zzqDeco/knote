@@ -148,9 +148,11 @@ func (m *Manager) Start(ctx context.Context, opts StartOptions) ([]protocol.Even
 			}
 			return nil, fmt.Errorf("resume failed: %w", err)
 		}
+		authorization := protocol.AuthorizationContext{}
 		if resumeAuthorization != nil {
-			loaded = m.filterPersistedEvents(ctx, *resumeAuthorization, loaded)
+			authorization = *resumeAuthorization
 		}
+		loaded = m.filterPersistedEvents(ctx, authorization, loaded)
 	}
 	info := m.newEinoSessionLocked(ctx, resumeID)
 	m.einoSession = info
@@ -403,14 +405,11 @@ func (m *Manager) loadHistory(ctx context.Context, sessionID string) []protocol.
 	if err != nil {
 		return nil
 	}
-	if m.deps.AuthorizationContextProvider != nil {
-		authorization, ok := protocol.AuthorizationContextFrom(ctx)
-		if !ok || authorization.SessionID != sessionID {
-			return nil
-		}
-		return m.filterPersistedEvents(ctx, authorization, events)
+	authorization, ok := protocol.AuthorizationContextFrom(ctx)
+	if !ok || authorization.SessionID != sessionID {
+		authorization = protocol.AuthorizationContext{}
 	}
-	return events
+	return m.filterPersistedEvents(ctx, authorization, events)
 }
 
 func (m *Manager) emitAndReturn(events []protocol.Event) []protocol.Event {

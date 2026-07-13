@@ -29,10 +29,6 @@ func (m *Manager) filterPersistedEvents(
 	current protocol.AuthorizationContext,
 	events []protocol.Event,
 ) []protocol.Event {
-	if m.deps.AuthorizationContextProvider == nil {
-		return append([]protocol.Event(nil), events...)
-	}
-
 	blocks := make(map[string]replayBlock)
 	for _, event := range events {
 		if event.ProtectedContent == nil {
@@ -57,7 +53,7 @@ func (m *Manager) filterPersistedEvents(
 	sort.Strings(blockIDs)
 	for _, blockID := range blockIDs {
 		block := blocks[blockID]
-		if !block.valid || m.deps.ProtectedContentAuthorizer == nil {
+		if !block.valid || m.deps.AuthorizationContextProvider == nil || m.deps.ProtectedContentAuthorizer == nil {
 			continue
 		}
 		if err := m.deps.ProtectedContentAuthorizer(ctx, current, block.binding); err == nil {
@@ -66,19 +62,44 @@ func (m *Manager) filterPersistedEvents(
 	}
 
 	filtered := make([]protocol.Event, 0, len(events))
+	permissionedReplay := m.deps.AuthorizationContextProvider != nil
+	slashTurn := false
 	for _, event := range events {
+		if event.Type == protocol.EventUserMessage {
+			slashTurn = strings.HasPrefix(strings.TrimSpace(event.Message), "/")
+		}
 		if event.ProtectedContent != nil {
+			slashTurn = false
 			if allowed[event.ProtectedContent.BlockID] {
 				filtered = append(filtered, event)
 			}
 			continue
 		}
-		if legacyProtectedEvent(event) {
+		unprotectedSlash := slashReplayEvent(event, slashTurn)
+		if permissionedReplay && legacyProtectedEvent(event) && !unprotectedSlash {
 			continue
 		}
 		filtered = append(filtered, event)
+		if unprotectedSlash && (event.Type == protocol.EventAssistantDone || event.Type == protocol.EventError) {
+			slashTurn = false
+		}
 	}
 	return filtered
+}
+
+func slashReplayEvent(event protocol.Event, slashTurn bool) bool {
+	if eventPayloadValue(event.Payload, "source") == "slash" {
+		return true
+	}
+	if !slashTurn {
+		return false
+	}
+	switch event.Type {
+	case protocol.EventAssistantDelta, protocol.EventAssistantDone, protocol.EventError:
+		return true
+	default:
+		return false
+	}
 }
 
 func legacyProtectedEvent(event protocol.Event) bool {
@@ -94,12 +115,16 @@ func legacyProtectedEvent(event protocol.Event) bool {
 }
 
 func eventToolName(payload any) string {
+	return eventPayloadValue(payload, "tool")
+}
+
+func eventPayloadValue(payload any, key string) string {
 	switch value := payload.(type) {
 	case map[string]string:
-		return strings.TrimSpace(value["tool"])
+		return strings.TrimSpace(value[key])
 	case map[string]any:
-		name, _ := value["tool"].(string)
-		return strings.TrimSpace(name)
+		item, _ := value[key].(string)
+		return strings.TrimSpace(item)
 	default:
 		return ""
 	}

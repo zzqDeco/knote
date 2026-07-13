@@ -89,9 +89,12 @@ func (r *Runner) Run(ctx context.Context, input runtime.EinoRunInput) ([]protoco
 	agentEvents, err := executor.Run(ctx, messages)
 	_, permissionedContext := protocol.AuthorizationContextFrom(ctx)
 	if err != nil && permissionedContext {
+		if errors.Is(err, runtime.ErrSideEffectPending) {
+			return events, runtime.ErrSideEffectPending
+		}
 		return events, fmt.Errorf("%s", protectedContentUnavailableMessage)
 	}
-	binding, permissioned, bindingErr := protectedBindingFromAgentEvents(ctx, agentEvents)
+	binding, permissioned, allowUnboundAssistant, bindingErr := protectedBindingFromAgentEvents(ctx, agentEvents)
 	if bindingErr != nil {
 		generic := fmt.Errorf("%s", protectedContentUnavailableMessage)
 		events = append(events, protocol.NewEvent(protocol.EventError, input.SessionID, generic.Error(), nil))
@@ -103,7 +106,7 @@ func (r *Runner) Run(ctx context.Context, input runtime.EinoRunInput) ([]protoco
 			bindProjectedEvents(projected, binding)
 		} else if permissionedContext {
 			sanitizePermissionedErrors(projected)
-			if hasAssistantOutput(projected) {
+			if hasAssistantOutput(projected) && !allowUnboundAssistant {
 				generic := fmt.Errorf("%s", protectedContentUnavailableMessage)
 				events = append(events, protocol.NewEvent(protocol.EventError, input.SessionID, generic.Error(), nil))
 				return events, generic
@@ -126,40 +129,73 @@ func (r *Runner) Run(ctx context.Context, input runtime.EinoRunInput) ([]protoco
 func protectedBindingFromAgentEvents(
 	ctx context.Context,
 	events []*adk.AgentEvent,
-) (*protocol.ProtectedContentBinding, bool, error) {
+) (*protocol.ProtectedContentBinding, bool, bool, error) {
 	authorization, authorized := protocol.AuthorizationContextFrom(ctx)
 	var packages []protocol.EvidencePackage
+	hasNonPermissionedTool := false
+	permissionedToolAttempted := false
 	for _, event := range events {
+		if authorized {
+			attempted, err := permissionedAgentToolAttempt(event)
+			if err != nil {
+				return nil, true, false, err
+			}
+			permissionedToolAttempted = permissionedToolAttempted || attempted
+		}
 		toolName, content, ok, err := permissionedAgentToolOutput(event)
 		if err != nil {
-			return nil, true, err
+			return nil, true, false, err
 		}
 		if !ok {
 			continue
 		}
 		if authorized && toolName == "" {
-			return nil, true, errors.New("permissioned run received unnamed tool output")
+			return nil, true, false, errors.New("permissioned run received unnamed tool output")
 		}
 		if !permissionedToolName(toolName) {
+			hasNonPermissionedTool = true
 			continue
 		}
 		if !authorized {
-			return nil, true, errors.New("permissioned tool output requires authorization")
+			return nil, true, false, errors.New("permissioned tool output requires authorization")
 		}
 		evidencePackage, err := decodeEvidencePackage(content)
 		if err != nil {
-			return nil, true, err
+			return nil, true, false, err
 		}
 		packages = append(packages, evidencePackage)
 	}
 	if len(packages) == 0 {
-		return nil, false, nil
+		return nil, false, hasNonPermissionedTool && !permissionedToolAttempted, nil
 	}
 	binding, err := protocol.NewProtectedContentBinding(authorization, packages...)
 	if err != nil {
-		return nil, true, err
+		return nil, true, false, err
 	}
-	return &binding, true, nil
+	return &binding, true, false, nil
+}
+
+func permissionedAgentToolAttempt(event *adk.AgentEvent) (bool, error) {
+	if event == nil || event.Output == nil || event.Output.MessageOutput == nil || event.Output.MessageOutput.Role != schema.Assistant {
+		return false, nil
+	}
+	message, _, err := adk.GetMessage(event)
+	if err != nil {
+		return false, err
+	}
+	if message == nil {
+		return false, nil
+	}
+	for _, call := range message.ToolCalls {
+		toolName := strings.TrimSpace(call.Function.Name)
+		if toolName == "" {
+			return false, errors.New("permissioned run received unnamed tool call")
+		}
+		if permissionedToolName(toolName) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func permissionedAgentToolOutput(event *adk.AgentEvent) (string, string, bool, error) {

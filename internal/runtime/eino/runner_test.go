@@ -3,6 +3,7 @@ package eino
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -177,6 +178,108 @@ func TestRunnerDiscardsPartialPermissionedEventsOnExecutorError(t *testing.T) {
 			if strings.Contains(event.Message, canary) {
 				t.Fatalf("failed permissioned turn leaked %q: %+v", canary, events)
 			}
+		}
+	}
+}
+
+func TestRunnerPreservesPendingSideEffectSentinelInPermissionedContext(t *testing.T) {
+	authorization := testEinoAuthorization("sess_eino")
+	ctx, err := protocol.WithAuthorizationContext(context.Background(), authorization)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := NewRunner(Options{Executor: &fakeExecutor{
+		events: []*adk.AgentEvent{
+			adk.EventFromMessage(schema.ToolMessage("PARTIAL_TOOL_CANARY", "call_1", schema.WithToolName("knote_diff")), nil, schema.Tool, "knote_diff"),
+			adk.EventFromMessage(schema.AssistantMessage("PARTIAL_ASSISTANT_CANARY", nil), nil, schema.Assistant, ""),
+		},
+		err: fmt.Errorf("PENDING_EXECUTOR_CANARY: %w", runtime.ErrSideEffectPending),
+	}})
+
+	events, err := runner.Run(ctx, runtime.EinoRunInput{SessionID: authorization.SessionID, Message: "build knowledge"})
+	if !errors.Is(err, runtime.ErrSideEffectPending) {
+		t.Fatalf("pending side-effect error lost sentinel identity: %v", err)
+	}
+	if strings.Contains(err.Error(), "PENDING_EXECUTOR_CANARY") {
+		t.Fatalf("pending side-effect error exposed executor details: %v", err)
+	}
+	for _, event := range events {
+		if event.Type == protocol.EventToolComplete || event.Type == protocol.EventAssistantDone || event.Type == protocol.EventError {
+			t.Fatalf("pending permissioned turn retained partial or error output: %+v", events)
+		}
+		if strings.Contains(event.Message, "PARTIAL_") || strings.Contains(event.Message, "PENDING_EXECUTOR_CANARY") {
+			t.Fatalf("pending permissioned turn leaked executor output: %+v", events)
+		}
+	}
+}
+
+func TestRunnerPendingSideEffectWaitsForManagerConfirmationWithoutError(t *testing.T) {
+	workspace := t.TempDir()
+	authorization := testEinoAuthorization("sess_eino")
+	bridge := runtime.NewSideEffectBridge()
+	runner := NewRunner(Options{Executor: pendingSideEffectExecutor{
+		bridge:    bridge,
+		sessionID: authorization.SessionID,
+	}})
+	manager := runtime.New(runtime.Dependencies{
+		Workspace:   workspace,
+		Sessions:    local.New(workspace),
+		EinoRunner:  runner,
+		SideEffects: bridge,
+		AuthorizationContextProvider: func(_ context.Context, sessionID string) (protocol.AuthorizationContext, error) {
+			current := authorization
+			current.SessionID = sessionID
+			return current, nil
+		},
+		NewSessionID: func() string { return authorization.SessionID },
+	})
+	if _, err := manager.Start(context.Background(), runtime.StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	events := manager.SendMessage(context.Background(), "build knowledge")
+	if !hasEvent(events, protocol.EventConfirmRequest) {
+		t.Fatalf("pending side effect did not reach confirmation state: %+v", events)
+	}
+	for _, event := range events {
+		if event.Type == protocol.EventError || event.Type == protocol.EventToolComplete || event.Type == protocol.EventAssistantDone {
+			t.Fatalf("manager exposed an error or partial output while confirmation waits: %+v", events)
+		}
+		if strings.Contains(event.Message, "PENDING_MANAGER_CANARY") {
+			t.Fatalf("manager leaked pending executor output: %+v", events)
+		}
+	}
+}
+
+func TestRunnerAllowsSafeNonPermissionedToolAnswerInAuthorizationContext(t *testing.T) {
+	authorization := testEinoAuthorization("sess_eino")
+	ctx, err := protocol.WithAuthorizationContext(context.Background(), authorization)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := NewRunner(Options{Executor: &fakeExecutor{events: []*adk.AgentEvent{
+		adk.EventFromMessage(schema.AssistantMessage("", []schema.ToolCall{
+			{ID: "call_1", Function: schema.FunctionCall{Name: "knote_diff", Arguments: `{}`}},
+			{ID: "call_2", Function: schema.FunctionCall{Name: "knote_versions", Arguments: `{}`}},
+		}), nil, schema.Assistant, ""),
+		adk.EventFromMessage(schema.ToolMessage("SAFE_DIFF_CANARY", "call_1", schema.WithToolName("knote_diff")), nil, schema.Tool, "knote_diff"),
+		adk.EventFromMessage(schema.ToolMessage("SAFE_VERSIONS_CANARY", "call_2", schema.WithToolName("knote_versions")), nil, schema.Tool, "knote_versions"),
+		adk.EventFromMessage(schema.AssistantMessage("SAFE_ASSISTANT_CANARY", nil), nil, schema.Assistant, ""),
+	}}})
+
+	events, err := runner.Run(ctx, runtime.EinoRunInput{SessionID: authorization.SessionID, Message: "compare versions"})
+	if err != nil {
+		t.Fatalf("safe non-permissioned turn failed: %v, events=%+v", err, events)
+	}
+	if got := lastMessage(events, protocol.EventAssistantDone); got != "SAFE_ASSISTANT_CANARY" {
+		t.Fatalf("safe assistant answer = %q, events=%+v", got, events)
+	}
+	if got := countEvents(events, protocol.EventToolComplete); got != 2 {
+		t.Fatalf("safe tool completion count = %d, want 2: %+v", got, events)
+	}
+	for _, event := range events {
+		if event.Type == protocol.EventError || event.ProtectedContent != nil {
+			t.Fatalf("safe non-permissioned turn was rejected or protected: %+v", events)
 		}
 	}
 }
@@ -405,6 +508,24 @@ func TestRunnerFailsPermissionedOutputClosedAndSanitizesErrors(t *testing.T) {
 			}},
 		},
 		{
+			name: "safe tool cannot mask malformed permissioned evidence",
+			executor: &fakeExecutor{events: []*adk.AgentEvent{
+				adk.EventFromMessage(schema.ToolMessage("SAFE_TOOL_BEFORE_MALFORMED_CANARY", "call_1", schema.WithToolName("knote_diff")), nil, schema.Tool, "knote_diff"),
+				adk.EventFromMessage(schema.ToolMessage(`{"answer":"MIXED_MALFORMED_OUTPUT_CANARY"}`, "call_2", schema.WithToolName("knote_query")), nil, schema.Tool, "knote_query"),
+				adk.EventFromMessage(schema.AssistantMessage("MIXED_UNBOUND_ANSWER_CANARY", nil), nil, schema.Assistant, ""),
+			}},
+		},
+		{
+			name: "safe tool cannot mask permissioned tool attempt",
+			executor: &fakeExecutor{events: []*adk.AgentEvent{
+				adk.EventFromMessage(schema.AssistantMessage("", []schema.ToolCall{{
+					ID: "call_query", Function: schema.FunctionCall{Name: "knote_query", Arguments: `{}`},
+				}}), nil, schema.Assistant, ""),
+				adk.EventFromMessage(schema.ToolMessage("SAFE_TOOL_AFTER_QUERY_CANARY", "call_diff", schema.WithToolName("knote_diff")), nil, schema.Tool, "knote_diff"),
+				adk.EventFromMessage(schema.AssistantMessage("ATTEMPTED_QUERY_UNBOUND_ANSWER_CANARY", nil), nil, schema.Assistant, ""),
+			}},
+		},
+		{
 			name: "executor error after evidence",
 			executor: &fakeExecutor{
 				events: []*adk.AgentEvent{
@@ -438,6 +559,9 @@ func TestRunnerFailsPermissionedOutputClosedAndSanitizesErrors(t *testing.T) {
 			}
 			for _, event := range events {
 				if strings.Contains(event.Message, "MALFORMED_OUTPUT_CANARY") ||
+					strings.Contains(event.Message, "SAFE_TOOL_BEFORE_MALFORMED_CANARY") ||
+					strings.Contains(event.Message, "MIXED_UNBOUND_ANSWER_CANARY") ||
+					strings.Contains(event.Message, "ATTEMPTED_QUERY_UNBOUND_ANSWER_CANARY") ||
 					strings.Contains(event.Message, "UNNAMED_CONTENT_CANARY") ||
 					strings.Contains(event.Message, "UNNAMED_OUTPUT_CANARY") ||
 					strings.Contains(event.Message, "EXECUTOR_ERROR_CANARY") ||
@@ -530,6 +654,26 @@ type fakeExecutor struct {
 	err      error
 }
 
+type pendingSideEffectExecutor struct {
+	bridge    *runtime.SideEffectBridge
+	sessionID string
+}
+
+func (e pendingSideEffectExecutor) Run(ctx context.Context, _ []*schema.Message) ([]*adk.AgentEvent, error) {
+	err := e.bridge.Request(ctx, runtime.SideEffectRequest{
+		SessionID:       e.sessionID,
+		ToolName:        "knote_build",
+		Action:          "build",
+		ArgumentsInJSON: "{}",
+		Execute: func(context.Context, runtime.SideEffectRequest) ([]protocol.Event, error) {
+			return nil, nil
+		},
+	})
+	return []*adk.AgentEvent{
+		adk.EventFromMessage(schema.AssistantMessage("PENDING_MANAGER_CANARY", nil), nil, schema.Assistant, ""),
+	}, err
+}
+
 func (e *fakeExecutor) Run(_ context.Context, messages []*schema.Message) ([]*adk.AgentEvent, error) {
 	e.messages = append([]*schema.Message(nil), messages...)
 	return append([]*adk.AgentEvent(nil), e.events...), e.err
@@ -542,6 +686,16 @@ func hasEvent(events []protocol.Event, eventType protocol.EventType) bool {
 		}
 	}
 	return false
+}
+
+func countEvents(events []protocol.Event, eventType protocol.EventType) int {
+	count := 0
+	for _, event := range events {
+		if event.Type == eventType {
+			count++
+		}
+	}
+	return count
 }
 
 func lastMessage(events []protocol.Event, eventType protocol.EventType) string {
