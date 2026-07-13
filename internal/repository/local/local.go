@@ -247,6 +247,27 @@ func (s Store) List(ctx context.Context, limit int) ([]repository.SessionSummary
 	return listSessions(s.workspace, limit)
 }
 
+func (s Store) BindAuthorization(ctx context.Context, envelope protocol.SessionAuthorizationEnvelope) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return bindSessionAuthorization(ctx, s.workspace, envelope)
+}
+
+func (s Store) LoadAuthorization(ctx context.Context, sessionID string) (protocol.SessionAuthorizationEnvelope, error) {
+	if err := ctx.Err(); err != nil {
+		return protocol.SessionAuthorizationEnvelope{}, err
+	}
+	return loadSessionAuthorization(s.workspace, sessionID)
+}
+
+func (s Store) ListAuthorization(ctx context.Context) ([]protocol.SessionAuthorizationEnvelope, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return listSessionAuthorization(s.workspace)
+}
+
 func (s Store) Status(ctx context.Context) (repository.Status, error) {
 	if err := ctx.Err(); err != nil {
 		return repository.Status{}, err

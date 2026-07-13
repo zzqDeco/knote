@@ -107,10 +107,6 @@ func New(deps Dependencies) *Manager {
 
 func (m *Manager) Start(ctx context.Context, opts StartOptions) ([]protocol.Event, error) {
 	m.mu.Lock()
-	if strings.TrimSpace(opts.ResumeID) != "" && m.deps.AuthorizationContextProvider != nil {
-		m.mu.Unlock()
-		return nil, permissionedResumeError()
-	}
 	if m.einoSession.ID != "" {
 		sessionID := m.einoSession.ID
 		m.mu.Unlock()
@@ -130,9 +126,36 @@ func (m *Manager) Start(ctx context.Context, opts StartOptions) ([]protocol.Even
 		m.mu.Unlock()
 		return nil, err
 	}
-	info, loaded := m.newEinoSessionLocked(ctx, opts.ResumeID)
+	resumeID := strings.TrimSpace(opts.ResumeID)
+	var resumeAuthorization *protocol.AuthorizationContext
+	if resumeID != "" && m.deps.AuthorizationContextProvider != nil {
+		authorization, err := m.authorizeSessionResume(ctx, resumeID)
+		if err != nil {
+			m.mu.Unlock()
+			return nil, err
+		}
+		resumeAuthorization = &authorization
+	}
+	var loaded []protocol.Event
+	if resumeID != "" {
+		var err error
+		loaded, err = m.deps.Sessions.Load(ctx, resumeID)
+		if err != nil {
+			m.mu.Unlock()
+			if resumeAuthorization != nil {
+				return nil, permissionedResumeError()
+			}
+			return nil, fmt.Errorf("resume failed: %w", err)
+		}
+	}
+	info := m.newEinoSessionLocked(ctx, resumeID)
 	m.einoSession = info
-	m.authorizationBinding = nil
+	if resumeAuthorization == nil {
+		m.authorizationBinding = nil
+	} else {
+		binding := newAuthorizationBinding(*resumeAuthorization)
+		m.authorizationBinding = &binding
+	}
 	m.mu.Unlock()
 	events := []protocol.Event{
 		protocol.NewEvent(protocol.EventGatewayReady, info.ID, "knote runtime ready", nil),
@@ -161,7 +184,10 @@ func (m *Manager) SendMessage(ctx context.Context, input string) []protocol.Even
 	}
 	events := []protocol.Event{protocol.NewEvent(protocol.EventUserMessage, einoSession.ID, input, nil)}
 	if strings.HasPrefix(input, "/") {
-		return m.handleSlash(ctx, einoSession.ID, input)
+		command, _ := parseSlash(input)
+		if command == "new" {
+			return m.handleSlash(ctx, einoSession.ID, input)
+		}
 	}
 	runCtx := ctx
 	if authorizationProvider != nil {
@@ -175,10 +201,13 @@ func (m *Manager) SendMessage(ctx context.Context, input string) []protocol.Even
 			events = append(events, protocol.NewEvent(protocol.EventError, einoSession.ID, err.Error(), nil))
 			return m.emitAndReturn(events)
 		}
-		if err := m.bindAuthorizationContext(einoSession.ID, authorization); err != nil {
+		if err := m.bindSessionAuthorization(ctx, einoSession.ID, authorization); err != nil {
 			events = append(events, protocol.NewEvent(protocol.EventError, einoSession.ID, err.Error(), nil))
 			return m.emitAndReturn(events)
 		}
+	}
+	if strings.HasPrefix(input, "/") {
+		return m.handleSlash(runCtx, einoSession.ID, input)
 	}
 	history := m.loadHistory(ctx, einoSession.ID)
 	if m.deps.SideEffects != nil {
@@ -263,10 +292,9 @@ func (m *Manager) RunnerInfo(ctx context.Context) (RunnerInfo, error) {
 	return info, nil
 }
 
-func (m *Manager) newEinoSessionLocked(ctx context.Context, resumeID string) (protocol.SessionInfo, []protocol.Event) {
+func (m *Manager) newEinoSessionLocked(ctx context.Context, resumeID string) protocol.SessionInfo {
 	sessionID := strings.TrimSpace(resumeID)
 	resumed := true
-	var loaded []protocol.Event
 	if sessionID == "" {
 		if m.deps.NewSessionID != nil {
 			sessionID = m.deps.NewSessionID()
@@ -274,8 +302,6 @@ func (m *Manager) newEinoSessionLocked(ctx context.Context, resumeID string) (pr
 			sessionID = "sess_" + time.Now().UTC().Format("20060102T150405.000000000")
 		}
 		resumed = false
-	} else if m.deps.Sessions != nil {
-		loaded, _ = m.deps.Sessions.Load(ctx, sessionID)
 	}
 	status := repository.Status{}
 	if m.deps.Versions != nil {
@@ -293,7 +319,7 @@ func (m *Manager) newEinoSessionLocked(ctx context.Context, resumeID string) (pr
 		KAGMode:   kagMode,
 		CreatedAt: time.Now().UTC(),
 		Resumed:   resumed,
-	}, loaded
+	}
 }
 
 func (m *Manager) Subscribe(fn EventSubscriber) func() {

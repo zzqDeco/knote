@@ -20,7 +20,6 @@ func (m *Manager) handleSlash(ctx context.Context, sessionID string, input strin
 	cmd, arg := parseSlash(input)
 	switch cmd {
 	case "new":
-		m.persist([]protocol.Event{userEvent})
 		events := append([]protocol.Event{userEvent}, m.newSession(ctx)...)
 		m.emit(events)
 		return events
@@ -102,7 +101,7 @@ func (m *Manager) invokeTool(ctx context.Context, sessionID string, toolName str
 
 func (m *Manager) newSession(ctx context.Context) []protocol.Event {
 	m.mu.Lock()
-	info, _ := m.newEinoSessionLocked(ctx, "")
+	info := m.newEinoSessionLocked(ctx, "")
 	m.einoSession = info
 	m.authorizationBinding = nil
 	m.mu.Unlock()
@@ -116,9 +115,6 @@ func (m *Manager) newSession(ctx context.Context) []protocol.Event {
 }
 
 func (m *Manager) resumeSession(ctx context.Context, currentSessionID string, sessionID string) []protocol.Event {
-	if m.deps.AuthorizationContextProvider != nil {
-		return []protocol.Event{protocol.NewEvent(protocol.EventError, currentSessionID, permissionedResumeErrorMessage, nil)}
-	}
 	sessionID = strings.TrimSpace(sessionID)
 	if sessionID == "" {
 		return m.sessionList(ctx, currentSessionID)
@@ -126,8 +122,19 @@ func (m *Manager) resumeSession(ctx context.Context, currentSessionID string, se
 	if m.deps.Sessions == nil {
 		return []protocol.Event{protocol.NewEvent(protocol.EventError, currentSessionID, "session storage is not configured", nil)}
 	}
+	var resumeAuthorization *protocol.AuthorizationContext
+	if m.deps.AuthorizationContextProvider != nil {
+		authorization, err := m.authorizeSessionResume(ctx, sessionID)
+		if err != nil {
+			return []protocol.Event{protocol.NewEvent(protocol.EventError, currentSessionID, permissionedResumeErrorMessage, nil)}
+		}
+		resumeAuthorization = &authorization
+	}
 	loaded, err := m.deps.Sessions.Load(ctx, sessionID)
 	if err != nil {
+		if resumeAuthorization != nil {
+			return []protocol.Event{protocol.NewEvent(protocol.EventError, currentSessionID, permissionedResumeErrorMessage, nil)}
+		}
 		return []protocol.Event{protocol.NewEvent(protocol.EventError, currentSessionID, "resume failed: "+err.Error(), nil)}
 	}
 	status := repository.Status{}
@@ -149,7 +156,12 @@ func (m *Manager) resumeSession(ctx context.Context, currentSessionID string, se
 	}
 	m.mu.Lock()
 	m.einoSession = info
-	m.authorizationBinding = nil
+	if resumeAuthorization == nil {
+		m.authorizationBinding = nil
+	} else {
+		binding := newAuthorizationBinding(*resumeAuthorization)
+		m.authorizationBinding = &binding
+	}
 	m.mu.Unlock()
 	infoEvent := protocol.NewEvent(protocol.EventSessionInfo, sessionID, "session resumed", info)
 	m.persist([]protocol.Event{infoEvent})
@@ -164,9 +176,50 @@ func (m *Manager) sessionList(ctx context.Context, sessionID string) []protocol.
 	if m.deps.Sessions == nil {
 		return []protocol.Event{protocol.NewEvent(protocol.EventError, sessionID, "session storage is not configured", nil)}
 	}
-	summaries, err := m.deps.Sessions.List(ctx, 10)
-	if err != nil {
-		return []protocol.Event{protocol.NewEvent(protocol.EventError, sessionID, "list sessions failed: "+err.Error(), nil)}
+	var summaries []repository.SessionSummary
+	if m.deps.AuthorizationContextProvider == nil {
+		var err error
+		summaries, err = m.deps.Sessions.List(ctx, 10)
+		if err != nil {
+			return []protocol.Event{protocol.NewEvent(protocol.EventError, sessionID, "list sessions failed: "+err.Error(), nil)}
+		}
+	} else {
+		if _, ok := protocol.AuthorizationContextFrom(ctx); !ok {
+			return []protocol.Event{protocol.NewEvent(protocol.EventError, sessionID, sessionAuthorizationErrorMessage, nil)}
+		}
+		permissioned, ok := m.deps.Sessions.(repository.PermissionedSessions)
+		if !ok {
+			return []protocol.Event{protocol.NewEvent(protocol.EventError, sessionID, sessionAuthorizationErrorMessage, nil)}
+		}
+		envelopes, err := permissioned.ListAuthorization(ctx)
+		if err != nil {
+			return []protocol.Event{protocol.NewEvent(protocol.EventError, sessionID, "list sessions failed", nil)}
+		}
+		for _, envelope := range envelopes {
+			targetAuthorization, err := m.deps.AuthorizationContextProvider.authorizationContext(ctx, envelope.SessionID)
+			if err != nil || envelope.ValidateFor(targetAuthorization) != nil {
+				continue
+			}
+			events, err := m.deps.Sessions.Load(ctx, envelope.SessionID)
+			if err != nil {
+				continue
+			}
+			summary := repository.SessionSummary{ID: envelope.SessionID, EventCount: len(events)}
+			if len(events) > 0 {
+				summary.LastEventAt = events[len(events)-1].CreatedAt.UTC()
+				summary.UpdatedAt = summary.LastEventAt
+			}
+			summaries = append(summaries, summary)
+		}
+		sort.Slice(summaries, func(i, j int) bool {
+			if !summaries[i].UpdatedAt.Equal(summaries[j].UpdatedAt) {
+				return summaries[i].UpdatedAt.After(summaries[j].UpdatedAt)
+			}
+			return summaries[i].ID > summaries[j].ID
+		})
+		if len(summaries) > 10 {
+			summaries = summaries[:10]
+		}
 	}
 	if len(summaries) == 0 {
 		return []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, sessionID, "No saved sessions.", map[string]any{"overlay": "details", "sessions": summaries})}
