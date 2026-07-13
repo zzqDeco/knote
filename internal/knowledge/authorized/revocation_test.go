@@ -337,14 +337,7 @@ func TestAuthorizeProtectedContentRejectsChangedChunkAuthorizationBoundaryHandle
 		t.Fatal(err)
 	}
 	authorization := queryTestAuthorization("alice", "request-boundary-replay")
-	binding, err := protocol.NewProtectedContentBindingFromResources(
-		authorization.SessionID,
-		authorization.RequestID,
-		[]protocol.ProtectedResourceBinding{{Resource: chunk, AuthorizationResource: parent}},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
+	binding := revocationTestBindingForItem(t, authorization, queryTestChunkItem(chunk, parent))
 	if _, err := service.AuthorizeProtectedContent(context.Background(), authorization, binding); err != nil {
 		t.Fatalf("current authorization boundary was denied: %v", err)
 	}
@@ -354,6 +347,106 @@ func TestAuthorizeProtectedContentRejectsChangedChunkAuthorizationBoundaryHandle
 	loader.items[chunk.ResourceID] = queryTestChunkItem(chunk, changedParent)
 	if _, err := service.AuthorizeProtectedContent(context.Background(), authorization, binding); !errors.Is(err, ErrProtectedContentUnavailable) {
 		t.Fatalf("changed authorization boundary remained replayable: %v", err)
+	}
+}
+
+func TestAuthorizeProtectedContentValidatesSelectedDerivedEvidenceProvenance(t *testing.T) {
+	authorization := queryTestAuthorization("alice", "request-derived-replay")
+	artifact := queryTestDocument(queryTestModelID, "derived content", "projection-v1")
+	artifact.Type = protocol.ResourceDerivedArtifact
+	artifact.AuthorizationID = "derived_artifact:" + string(artifact.ResourceID)
+	source := queryTestDocument(queryTestOtherID, "source content", "projection-v1")
+	item := protocol.EvidenceItem{
+		Resource: artifact, Content: "derived content", Derivation: protocol.DerivationAllRequired,
+		Supports: []protocol.ProvenanceSupport{{
+			SupportID: "support-source", Resource: source,
+			Evidence: []protocol.ResourceHandle{source}, Complete: false,
+		}},
+		Citation: protocol.Citation{Handle: "citation-derived", Resource: artifact},
+	}
+	binding := revocationTestBindingForItem(t, authorization, item)
+	loader := &queryTestLoader{load: func(handles []protocol.ResourceHandle) ([]protocol.EvidenceItem, error) {
+		if len(handles) != 1 || handles[0] != artifact {
+			return nil, fmt.Errorf("strict loader received non-root handles: %#v", handles)
+		}
+		return []protocol.EvidenceItem{item}, nil
+	}}
+	service := revocationTestServiceWithLoader(t, loader)
+
+	report, err := service.AuthorizeProtectedContent(context.Background(), authorization, binding)
+	if err != nil || !report.Allowed() {
+		t.Fatalf("derived evidence authorization = %#v, %v", report, err)
+	}
+	if report.ResourceCount != 2 || report.AllowedCount != 2 {
+		t.Fatalf("derived evidence authorization decisions = %#v", report)
+	}
+	if len(loader.calls) != 1 || len(loader.calls[0]) != 1 || loader.calls[0][0] != artifact {
+		t.Fatalf("derived evidence loader calls = %#v", loader.calls)
+	}
+}
+
+func TestAuthorizeProtectedContentRejectsDerivedEvidenceMetadataDrift(t *testing.T) {
+	authorization := queryTestAuthorization("alice", "request-derived-drift")
+	artifact := queryTestDocument(queryTestModelID, "derived content", "projection-v1")
+	artifact.Type = protocol.ResourceDerivedArtifact
+	artifact.AuthorizationID = "derived_artifact:" + string(artifact.ResourceID)
+	parent := queryTestDocument(queryTestOtherID, "parent", "projection-v1")
+	chunkID, err := protocol.NewStableResourceID("tenant-1", "kb-1", protocol.ResourceChunk, "derived-support")
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunk := queryTestChunk(chunkID, parent, "chunk")
+	original := protocol.EvidenceItem{
+		Resource: artifact, Content: "derived content", Derivation: protocol.DerivationAllRequired,
+		Supports: []protocol.ProvenanceSupport{{
+			SupportID: "support-chunk", Resource: chunk,
+			Evidence: []protocol.ResourceHandle{parent}, Complete: false,
+		}},
+		Citation: protocol.Citation{Handle: "citation-derived", Resource: artifact},
+	}
+	binding := revocationTestBindingForItem(t, authorization, original)
+
+	for _, test := range []struct {
+		name   string
+		mutate func(protocol.EvidenceItem) protocol.EvidenceItem
+	}{
+		{
+			name: "selected handle",
+			mutate: func(item protocol.EvidenceItem) protocol.EvidenceItem {
+				item.Resource.Versions.Content = "content-v2"
+				item.Citation.Resource = item.Resource
+				return item
+			},
+		},
+		{
+			name: "provenance handle",
+			mutate: func(item protocol.EvidenceItem) protocol.EvidenceItem {
+				item.Supports[0].Resource.Versions.Content = "content-v2"
+				return item
+			},
+		},
+		{
+			name: "authorization boundary",
+			mutate: func(item protocol.EvidenceItem) protocol.EvidenceItem {
+				item.Supports[0].Evidence[0].Versions.Content = "content-v2"
+				return item
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			loaded := original
+			loaded.Supports = append([]protocol.ProvenanceSupport(nil), original.Supports...)
+			loaded.Supports[0].Evidence = append([]protocol.ResourceHandle(nil), original.Supports[0].Evidence...)
+			loaded = test.mutate(loaded)
+			loader := &queryTestLoader{load: func([]protocol.ResourceHandle) ([]protocol.EvidenceItem, error) {
+				return []protocol.EvidenceItem{loaded}, nil
+			}}
+			service := revocationTestServiceWithLoader(t, loader)
+
+			if _, err := service.AuthorizeProtectedContent(context.Background(), authorization, binding); !errors.Is(err, ErrProtectedContentUnavailable) {
+				t.Fatalf("derived evidence %s drift remained replayable: %v", test.name, err)
+			}
+		})
 	}
 }
 
@@ -369,25 +462,17 @@ func TestAuthorizeProtectedContentWithoutCacheRejectsExactHandleAndBoundaryDrift
 
 	for _, test := range []struct {
 		name     string
-		resource protocol.ResourceHandle
-		boundary protocol.ResourceHandle
+		original protocol.EvidenceItem
 		loaded   protocol.EvidenceItem
 	}{
-		{name: "exact handle", resource: document, boundary: document, loaded: queryTestItem(changedDocument)},
-		{name: "authorization boundary", resource: chunk, boundary: parent, loaded: queryTestChunkItem(chunk, changedParent)},
+		{name: "exact handle", original: queryTestItem(document), loaded: queryTestItem(changedDocument)},
+		{name: "authorization boundary", original: queryTestChunkItem(chunk, parent), loaded: queryTestChunkItem(chunk, changedParent)},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			binding, err := protocol.NewProtectedContentBindingFromResources(
-				authorization.SessionID,
-				authorization.RequestID,
-				[]protocol.ProtectedResourceBinding{{Resource: test.resource, AuthorizationResource: test.boundary}},
-			)
-			if err != nil {
-				t.Fatal(err)
-			}
+			binding := revocationTestBindingForItem(t, authorization, test.original)
 			authorizer := &queryTestAuthorizer{}
 			loader := &queryTestLoader{items: map[protocol.ResourceID]protocol.EvidenceItem{
-				test.resource.ResourceID: test.loaded,
+				test.original.Resource.ResourceID: test.loaded,
 			}}
 			service, err := New(Options{
 				KAG: &queryTestKAG{}, Authorizer: authorizer, Loader: loader,
@@ -547,6 +632,52 @@ func revocationTestBinding(
 		t.Fatal(err)
 	}
 	return binding
+}
+
+func revocationTestBindingForItem(
+	t *testing.T,
+	authorization protocol.AuthorizationContext,
+	item protocol.EvidenceItem,
+) protocol.ProtectedContentBinding {
+	t.Helper()
+	handles, boundaries, _, err := collectEvidenceHandles(authorization, []protocol.EvidenceItem{item})
+	if err != nil {
+		t.Fatal(err)
+	}
+	objects := make(map[string]objectCheck, len(handles))
+	for index, handle := range handles {
+		if _, ok := objects[handle.AuthorizationID]; !ok {
+			objects[handle.AuthorizationID] = objectCheck{
+				correlationID: fmt.Sprintf("binding-root-%d", index), allowed: true,
+			}
+		}
+	}
+	evidence, err := buildEvidencePackage(
+		authorization,
+		[]protocol.EvidenceItem{item},
+		checkedEvidence{handles: handles, boundaries: boundaries, projection: handles[0].Versions.Projection, objects: objects},
+		time.Unix(1, 0).UTC(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding, err := protocol.NewProtectedContentBinding(authorization, evidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return binding
+}
+
+func revocationTestServiceWithLoader(t *testing.T, loader EvidenceLoader) *Service {
+	t.Helper()
+	service, err := New(Options{
+		KAG: &queryTestKAG{}, Authorizer: &queryTestAuthorizer{}, Loader: loader,
+		RetrieveLimit: 10, EvidenceLimit: 2, Now: time.Now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return service
 }
 
 func revocationTestService(

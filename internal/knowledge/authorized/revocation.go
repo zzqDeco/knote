@@ -104,22 +104,8 @@ func (s *Service) AuthorizeProtectedContent(
 	if err != nil || !report.Allowed() {
 		return report, ErrProtectedContentUnavailable
 	}
-	handles := make([]protocol.ResourceHandle, len(binding.Resources))
-	for index, resource := range binding.Resources {
-		handles[index] = resource.Resource
-	}
-	loaded, err := s.loadExact(ctx, current, handles)
-	if err != nil {
+	if err := s.validateProtectedEvidence(ctx, current, binding); err != nil {
 		return report, ErrProtectedContentUnavailable
-	}
-	_, boundaries, _, err := collectEvidenceHandles(current, loaded)
-	if err != nil {
-		return report, ErrProtectedContentUnavailable
-	}
-	for _, resource := range binding.Resources {
-		if boundaries[resource.Resource.ResourceID] != resource.AuthorizationResource {
-			return report, ErrProtectedContentUnavailable
-		}
 	}
 	report, err = s.liveAuthorizationReport(ctx, current, binding, "replay")
 	if err != nil || !report.Allowed() {
@@ -129,6 +115,32 @@ func (s *Service) AuthorizeProtectedContent(
 		return report, ErrProtectedContentUnavailable
 	}
 	return report, nil
+}
+
+func (s *Service) validateProtectedEvidence(
+	ctx context.Context,
+	current protocol.AuthorizationContext,
+	binding protocol.ProtectedContentBinding,
+) error {
+	loaded, err := s.loadExact(ctx, current, binding.EvidenceRoots)
+	if err != nil {
+		return ErrProtectedContentUnavailable
+	}
+	handles, boundaries, _, err := collectEvidenceHandles(current, loaded)
+	if err != nil || len(handles) != len(binding.Resources) {
+		return ErrProtectedContentUnavailable
+	}
+	exact := make(map[protocol.ResourceID]protocol.ResourceHandle, len(handles))
+	for _, handle := range handles {
+		exact[handle.ResourceID] = handle
+	}
+	for _, resource := range binding.Resources {
+		if exact[resource.Resource.ResourceID] != resource.Resource ||
+			boundaries[resource.Resource.ResourceID] != resource.AuthorizationResource {
+			return ErrProtectedContentUnavailable
+		}
+	}
+	return nil
 }
 
 func protectedBindingResourceIDs(binding protocol.ProtectedContentBinding) []protocol.ResourceID {

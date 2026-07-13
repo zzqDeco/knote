@@ -88,6 +88,9 @@ func (r *Runner) Run(ctx context.Context, input runtime.EinoRunInput) ([]protoco
 	events := []protocol.Event{protocol.NewEvent(protocol.EventAssistantStart, input.SessionID, "eino runner started", nil)}
 	agentEvents, err := executor.Run(ctx, messages)
 	_, permissionedContext := protocol.AuthorizationContextFrom(ctx)
+	if err != nil && permissionedContext {
+		return events, fmt.Errorf("%s", protectedContentUnavailableMessage)
+	}
 	binding, permissioned, bindingErr := protectedBindingFromAgentEvents(ctx, agentEvents)
 	if bindingErr != nil {
 		generic := fmt.Errorf("%s", protectedContentUnavailableMessage)
@@ -206,6 +209,7 @@ func bindProjectedEvents(events []protocol.Event, binding *protocol.ProtectedCon
 		if event.Type == protocol.EventAssistantDone ||
 			event.Type == protocol.EventError ||
 			event.Type == protocol.EventApprovalRequest ||
+			event.Type == protocol.EventStatusUpdate ||
 			((event.Type == protocol.EventToolComplete || event.Type == protocol.EventToolError) && permissionedToolName(eventToolName(event.Payload))) {
 			copy := *binding
 			event.ProtectedContent = &copy

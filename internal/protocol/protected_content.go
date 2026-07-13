@@ -12,7 +12,7 @@ import (
 	"strings"
 )
 
-const ProtectedContentBindingVersion = "v1"
+const ProtectedContentBindingVersion = "v2"
 
 const protectedBlockIDPrefix = "block_"
 
@@ -59,11 +59,12 @@ func (b ProtectedResourceBinding) ValidateFor(auth AuthorizationContext) error {
 // ProtectedContentBinding binds every content-bearing event produced by one
 // permissioned query turn to the same fail-closed replay block.
 type ProtectedContentBinding struct {
-	Version   string                     `json:"version"`
-	BlockID   string                     `json:"block_id"`
-	SessionID string                     `json:"session_id"`
-	RequestID string                     `json:"request_id"`
-	Resources []ProtectedResourceBinding `json:"resources"`
+	Version       string                     `json:"version"`
+	BlockID       string                     `json:"block_id"`
+	SessionID     string                     `json:"session_id"`
+	RequestID     string                     `json:"request_id"`
+	EvidenceRoots []ResourceHandle           `json:"evidence_roots"`
+	Resources     []ProtectedResourceBinding `json:"resources"`
 }
 
 // UnmarshalJSON rejects unknown fields and non-canonical bindings at the
@@ -102,9 +103,13 @@ func NewProtectedContentBinding(auth AuthorizationContext, packages ...EvidenceP
 		return ProtectedContentBinding{}, fmt.Errorf("protected content requires at least one evidence package")
 	}
 	resources := make([]ProtectedResourceBinding, 0)
+	roots := make([]ResourceHandle, 0)
 	for index, evidencePackage := range packages {
 		if err := evidencePackage.ValidateFor(auth); err != nil {
 			return ProtectedContentBinding{}, fmt.Errorf("protected evidence package %d: %w", index, err)
+		}
+		for _, item := range evidencePackage.Items {
+			roots = append(roots, item.Resource)
 		}
 		for _, decision := range evidencePackage.Decisions {
 			resources = append(resources, ProtectedResourceBinding{
@@ -113,14 +118,28 @@ func NewProtectedContentBinding(auth AuthorizationContext, packages ...EvidenceP
 			})
 		}
 	}
-	return NewProtectedContentBindingFromResources(auth.SessionID, auth.RequestID, resources)
+	return newProtectedContentBinding(auth.SessionID, auth.RequestID, roots, resources)
 }
 
 // NewProtectedContentBindingFromResources canonicalizes exact handles before
-// deriving the stable block ID.
+// deriving the stable block ID. Without evidence-package metadata, every
+// supplied resource is conservatively treated as a top-level evidence root.
 func NewProtectedContentBindingFromResources(
 	sessionID string,
 	requestID string,
+	resources []ProtectedResourceBinding,
+) (ProtectedContentBinding, error) {
+	roots := make([]ResourceHandle, len(resources))
+	for index, resource := range resources {
+		roots[index] = resource.Resource
+	}
+	return newProtectedContentBinding(sessionID, requestID, roots, resources)
+}
+
+func newProtectedContentBinding(
+	sessionID string,
+	requestID string,
+	roots []ResourceHandle,
 	resources []ProtectedResourceBinding,
 ) (ProtectedContentBinding, error) {
 	if err := validateToken("protected session_id", sessionID); err != nil {
@@ -131,6 +150,9 @@ func NewProtectedContentBindingFromResources(
 	}
 	if len(resources) == 0 {
 		return ProtectedContentBinding{}, fmt.Errorf("protected content requires at least one resource")
+	}
+	if len(roots) == 0 {
+		return ProtectedContentBinding{}, fmt.Errorf("protected content requires at least one evidence root")
 	}
 
 	canonical := append([]ProtectedResourceBinding(nil), resources...)
@@ -154,12 +176,33 @@ func NewProtectedContentBindingFromResources(
 			return ProtectedContentBinding{}, fmt.Errorf("protected resource %s has conflicting exact handles", deduplicated[index].Resource.ResourceID)
 		}
 	}
+	canonicalRoots := append([]ResourceHandle(nil), roots...)
+	for index, root := range canonicalRoots {
+		if err := root.Validate(); err != nil {
+			return ProtectedContentBinding{}, fmt.Errorf("protected evidence root %d: %w", index, err)
+		}
+	}
+	sort.Slice(canonicalRoots, func(i, j int) bool {
+		return protectedEvidenceRootSortKey(canonicalRoots[i]) < protectedEvidenceRootSortKey(canonicalRoots[j])
+	})
+	deduplicatedRoots := canonicalRoots[:0]
+	for _, root := range canonicalRoots {
+		if len(deduplicatedRoots) == 0 || protectedEvidenceRootSortKey(deduplicatedRoots[len(deduplicatedRoots)-1]) != protectedEvidenceRootSortKey(root) {
+			deduplicatedRoots = append(deduplicatedRoots, root)
+		}
+	}
+	for index := 1; index < len(deduplicatedRoots); index++ {
+		if deduplicatedRoots[index-1].ResourceID == deduplicatedRoots[index].ResourceID {
+			return ProtectedContentBinding{}, fmt.Errorf("protected evidence root %s has conflicting exact handles", deduplicatedRoots[index].ResourceID)
+		}
+	}
 
 	binding := ProtectedContentBinding{
-		Version:   ProtectedContentBindingVersion,
-		SessionID: sessionID,
-		RequestID: requestID,
-		Resources: append([]ProtectedResourceBinding(nil), deduplicated...),
+		Version:       ProtectedContentBindingVersion,
+		SessionID:     sessionID,
+		RequestID:     requestID,
+		EvidenceRoots: append([]ResourceHandle(nil), deduplicatedRoots...),
+		Resources:     append([]ProtectedResourceBinding(nil), deduplicated...),
 	}
 	binding.BlockID = protectedContentBlockID(binding)
 	if err := binding.Validate(); err != nil {
@@ -184,8 +227,11 @@ func (b ProtectedContentBinding) Validate() error {
 	if len(b.Resources) == 0 {
 		return fmt.Errorf("protected content binding has no resources")
 	}
+	if len(b.EvidenceRoots) == 0 {
+		return fmt.Errorf("protected content binding has no evidence roots")
+	}
 	previousKey := ""
-	seenIDs := make(map[ResourceID]struct{}, len(b.Resources))
+	bound := make(map[ResourceID]ResourceHandle, len(b.Resources))
 	for index, resource := range b.Resources {
 		if err := resource.Validate(); err != nil {
 			return fmt.Errorf("protected resource binding %d: %w", index, err)
@@ -195,10 +241,33 @@ func (b ProtectedContentBinding) Validate() error {
 			return fmt.Errorf("protected resource bindings must be sorted and unique")
 		}
 		previousKey = key
-		if _, duplicate := seenIDs[resource.Resource.ResourceID]; duplicate {
+		if _, duplicate := bound[resource.Resource.ResourceID]; duplicate {
 			return fmt.Errorf("protected resource %s has conflicting exact handles", resource.Resource.ResourceID)
 		}
-		seenIDs[resource.Resource.ResourceID] = struct{}{}
+		bound[resource.Resource.ResourceID] = resource.Resource
+	}
+	previousKey = ""
+	seenRoots := make(map[ResourceID]struct{}, len(b.EvidenceRoots))
+	for index, root := range b.EvidenceRoots {
+		if err := root.Validate(); err != nil {
+			return fmt.Errorf("protected evidence root %d: %w", index, err)
+		}
+		key := protectedEvidenceRootSortKey(root)
+		if index > 0 && key <= previousKey {
+			return fmt.Errorf("protected evidence roots must be sorted and unique")
+		}
+		previousKey = key
+		if _, duplicate := seenRoots[root.ResourceID]; duplicate {
+			return fmt.Errorf("protected evidence root %s has conflicting exact handles", root.ResourceID)
+		}
+		seenRoots[root.ResourceID] = struct{}{}
+		resource, ok := bound[root.ResourceID]
+		if !ok {
+			return fmt.Errorf("protected evidence root %s is not bound", root.ResourceID)
+		}
+		if resource != root {
+			return fmt.Errorf("protected evidence root %s does not match its bound exact handle", root.ResourceID)
+		}
 	}
 	if expected := protectedContentBlockID(b); b.BlockID != expected {
 		return fmt.Errorf("protected content block_id does not match its metadata")
@@ -221,6 +290,11 @@ func (b ProtectedContentBinding) ValidateFor(auth AuthorizationContext) error {
 			return fmt.Errorf("protected resource binding %d: %w", index, err)
 		}
 	}
+	for index, root := range b.EvidenceRoots {
+		if err := root.ValidateFor(auth); err != nil {
+			return fmt.Errorf("protected evidence root %d: %w", index, err)
+		}
+	}
 	return nil
 }
 
@@ -229,15 +303,22 @@ func protectedResourceSortKey(resource ProtectedResourceBinding) string {
 	return string(encoded)
 }
 
+func protectedEvidenceRootSortKey(resource ResourceHandle) string {
+	encoded, _ := json.Marshal(resource)
+	return string(encoded)
+}
+
 func protectedContentBlockID(binding ProtectedContentBinding) string {
 	metadata := struct {
-		Version   string                     `json:"version"`
-		SessionID string                     `json:"session_id"`
-		RequestID string                     `json:"request_id"`
-		Resources []ProtectedResourceBinding `json:"resources"`
+		Version       string                     `json:"version"`
+		SessionID     string                     `json:"session_id"`
+		RequestID     string                     `json:"request_id"`
+		EvidenceRoots []ResourceHandle           `json:"evidence_roots"`
+		Resources     []ProtectedResourceBinding `json:"resources"`
 	}{
 		Version: binding.Version, SessionID: binding.SessionID,
-		RequestID: binding.RequestID, Resources: binding.Resources,
+		RequestID: binding.RequestID, EvidenceRoots: binding.EvidenceRoots,
+		Resources: binding.Resources,
 	}
 	encoded, _ := json.Marshal(metadata)
 	sum := sha256.Sum256(encoded)

@@ -34,6 +34,10 @@ func TestProtectedContentBindingIsStableSortedAndMetadataOnly(t *testing.T) {
 	if len(forward.Resources) != 2 || protectedResourceSortKey(forward.Resources[0]) >= protectedResourceSortKey(forward.Resources[1]) {
 		t.Fatalf("protected resources are not sorted: %#v", forward.Resources)
 	}
+	if forward.Version != ProtectedContentBindingVersion || len(forward.EvidenceRoots) != 2 ||
+		protectedEvidenceRootSortKey(forward.EvidenceRoots[0]) >= protectedEvidenceRootSortKey(forward.EvidenceRoots[1]) {
+		t.Fatalf("protected evidence roots are not versioned and sorted: %#v", forward)
+	}
 	if err := forward.ValidateFor(auth); err != nil {
 		t.Fatalf("validate protected binding: %v", err)
 	}
@@ -46,6 +50,50 @@ func TestProtectedContentBindingIsStableSortedAndMetadataOnly(t *testing.T) {
 		if strings.Contains(string(encoded), canary) {
 			t.Fatalf("protected metadata leaked %q: %s", canary, encoded)
 		}
+	}
+}
+
+func TestProtectedContentBindingPersistsOnlyTopLevelEvidenceRoots(t *testing.T) {
+	auth := testAuthorizationContext()
+	rootID, err := NewStableResourceID(auth.TenantID, auth.KnowledgeBaseID, ResourceDocument, "sources/root.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	supportID, err := NewStableResourceID(auth.TenantID, auth.KnowledgeBaseID, ResourceDocument, "sources/support.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := testResourceHandle(t, rootID)
+	support := testResourceHandle(t, supportID)
+	evidence := testEvidencePackage(t, auth, root)
+	evidence.Items[0].Supports = []ProvenanceSupport{{
+		SupportID: "support-source", Resource: support,
+		Evidence: []ResourceHandle{support}, Complete: true,
+	}}
+	supportDecision := testDecision(t, supportID)
+	supportDecision.CorrelationID = "decision-support"
+	evidence.Decisions = append(evidence.Decisions, supportDecision)
+	if err := evidence.ValidateFor(auth); err != nil {
+		t.Fatal(err)
+	}
+
+	binding, err := NewProtectedContentBinding(auth, evidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(binding.Resources) != 2 {
+		t.Fatalf("protected decision resources = %#v", binding.Resources)
+	}
+	if !reflect.DeepEqual(binding.EvidenceRoots, []ResourceHandle{root}) {
+		t.Fatalf("protected evidence roots = %#v", binding.EvidenceRoots)
+	}
+	if err := binding.ValidateFor(auth); err != nil {
+		t.Fatal(err)
+	}
+	tamperedRoots := binding
+	tamperedRoots.EvidenceRoots = []ResourceHandle{support}
+	if err := tamperedRoots.Validate(); err == nil {
+		t.Fatal("evidence-root tampering did not invalidate block_id")
 	}
 }
 
@@ -130,6 +178,18 @@ func TestProtectedContentBindingRejectsNonCanonicalPersistedMetadata(t *testing.
 	if err := duplicate.Validate(); err == nil {
 		t.Fatal("duplicate protected resource succeeded")
 	}
+	duplicateRoot := binding
+	duplicateRoot.EvidenceRoots = append(duplicateRoot.EvidenceRoots, duplicateRoot.EvidenceRoots[0])
+	duplicateRoot.BlockID = protectedContentBlockID(duplicateRoot)
+	if err := duplicateRoot.Validate(); err == nil {
+		t.Fatal("duplicate protected evidence root succeeded")
+	}
+	missingRoot := binding
+	missingRoot.EvidenceRoots = nil
+	missingRoot.BlockID = protectedContentBlockID(missingRoot)
+	if err := missingRoot.Validate(); err == nil {
+		t.Fatal("missing protected evidence root succeeded")
+	}
 
 	secondID, err := NewStableResourceID(auth.TenantID, auth.KnowledgeBaseID, ResourceDocument, "sources/second.md")
 	if err != nil {
@@ -150,6 +210,26 @@ func TestProtectedContentBindingRejectsNonCanonicalPersistedMetadata(t *testing.
 	unsorted.Resources[0], unsorted.Resources[1] = unsorted.Resources[1], unsorted.Resources[0]
 	if err := unsorted.Validate(); err == nil {
 		t.Fatal("unsorted protected resources succeeded")
+	}
+	unsortedRoots := sorted
+	unsortedRoots.EvidenceRoots = append([]ResourceHandle(nil), sorted.EvidenceRoots...)
+	unsortedRoots.EvidenceRoots[0], unsortedRoots.EvidenceRoots[1] = unsortedRoots.EvidenceRoots[1], unsortedRoots.EvidenceRoots[0]
+	unsortedRoots.BlockID = protectedContentBlockID(unsortedRoots)
+	if err := unsortedRoots.Validate(); err == nil {
+		t.Fatal("unsorted protected evidence roots succeeded")
+	}
+	unboundRoot := binding
+	unboundRoot.EvidenceRoots = []ResourceHandle{second.Resource}
+	unboundRoot.BlockID = protectedContentBlockID(unboundRoot)
+	if err := unboundRoot.Validate(); err == nil {
+		t.Fatal("unbound protected evidence root succeeded")
+	}
+	staleRoot := binding
+	staleRoot.EvidenceRoots = append([]ResourceHandle(nil), binding.EvidenceRoots...)
+	staleRoot.EvidenceRoots[0].Versions.Content = "content-v2"
+	staleRoot.BlockID = protectedContentBlockID(staleRoot)
+	if err := staleRoot.Validate(); err == nil {
+		t.Fatal("stale protected evidence root succeeded")
 	}
 
 	encoded, err := json.Marshal(binding)

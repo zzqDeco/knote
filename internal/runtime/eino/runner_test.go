@@ -147,6 +147,40 @@ func TestRunnerKeepsPartialEventsOnExecutorError(t *testing.T) {
 	}
 }
 
+func TestRunnerDiscardsPartialPermissionedEventsOnExecutorError(t *testing.T) {
+	authorization := testEinoAuthorization("sess_eino")
+	evidencePackage := testEinoEvidencePackage(t, authorization, "sources/partial.md", "PARTIAL_EVIDENCE_CANARY")
+	ctx, err := protocol.WithAuthorizationContext(context.Background(), authorization)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := NewRunner(Options{Executor: &fakeExecutor{
+		events: []*adk.AgentEvent{
+			adk.EventFromMessage(schema.ToolMessage(testPermissionedToolOutput(t, evidencePackage, "PARTIAL_TOOL_CANARY"), "call_1", schema.WithToolName("knote_query")), nil, schema.Tool, "knote_query"),
+			adk.EventFromMessage(schema.AssistantMessage("PARTIAL_ASSISTANT_CANARY", nil), nil, schema.Assistant, ""),
+		},
+		err: errors.New("EXECUTOR_FAILURE_CANARY"),
+	}})
+
+	events, err := runner.Run(ctx, runtime.EinoRunInput{SessionID: authorization.SessionID, Message: "question"})
+	if err == nil || err.Error() != protectedContentUnavailableMessage {
+		t.Fatalf("permissioned executor error = %v, events=%+v", err, events)
+	}
+	for _, event := range events {
+		if event.Type == protocol.EventToolComplete || event.Type == protocol.EventAssistantDone {
+			t.Fatalf("failed permissioned turn retained partial output: %+v", events)
+		}
+		if event.ProtectedContent != nil {
+			t.Fatalf("failed permissioned turn retained protected output: %+v", events)
+		}
+		for _, canary := range []string{"PARTIAL_TOOL_CANARY", "PARTIAL_ASSISTANT_CANARY", "PARTIAL_EVIDENCE_CANARY", "EXECUTOR_FAILURE_CANARY"} {
+			if strings.Contains(event.Message, canary) {
+				t.Fatalf("failed permissioned turn leaked %q: %+v", canary, events)
+			}
+		}
+	}
+}
+
 func TestRunnerBindsAllPermissionedToolOutputsAndAnswerToOneBlock(t *testing.T) {
 	authorization := testEinoAuthorization("sess_eino")
 	first := testEinoEvidencePackage(t, authorization, "sources/first.md", "FIRST_CONTENT_CANARY")
@@ -261,6 +295,97 @@ func TestRunnerBindsPermissionedInterruptForRevocationReplay(t *testing.T) {
 			t.Fatalf("revoked permissioned interrupt replay leaked protected content: %+v", replayed)
 		}
 	}
+}
+
+func TestRunnerBindsPermissionedStatusForRevocationReplay(t *testing.T) {
+	workspace := t.TempDir()
+	authorization := testEinoAuthorization("sess_eino")
+	evidencePackage := testEinoEvidencePackage(t, authorization, "sources/status.md", "STATUS_EVIDENCE_CANARY")
+	runner := NewRunner(Options{Executor: &fakeExecutor{events: []*adk.AgentEvent{
+		adk.EventFromMessage(schema.ToolMessage(testPermissionedToolOutput(t, evidencePackage, "answer"), "call_1", schema.WithToolName("knote_query")), nil, schema.Tool, "knote_query"),
+		adk.EventFromMessage(schema.SystemMessage("PERMISSIONED_STATUS_CANARY"), nil, schema.System, ""),
+	}}})
+	store := local.New(workspace)
+	provider := func(_ context.Context, sessionID string) (protocol.AuthorizationContext, error) {
+		current := authorization
+		current.SessionID = sessionID
+		return current, nil
+	}
+	manager := runtime.New(runtime.Dependencies{
+		Workspace:                    workspace,
+		Sessions:                     store,
+		EinoRunner:                   runner,
+		AuthorizationContextProvider: provider,
+		NewSessionID:                 func() string { return authorization.SessionID },
+	})
+	if _, err := manager.Start(context.Background(), runtime.StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	produced := manager.SendMessage(context.Background(), "question")
+	var blockID string
+	boundTypes := map[protocol.EventType]bool{}
+	for _, event := range produced {
+		if event.Type != protocol.EventToolComplete && event.Type != protocol.EventStatusUpdate {
+			continue
+		}
+		if event.ProtectedContent == nil {
+			t.Fatalf("permissioned tool or status event has no replay binding: %+v", event)
+		}
+		if blockID == "" {
+			blockID = event.ProtectedContent.BlockID
+		} else if event.ProtectedContent.BlockID != blockID {
+			t.Fatalf("permissioned status used a different replay block: %+v", produced)
+		}
+		boundTypes[event.Type] = true
+	}
+	if blockID == "" || !boundTypes[protocol.EventToolComplete] || !boundTypes[protocol.EventStatusUpdate] {
+		t.Fatalf("permissioned tool and status were not both replay-bound: %+v", produced)
+	}
+
+	authorizationCalls := 0
+	replayManager := runtime.New(runtime.Dependencies{
+		Workspace:                    workspace,
+		Sessions:                     store,
+		EinoRunner:                   runner,
+		AuthorizationContextProvider: provider,
+		ProtectedContentAuthorizer: func(context.Context, protocol.AuthorizationContext, protocol.ProtectedContentBinding) error {
+			authorizationCalls++
+			return errors.New("revoked")
+		},
+		NewSessionID: func() string { return "sess_other" },
+	})
+	replayed, err := replayManager.Start(context.Background(), runtime.StartOptions{ResumeID: authorization.SessionID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if authorizationCalls != 1 {
+		t.Fatalf("protected replay authorization calls = %d, want 1", authorizationCalls)
+	}
+	for _, event := range replayed {
+		if strings.Contains(event.Message, "PERMISSIONED_STATUS_CANARY") || strings.Contains(event.Message, "STATUS_EVIDENCE_CANARY") {
+			t.Fatalf("revoked permissioned status replay leaked protected content: %+v", replayed)
+		}
+	}
+}
+
+func TestRunnerPreservesContextFreeStatus(t *testing.T) {
+	runner := NewRunner(Options{Executor: &fakeExecutor{events: []*adk.AgentEvent{
+		adk.EventFromMessage(schema.SystemMessage("CONTEXT_FREE_STATUS_CANARY"), nil, schema.System, ""),
+	}}})
+	events, err := runner.Run(context.Background(), runtime.EinoRunInput{SessionID: "s1", Message: "question"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		if event.Type != protocol.EventStatusUpdate {
+			continue
+		}
+		if event.Message != "CONTEXT_FREE_STATUS_CANARY" || event.ProtectedContent != nil {
+			t.Fatalf("context-free status behavior changed: %+v", event)
+		}
+		return
+	}
+	t.Fatalf("context-free status was not projected: %+v", events)
 }
 
 func TestRunnerFailsPermissionedOutputClosedAndSanitizesErrors(t *testing.T) {
