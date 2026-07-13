@@ -490,7 +490,7 @@ func TestRuntimeStartResumeFailsClosedWithoutAuthorizationEnvelope(t *testing.T)
 	}
 }
 
-func TestRuntimeStartResumeReplaysHistoryForMatchingAuthorizationEnvelope(t *testing.T) {
+func TestRuntimeStartResumeSuppressesLegacyHistoryForMatchingAuthorizationEnvelope(t *testing.T) {
 	workspace := t.TempDir()
 	stored := local.New(workspace)
 	authorization := testAuthorizationContext("sess_authorized")
@@ -512,8 +512,8 @@ func TestRuntimeStartResumeReplaysHistoryForMatchingAuthorizationEnvelope(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !hasMessage(events, protocol.EventAssistantDone, "old answer") || rt.SessionID() != "sess_authorized" {
-		t.Fatalf("permissioned start resume did not replay matching history: session=%q events=%+v", rt.SessionID(), events)
+	if hasMessage(events, protocol.EventAssistantDone, "old answer") || rt.SessionID() != "sess_authorized" {
+		t.Fatalf("permissioned start resume exposed legacy history: session=%q events=%+v", rt.SessionID(), events)
 	}
 	if store.loadCalls != 1 || store.authorizationLoadCalls != 1 {
 		t.Fatalf("permissioned start resume loads = history:%d envelope:%d, want 1 each", store.loadCalls, store.authorizationLoadCalls)
@@ -617,7 +617,7 @@ func TestRuntimeSlashResumeFailsClosedWithoutAuthorizationEnvelope(t *testing.T)
 	}
 }
 
-func TestRuntimeSlashResumeReplaysHistoryForMatchingAuthorizationEnvelope(t *testing.T) {
+func TestRuntimeSlashResumeSuppressesLegacyHistoryForMatchingAuthorizationEnvelope(t *testing.T) {
 	workspace := t.TempDir()
 	stored := local.New(workspace)
 	bindTestSessionAuthorization(t, stored, testAuthorizationContext("sess_authorized"))
@@ -635,8 +635,8 @@ func TestRuntimeSlashResumeReplaysHistoryForMatchingAuthorizationEnvelope(t *tes
 		t.Fatal(err)
 	}
 	events := rt.SendMessage(context.Background(), "/resume sess_authorized")
-	if !hasMessage(events, protocol.EventAssistantDone, "old answer") || hasEvent(events, protocol.EventError) {
-		t.Fatalf("permissioned slash resume did not replay matching history: %+v", events)
+	if hasMessage(events, protocol.EventAssistantDone, "old answer") || hasEvent(events, protocol.EventError) {
+		t.Fatalf("permissioned slash resume exposed legacy history: %+v", events)
 	}
 	if rt.SessionID() != "sess_authorized" || store.loadCalls != 1 || store.authorizationLoadCalls != 1 {
 		t.Fatalf("permissioned slash resume state = session:%q history:%d envelope:%d", rt.SessionID(), store.loadCalls, store.authorizationLoadCalls)

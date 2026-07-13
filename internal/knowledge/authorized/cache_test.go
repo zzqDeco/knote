@@ -189,38 +189,153 @@ func TestQueryCacheSeparatesQueryPlanLimits(t *testing.T) {
 	}
 }
 
-func TestQueryCacheStaleWatermarkCannotBypassLiveRevocation(t *testing.T) {
-	document := queryTestDocument(queryTestModelID, "content", "projection-v1")
-	backend := &queryTestKAG{retrieveResult: queryTestRetrieve(document)}
-	allowed := true
+func TestQueryCacheRevocationFallsBackToFreshAuthorizedEvidence(t *testing.T) {
+	revoked := queryTestDocument(queryTestModelID, "content", "projection-v1")
+	alternative := queryTestDocument(queryTestOtherID, "b", "projection-v1")
+	backend := &queryTestKAG{retrieveResult: queryTestRetrieve(revoked)}
+	allowedObject := revoked.AuthorizationID
 	authorizer := &queryTestAuthorizer{decide: func(_ int, request authz.BatchCheckRequest) ([]authz.Decision, error) {
-		return queryTestDecisions(request, func(authz.BatchCheckItem) bool { return allowed }), nil
+		return queryTestDecisions(request, func(check authz.BatchCheckItem) bool {
+			return check.Object == allowedObject
+		}), nil
 	}}
 	loader := &queryTestLoader{items: map[protocol.ResourceID]protocol.EvidenceItem{
-		document.ResourceID: queryTestItem(document),
+		revoked.ResourceID:     queryTestItem(revoked),
+		alternative.ResourceID: queryTestItem(alternative),
 	}}
 	cache := mustQueryCache(t, 8)
 	service := cacheTestService(t, backend, authorizer, loader, cache, "retriever-v1", "prompt-v1")
 	authorization := queryTestAuthorization("alice", "request-before-revoke")
+	authorization.Consistency = protocol.ConsistencyMinimizeLatency
 	request := protocol.QueryRequest{Question: "revoked question", Authorization: authorization}
-	if _, err := service.Query(context.Background(), request); err != nil {
+	first, err := service.Query(context.Background(), request)
+	if err != nil {
 		t.Fatal(err)
 	}
+	if !reflect.DeepEqual(first.Generation.EvidenceResourceIDs, []protocol.ResourceID{revoked.ResourceID}) {
+		t.Fatalf("initial generation evidence = %v", first.Generation.EvidenceResourceIDs)
+	}
 
-	allowed = false
+	allowedObject = alternative.AuthorizationID
+	backend.retrieveResult = queryTestRetrieve(revoked, alternative)
 	request.Authorization.RequestID = "request-after-revoke"
-	_, err := service.Query(context.Background(), request)
-	if !errors.Is(err, errNoEvidence) {
-		t.Fatalf("revoked cache result error = %v", err)
+	second, err := service.Query(context.Background(), request)
+	if err != nil {
+		t.Fatalf("fresh fallback after cache revocation: %v", err)
 	}
-	if strings.Contains(err.Error(), string(document.ResourceID)) || strings.Contains(err.Error(), "content") {
-		t.Fatalf("revocation error leaked evidence: %v", err)
+	if got := second.Generation.EvidenceResourceIDs; !reflect.DeepEqual(got, []protocol.ResourceID{alternative.ResourceID}) {
+		t.Fatalf("fresh generation evidence = %v", got)
 	}
-	if backend.retrieveCalls != 2 || backend.generateCalls != 1 {
-		t.Fatalf("revoked hit returned or regenerated cached evidence: retrieve=%d generate=%d", backend.retrieveCalls, backend.generateCalls)
+	if len(backend.lastGenerate.Evidence) != 1 || backend.lastGenerate.Evidence[0].Resource != alternative {
+		t.Fatalf("unauthorized evidence reached generation: %#v", backend.lastGenerate.Evidence)
 	}
-	if _, ok := cache.get(cacheTestKey(request, "retriever-v1", "prompt-v1")); ok {
-		t.Fatal("revoked cache entry was not evicted")
+	if backend.retrieveCalls != 2 || backend.generateCalls != 2 {
+		t.Fatalf("fresh fallback calls: retrieve=%d generate=%d", backend.retrieveCalls, backend.generateCalls)
+	}
+	if got := authorizer.calls[2].Consistency; got != authz.ConsistencyHigherConsistency {
+		t.Fatalf("cache live recheck consistency = %q", got)
+	}
+
+	request.Authorization.RequestID = "request-after-refresh"
+	third, err := service.Query(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if backend.retrieveCalls != 2 || backend.generateCalls != 2 {
+		t.Fatalf("fresh result was not cached: retrieve=%d generate=%d", backend.retrieveCalls, backend.generateCalls)
+	}
+	if got := third.Generation.EvidenceResourceIDs; !reflect.DeepEqual(got, []protocol.ResourceID{alternative.ResourceID}) {
+		t.Fatalf("refreshed cache evidence = %v", got)
+	}
+	if err := third.Evidence.ValidateFor(request.Authorization); err != nil {
+		t.Fatalf("refreshed cache binding: %v", err)
+	}
+}
+
+func TestQueryCacheStaleRevisionDoesNotDeleteConcurrentRefresh(t *testing.T) {
+	stale := queryTestDocument(queryTestModelID, "content", "projection-v1")
+	fresh := queryTestDocument(queryTestOtherID, "b", "projection-v1")
+	backend := &queryTestKAG{retrieveResult: queryTestRetrieve(stale)}
+	cacheCheckStarted := make(chan struct{})
+	continueCacheCheck := make(chan struct{})
+	freshCheckStarted := make(chan struct{})
+	continueFreshCheck := make(chan struct{})
+	authorizer := &queryTestAuthorizer{decide: func(call int, request authz.BatchCheckRequest) ([]authz.Decision, error) {
+		switch call {
+		case 2:
+			close(cacheCheckStarted)
+			<-continueCacheCheck
+		case 4:
+			close(freshCheckStarted)
+			<-continueFreshCheck
+		}
+		return queryTestDecisions(request, func(authz.BatchCheckItem) bool { return true }), nil
+	}}
+	loader := &queryTestLoader{items: map[protocol.ResourceID]protocol.EvidenceItem{
+		stale.ResourceID: queryTestItem(stale), fresh.ResourceID: queryTestItem(fresh),
+	}}
+	cache := mustQueryCache(t, 8)
+	service := cacheTestService(t, backend, authorizer, loader, cache, "retriever-v1", "prompt-v1")
+	request := protocol.QueryRequest{
+		Question: "revision race", Authorization: queryTestAuthorization("alice", "request-prime"),
+	}
+	prime, err := service.Query(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := cacheTestKey(request, "retriever-v1", "prompt-v1")
+	staleSnapshot, ok := cache.get(key)
+	if !ok {
+		t.Fatal("primed cache entry missing")
+	}
+
+	backend.retrieveResult = queryTestRetrieve(fresh)
+	request.Authorization.RequestID = "request-racing"
+	type queryOutcome struct {
+		result QueryResult
+		err    error
+	}
+	outcomes := make(chan queryOutcome, 1)
+	go func() {
+		result, queryErr := service.Query(context.Background(), request)
+		outcomes <- queryOutcome{result: result, err: queryErr}
+	}()
+	<-cacheCheckStarted
+
+	concurrent := cloneQueryResult(prime)
+	concurrent.Generation.Answer = "concurrent refresh"
+	if !cache.put(key, concurrent) {
+		t.Fatal("concurrent cache refresh was rejected")
+	}
+	refreshedSnapshot, ok := cache.get(key)
+	if !ok || refreshedSnapshot.revision == staleSnapshot.revision {
+		t.Fatalf("concurrent refresh revision = %d, stale = %d", refreshedSnapshot.revision, staleSnapshot.revision)
+	}
+	close(continueCacheCheck)
+	select {
+	case <-freshCheckStarted:
+	case outcome := <-outcomes:
+		t.Fatalf("stale revision returned before fresh path: result=%#v err=%v", outcome.result, outcome.err)
+	}
+
+	duringFresh, ok := cache.get(key)
+	if !ok || duringFresh.revision != refreshedSnapshot.revision || duringFresh.result.Generation.Answer != "concurrent refresh" {
+		t.Fatalf("concurrent refresh was deleted: %#v", duringFresh)
+	}
+	close(continueFreshCheck)
+	outcome := <-outcomes
+	if outcome.err != nil {
+		t.Fatal(outcome.err)
+	}
+	if got := outcome.result.Generation.EvidenceResourceIDs; !reflect.DeepEqual(got, []protocol.ResourceID{fresh.ResourceID}) {
+		t.Fatalf("fresh race result evidence = %v", got)
+	}
+	finalSnapshot, ok := cache.get(key)
+	if !ok || finalSnapshot.revision <= refreshedSnapshot.revision {
+		t.Fatalf("fresh result did not replace concurrent cache entry: %#v", finalSnapshot)
+	}
+	if got := finalSnapshot.result.Generation.EvidenceResourceIDs; !reflect.DeepEqual(got, []protocol.ResourceID{fresh.ResourceID}) {
+		t.Fatalf("final cache evidence = %v", got)
 	}
 }
 
@@ -265,6 +380,7 @@ func TestQueryCacheReauthorizesLocalTupleRevocations(t *testing.T) {
 			service := cacheTestService(t, backend, local, loader, cache, "retriever-v1", "prompt-v1")
 			authorization := queryTestAuthorization(test.principal, "request-before")
 			authorization.AuthorizationModelID = cacheTestLocalModel
+			authorization.Consistency = protocol.ConsistencyMinimizeLatency
 			request := protocol.QueryRequest{Question: "tuple revoke", Authorization: authorization}
 			if _, err := service.Query(context.Background(), request); err != nil {
 				t.Fatal(err)
@@ -277,8 +393,12 @@ func TestQueryCacheReauthorizesLocalTupleRevocations(t *testing.T) {
 			if !errors.Is(err, errNoEvidence) {
 				t.Fatalf("revoked tuple returned error %v", err)
 			}
-			if backend.generateCalls != 1 {
+			if backend.retrieveCalls != 2 || backend.generateCalls != 1 {
 				t.Fatalf("revoked tuple returned a cached answer")
+			}
+			if strings.Contains(err.Error(), test.principal) ||
+				strings.Contains(err.Error(), string(document.ResourceID)) {
+				t.Fatalf("revoked tuple error leaked metadata or content: %v", err)
 			}
 		})
 	}
@@ -321,11 +441,13 @@ func TestQueryCacheInvalidationMeasuresLatencyAndCoversProvenance(t *testing.T) 
 	if _, ok := cache.get(key); ok {
 		t.Fatal("provenance-bound cache entry survived parent revocation")
 	}
-	cache.put(key, QueryResult{
+	if accepted := cache.put(key, QueryResult{
 		Evidence: protocol.EvidencePackage{Items: []protocol.EvidenceItem{
 			queryTestChunkItem(chunk, parent),
 		}},
-	})
+	}); accepted {
+		t.Fatal("in-flight result was accepted after resource invalidation")
+	}
 	if _, ok := cache.get(key); ok {
 		t.Fatal("in-flight result repopulated a resource-invalidated cache entry")
 	}

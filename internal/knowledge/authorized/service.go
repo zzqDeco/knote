@@ -119,8 +119,8 @@ func (s *Service) Query(ctx context.Context, request protocol.QueryRequest) (Que
 			s.retrieveLimit, s.evidenceLimit, s.expandLimit,
 		)
 		if snapshot, ok := s.cache.get(cacheKey); ok {
-			if cached, valid := s.revalidateCached(ctx, request, snapshot.result); valid &&
-				s.cache.containsRevision(cacheKey, snapshot.revision) {
+			cached, err := s.revalidateCached(ctx, request, snapshot.result)
+			if err == nil && s.cache.containsRevision(cacheKey, snapshot.revision) {
 				return cached, nil
 			}
 			s.cache.deleteIfRevision(cacheKey, snapshot.revision)
@@ -202,6 +202,9 @@ func (s *Service) Query(ctx context.Context, request protocol.QueryRequest) (Que
 	if err != nil {
 		return QueryResult{}, fmt.Errorf("authorized query evidence package: %w", err)
 	}
+	if s.cache != nil && s.cache.containsInvalidatedResource(evidenceResourceIDs(checked.handles, checked.boundaries)) {
+		return QueryResult{}, ErrProtectedContentUnavailable
+	}
 
 	generateRequest := newGenerateRequest(authorization, request.Question, items)
 	generation, err := s.kag.Generate(ctx, generateRequest)
@@ -212,8 +215,8 @@ func (s *Service) Query(ctx context.Context, request protocol.QueryRequest) (Que
 		return QueryResult{}, fmt.Errorf("authorized query generate result: %w", err)
 	}
 	result := QueryResult{Generation: generation, Evidence: evidencePackage}
-	if s.cache != nil {
-		s.cache.put(cacheKey, result)
+	if s.cache != nil && !s.cache.put(cacheKey, result) {
+		return QueryResult{}, ErrProtectedContentUnavailable
 	}
 	return result, nil
 }
@@ -229,25 +232,25 @@ func (s *Service) revalidateCached(
 	ctx context.Context,
 	request protocol.QueryRequest,
 	cached QueryResult,
-) (QueryResult, bool) {
+) (QueryResult, error) {
 	original := authorizationFromPackage(cached.Evidence)
 	if err := cached.Evidence.ValidateFor(original); err != nil {
-		return QueryResult{}, false
+		return QueryResult{}, ErrProtectedContentUnavailable
 	}
 	expectedFingerprint, err := protocol.NewVisibilityFingerprint(
 		request.Authorization,
 		cached.Evidence.ProjectionVersion,
 	)
 	if err != nil || expectedFingerprint != cached.Evidence.VisibilityFingerprint {
-		return QueryResult{}, false
+		return QueryResult{}, ErrProtectedContentUnavailable
 	}
 	originalGenerate := newGenerateRequest(original, request.Question, cached.Evidence.Items)
 	if err := cached.Generation.ValidateFor(originalGenerate); err != nil {
-		return QueryResult{}, false
+		return QueryResult{}, ErrProtectedContentUnavailable
 	}
 
-	if _, err := s.checkEvidence(ctx, request.Authorization, "cache", cached.Evidence.Items); err != nil {
-		return QueryResult{}, false
+	if _, err := s.checkLiveEvidence(ctx, request.Authorization, "cache", cached.Evidence.Items); err != nil {
+		return QueryResult{}, ErrProtectedContentUnavailable
 	}
 	handles := make([]protocol.ResourceHandle, len(cached.Evidence.Items))
 	for index, item := range cached.Evidence.Items {
@@ -255,28 +258,28 @@ func (s *Service) revalidateCached(
 	}
 	loaded, err := s.loadExact(ctx, request.Authorization, handles)
 	if err != nil || !reflect.DeepEqual(loaded, cached.Evidence.Items) {
-		return QueryResult{}, false
+		return QueryResult{}, ErrProtectedContentUnavailable
 	}
-	checked, err := s.checkEvidence(ctx, request.Authorization, "cache-final", loaded)
+	checked, err := s.checkLiveEvidence(ctx, request.Authorization, "cache-final", loaded)
 	if err != nil {
-		return QueryResult{}, false
+		return QueryResult{}, ErrProtectedContentUnavailable
 	}
 	checkedAt := s.now().UTC()
 	if checkedAt.IsZero() {
-		return QueryResult{}, false
+		return QueryResult{}, ErrProtectedContentUnavailable
 	}
 	evidencePackage, err := buildEvidencePackage(request.Authorization, loaded, checked, checkedAt)
 	if err != nil {
-		return QueryResult{}, false
+		return QueryResult{}, ErrProtectedContentUnavailable
 	}
 	generateRequest := newGenerateRequest(request.Authorization, request.Question, loaded)
 	if err := cached.Generation.ValidateFor(generateRequest); err != nil {
-		return QueryResult{}, false
+		return QueryResult{}, ErrProtectedContentUnavailable
 	}
 	return QueryResult{
 		Generation: cloneGeneration(cached.Generation),
 		Evidence:   evidencePackage,
-	}, true
+	}, nil
 }
 
 func (s *Service) checkEvidence(
@@ -387,20 +390,20 @@ func (s *Service) OpenCitation(
 	citationHandle string,
 ) (protocol.EvidenceItem, error) {
 	if ctx == nil {
-		return protocol.EvidenceItem{}, fmt.Errorf("open citation requires a context")
+		return protocol.EvidenceItem{}, ErrCitationUnavailable
 	}
 	original := authorizationFromPackage(evidencePackage)
 	if err := evidencePackage.ValidateFor(original); err != nil {
-		return protocol.EvidenceItem{}, fmt.Errorf("open citation evidence package: %w", err)
+		return protocol.EvidenceItem{}, ErrCitationUnavailable
 	}
 	if err := current.Validate(); err != nil {
-		return protocol.EvidenceItem{}, fmt.Errorf("open citation authorization: %w", err)
+		return protocol.EvidenceItem{}, ErrCitationUnavailable
 	}
 	if err := validateCurrentCitationContext(current, original); err != nil {
-		return protocol.EvidenceItem{}, err
+		return protocol.EvidenceItem{}, ErrCitationUnavailable
 	}
 	if err := validateTextToken("citation_handle", citationHandle); err != nil {
-		return protocol.EvidenceItem{}, err
+		return protocol.EvidenceItem{}, ErrCitationUnavailable
 	}
 	var cited *protocol.EvidenceItem
 	for index := range evidencePackage.Items {
@@ -408,41 +411,47 @@ func (s *Service) OpenCitation(
 			continue
 		}
 		if cited != nil {
-			return protocol.EvidenceItem{}, fmt.Errorf("open citation handle %q is not unique", citationHandle)
+			return protocol.EvidenceItem{}, ErrCitationUnavailable
 		}
 		cited = &evidencePackage.Items[index]
 	}
 	if cited == nil {
-		return protocol.EvidenceItem{}, fmt.Errorf("open citation handle %q was not found", citationHandle)
+		return protocol.EvidenceItem{}, ErrCitationUnavailable
 	}
-	liveHandles, _, _, err := collectEvidenceHandles(current, []protocol.EvidenceItem{*cited})
+	liveHandles, boundaries, _, err := collectEvidenceHandles(current, []protocol.EvidenceItem{*cited})
 	if err != nil {
-		return protocol.EvidenceItem{}, fmt.Errorf("open citation evidence: %w", err)
+		return protocol.EvidenceItem{}, ErrCitationUnavailable
 	}
-	checked, err := s.checkObjects(ctx, current, "c", liveHandles)
+	if s.cache != nil && s.cache.containsInvalidatedResource(evidenceResourceIDs(liveHandles, boundaries)) {
+		return protocol.EvidenceItem{}, ErrCitationUnavailable
+	}
+	checked, err := s.checkLiveObjects(ctx, current, "c", liveHandles)
 	if err != nil {
-		return protocol.EvidenceItem{}, fmt.Errorf("open citation authorization check: %w", err)
+		return protocol.EvidenceItem{}, ErrCitationUnavailable
 	}
 	for _, resource := range liveHandles {
 		if !checked[resource.AuthorizationID].allowed {
-			return protocol.EvidenceItem{}, fmt.Errorf("open citation denied resource %s", resource.ResourceID)
+			return protocol.EvidenceItem{}, ErrCitationUnavailable
 		}
 	}
 	loaded, err := s.loadExact(ctx, current, []protocol.ResourceHandle{cited.Resource})
 	if err != nil {
-		return protocol.EvidenceItem{}, fmt.Errorf("open citation load: %w", err)
+		return protocol.EvidenceItem{}, ErrCitationUnavailable
 	}
 	if !reflect.DeepEqual(loaded[0], *cited) {
-		return protocol.EvidenceItem{}, fmt.Errorf("open citation loader changed the cited evidence item")
+		return protocol.EvidenceItem{}, ErrCitationUnavailable
 	}
-	checked, err = s.checkObjects(ctx, current, "c-final", liveHandles)
+	checked, err = s.checkLiveObjects(ctx, current, "c-final", liveHandles)
 	if err != nil {
-		return protocol.EvidenceItem{}, fmt.Errorf("open citation final authorization check: %w", err)
+		return protocol.EvidenceItem{}, ErrCitationUnavailable
 	}
 	for _, resource := range liveHandles {
 		if !checked[resource.AuthorizationID].allowed {
-			return protocol.EvidenceItem{}, fmt.Errorf("open citation final authorization check denied resource %s", resource.ResourceID)
+			return protocol.EvidenceItem{}, ErrCitationUnavailable
 		}
+	}
+	if s.cache != nil && s.cache.containsInvalidatedResource(evidenceResourceIDs(liveHandles, boundaries)) {
+		return protocol.EvidenceItem{}, ErrCitationUnavailable
 	}
 	return loaded[0], nil
 }
@@ -831,10 +840,6 @@ func validateCurrentCitationContext(current, original protocol.AuthorizationCont
 		{"session_id", current.SessionID, original.SessionID},
 		{"agent_id", current.AgentID, original.AgentID},
 		{"task_id", current.TaskID, original.TaskID},
-		{"authorization_model_id", current.AuthorizationModelID, original.AuthorizationModelID},
-		{"identity_watermark", current.IdentityWatermark, original.IdentityWatermark},
-		{"acl_watermark", current.ACLWatermark, original.ACLWatermark},
-		{"consistency", string(current.Consistency), string(original.Consistency)},
 	}
 	for _, binding := range bindings {
 		if binding.current != binding.original {

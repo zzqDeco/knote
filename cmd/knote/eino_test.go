@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	einotools "github.com/zzqDeco/knote/internal/eino/tools"
+	"github.com/zzqDeco/knote/internal/knowledge/kag"
 	"github.com/zzqDeco/knote/internal/knowledge/versioned"
 	"github.com/zzqDeco/knote/internal/repository"
 )
@@ -110,6 +111,20 @@ func TestPermissionedAuthorizationProviderOnlyEnablesFakeMode(t *testing.T) {
 	authorization, err := provider(context.Background(), "sess_fake")
 	if err != nil || authorization.PrincipalID != "bob" || authorization.SessionID != "sess_fake" {
 		t.Fatalf("fake-mode authorization = %+v, %v", authorization, err)
+	}
+}
+
+func TestPermissionedApplicationOnlyWiresCachedRevocationPathInFakeMode(t *testing.T) {
+	application, err := newPermissionedApplication(false, nil)
+	if err != nil || application != nil {
+		t.Fatalf("real-mode permissioned application = %#v, %v", application, err)
+	}
+	application, err = newPermissionedApplication(true, kag.Client{Fake: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if application == nil || application.fixture == nil || application.fixture.Service == nil {
+		t.Fatalf("fake-mode permissioned application was not fully wired: %#v", application)
 	}
 }
 

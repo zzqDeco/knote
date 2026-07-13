@@ -14,6 +14,8 @@ import (
 	"github.com/zzqDeco/knote/internal/runtime"
 )
 
+const protectedContentUnavailableMessage = "protected content is unavailable"
+
 type ToolExecutor struct {
 	tools map[string]einotool.InvokableTool
 }
@@ -61,17 +63,45 @@ func invokeTool(ctx context.Context, tools map[string]einotool.InvokableTool, se
 		return nil, err
 	}
 	if err != nil {
+		if isPermissionedToolCall(toolName) {
+			generic := errors.New(protectedContentUnavailableMessage)
+			events = append(events, protocol.NewEvent(protocol.EventToolError, sessionID, generic.Error(), map[string]string{"tool": toolName}))
+			return events, generic
+		}
 		events = append(events, protocol.NewEvent(protocol.EventToolError, sessionID, err.Error(), map[string]string{"tool": toolName}))
 		return events, err
+	}
+	binding, permissioned, err := protectedBindingFromToolOutput(ctx, toolName, out)
+	if err != nil {
+		generic := errors.New(protectedContentUnavailableMessage)
+		events = append(events, protocol.NewEvent(protocol.EventToolError, sessionID, generic.Error(), map[string]string{"tool": toolName}))
+		return events, generic
+	}
+	if permissioned {
+		events[0].ProtectedContent = binding
 	}
 	decoded := decodeToolResult(out)
 	payload := map[string]any{"tool": toolName, "result": decoded}
 	if failure := adapterFailureMessage(toolName, decoded); failure != "" {
+		if permissioned {
+			generic := errors.New(protectedContentUnavailableMessage)
+			errorPayload := map[string]string{"tool": toolName}
+			toolError := protocol.NewEvent(protocol.EventToolError, sessionID, generic.Error(), errorPayload)
+			toolError.ProtectedContent = binding
+			genericError := protocol.NewEvent(protocol.EventError, sessionID, generic.Error(), errorPayload)
+			genericError.ProtectedContent = binding
+			events = append(events, toolError, genericError)
+			return events, generic
+		}
 		events = append(events, protocol.NewEvent(protocol.EventToolError, sessionID, failure, payload))
 		events = append(events, protocol.NewEvent(protocol.EventError, sessionID, failure, payload))
 		return events, fmt.Errorf("%s", failure)
 	}
-	events = append(events, protocol.NewEvent(protocol.EventToolComplete, sessionID, toolName+" complete", payload))
+	complete := protocol.NewEvent(protocol.EventToolComplete, sessionID, toolName+" complete", payload)
+	if permissioned {
+		complete.ProtectedContent = binding
+	}
+	events = append(events, complete)
 	events = append(events, versionEventsForTool(sessionID, toolName, decoded)...)
 	if toolName == einotools.NameBuild {
 		if manifest, ok := decodedMap(decoded)["manifest"]; ok {
@@ -94,8 +124,72 @@ func invokeTool(ctx context.Context, tools map[string]einotool.InvokableTool, se
 	if toolName == einotools.NameEval {
 		return events, nil
 	}
-	events = append(events, protocol.NewEvent(protocol.EventAssistantDone, sessionID, "Eino tool result\n"+prettyToolResult(decoded), map[string]string{"tool": toolName}))
+	answer := protocol.NewEvent(protocol.EventAssistantDone, sessionID, "Eino tool result\n"+prettyToolResult(decoded), map[string]string{"tool": toolName})
+	if permissioned {
+		answer.ProtectedContent = binding
+	}
+	events = append(events, answer)
 	return events, nil
+}
+
+func protectedBindingFromToolOutput(
+	ctx context.Context,
+	toolName string,
+	out string,
+) (*protocol.ProtectedContentBinding, bool, error) {
+	if !permissionedToolName(toolName) {
+		return nil, false, nil
+	}
+	authorization, ok := protocol.AuthorizationContextFrom(ctx)
+	if !ok {
+		return nil, true, errors.New("permissioned tool output requires authorization")
+	}
+	evidencePackage, err := decodeEvidencePackage(out)
+	if err != nil {
+		return nil, true, err
+	}
+	binding, err := protocol.NewProtectedContentBinding(authorization, evidencePackage)
+	if err != nil {
+		return nil, true, err
+	}
+	return &binding, true, nil
+}
+
+func decodeEvidencePackage(out string) (protocol.EvidencePackage, error) {
+	var envelope struct {
+		EvidencePackage json.RawMessage `json:"evidence_package"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &envelope); err != nil {
+		return protocol.EvidencePackage{}, err
+	}
+	if len(envelope.EvidencePackage) == 0 || string(envelope.EvidencePackage) == "null" {
+		return protocol.EvidencePackage{}, errors.New("permissioned tool result has no evidence package")
+	}
+	var evidencePackage protocol.EvidencePackage
+	if err := json.Unmarshal(envelope.EvidencePackage, &evidencePackage); err != nil {
+		return protocol.EvidencePackage{}, err
+	}
+	return evidencePackage, nil
+}
+
+func isPermissionedToolCall(toolName string) bool {
+	return permissionedToolName(toolName)
+}
+
+func permissionedToolName(toolName string) bool {
+	return toolName == einotools.NameQuery || toolName == einotools.NameExplain
+}
+
+func eventToolName(payload any) string {
+	switch value := payload.(type) {
+	case map[string]string:
+		return strings.TrimSpace(value["tool"])
+	case map[string]any:
+		name, _ := value["tool"].(string)
+		return strings.TrimSpace(name)
+	default:
+		return ""
+	}
 }
 
 func decodeToolResult(out string) any {

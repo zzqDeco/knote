@@ -137,6 +137,11 @@ func (m *Manager) resumeSession(ctx context.Context, currentSessionID string, se
 		}
 		return []protocol.Event{protocol.NewEvent(protocol.EventError, currentSessionID, "resume failed: "+err.Error(), nil)}
 	}
+	authorization := protocol.AuthorizationContext{}
+	if resumeAuthorization != nil {
+		authorization = *resumeAuthorization
+	}
+	loaded = m.filterPersistedEvents(ctx, authorization, loaded)
 	status := repository.Status{}
 	if m.deps.Versions != nil {
 		status, _ = m.deps.Versions.Status(ctx)
@@ -204,6 +209,7 @@ func (m *Manager) sessionList(ctx context.Context, sessionID string) []protocol.
 			if err != nil {
 				continue
 			}
+			events = m.filterPersistedEvents(ctx, targetAuthorization, events)
 			summary := repository.SessionSummary{ID: envelope.SessionID, EventCount: len(events)}
 			if len(events) > 0 {
 				summary.LastEventAt = events[len(events)-1].CreatedAt.UTC()
