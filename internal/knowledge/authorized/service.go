@@ -499,6 +499,7 @@ func collectEvidenceHandles(
 ) ([]protocol.ResourceHandle, map[protocol.ResourceID]protocol.ResourceHandle, string, error) {
 	ordered := make([]protocol.ResourceHandle, 0, len(items))
 	seen := make(map[protocol.ResourceID]protocol.ResourceHandle)
+	chunkBoundaries := make(map[protocol.ResourceID]protocol.ResourceHandle)
 	projection := ""
 	add := func(resource protocol.ResourceHandle) error {
 		if err := resource.ValidateFor(authorization); err != nil {
@@ -519,16 +520,39 @@ func collectEvidenceHandles(
 		ordered = append(ordered, resource)
 		return nil
 	}
+	recordChunkBoundary := func(resource protocol.ResourceHandle, supports []protocol.ProvenanceSupport) error {
+		if resource.Type != protocol.ResourceChunk {
+			return nil
+		}
+		boundary, err := boundaryFromSupports(resource, supports)
+		if err != nil {
+			return err
+		}
+		if existing, duplicate := chunkBoundaries[resource.ResourceID]; duplicate && existing != boundary {
+			return fmt.Errorf("chunk %s has conflicting parent authorization boundaries", resource.ResourceID)
+		}
+		chunkBoundaries[resource.ResourceID] = boundary
+		return nil
+	}
 	for _, item := range items {
 		if err := add(item.Resource); err != nil {
+			return nil, nil, "", err
+		}
+		if err := recordChunkBoundary(item.Resource, item.Supports); err != nil {
 			return nil, nil, "", err
 		}
 		for _, support := range item.Supports {
 			if err := add(support.Resource); err != nil {
 				return nil, nil, "", err
 			}
+			if err := recordChunkBoundary(support.Resource, item.Supports); err != nil {
+				return nil, nil, "", err
+			}
 			for _, evidence := range support.Evidence {
 				if err := add(evidence); err != nil {
+					return nil, nil, "", err
+				}
+				if err := recordChunkBoundary(evidence, item.Supports); err != nil {
 					return nil, nil, "", err
 				}
 			}
@@ -536,15 +560,9 @@ func collectEvidenceHandles(
 	}
 	boundaries := make(map[protocol.ResourceID]protocol.ResourceHandle, len(ordered))
 	for _, resource := range ordered {
-		var boundary protocol.ResourceHandle
-		var err error
+		boundary := resource
 		if resource.Type == protocol.ResourceChunk {
-			boundary, err = boundaryFromItems(resource, items)
-		} else {
-			boundary = resource
-		}
-		if err != nil {
-			return nil, nil, "", err
+			boundary = chunkBoundaries[resource.ResourceID]
 		}
 		if err := validateBoundary(resource, boundary); err != nil {
 			return nil, nil, "", err
@@ -552,14 +570,6 @@ func collectEvidenceHandles(
 		boundaries[resource.ResourceID] = boundary
 	}
 	return ordered, boundaries, projection, nil
-}
-
-func boundaryFromItems(resource protocol.ResourceHandle, items []protocol.EvidenceItem) (protocol.ResourceHandle, error) {
-	supports := make([]protocol.ProvenanceSupport, 0)
-	for _, item := range items {
-		supports = append(supports, item.Supports...)
-	}
-	return boundaryFromSupports(resource, supports)
 }
 
 func boundaryFromSupports(resource protocol.ResourceHandle, supports []protocol.ProvenanceSupport) (protocol.ResourceHandle, error) {
@@ -656,6 +666,7 @@ func validateCurrentCitationContext(current, original protocol.AuthorizationCont
 		{"tenant_id", current.TenantID, original.TenantID},
 		{"knowledge_base_id", current.KnowledgeBaseID, original.KnowledgeBaseID},
 		{"principal_id", current.PrincipalID, original.PrincipalID},
+		{"session_id", current.SessionID, original.SessionID},
 		{"agent_id", current.AgentID, original.AgentID},
 		{"task_id", current.TaskID, original.TaskID},
 		{"authorization_model_id", current.AuthorizationModelID, original.AuthorizationModelID},

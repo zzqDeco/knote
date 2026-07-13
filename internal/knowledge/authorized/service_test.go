@@ -273,6 +273,34 @@ func TestQueryChunksFinalAuthorizationChecks(t *testing.T) {
 	}
 }
 
+func TestQueryRejectsChunkBoundaryFromAnotherEvidenceItem(t *testing.T) {
+	parent := queryTestDocument(queryTestModelID, "parent", "projection-v1")
+	chunk := queryTestChunk(queryTestOtherID, parent, "chunk")
+	other := queryTestDocument(queryTestThirdID, "b", "projection-v1")
+	malformedChunk := protocol.EvidenceItem{
+		Resource: chunk, Content: "chunk", Derivation: protocol.DerivationAnySupport,
+		Supports: []protocol.ProvenanceSupport{{
+			SupportID: "support-malformed-chunk", Resource: chunk,
+			Evidence: []protocol.ResourceHandle{other}, Complete: true,
+		}},
+		Citation: protocol.Citation{Handle: "citation-malformed-chunk", Resource: chunk},
+	}
+	backend := &queryTestKAG{retrieveResult: queryTestRetrieve(chunk, parent)}
+	loader := &queryTestLoader{items: map[protocol.ResourceID]protocol.EvidenceItem{
+		chunk.ResourceID:  malformedChunk,
+		parent.ResourceID: queryTestItem(parent),
+	}}
+	service := queryTestService(t, backend, &queryTestAuthorizer{}, loader, 0, 2)
+	if _, err := service.Query(context.Background(), protocol.QueryRequest{
+		Question: "q", Authorization: queryTestAuthorization("alice", "request-item-boundary"),
+	}); err == nil {
+		t.Fatal("a different evidence item's provenance must not supply the chunk parent boundary")
+	}
+	if backend.generateCalls != 0 {
+		t.Fatal("malformed chunk provenance reached generation")
+	}
+}
+
 func TestQueryRejectsInvalidRetrievalBeforeAuthorization(t *testing.T) {
 	valid := queryTestDocument(queryTestModelID, "a", "projection-v1")
 	crossTenant := valid
@@ -564,6 +592,7 @@ func TestOpenCitationFailsClosed(t *testing.T) {
 		func(value *protocol.AuthorizationContext) { value.TenantID = "other" },
 		func(value *protocol.AuthorizationContext) { value.KnowledgeBaseID = "other" },
 		func(value *protocol.AuthorizationContext) { value.PrincipalID = "bob" },
+		func(value *protocol.AuthorizationContext) { value.SessionID = "session-2" },
 		func(value *protocol.AuthorizationContext) { value.AgentID = "agent-2" },
 		func(value *protocol.AuthorizationContext) { value.TaskID = "task-2" },
 		func(value *protocol.AuthorizationContext) { value.AuthorizationModelID = "01ARZ3NDEKTSV4RRFFQ69G5FAA" },
