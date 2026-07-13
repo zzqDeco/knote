@@ -84,6 +84,25 @@ RESOURCE_FIELDS = frozenset(
 )
 RESOURCE_VERSION_FIELDS = frozenset({"source", "content", "acl", "index", "graph", "projection"})
 EVIDENCE_FIELDS = frozenset({"resource", "content", "citation_handle"})
+AUTHORIZATION_REQUIRED_FIELDS = frozenset(
+    {
+        "version",
+        "tenant_id",
+        "knowledge_base_id",
+        "principal_id",
+        "session_id",
+        "request_id",
+        "authorization_model_id",
+        "identity_watermark",
+        "acl_watermark",
+        "consistency",
+    }
+)
+AUTHORIZATION_OPTIONAL_FIELDS = frozenset({"agent_id", "task_id"})
+AUTHORIZATION_CONSISTENCY_VALUES = frozenset(
+    {"minimize_latency", "higher_consistency"}
+)
+AUTHORIZATION_CONTEXT_VERSION = "v1"
 RESOURCE_ID_RE = re.compile(r"res_[0-9a-f]{32}\Z")
 CONTENT_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 RESOURCE_TYPES = frozenset({"document", "chunk", "entity", "claim", "derived_artifact"})
@@ -1162,6 +1181,16 @@ def required_content(value: Any, field: str) -> str:
     return value
 
 
+def required_authorization_token(value: Any, field: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise AdapterRequestError(f"{field} must be a non-empty string")
+    if value.strip() != value:
+        raise AdapterRequestError(f"{field} contains leading or trailing whitespace")
+    if any(ord(character) < 32 or 127 <= ord(character) <= 159 for character in value):
+        raise AdapterRequestError(f"{field} contains control characters")
+    return value
+
+
 def primitive_limit(params: dict[str, Any], default: int) -> int:
     value = params.get("limit", default)
     if isinstance(value, bool) or not isinstance(value, int):
@@ -1183,6 +1212,56 @@ def validate_exact_fields(value: dict[str, Any], expected: frozenset[str], field
     if unexpected:
         details.append("unexpected " + ", ".join(unexpected))
     raise AdapterRequestError(f"{field} has invalid fields ({'; '.join(details)})")
+
+
+def validate_authorization(value: Any) -> dict[str, Any]:
+    field = "authorization"
+    if not isinstance(value, dict):
+        raise AdapterRequestError(f"{field} must be an object")
+    actual = set(value)
+    missing = sorted(AUTHORIZATION_REQUIRED_FIELDS - actual)
+    unexpected = sorted(
+        actual - AUTHORIZATION_REQUIRED_FIELDS - AUTHORIZATION_OPTIONAL_FIELDS
+    )
+    if missing or unexpected:
+        details: list[str] = []
+        if missing:
+            details.append("missing " + ", ".join(missing))
+        if unexpected:
+            details.append("unexpected " + ", ".join(unexpected))
+        raise AdapterRequestError(
+            f"{field} has invalid fields ({'; '.join(details)})"
+        )
+
+    normalized = {
+        name: required_authorization_token(value.get(name), f"{field}.{name}")
+        for name in sorted(AUTHORIZATION_REQUIRED_FIELDS)
+    }
+    if normalized["version"] != AUTHORIZATION_CONTEXT_VERSION:
+        raise AdapterRequestError(
+            f"{field}.version must be {AUTHORIZATION_CONTEXT_VERSION}"
+        )
+    if normalized["consistency"] not in AUTHORIZATION_CONSISTENCY_VALUES:
+        raise AdapterRequestError(f"{field}.consistency is unsupported")
+    for name in sorted(AUTHORIZATION_OPTIONAL_FIELDS):
+        if name in value:
+            normalized[name] = required_authorization_token(
+                value.get(name), f"{field}.{name}"
+            )
+    return normalized
+
+
+def require_authorization_scope(
+    resource: dict[str, Any], authorization: dict[str, Any], field: str
+) -> None:
+    if resource["tenant_id"] != authorization["tenant_id"]:
+        raise AdapterRequestError(
+            f"{field}.tenant_id is outside authorization tenant_id"
+        )
+    if resource["knowledge_base_id"] != authorization["knowledge_base_id"]:
+        raise AdapterRequestError(
+            f"{field}.knowledge_base_id is outside authorization knowledge_base_id"
+        )
 
 
 def validate_resource(value: Any, field: str) -> dict[str, Any]:
@@ -1313,6 +1392,7 @@ def add_test_stage_spy(
 
 
 def fake_retrieve(params: dict[str, Any]) -> dict[str, Any]:
+    authorization = validate_authorization(params.get("authorization"))
     required_string(params.get("query"), "query")
     limit = primitive_limit(params, len(FAKE_RETRIEVE_IDS))
     maybe_test_primitive_delay()
@@ -1321,6 +1401,10 @@ def fake_retrieve(params: dict[str, Any]) -> dict[str, Any]:
         for resource_id in FAKE_RETRIEVE_IDS[:limit]
     ]
     candidates = [candidate for candidate, _protected_content in retrieved]
+    for index, candidate in enumerate(candidates):
+        require_authorization_scope(
+            candidate["resource"], authorization, f"candidates[{index}].resource"
+        )
     resource_ids = [candidate["resource"]["resource_id"] for candidate in candidates]
     return add_test_stage_spy(
         {"mode": "fake", "candidates": candidates},
@@ -1329,11 +1413,15 @@ def fake_retrieve(params: dict[str, Any]) -> dict[str, Any]:
 
 
 def fake_expand(params: dict[str, Any]) -> dict[str, Any]:
+    authorization = validate_authorization(params.get("authorization"))
     frontier = params.get("frontier")
     if not isinstance(frontier, list) or not frontier:
         raise AdapterRequestError("frontier must be a list of candidate handles")
     handles = [validate_candidate(value, f"frontier[{index}]") for index, value in enumerate(frontier)]
     for index, handle in enumerate(handles):
+        require_authorization_scope(
+            handle["resource"], authorization, f"frontier[{index}].resource"
+        )
         require_fake_resource_binding(handle["resource"], f"frontier[{index}].resource")
     frontier_ids = sorted(handle["resource"]["resource_id"] for handle in handles)
     if len(frontier_ids) != len(set(frontier_ids)):
@@ -1357,6 +1445,10 @@ def fake_expand(params: dict[str, Any]) -> dict[str, Any]:
         (copy_fake_candidate(resource_id) for resource_id in candidate_ids),
         key=lambda candidate: (-candidate["score"], candidate["resource"]["resource_id"]),
     )[:limit]
+    for index, candidate in enumerate(candidates):
+        require_authorization_scope(
+            candidate["resource"], authorization, f"candidates[{index}].resource"
+        )
     output_ids = [candidate["resource"]["resource_id"] for candidate in candidates]
     included = set(output_ids)
     expansions = sorted(
@@ -1373,12 +1465,16 @@ def fake_expand(params: dict[str, Any]) -> dict[str, Any]:
 
 
 def fake_generate(params: dict[str, Any]) -> dict[str, Any]:
+    authorization = validate_authorization(params.get("authorization"))
     question = required_string(params.get("question"), "question")
     evidence = params.get("evidence")
     if not isinstance(evidence, list) or not evidence:
         raise AdapterRequestError("evidence must be a non-empty list of already-authorized evidence objects")
     items = [validate_evidence(value, f"evidence[{index}]") for index, value in enumerate(evidence)]
     for index, item in enumerate(items):
+        require_authorization_scope(
+            item["resource"], authorization, f"evidence[{index}].resource"
+        )
         require_fake_resource_binding(item["resource"], f"evidence[{index}].resource")
     resource_ids = [item["resource"]["resource_id"] for item in items]
     citation_handles = [item["citation_handle"] for item in items]

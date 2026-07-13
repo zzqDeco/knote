@@ -219,6 +219,19 @@ func (h ResourceHandle) Validate() error {
 	return h.Versions.Validate()
 }
 
+func (h ResourceHandle) ValidateFor(auth AuthorizationContext) error {
+	if err := auth.Validate(); err != nil {
+		return err
+	}
+	if err := h.Validate(); err != nil {
+		return err
+	}
+	if h.TenantID != auth.TenantID || h.KnowledgeBaseID != auth.KnowledgeBaseID {
+		return fmt.Errorf("resource %s crosses the authorization scope", h.ResourceID)
+	}
+	return nil
+}
+
 type DerivationMode string
 
 const (
@@ -345,6 +358,36 @@ func (d AuthorizationDecision) Validate() error {
 	default:
 		return fmt.Errorf("unsupported authorization decision %q", d.Outcome)
 	}
+}
+
+func (d AuthorizationDecision) ValidateFor(auth AuthorizationContext) error {
+	if err := auth.Validate(); err != nil {
+		return err
+	}
+	if err := d.Validate(); err != nil {
+		return err
+	}
+	bindings := []struct {
+		name string
+		got  string
+		want string
+	}{
+		{"request_id", d.RequestID, auth.RequestID},
+		{"session_id", d.SessionID, auth.SessionID},
+		{"principal_id", d.PrincipalID, auth.PrincipalID},
+		{"agent_id", d.AgentID, auth.AgentID},
+		{"task_id", d.TaskID, auth.TaskID},
+		{"authorization_model_id", d.AuthorizationModelID, auth.AuthorizationModelID},
+		{"identity_watermark", d.IdentityWatermark, auth.IdentityWatermark},
+		{"acl_watermark", d.ACLWatermark, auth.ACLWatermark},
+		{"consistency", string(d.Consistency), string(auth.Consistency)},
+	}
+	for _, binding := range bindings {
+		if binding.got != binding.want {
+			return fmt.Errorf("authorization decision %s does not match authorization context", binding.name)
+		}
+	}
+	return d.Resource.ValidateFor(auth)
 }
 
 func (d AuthorizationDecision) validateAuthorizationBoundary() error {
@@ -484,7 +527,7 @@ func (p EvidencePackage) ValidateFor(auth AuthorizationContext) error {
 	}
 	allowed := make(map[ResourceID]AuthorizationDecision, len(p.Decisions))
 	for _, decision := range p.Decisions {
-		if err := decision.Validate(); err != nil {
+		if err := decision.ValidateFor(auth); err != nil {
 			return err
 		}
 		if !decision.Authorized() {
@@ -514,10 +557,16 @@ func (p EvidencePackage) ValidateFor(auth AuthorizationContext) error {
 		}
 		allowed[decision.Resource.ResourceID] = decision
 	}
+	resources := make(map[ResourceID]struct{}, len(p.Items))
+	citations := make(map[string]struct{}, len(p.Items))
 	for _, item := range p.Items {
-		if err := item.Resource.Validate(); err != nil {
+		if err := item.Resource.ValidateFor(auth); err != nil {
 			return err
 		}
+		if _, duplicate := resources[item.Resource.ResourceID]; duplicate {
+			return fmt.Errorf("duplicate evidence resource %s", item.Resource.ResourceID)
+		}
+		resources[item.Resource.ResourceID] = struct{}{}
 		if item.Resource.TenantID != p.TenantID || item.Resource.KnowledgeBaseID != p.KnowledgeBaseID {
 			return fmt.Errorf("evidence resource crosses the authorization scope")
 		}
@@ -572,6 +621,10 @@ func (p EvidencePackage) ValidateFor(auth AuthorizationContext) error {
 		if err := validateToken("citation_handle", item.Citation.Handle); err != nil {
 			return err
 		}
+		if _, duplicate := citations[item.Citation.Handle]; duplicate {
+			return fmt.Errorf("duplicate citation handle %q", item.Citation.Handle)
+		}
+		citations[item.Citation.Handle] = struct{}{}
 		if err := item.Citation.Resource.Validate(); err != nil {
 			return err
 		}

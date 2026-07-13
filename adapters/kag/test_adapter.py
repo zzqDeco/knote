@@ -63,6 +63,27 @@ def fake_resource_handle(resource_id: str) -> dict[str, object]:
     return adapter.copy_fake_candidate(resource_id)["resource"]
 
 
+def authorization_context(**overrides: object) -> dict[str, object]:
+    authorization: dict[str, object] = {
+        "version": "v1",
+        "tenant_id": "tenant_fake",
+        "knowledge_base_id": "kb_fake",
+        "principal_id": "principal_fake",
+        "session_id": "session_fake",
+        "request_id": "request_fake",
+        "authorization_model_id": "model_fake",
+        "identity_watermark": "identity_fake",
+        "acl_watermark": "acl_fake",
+        "consistency": "higher_consistency",
+    }
+    authorization.update(overrides)
+    return authorization
+
+
+def authorized_params(**params: object) -> dict[str, object]:
+    return {"authorization": authorization_context(), **params}
+
+
 def initialize_checkout_projection(
     workspace: Path, namespace: str = "projection-one"
 ) -> tuple[Path, Path, str]:
@@ -136,7 +157,11 @@ class AdapterTest(unittest.TestCase):
         self.assertEqual(lines[-1]["data"]["mode"], "fake")
 
     def test_fake_retrieve_contract_is_deterministic_and_body_free(self) -> None:
-        request = {"id": "retrieve-1", "method": "kag.retrieve", "params": {"query": "What is knote?", "limit": 2}}
+        request = {
+            "id": "retrieve-1",
+            "method": "kag.retrieve",
+            "params": authorized_params(query="What is knote?", limit=2),
+        }
 
         _, first_lines = call_adapter(request)
         _, second_lines = call_adapter(request)
@@ -166,7 +191,11 @@ class AdapterTest(unittest.TestCase):
 
     def test_fake_expand_contract_contains_only_handles_and_edges(self) -> None:
         _, retrieve_lines = call_adapter(
-            {"id": "retrieve", "method": "kag.retrieve", "params": {"query": "What is knote?"}}
+            {
+                "id": "retrieve",
+                "method": "kag.retrieve",
+                "params": authorized_params(query="What is knote?"),
+            }
         )
         intro = next(
             candidate
@@ -175,7 +204,11 @@ class AdapterTest(unittest.TestCase):
         )
 
         _, lines = call_adapter(
-            {"id": "expand", "method": "kag.expand", "params": {"frontier": [intro], "limit": 2}}
+            {
+                "id": "expand",
+                "method": "kag.expand",
+                "params": authorized_params(frontier=[intro], limit=2),
+            }
         )
 
         response = lines[-1]
@@ -215,7 +248,7 @@ class AdapterTest(unittest.TestCase):
             {
                 "id": "generate",
                 "method": "kag.generate",
-                "params": {"question": "What is knote?", "evidence": evidence},
+                "params": authorized_params(question="What is knote?", evidence=evidence),
             }
         )
 
@@ -256,6 +289,106 @@ class AdapterTest(unittest.TestCase):
 
         self.assertEqual(validated["content"], content)
 
+    def test_authorization_context_is_exact_and_fail_closed(self) -> None:
+        accepted = authorization_context(agent_id="agent_fake", task_id="task_fake")
+        _, accepted_lines = call_adapter(
+            {
+                "id": "accepted",
+                "method": "kag.retrieve",
+                "params": {"authorization": accepted, "query": "q", "limit": 1},
+            }
+        )
+        self.assertEqual(accepted_lines[-1]["type"], "result")
+
+        invalid_authorizations: list[tuple[dict[str, object], str]] = []
+        missing = authorization_context()
+        missing.pop("principal_id")
+        invalid_authorizations.append((missing, "missing principal_id"))
+        invalid_authorizations.extend(
+            [
+                (authorization_context(unexpected="value"), "unexpected unexpected"),
+                (authorization_context(version="v2"), "authorization.version must be v1"),
+                (
+                    authorization_context(consistency="eventual"),
+                    "authorization.consistency is unsupported",
+                ),
+                (
+                    authorization_context(principal_id=" principal_fake"),
+                    "authorization.principal_id contains leading or trailing whitespace",
+                ),
+                (
+                    authorization_context(request_id="request\ninvalid"),
+                    "authorization.request_id contains control characters",
+                ),
+            ]
+        )
+        for authorization, expected_error in invalid_authorizations:
+            with self.subTest(expected_error=expected_error):
+                _, lines = call_adapter(
+                    {
+                        "id": "invalid-auth",
+                        "method": "kag.retrieve",
+                        "params": {"authorization": authorization, "query": "q"},
+                    }
+                )
+                response = lines[-1]
+                self.assertEqual(response["type"], "error")
+                self.assertEqual(response["code"], "invalid_request")
+                self.assertIn(expected_error, response["error"])
+
+    def test_fake_primitives_reject_resources_outside_authorization_scope(self) -> None:
+        candidate = adapter.copy_fake_candidate(adapter.FAKE_INTRO_ID)
+        outside_tenant = {
+            **candidate,
+            "resource": {**candidate["resource"], "tenant_id": "tenant_other"},
+        }
+        evidence_resource = fake_resource_handle(adapter.FAKE_INTRO_ID)
+        outside_knowledge_base = {
+            **evidence_resource,
+            "knowledge_base_id": "kb_other",
+        }
+        evidence = {
+            "resource": outside_knowledge_base,
+            "content": adapter.FAKE_CONTENT_BY_ID[adapter.FAKE_INTRO_ID],
+            "citation_handle": "cite_intro",
+        }
+        cases = [
+            (
+                {
+                    "id": "retrieve-scope",
+                    "method": "kag.retrieve",
+                    "params": {
+                        "authorization": authorization_context(tenant_id="tenant_other"),
+                        "query": "q",
+                    },
+                },
+                "outside authorization tenant_id",
+            ),
+            (
+                {
+                    "id": "expand-scope",
+                    "method": "kag.expand",
+                    "params": authorized_params(frontier=[outside_tenant]),
+                },
+                "outside authorization tenant_id",
+            ),
+            (
+                {
+                    "id": "generate-scope",
+                    "method": "kag.generate",
+                    "params": authorized_params(question="q", evidence=[evidence]),
+                },
+                "outside authorization knowledge_base_id",
+            ),
+        ]
+        for request, expected_error in cases:
+            with self.subTest(method=request["method"]):
+                _, lines = call_adapter(request)
+                response = lines[-1]
+                self.assertEqual(response["type"], "error")
+                self.assertEqual(response["code"], "invalid_request")
+                self.assertIn(expected_error, response["error"])
+
     def test_denied_candidates_are_absent_from_later_hops_and_generation(self) -> None:
         denied_candidate_id = adapter.FAKE_DENIED_CANARY_ID
         denied_candidate_body = adapter.FAKE_CONTENT_BY_ID[denied_candidate_id]
@@ -264,7 +397,11 @@ class AdapterTest(unittest.TestCase):
         observed_processes: list[subprocess.CompletedProcess[str]] = []
 
         retrieve_proc, retrieve_lines = call_adapter(
-            {"id": "r", "method": "kag.retrieve", "params": {"query": "What is knote?"}},
+            {
+                "id": "r",
+                "method": "kag.retrieve",
+                "params": authorized_params(query="What is knote?"),
+            },
             stage_spy=True,
         )
         observed_processes.append(retrieve_proc)
@@ -284,7 +421,11 @@ class AdapterTest(unittest.TestCase):
             item for item in authorized_retrieval if candidate_resource_id(item) == adapter.FAKE_INTRO_ID
         )
         first_expand_proc, first_expand_lines = call_adapter(
-            {"id": "x1", "method": "kag.expand", "params": {"frontier": [intro], "limit": 10}},
+            {
+                "id": "x1",
+                "method": "kag.expand",
+                "params": authorized_params(frontier=[intro], limit=10),
+            },
             stage_spy=True,
         )
         observed_processes.append(first_expand_proc)
@@ -300,7 +441,11 @@ class AdapterTest(unittest.TestCase):
             if candidate_resource_id(item) != denied_frontier_id
         ]
         second_expand_proc, second_expand_lines = call_adapter(
-            {"id": "x2", "method": "kag.expand", "params": {"frontier": authorized_frontier, "limit": 10}},
+            {
+                "id": "x2",
+                "method": "kag.expand",
+                "params": authorized_params(frontier=authorized_frontier, limit=10),
+            },
             stage_spy=True,
         )
         observed_processes.append(second_expand_proc)
@@ -334,7 +479,9 @@ class AdapterTest(unittest.TestCase):
             {
                 "id": "g",
                 "method": "kag.generate",
-                "params": {"question": "What is knote?", "evidence": authorized_evidence},
+                "params": authorized_params(
+                    question="What is knote?", evidence=authorized_evidence
+                ),
             },
             stage_spy=True,
         )
@@ -362,28 +509,52 @@ class AdapterTest(unittest.TestCase):
     def test_primitive_contract_rejects_malformed_input(self) -> None:
         valid_candidate = adapter.copy_fake_candidate(adapter.FAKE_INTRO_ID)
         valid_resource = fake_resource_handle(adapter.FAKE_INTRO_ID)
+        auth = authorization_context()
         cases = [
             (
                 {"id": "bad", "method": "kag.retrieve", "params": {"limit": 1}},
+                "authorization must be an object",
+            ),
+            (
+                {
+                    "id": "bad",
+                    "method": "kag.retrieve",
+                    "params": {"authorization": auth, "limit": 1},
+                },
                 "query must be a non-empty string",
             ),
             (
-                {"id": "bad", "method": "kag.retrieve", "params": {"query": "q", "limit": 0}},
+                {
+                    "id": "bad",
+                    "method": "kag.retrieve",
+                    "params": {"authorization": auth, "query": "q", "limit": 0},
+                },
                 "limit must be between 1 and 100",
             ),
             (
-                {"id": "bad", "method": "kag.expand", "params": {"frontier": valid_candidate}},
-                "frontier must be a list",
-            ),
-            (
-                {"id": "bad", "method": "kag.expand", "params": {"frontier": []}},
+                {
+                    "id": "bad",
+                    "method": "kag.expand",
+                    "params": {"authorization": auth, "frontier": valid_candidate},
+                },
                 "frontier must be a list",
             ),
             (
                 {
                     "id": "bad",
                     "method": "kag.expand",
-                    "params": {"frontier": [{**valid_candidate, "content": "protected"}]},
+                    "params": {"authorization": auth, "frontier": []},
+                },
+                "frontier must be a list",
+            ),
+            (
+                {
+                    "id": "bad",
+                    "method": "kag.expand",
+                    "params": {
+                        "authorization": auth,
+                        "frontier": [{**valid_candidate, "content": "protected"}],
+                    },
                 },
                 "unexpected content",
             ),
@@ -391,7 +562,10 @@ class AdapterTest(unittest.TestCase):
                 {
                     "id": "bad",
                     "method": "kag.expand",
-                    "params": {"frontier": [{**valid_candidate, "score": float("nan")}]},
+                    "params": {
+                        "authorization": auth,
+                        "frontier": [{**valid_candidate, "score": float("nan")}],
+                    },
                 },
                 "score must be finite",
             ),
@@ -400,6 +574,7 @@ class AdapterTest(unittest.TestCase):
                     "id": "bad",
                     "method": "kag.expand",
                     "params": {
+                        "authorization": auth,
                         "frontier": [
                             {
                                 **valid_candidate,
@@ -415,6 +590,7 @@ class AdapterTest(unittest.TestCase):
                     "id": "bad",
                     "method": "kag.expand",
                     "params": {
+                        "authorization": auth,
                         "frontier": [
                             {
                                 **valid_candidate,
@@ -432,7 +608,11 @@ class AdapterTest(unittest.TestCase):
                 "does not match the exact fake serving resource handle",
             ),
             (
-                {"id": "bad", "method": "kag.generate", "params": {"question": "q"}},
+                {
+                    "id": "bad",
+                    "method": "kag.generate",
+                    "params": {"authorization": auth, "question": "q"},
+                },
                 "evidence must be a non-empty list",
             ),
             (
@@ -440,6 +620,7 @@ class AdapterTest(unittest.TestCase):
                     "id": "bad",
                     "method": "kag.generate",
                     "params": {
+                        "authorization": auth,
                         "question": "q",
                         "evidence": [
                             {"resource": valid_resource, "citation_handle": "cite_intro"}
@@ -453,6 +634,7 @@ class AdapterTest(unittest.TestCase):
                     "id": "bad",
                     "method": "kag.generate",
                     "params": {
+                        "authorization": auth,
                         "question": "q",
                         "evidence": [
                             {
@@ -473,6 +655,7 @@ class AdapterTest(unittest.TestCase):
                     "id": "bad",
                     "method": "kag.generate",
                     "params": {
+                        "authorization": auth,
                         "question": "q",
                         "evidence": [
                             {
@@ -563,7 +746,11 @@ class AdapterTest(unittest.TestCase):
         env = os.environ.copy()
         env["KNOTE_KAG_FAKE"] = "1"
         env[adapter.TEST_DELAY_MS_ENV] = "500"
-        request = {"id": "slow", "method": "kag.retrieve", "params": {"query": "q"}}
+        request = {
+            "id": "slow",
+            "method": "kag.retrieve",
+            "params": authorized_params(query="q"),
+        }
 
         with self.assertRaises(subprocess.TimeoutExpired):
             subprocess.run(
