@@ -179,6 +179,25 @@ func TestServiceBuildArtifactsAreStableAndEntityIsPerDocument(t *testing.T) {
 	if got, want := len(repo.artifacts.Entities[0].EvidenceChunkIDs), len(repo.artifacts.Chunks); got != want {
 		t.Fatalf("document entity evidence chunk count = %d, want %d", got, want)
 	}
+	if first.BundleManifest.GraphBindingContractVersion != protocol.GraphBindingContractVersion {
+		t.Fatalf("graph binding contract version = %d", first.BundleManifest.GraphBindingContractVersion)
+	}
+	if got, want := len(repo.artifacts.GraphBindings), repo.artifacts.ProjectionResourceCount; got != want {
+		t.Fatalf("graph binding count = %d, want %d", got, want)
+	}
+	if err := protocol.ValidateGraphResourceBindings(repo.artifacts.GraphBindings); err != nil {
+		t.Fatalf("graph bindings: %v", err)
+	}
+	if len(repo.artifacts.ClaimBindings) != 0 {
+		t.Fatalf("synthetic Phase 1 claims gained fabricated graph triples: %+v", repo.artifacts.ClaimBindings)
+	}
+	filePaths := make(map[string]bool, len(first.BundleManifest.Files))
+	for _, file := range first.BundleManifest.Files {
+		filePaths[file.Path] = true
+	}
+	if !filePaths[protocol.GraphBindingsArtifactPath] || !filePaths[protocol.ClaimBindingsArtifactPath] {
+		t.Fatalf("bundle manifest omitted graph binding files: %+v", first.BundleManifest.Files)
+	}
 }
 
 func TestServiceBuildUsesProjectionIsolatedKAGNamespaceAndMetadata(t *testing.T) {

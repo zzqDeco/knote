@@ -128,6 +128,8 @@ type ArtifactSet struct {
 	Entities                []protocol.Entity
 	Relations               []protocol.Relation
 	Claims                  []protocol.Claim
+	GraphBindings           []protocol.GraphResourceBinding
+	ClaimBindings           []protocol.ClaimTripleBinding
 	Summaries               []protocol.Summary
 	SchemaYAML              string
 	BuildReport             string

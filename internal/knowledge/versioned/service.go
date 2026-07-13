@@ -586,12 +586,18 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
-const defaultSchemaYAML = `version: 1
+const defaultSchemaYAML = `version: 2
 artifacts:
   documents: documents.jsonl
   chunks: chunks.jsonl
   entities: entities.jsonl
   relations: relations.jsonl
   claims: claims.jsonl
+  graph_bindings: graph_bindings.jsonl
+  claim_bindings: claim_bindings.jsonl
   summaries: summaries.jsonl
+graph_binding_contract:
+  version: 1
+  graph_object_type: KnoteResource
+  claim_edge_type: KnoteClaimEdge
 `

@@ -82,11 +82,22 @@ func (e *AdapterError) Error() string {
 }
 
 func (e *AdapterError) Is(target error) bool {
-	return target == ErrUnsupportedPrimitive && e.Code == ErrorCodeUnsupportedPrimitive
+	switch target {
+	case ErrUnsupportedPrimitive:
+		return e.Code == ErrorCodeUnsupportedPrimitive
+	case ErrInvalidGraphBinding:
+		return e.Code == ErrorCodeInvalidGraphBinding
+	default:
+		return false
+	}
 }
 
 func IsUnsupportedPrimitive(err error) bool {
 	return errors.Is(err, ErrUnsupportedPrimitive)
+}
+
+func IsInvalidGraphBinding(err error) bool {
+	return errors.Is(err, ErrInvalidGraphBinding)
 }
 
 type Backend interface {

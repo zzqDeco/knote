@@ -13,9 +13,15 @@ import (
 	"github.com/zzqDeco/knote/internal/protocol"
 )
 
-const ErrorCodeUnsupportedPrimitive = "unsupported_primitive"
+const (
+	ErrorCodeUnsupportedPrimitive = "unsupported_primitive"
+	ErrorCodeInvalidGraphBinding  = "invalid_graph_binding"
+)
 
-var ErrUnsupportedPrimitive = errors.New("KAG primitive is unsupported")
+var (
+	ErrUnsupportedPrimitive = errors.New("KAG primitive is unsupported")
+	ErrInvalidGraphBinding  = errors.New("KAG graph binding is invalid")
+)
 
 // PrimitiveBackend is the controlled KAG boundary used by authorized retrieval.
 // It deliberately excludes the opaque solver-backed Query and Explain methods.

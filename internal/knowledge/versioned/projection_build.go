@@ -284,6 +284,26 @@ func (s service) prepareArtifactProjection(ctx context.Context) (repository.Arti
 		resource.ProjectionStatus = catalog.SucceededProjectionStatus()
 		publishedResources[i] = resource
 	}
+	set.GraphBindings = make([]protocol.GraphResourceBinding, 0, len(publishedResources))
+	for _, resource := range publishedResources {
+		handle, err := resource.ServingHandle()
+		if err != nil {
+			return repository.ArtifactSet{}, projectionBuild{}, err
+		}
+		binding, err := protocol.NewGraphResourceBinding(handle)
+		if err != nil {
+			return repository.ArtifactSet{}, projectionBuild{}, err
+		}
+		set.GraphBindings = append(set.GraphBindings, binding)
+	}
+	protocol.SortGraphResourceBindings(set.GraphBindings)
+	if err := protocol.ValidateGraphResourceBindings(set.GraphBindings); err != nil {
+		return repository.ArtifactSet{}, projectionBuild{}, err
+	}
+	// Synthetic Phase 1 claims have no semantic subject/predicate/object
+	// identity. Emit an explicit empty file instead of fabricating graph facts;
+	// issue #58 populates source-backed claim bindings.
+	set.ClaimBindings = []protocol.ClaimTripleBinding{}
 	publicProjection, err := catalog.NewProjection(scope, projectionVersion, snapshot.Ref(), catalog.StatePublished, publishedResources)
 	if err != nil {
 		return repository.ArtifactSet{}, projectionBuild{}, err
@@ -297,8 +317,9 @@ func (s service) prepareArtifactProjection(ctx context.Context) (repository.Arti
 	set.BundleManifest = protocol.ArtifactBundleManifest{
 		Version: protocol.ArtifactBundleManifestVersion, ProjectionID: projectionVersion,
 		ProjectionVersion: projectionVersion, Namespace: namespaceBase + "__" + projectionVersion,
-		AuthorizationObject:  "knowledge-base:" + scope.KnowledgeBaseID,
-		AuthorizationVersion: aclVersion,
+		AuthorizationObject:         "knowledge-base:" + scope.KnowledgeBaseID,
+		AuthorizationVersion:        aclVersion,
+		GraphBindingContractVersion: protocol.GraphBindingContractVersion,
 		SourceSnapshot: protocol.ArtifactSourceSnapshot{
 			Version: snapshot.Ref().Version, Digest: strings.TrimPrefix(string(snapshot.Ref().Digest), "sha256:"),
 			DocumentCount: snapshot.Ref().DocumentCount,

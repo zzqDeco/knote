@@ -1,6 +1,7 @@
 package protocol
 
 import (
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -15,6 +16,37 @@ func TestArtifactBundleManifestRejectsUnsafeNamespace(t *testing.T) {
 				t.Fatalf("unsafe namespace %q was accepted", namespace)
 			}
 		})
+	}
+}
+
+func TestArtifactBundleManifestRequiresVersionedGraphBindingPair(t *testing.T) {
+	manifest := validArtifactBundleManifest()
+	manifest.GraphBindingContractVersion = GraphBindingContractVersion
+	manifest.Files = append(manifest.Files,
+		ArtifactBundleFile{Path: ClaimBindingsArtifactPath, SHA256: strings.Repeat("c", 64)},
+		ArtifactBundleFile{Path: GraphBindingsArtifactPath, SHA256: strings.Repeat("d", 64)},
+	)
+	sort.Slice(manifest.Files, func(i, j int) bool { return manifest.Files[i].Path < manifest.Files[j].Path })
+	if err := manifest.Validate(); err != nil {
+		t.Fatal(err)
+	}
+
+	missing := manifest
+	missing.Files = append([]ArtifactBundleFile(nil), manifest.Files...)
+	for index, file := range missing.Files {
+		if file.Path == ClaimBindingsArtifactPath {
+			missing.Files = append(missing.Files[:index], missing.Files[index+1:]...)
+			break
+		}
+	}
+	if err := missing.Validate(); err == nil {
+		t.Fatal("manifest accepted an incomplete graph binding file pair")
+	}
+
+	undeclared := manifest
+	undeclared.GraphBindingContractVersion = 0
+	if err := undeclared.Validate(); err == nil {
+		t.Fatal("manifest accepted graph bindings without a declared contract version")
 	}
 }
 
