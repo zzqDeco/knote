@@ -181,6 +181,47 @@ func TestQueryScopesEvidencePerPrincipal(t *testing.T) {
 	}
 }
 
+func TestQueryHidesDeniedResourceExistence(t *testing.T) {
+	document := queryTestDocument(queryTestModelID, "content", "projection-v1")
+	request := protocol.QueryRequest{
+		Question: "q", Authorization: queryTestAuthorization("alice", "request-hidden"),
+	}
+
+	absentService := queryTestService(t, &queryTestKAG{retrieveResult: queryTestRetrieve()}, &queryTestAuthorizer{}, &queryTestLoader{}, 0, 2)
+	_, absentErr := absentService.Query(context.Background(), request)
+
+	hiddenAuthorizer := &queryTestAuthorizer{decide: func(_ int, batch authz.BatchCheckRequest) ([]authz.Decision, error) {
+		return queryTestDecisions(batch, func(authz.BatchCheckItem) bool { return false }), nil
+	}}
+	hiddenService := queryTestService(t, &queryTestKAG{retrieveResult: queryTestRetrieve(document)}, hiddenAuthorizer, &queryTestLoader{}, 0, 2)
+	_, hiddenErr := hiddenService.Query(context.Background(), request)
+
+	revokedAuthorizer := &queryTestAuthorizer{decide: func(call int, batch authz.BatchCheckRequest) ([]authz.Decision, error) {
+		return queryTestDecisions(batch, func(authz.BatchCheckItem) bool { return call == 0 }), nil
+	}}
+	revokedBackend := &queryTestKAG{retrieveResult: queryTestRetrieve(document)}
+	revokedLoader := &queryTestLoader{items: map[protocol.ResourceID]protocol.EvidenceItem{
+		document.ResourceID: queryTestItem(document),
+	}}
+	revokedService := queryTestService(t, revokedBackend, revokedAuthorizer, revokedLoader, 0, 2)
+	_, revokedErr := revokedService.Query(context.Background(), request)
+
+	for name, err := range map[string]error{"absent": absentErr, "hidden": hiddenErr, "revoked": revokedErr} {
+		if !errors.Is(err, errNoEvidence) {
+			t.Fatalf("%s error = %v, want generic no-evidence error", name, err)
+		}
+		if strings.Contains(err.Error(), string(document.ResourceID)) {
+			t.Fatalf("%s error leaked denied resource ID: %v", name, err)
+		}
+	}
+	if absentErr.Error() != hiddenErr.Error() || absentErr.Error() != revokedErr.Error() {
+		t.Fatalf("externally visible errors differ: absent=%q hidden=%q revoked=%q", absentErr, hiddenErr, revokedErr)
+	}
+	if revokedBackend.generateCalls != 0 {
+		t.Fatal("revoked evidence reached generation")
+	}
+}
+
 func TestQueryFailsClosedOnMalformedBatchResults(t *testing.T) {
 	documentA := queryTestDocument(queryTestModelID, "a", "projection-v1")
 	documentB := queryTestDocument(queryTestOtherID, "b", "projection-v1")
@@ -298,6 +339,37 @@ func TestQueryRejectsChunkBoundaryFromAnotherEvidenceItem(t *testing.T) {
 	}
 	if backend.generateCalls != 0 {
 		t.Fatal("malformed chunk provenance reached generation")
+	}
+}
+
+func TestQueryRejectsChunkBoundaryFromAnotherAnySupport(t *testing.T) {
+	parent := queryTestDocument(queryTestModelID, "parent", "projection-v1")
+	chunk := queryTestChunk(queryTestOtherID, parent, "chunk")
+	other := queryTestDocument(queryTestThirdID, "b", "projection-v1")
+	item := protocol.EvidenceItem{
+		Resource: chunk, Content: "chunk", Derivation: protocol.DerivationAnySupport,
+		Supports: []protocol.ProvenanceSupport{
+			{
+				SupportID: "support-without-parent", Resource: chunk,
+				Evidence: []protocol.ResourceHandle{other}, Complete: true,
+			},
+			{
+				SupportID: "support-with-parent", Resource: parent,
+				Evidence: []protocol.ResourceHandle{parent}, Complete: true,
+			},
+		},
+		Citation: protocol.Citation{Handle: "citation-cross-support-chunk", Resource: chunk},
+	}
+	backend := &queryTestKAG{retrieveResult: queryTestRetrieve(chunk)}
+	loader := &queryTestLoader{items: map[protocol.ResourceID]protocol.EvidenceItem{chunk.ResourceID: item}}
+	service := queryTestService(t, backend, &queryTestAuthorizer{}, loader, 0, 1)
+	if _, err := service.Query(context.Background(), protocol.QueryRequest{
+		Question: "q", Authorization: queryTestAuthorization("alice", "request-support-boundary"),
+	}); err == nil {
+		t.Fatal("an any_support branch must not borrow a chunk parent from another support")
+	}
+	if backend.generateCalls != 0 {
+		t.Fatal("cross-support chunk boundary reached generation")
 	}
 }
 

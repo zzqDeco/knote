@@ -3,6 +3,7 @@ package authorized
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -13,6 +14,8 @@ import (
 	"github.com/zzqDeco/knote/internal/knowledge/kag"
 	"github.com/zzqDeco/knote/internal/protocol"
 )
+
+var errNoEvidence = errors.New("authorized query found no evidence")
 
 const (
 	defaultRetrieveLimit = 20
@@ -105,7 +108,7 @@ func (s *Service) Query(ctx context.Context, request protocol.QueryRequest) (Que
 		return QueryResult{}, fmt.Errorf("authorized query retrieve result: %w", err)
 	}
 	if len(retrieved.Candidates) == 0 {
-		return QueryResult{}, fmt.Errorf("authorized query found no retrieval candidates")
+		return QueryResult{}, errNoEvidence
 	}
 
 	approved, err := s.filterAuthorizedCandidates(ctx, authorization, "r", retrieved.Candidates)
@@ -139,7 +142,7 @@ func (s *Service) Query(ctx context.Context, request protocol.QueryRequest) (Que
 		selected = appendCandidates(selected, approvedExpansion, s.evidenceLimit)
 	}
 	if len(selected) == 0 {
-		return QueryResult{}, fmt.Errorf("authorized query found no authorized evidence")
+		return QueryResult{}, errNoEvidence
 	}
 
 	handles := make([]protocol.ResourceHandle, len(selected))
@@ -169,7 +172,7 @@ func (s *Service) Query(ctx context.Context, request protocol.QueryRequest) (Que
 	for index, resource := range allHandles {
 		result := batch[resource.AuthorizationID]
 		if !result.allowed {
-			return QueryResult{}, fmt.Errorf("authorized query final evidence check denied resource %s", resource.ResourceID)
+			return QueryResult{}, errNoEvidence
 		}
 		decision := protocol.AuthorizationDecision{
 			CorrelationID:         result.correlationID,
@@ -538,20 +541,41 @@ func collectEvidenceHandles(
 		if err := add(item.Resource); err != nil {
 			return nil, nil, "", err
 		}
-		if err := recordChunkBoundary(item.Resource, item.Supports); err != nil {
-			return nil, nil, "", err
-		}
 		for _, support := range item.Supports {
 			if err := add(support.Resource); err != nil {
-				return nil, nil, "", err
-			}
-			if err := recordChunkBoundary(support.Resource, item.Supports); err != nil {
 				return nil, nil, "", err
 			}
 			for _, evidence := range support.Evidence {
 				if err := add(evidence); err != nil {
 					return nil, nil, "", err
 				}
+			}
+		}
+		if item.Derivation == protocol.DerivationAnySupport {
+			for _, support := range item.Supports {
+				currentSupport := []protocol.ProvenanceSupport{support}
+				if err := recordChunkBoundary(item.Resource, currentSupport); err != nil {
+					return nil, nil, "", err
+				}
+				if err := recordChunkBoundary(support.Resource, currentSupport); err != nil {
+					return nil, nil, "", err
+				}
+				for _, evidence := range support.Evidence {
+					if err := recordChunkBoundary(evidence, currentSupport); err != nil {
+						return nil, nil, "", err
+					}
+				}
+			}
+			continue
+		}
+		if err := recordChunkBoundary(item.Resource, item.Supports); err != nil {
+			return nil, nil, "", err
+		}
+		for _, support := range item.Supports {
+			if err := recordChunkBoundary(support.Resource, item.Supports); err != nil {
+				return nil, nil, "", err
+			}
+			for _, evidence := range support.Evidence {
 				if err := recordChunkBoundary(evidence, item.Supports); err != nil {
 					return nil, nil, "", err
 				}
