@@ -203,6 +203,9 @@ func (s *Service) Query(ctx context.Context, request protocol.QueryRequest) (Que
 	if err != nil {
 		return QueryResult{}, fmt.Errorf("authorized query evidence package: %w", err)
 	}
+	if s.cache != nil && s.cache.containsInvalidatedResource(evidenceResourceIDs(checked.handles, checked.boundaries)) {
+		return QueryResult{}, ErrProtectedContentUnavailable
+	}
 
 	generateRequest := newGenerateRequest(authorization, request.Question, items)
 	generation, err := s.kag.Generate(ctx, generateRequest)
@@ -447,6 +450,9 @@ func (s *Service) OpenCitation(
 		if !checked[resource.AuthorizationID].allowed {
 			return protocol.EvidenceItem{}, ErrCitationUnavailable
 		}
+	}
+	if s.cache != nil && s.cache.containsInvalidatedResource(evidenceResourceIDs(liveHandles, boundaries)) {
+		return protocol.EvidenceItem{}, ErrCitationUnavailable
 	}
 	return loaded[0], nil
 }

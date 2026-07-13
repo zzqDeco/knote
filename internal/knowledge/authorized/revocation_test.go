@@ -321,6 +321,78 @@ func TestAuthorizeProtectedContentRejectsChangedExactResourceHandle(t *testing.T
 	}
 }
 
+func TestAuthorizeProtectedContentRejectsChangedChunkAuthorizationBoundaryHandle(t *testing.T) {
+	parent := queryTestDocument(queryTestModelID, "parent", "projection-v1")
+	chunk := queryTestChunk(queryTestOtherID, parent, "chunk")
+	loader := &queryTestLoader{items: map[protocol.ResourceID]protocol.EvidenceItem{
+		chunk.ResourceID: queryTestChunkItem(chunk, parent),
+	}}
+	service, err := New(Options{
+		KAG: &queryTestKAG{}, Authorizer: &queryTestAuthorizer{}, Loader: loader,
+		Cache: mustQueryCache(t, 2), RetrieverVersion: "retriever-v1", PromptVersion: "prompt-v1",
+		RetrieveLimit: 10, EvidenceLimit: 2, Now: time.Now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorization := queryTestAuthorization("alice", "request-boundary-replay")
+	binding, err := protocol.NewProtectedContentBindingFromResources(
+		authorization.SessionID,
+		authorization.RequestID,
+		[]protocol.ProtectedResourceBinding{{Resource: chunk, AuthorizationResource: parent}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.AuthorizeProtectedContent(context.Background(), authorization, binding); err != nil {
+		t.Fatalf("current authorization boundary was denied: %v", err)
+	}
+
+	changedParent := parent
+	changedParent.Versions.Content = "content-v2"
+	loader.items[chunk.ResourceID] = queryTestChunkItem(chunk, changedParent)
+	if _, err := service.AuthorizeProtectedContent(context.Background(), authorization, binding); !errors.Is(err, ErrProtectedContentUnavailable) {
+		t.Fatalf("changed authorization boundary remained replayable: %v", err)
+	}
+}
+
+func TestAuthorizeProtectedContentRejectsTombstoneIntroducedDuringExactLoad(t *testing.T) {
+	document := queryTestDocument(queryTestModelID, "content", "projection-v1")
+	cache := mustQueryCache(t, 2)
+	loadStarted := make(chan struct{})
+	releaseLoad := make(chan struct{})
+	loader := &queryTestLoader{load: func([]protocol.ResourceHandle) ([]protocol.EvidenceItem, error) {
+		close(loadStarted)
+		<-releaseLoad
+		return []protocol.EvidenceItem{queryTestItem(document)}, nil
+	}}
+	service, err := New(Options{
+		KAG: &queryTestKAG{}, Authorizer: &queryTestAuthorizer{}, Loader: loader,
+		Cache: cache, RetrieverVersion: "retriever-v1", PromptVersion: "prompt-v1",
+		RetrieveLimit: 10, EvidenceLimit: 2, Now: time.Now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorization := queryTestAuthorization("alice", "request-concurrent-revoke")
+	binding := revocationTestBinding(t, authorization, document)
+	done := make(chan error, 1)
+	go func() {
+		_, err := service.AuthorizeProtectedContent(context.Background(), authorization, binding)
+		done <- err
+	}()
+
+	<-loadStarted
+	if _, err := cache.InvalidateResource(document.ResourceID, time.Now()); err != nil {
+		close(releaseLoad)
+		t.Fatal(err)
+	}
+	close(releaseLoad)
+	if err := <-done; !errors.Is(err, ErrProtectedContentUnavailable) {
+		t.Fatalf("protected content survived concurrent tombstone: %v", err)
+	}
+}
+
 func TestRevocationRejectsMissingOrUnboundTargetsBeforeInvalidation(t *testing.T) {
 	document := queryTestDocument(queryTestModelID, "content", "projection-v1")
 	cache := mustQueryCache(t, 4)

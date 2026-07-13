@@ -96,7 +96,8 @@ func (s *Service) AuthorizeProtectedContent(
 	if err := binding.ValidateFor(current); err != nil {
 		return LiveAuthorizationReport{}, ErrProtectedContentUnavailable
 	}
-	if s.cache != nil && s.cache.containsInvalidatedResource(protectedBindingResourceIDs(binding)) {
+	resourceIDs := protectedBindingResourceIDs(binding)
+	if s.cache != nil && s.cache.containsInvalidatedResource(resourceIDs) {
 		return LiveAuthorizationReport{}, ErrProtectedContentUnavailable
 	}
 	report, err := s.liveAuthorizationReport(ctx, current, binding, "replay")
@@ -108,7 +109,20 @@ func (s *Service) AuthorizeProtectedContent(
 		for index, resource := range binding.Resources {
 			handles[index] = resource.Resource
 		}
-		if _, err := s.loadExact(ctx, current, handles); err != nil {
+		loaded, err := s.loadExact(ctx, current, handles)
+		if err != nil {
+			return report, ErrProtectedContentUnavailable
+		}
+		_, boundaries, _, err := collectEvidenceHandles(current, loaded)
+		if err != nil {
+			return report, ErrProtectedContentUnavailable
+		}
+		for _, resource := range binding.Resources {
+			if boundaries[resource.Resource.ResourceID] != resource.AuthorizationResource {
+				return report, ErrProtectedContentUnavailable
+			}
+		}
+		if s.cache.containsInvalidatedResource(resourceIDs) {
 			return report, ErrProtectedContentUnavailable
 		}
 	}

@@ -505,6 +505,45 @@ func TestQueryRejectsLoaderMutationAndFinalRevocation(t *testing.T) {
 	})
 }
 
+func TestQueryRejectsExistingTombstoneBeforeGenerate(t *testing.T) {
+	document := queryTestDocument(queryTestModelID, "content", "projection-v1")
+	parent := queryTestDocument(queryTestOtherID, "parent", "projection-v1")
+	chunk := queryTestChunk(queryTestThirdID, parent, "chunk")
+	for _, test := range []struct {
+		name      string
+		resource  protocol.ResourceHandle
+		item      protocol.EvidenceItem
+		tombstone protocol.ResourceID
+	}{
+		{name: "evidence", resource: document, item: queryTestItem(document), tombstone: document.ResourceID},
+		{name: "authorization boundary", resource: chunk, item: queryTestChunkItem(chunk, parent), tombstone: parent.ResourceID},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cache := mustQueryCache(t, 2)
+			if _, err := cache.InvalidateResource(test.tombstone, time.Date(2026, 7, 13, 1, 0, 0, 0, time.UTC)); err != nil {
+				t.Fatal(err)
+			}
+			backend := &queryTestKAG{retrieveResult: queryTestRetrieve(test.resource)}
+			loader := &queryTestLoader{items: map[protocol.ResourceID]protocol.EvidenceItem{
+				test.resource.ResourceID: test.item,
+			}}
+			service := cacheTestService(
+				t, backend, &queryTestAuthorizer{}, loader, cache, "retriever-v1", "prompt-v1",
+			)
+
+			_, err := service.Query(context.Background(), protocol.QueryRequest{
+				Question: "q", Authorization: queryTestAuthorization("alice", "request-tombstone-"+test.name),
+			})
+			if !errors.Is(err, ErrProtectedContentUnavailable) {
+				t.Fatalf("query error = %v, want protected content unavailable", err)
+			}
+			if backend.retrieveCalls != 1 || backend.generateCalls != 0 {
+				t.Fatalf("KAG calls: retrieve=%d generate=%d", backend.retrieveCalls, backend.generateCalls)
+			}
+		})
+	}
+}
+
 func TestQueryFailsClosedWithoutFallback(t *testing.T) {
 	document := queryTestDocument(queryTestModelID, "content", "projection-v1")
 	t.Run("retrieve error", func(t *testing.T) {
@@ -729,6 +768,53 @@ func TestOpenCitationUsesCurrentModelWithStaleWatermarks(t *testing.T) {
 		if call.AuthorizationModelID != current.AuthorizationModelID || call.Consistency != authz.ConsistencyHigherConsistency {
 			t.Fatalf("current-model citation check = %#v", call)
 		}
+	}
+}
+
+func TestOpenCitationRejectsTombstoneIntroducedDuringFinalCheck(t *testing.T) {
+	document := queryTestDocument(queryTestModelID, "content", "projection-v1")
+	item := queryTestItem(document)
+	authorization := queryTestAuthorization("alice", "request-query")
+	baseService := queryTestService(
+		t,
+		&queryTestKAG{retrieveResult: queryTestRetrieve(document)},
+		&queryTestAuthorizer{},
+		&queryTestLoader{items: map[protocol.ResourceID]protocol.EvidenceItem{document.ResourceID: item}},
+		0,
+		2,
+	)
+	result, err := baseService.Query(context.Background(), protocol.QueryRequest{Question: "q", Authorization: authorization})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cache := mustQueryCache(t, 2)
+	var invalidationErr error
+	authorizer := &queryTestAuthorizer{decide: func(call int, request authz.BatchCheckRequest) ([]authz.Decision, error) {
+		if call == 1 {
+			_, invalidationErr = cache.InvalidateResource(
+				document.ResourceID, time.Date(2026, 7, 13, 1, 0, 0, 0, time.UTC),
+			)
+		}
+		return queryTestDecisions(request, func(authz.BatchCheckItem) bool { return true }), nil
+	}}
+	loader := &queryTestLoader{items: map[protocol.ResourceID]protocol.EvidenceItem{document.ResourceID: item}}
+	service := cacheTestService(t, &queryTestKAG{}, authorizer, loader, cache, "retriever-v1", "prompt-v1")
+	current := authorization
+	current.RequestID = "request-citation"
+
+	opened, err := service.OpenCitation(context.Background(), current, result.Evidence, item.Citation.Handle)
+	if invalidationErr != nil {
+		t.Fatal(invalidationErr)
+	}
+	if !errors.Is(err, ErrCitationUnavailable) {
+		t.Fatalf("open citation error = %v, want citation unavailable", err)
+	}
+	if !reflect.DeepEqual(opened, protocol.EvidenceItem{}) {
+		t.Fatalf("open citation returned protected content: %#v", opened)
+	}
+	if len(authorizer.calls) != 2 || len(loader.calls) != 1 {
+		t.Fatalf("citation checks: authz=%d load=%d", len(authorizer.calls), len(loader.calls))
 	}
 }
 
