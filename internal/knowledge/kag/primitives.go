@@ -217,12 +217,18 @@ func (r GenerateRequest) Validate() error {
 	}
 	seen := make(map[protocol.ResourceID]struct{}, len(r.Evidence))
 	seenCitations := make(map[string]struct{}, len(r.Evidence))
+	projection := ""
 	for index, evidence := range r.Evidence {
 		if err := evidence.Validate(); err != nil {
 			return fmt.Errorf("evidence %d: %w", index, err)
 		}
 		if err := validateResourceForAuthorization(evidence.Resource, r.Authorization); err != nil {
 			return fmt.Errorf("evidence %d: %w", index, err)
+		}
+		if projection == "" {
+			projection = evidence.Resource.Versions.Projection
+		} else if evidence.Resource.Versions.Projection != projection {
+			return fmt.Errorf("evidence %d projection %q does not match request projection %q", index, evidence.Resource.Versions.Projection, projection)
 		}
 		if _, duplicate := seen[evidence.Resource.ResourceID]; duplicate {
 			return fmt.Errorf("duplicate evidence resource %s", evidence.Resource.ResourceID)
@@ -456,9 +462,15 @@ func validateCandidatesForAuthorization(
 	if err := validateCandidates(candidates, limit); err != nil {
 		return err
 	}
+	projection := ""
 	for index, candidate := range candidates {
 		if err := validateResourceForAuthorization(candidate.Resource, authorization); err != nil {
 			return fmt.Errorf("candidate %d: %w", index, err)
+		}
+		if projection == "" {
+			projection = candidate.Resource.Versions.Projection
+		} else if candidate.Resource.Versions.Projection != projection {
+			return fmt.Errorf("candidate %d projection %q does not match candidate set projection %q", index, candidate.Resource.Versions.Projection, projection)
 		}
 	}
 	return nil

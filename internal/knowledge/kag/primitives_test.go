@@ -321,6 +321,50 @@ func TestExpandBindsCandidatesToAuthorizedFrontierProjection(t *testing.T) {
 	}
 }
 
+func TestPrimitiveRequestsRejectMixedProjectionSets(t *testing.T) {
+	auth := testAuthorizationContext()
+	first := testPrimitiveResource(testResourceA)
+	second := testPrimitiveResource(testResourceB)
+	second.Versions.Projection = "projection-v2"
+
+	retrieve := RetrieveResult{
+		Mode: "fake",
+		Candidates: []CandidateHandle{
+			{Resource: first, Score: 0.9},
+			{Resource: second, Score: 0.8},
+		},
+	}
+	if err := retrieve.ValidateFor(RetrieveRequest{
+		Authorization: auth, Query: "knote", Limit: 10,
+	}); err == nil || !strings.Contains(err.Error(), "projection") {
+		t.Fatalf("mixed-projection retrieve candidates should fail, got %v", err)
+	}
+
+	expand := ExpandRequest{
+		Authorization: auth,
+		Frontier: []CandidateHandle{
+			{Resource: first, Score: 0.9},
+			{Resource: second, Score: 0.8},
+		},
+		Limit: 10,
+	}
+	if err := expand.Validate(); err == nil || !strings.Contains(err.Error(), "projection") {
+		t.Fatalf("mixed-projection expansion frontier should fail, got %v", err)
+	}
+
+	generate := GenerateRequest{
+		Authorization: auth,
+		Question:      "knote",
+		Evidence: []AuthorizedEvidence{
+			{Resource: first, Content: "allowed body", CitationHandle: "citation-1"},
+			{Resource: second, Content: "allowed body", CitationHandle: "citation-2"},
+		},
+	}
+	if err := generate.Validate(); err == nil || !strings.Contains(err.Error(), "projection") {
+		t.Fatalf("mixed-projection generation evidence should fail, got %v", err)
+	}
+}
+
 func TestPrimitiveDecodeRejectsUnknownLeakFields(t *testing.T) {
 	resource, err := structParams(testPrimitiveResource(testResourceA))
 	if err != nil {
