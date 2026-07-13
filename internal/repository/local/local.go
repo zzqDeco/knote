@@ -251,7 +251,7 @@ func (s Store) BindAuthorization(ctx context.Context, envelope protocol.SessionA
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return bindSessionAuthorization(s.workspace, envelope)
+	return bindSessionAuthorization(ctx, s.workspace, envelope)
 }
 
 func (s Store) LoadAuthorization(ctx context.Context, sessionID string) (protocol.SessionAuthorizationEnvelope, error) {

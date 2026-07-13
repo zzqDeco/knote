@@ -342,7 +342,7 @@ func TestSessionAuthorizationStagesCompleteEnvelopeBeforeAtomicPublish(t *testin
 	}
 	assertPermissions(t, temporary, 0o600)
 
-	created, err := publishSessionAuthorization(temporary, path)
+	created, err := publishSessionAuthorization(context.Background(), temporary, path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -351,6 +351,112 @@ func TestSessionAuthorizationStagesCompleteEnvelopeBeforeAtomicPublish(t *testin
 	}
 	if published := mustRead(t, path); published != string(data) {
 		t.Fatalf("published authorization changed:\n%s", published)
+	}
+}
+
+func TestSessionAuthorizationAtomicPublishCreatesExactlyOneConcurrentWinner(t *testing.T) {
+	workspace := t.TempDir()
+	if err := secureSessionDirectory(workspace, true); err != nil {
+		t.Fatal(err)
+	}
+	path := sessionAuthorizationPath(workspace, "sess_one")
+	first, err := stageSessionAuthorization(path, []byte("first\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(first)
+	second, err := stageSessionAuthorization(path, []byte("second\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(second)
+
+	start := make(chan struct{})
+	type result struct {
+		created bool
+		err     error
+	}
+	results := make(chan result, 2)
+	for _, temporary := range []string{first, second} {
+		temporary := temporary
+		go func() {
+			<-start
+			created, err := publishSessionAuthorization(context.Background(), temporary, path)
+			results <- result{created: created, err: err}
+		}()
+	}
+	close(start)
+	created := 0
+	for range 2 {
+		result := <-results
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		if result.created {
+			created++
+		}
+	}
+	if created != 1 {
+		t.Fatalf("atomic publish created %d envelopes, want exactly one", created)
+	}
+	if published := mustRead(t, path); published != "first\n" && published != "second\n" {
+		t.Fatalf("published partial or unexpected envelope: %q", published)
+	}
+}
+
+func TestSessionAuthorizationAtomicPublishRecoversStaleLock(t *testing.T) {
+	workspace := t.TempDir()
+	if err := secureSessionDirectory(workspace, true); err != nil {
+		t.Fatal(err)
+	}
+	path := sessionAuthorizationPath(workspace, "sess_one")
+	temporary, err := stageSessionAuthorization(path, []byte("complete\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(temporary)
+	lockPath := path + sessionAuthorizationLockSuffix
+	if err := os.Mkdir(lockPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stale := time.Now().Add(-2 * sessionAuthorizationLockStale)
+	if err := os.Chtimes(lockPath, stale, stale); err != nil {
+		t.Fatal(err)
+	}
+
+	created, err := publishSessionAuthorization(context.Background(), temporary, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !created || mustRead(t, path) != "complete\n" {
+		t.Fatal("stale publication lock did not recover to a complete envelope")
+	}
+	if _, err := os.Stat(lockPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("publication lock remained after recovery: %v", err)
+	}
+}
+
+func TestSessionAuthorizationAtomicPublishHonorsContextCancellation(t *testing.T) {
+	workspace := t.TempDir()
+	if err := secureSessionDirectory(workspace, true); err != nil {
+		t.Fatal(err)
+	}
+	path := sessionAuthorizationPath(workspace, "sess_one")
+	temporary, err := stageSessionAuthorization(path, []byte("complete\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(temporary)
+	if err := os.Mkdir(path+sessionAuthorizationLockSuffix, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	if _, err := publishSessionAuthorization(ctx, temporary, path); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("publish lock wait returned %v, want context deadline", err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("canceled publication created durable envelope: %v", err)
 	}
 }
 

@@ -2,7 +2,9 @@ package local
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -17,7 +19,12 @@ import (
 	"github.com/zzqDeco/knote/internal/repository"
 )
 
-const sessionAuthorizationSuffix = ".authorization.json"
+const (
+	sessionAuthorizationSuffix           = ".authorization.json"
+	sessionAuthorizationLockSuffix       = ".publish-lock"
+	sessionAuthorizationLockStale        = time.Minute
+	sessionAuthorizationLockPollInterval = 10 * time.Millisecond
+)
 
 var sessionAuthorizationMu sync.RWMutex
 
@@ -159,7 +166,7 @@ func validateSessionID(sessionID string) error {
 	return nil
 }
 
-func bindSessionAuthorization(workspace string, envelope protocol.SessionAuthorizationEnvelope) error {
+func bindSessionAuthorization(ctx context.Context, workspace string, envelope protocol.SessionAuthorizationEnvelope) error {
 	sessionAuthorizationMu.Lock()
 	defer sessionAuthorizationMu.Unlock()
 
@@ -186,7 +193,7 @@ func bindSessionAuthorization(workspace string, envelope protocol.SessionAuthori
 		return err
 	}
 	data = append(data, '\n')
-	created, err := createSessionAuthorization(sessionAuthorizationPath(workspace, envelope.SessionID), data)
+	created, err := createSessionAuthorization(ctx, sessionAuthorizationPath(workspace, envelope.SessionID), data)
 	if err != nil {
 		return err
 	}
@@ -286,13 +293,13 @@ func listSessionAuthorization(workspace string) ([]protocol.SessionAuthorization
 	return envelopes, nil
 }
 
-func createSessionAuthorization(path string, data []byte) (bool, error) {
+func createSessionAuthorization(ctx context.Context, path string, data []byte) (bool, error) {
 	temporary, err := stageSessionAuthorization(path, data)
 	if err != nil {
 		return false, err
 	}
 	defer os.Remove(temporary)
-	return publishSessionAuthorization(temporary, path)
+	return publishSessionAuthorization(ctx, temporary, path)
 }
 
 func stageSessionAuthorization(path string, data []byte) (string, error) {
@@ -324,32 +331,72 @@ func stageSessionAuthorization(path string, data []byte) (string, error) {
 	return temporary, nil
 }
 
-func publishSessionAuthorization(temporary, path string) (bool, error) {
-	if err := os.Link(temporary, path); err == nil {
-		if err := syncArtifactDirectory(filepath.Dir(path)); err != nil {
+func publishSessionAuthorization(ctx context.Context, temporary, path string) (bool, error) {
+	lockPath := path + sessionAuthorizationLockSuffix
+	for {
+		if err := ctx.Err(); err != nil {
 			return false, err
 		}
-		return true, nil
-	} else if os.IsExist(err) {
-		return false, nil
-	}
+		if _, err := os.Lstat(path); err == nil {
+			return false, nil
+		} else if !os.IsNotExist(err) {
+			return false, err
+		}
 
-	// Some network and removable filesystems do not support hard links. The
-	// process-wide authorization lock preserves create-once semantics there,
-	// while rename still keeps incomplete JSON out of the durable path.
-	if _, err := os.Lstat(path); err == nil {
-		return false, nil
-	} else if !os.IsNotExist(err) {
+		if err := os.Mkdir(lockPath, 0o700); err == nil {
+			defer os.Remove(lockPath)
+			if _, err := os.Lstat(path); err == nil {
+				return false, nil
+			} else if !os.IsNotExist(err) {
+				return false, err
+			}
+			if err := os.Rename(temporary, path); err != nil {
+				return false, err
+			}
+			if err := syncArtifactDirectory(filepath.Dir(path)); err != nil {
+				return false, err
+			}
+			return true, nil
+		} else if !errors.Is(err, os.ErrExist) {
+			return false, fmt.Errorf("acquire session authorization publish lock: %w", err)
+		}
+
+		if _, err := recoverStaleSessionAuthorizationLock(lockPath, temporary); err != nil {
+			return false, err
+		}
+		timer := time.NewTimer(sessionAuthorizationLockPollInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return false, ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func recoverStaleSessionAuthorizationLock(lockPath, temporary string) (bool, error) {
+	info, err := os.Lstat(lockPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return true, nil
+	}
+	if err != nil {
 		return false, err
 	}
-	if err := os.Rename(temporary, path); err != nil {
-		if _, statErr := os.Lstat(path); statErr == nil {
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return false, fmt.Errorf("session authorization publish lock is not a directory")
+	}
+	if time.Since(info.ModTime()) < sessionAuthorizationLockStale {
+		return false, nil
+	}
+	stalePath := lockPath + ".stale-" + filepath.Base(temporary)
+	if err := os.Rename(lockPath, stalePath); err != nil {
+		if errors.Is(err, os.ErrNotExist) || errors.Is(err, os.ErrExist) {
 			return false, nil
 		}
-		return false, err
+		return false, fmt.Errorf("recover stale session authorization publish lock: %w", err)
 	}
-	if err := syncArtifactDirectory(filepath.Dir(path)); err != nil {
-		return false, err
+	if err := os.Remove(stalePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return false, fmt.Errorf("remove stale session authorization publish lock: %w", err)
 	}
 	return true, nil
 }
