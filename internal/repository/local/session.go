@@ -287,33 +287,70 @@ func listSessionAuthorization(workspace string) ([]protocol.SessionAuthorization
 }
 
 func createSessionAuthorization(path string, data []byte) (bool, error) {
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	temporary, err := stageSessionAuthorization(path, data)
 	if err != nil {
-		if os.IsExist(err) {
-			return false, nil
-		}
 		return false, err
 	}
+	defer os.Remove(temporary)
+	return publishSessionAuthorization(temporary, path)
+}
+
+func stageSessionAuthorization(path string, data []byte) (string, error) {
+	file, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+"-*.tmp")
+	if err != nil {
+		return "", err
+	}
+	temporary := file.Name()
 	complete := false
 	defer func() {
 		if !complete {
 			_ = file.Close()
-			_ = os.Remove(path)
+			_ = os.Remove(temporary)
 		}
 	}()
 	if err := file.Chmod(0o600); err != nil {
-		return false, err
+		return "", err
 	}
 	if _, err := file.Write(data); err != nil {
-		return false, err
+		return "", err
 	}
 	if err := file.Sync(); err != nil {
-		return false, err
+		return "", err
 	}
 	if err := file.Close(); err != nil {
-		return false, err
+		return "", err
 	}
 	complete = true
+	return temporary, nil
+}
+
+func publishSessionAuthorization(temporary, path string) (bool, error) {
+	if err := os.Link(temporary, path); err == nil {
+		if err := syncArtifactDirectory(filepath.Dir(path)); err != nil {
+			return false, err
+		}
+		return true, nil
+	} else if os.IsExist(err) {
+		return false, nil
+	}
+
+	// Some network and removable filesystems do not support hard links. The
+	// process-wide authorization lock preserves create-once semantics there,
+	// while rename still keeps incomplete JSON out of the durable path.
+	if _, err := os.Lstat(path); err == nil {
+		return false, nil
+	} else if !os.IsNotExist(err) {
+		return false, err
+	}
+	if err := os.Rename(temporary, path); err != nil {
+		if _, statErr := os.Lstat(path); statErr == nil {
+			return false, nil
+		}
+		return false, err
+	}
+	if err := syncArtifactDirectory(filepath.Dir(path)); err != nil {
+		return false, err
+	}
 	return true, nil
 }
 

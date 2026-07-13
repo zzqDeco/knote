@@ -316,6 +316,44 @@ func TestSessionAuthorizationBindIsIdempotentConcurrently(t *testing.T) {
 	}
 }
 
+func TestSessionAuthorizationStagesCompleteEnvelopeBeforeAtomicPublish(t *testing.T) {
+	workspace := t.TempDir()
+	if err := secureSessionDirectory(workspace, true); err != nil {
+		t.Fatal(err)
+	}
+	envelope := testSessionAuthorizationEnvelope(t, "sess_one", "request-1", time.Unix(1, 0).UTC())
+	data, err := json.MarshalIndent(envelope, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data = append(data, '\n')
+	path := sessionAuthorizationPath(workspace, envelope.SessionID)
+
+	temporary, err := stageSessionAuthorization(path, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(temporary)
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("staging exposed durable authorization path: %v", err)
+	}
+	if staged := mustRead(t, temporary); staged != string(data) {
+		t.Fatalf("staged authorization is incomplete:\n%s", staged)
+	}
+	assertPermissions(t, temporary, 0o600)
+
+	created, err := publishSessionAuthorization(temporary, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !created {
+		t.Fatal("complete staged authorization was not published")
+	}
+	if published := mustRead(t, path); published != string(data) {
+		t.Fatalf("published authorization changed:\n%s", published)
+	}
+}
+
 func TestSessionAuthorizationMissingAndPathValidation(t *testing.T) {
 	ctx := context.Background()
 	store := New(t.TempDir())
