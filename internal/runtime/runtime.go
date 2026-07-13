@@ -29,19 +29,22 @@ type Runtime interface {
 }
 
 type Dependencies struct {
-	Workspace     string
-	Config        repository.Config
-	SettingsYAML  string
-	Sessions      repository.Sessions
-	Versions      repository.Versions
-	WorkspaceRepo repository.Workspace
-	Knowledge     versioned.Service
-	RunnerMode    RunnerMode
-	EinoRunner    EinoRunner
-	SideEffects   *SideEffectBridge
-	ToolExecutor  ToolExecutor
-	NewSessionID  func() string
+	Workspace                    string
+	Config                       repository.Config
+	SettingsYAML                 string
+	Sessions                     repository.Sessions
+	Versions                     repository.Versions
+	WorkspaceRepo                repository.Workspace
+	Knowledge                    versioned.Service
+	RunnerMode                   RunnerMode
+	EinoRunner                   EinoRunner
+	AuthorizationContextProvider AuthorizationContextProvider
+	SideEffects                  *SideEffectBridge
+	ToolExecutor                 ToolExecutor
+	NewSessionID                 func() string
 }
+
+type AuthorizationContextProvider func(ctx context.Context, sessionID string) (protocol.AuthorizationContext, error)
 
 type StartOptions struct {
 	ResumeID string
@@ -145,6 +148,7 @@ func (m *Manager) SendMessage(ctx context.Context, input string) []protocol.Even
 	m.mu.Lock()
 	einoSession := m.einoSession
 	einoRunner := m.deps.EinoRunner
+	authorizationProvider := m.deps.AuthorizationContextProvider
 	m.mu.Unlock()
 	if einoSession.ID == "" {
 		return m.emitAndReturn(m.runtimeError("runtime has not started"))
@@ -153,10 +157,19 @@ func (m *Manager) SendMessage(ctx context.Context, input string) []protocol.Even
 	if strings.HasPrefix(input, "/") {
 		return m.handleSlash(ctx, einoSession.ID, input)
 	}
+	authorization, err := authorizationProvider.authorizationContext(ctx, einoSession.ID)
+	if err != nil {
+		events = append(events, protocol.NewEvent(protocol.EventError, einoSession.ID, err.Error(), nil))
+		return m.persistEmitAndReturn(events)
+	}
+	runCtx, err := protocol.WithAuthorizationContext(ctx, authorization)
+	if err != nil {
+		events = append(events, protocol.NewEvent(protocol.EventError, einoSession.ID, err.Error(), nil))
+		return m.persistEmitAndReturn(events)
+	}
 	history := m.loadHistory(ctx, einoSession.ID)
-	runCtx := ctx
 	if m.deps.SideEffects != nil {
-		runCtx = withSideEffectSession(ctx, einoSession.ID)
+		runCtx = withSideEffectSession(runCtx, einoSession.ID)
 	}
 	runnerEvents, err := einoRunner.Run(runCtx, EinoRunInput{SessionID: einoSession.ID, Message: input, History: history})
 	events = append(events, runnerEvents...)

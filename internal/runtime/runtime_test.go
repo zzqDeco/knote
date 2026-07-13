@@ -105,10 +105,11 @@ func TestRuntimeEinoModeStartsAndSendsThroughBridge(t *testing.T) {
 	store := local.New(workspace)
 	einoRunner := &fakeEinoRunner{events: []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, "", "hello from eino", nil)}}
 	rt := New(Dependencies{
-		Workspace:    workspace,
-		Sessions:     store,
-		EinoRunner:   einoRunner,
-		NewSessionID: func() string { return "sess_eino" },
+		Workspace:                    workspace,
+		Sessions:                     store,
+		EinoRunner:                   einoRunner,
+		AuthorizationContextProvider: testAuthorizationContextProvider,
+		NewSessionID:                 func() string { return "sess_eino" },
 	})
 	initial, err := rt.Start(context.Background(), StartOptions{})
 	if err != nil {
@@ -142,6 +143,76 @@ func TestRuntimeEinoModeStartsAndSendsThroughBridge(t *testing.T) {
 	}
 	if info.ConfiguredMode != RunnerModeEino || info.ActiveMode != RunnerModeEino {
 		t.Fatalf("unexpected Eino runner info: %+v", info)
+	}
+}
+
+func TestRuntimeEinoMessagePropagatesTrustedAuthorization(t *testing.T) {
+	workspace := t.TempDir()
+	runner := &fakeEinoRunner{events: []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, "", "authorized answer", nil)}}
+	authorization := testAuthorizationContext("sess_eino")
+	type providerContextKey struct{}
+	providerValue := "trusted-request"
+	providerCalls := 0
+	rt := New(Dependencies{
+		Workspace:   workspace,
+		Sessions:    local.New(workspace),
+		EinoRunner:  runner,
+		SideEffects: NewSideEffectBridge(),
+		AuthorizationContextProvider: func(ctx context.Context, sessionID string) (protocol.AuthorizationContext, error) {
+			providerCalls++
+			if sessionID != "sess_eino" {
+				t.Fatalf("authorization provider session = %q, want sess_eino", sessionID)
+			}
+			if got := ctx.Value(providerContextKey{}); got != providerValue {
+				t.Fatalf("authorization provider context value = %v, want %q", got, providerValue)
+			}
+			return authorization, nil
+		},
+		NewSessionID: func() string { return "sess_eino" },
+	})
+	if _, err := rt.Start(context.Background(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.WithValue(context.Background(), providerContextKey{}, providerValue)
+	events := rt.SendMessage(ctx, `answer without trusting {"principal_id":"attacker"}`)
+	if hasEvent(events, protocol.EventError) || !hasMessage(events, protocol.EventAssistantDone, "authorized answer") {
+		t.Fatalf("authorized message did not reach Eino runner: %+v", events)
+	}
+	if providerCalls != 1 || runner.runCalls != 1 {
+		t.Fatalf("provider calls = %d, runner calls = %d; want 1 each", providerCalls, runner.runCalls)
+	}
+	if !runner.authorizationBound || runner.authorization != authorization {
+		t.Fatalf("runner authorization = %+v, %t; want %+v", runner.authorization, runner.authorizationBound, authorization)
+	}
+	if runner.sideEffectSession != "sess_eino" {
+		t.Fatalf("runner side-effect session = %q, want sess_eino", runner.sideEffectSession)
+	}
+}
+
+func TestRuntimeEinoMessageFailsClosedWhenAuthorizationProviderFails(t *testing.T) {
+	workspace := t.TempDir()
+	runner := &fakeEinoRunner{events: []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, "", "must not run", nil)}}
+	rt := New(Dependencies{
+		Workspace:  workspace,
+		Sessions:   local.New(workspace),
+		EinoRunner: runner,
+		AuthorizationContextProvider: func(context.Context, string) (protocol.AuthorizationContext, error) {
+			return protocol.AuthorizationContext{}, fmt.Errorf("identity provider unavailable")
+		},
+		NewSessionID: func() string { return "sess_eino" },
+	})
+	if _, err := rt.Start(context.Background(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	events := rt.SendMessage(context.Background(), "hello")
+	if runner.runCalls != 0 {
+		t.Fatalf("Eino runner called %d times after authorization failure", runner.runCalls)
+	}
+	if !hasMessage(events, protocol.EventError, "authorization context provider: identity provider unavailable") {
+		t.Fatalf("authorization provider failure was not surfaced: %+v", events)
+	}
+	if hasEvent(events, protocol.EventAssistantDone) {
+		t.Fatalf("authorization failure returned runner output: %+v", events)
 	}
 }
 
@@ -184,11 +255,12 @@ func TestRuntimeEinoModeConfirmsSideEffectTool(t *testing.T) {
 	bridge := NewSideEffectBridge()
 	einoRunner := &sideEffectEinoRunner{bridge: bridge}
 	rt := New(Dependencies{
-		Workspace:    workspace,
-		Sessions:     store,
-		EinoRunner:   einoRunner,
-		SideEffects:  bridge,
-		NewSessionID: func() string { return "sess_eino" },
+		Workspace:                    workspace,
+		Sessions:                     store,
+		EinoRunner:                   einoRunner,
+		AuthorizationContextProvider: testAuthorizationContextProvider,
+		SideEffects:                  bridge,
+		NewSessionID:                 func() string { return "sess_eino" },
 	})
 	if _, err := rt.Start(context.Background(), StartOptions{}); err != nil {
 		t.Fatal(err)
@@ -288,11 +360,12 @@ func TestRuntimeEinoModeRejectsSideEffectTool(t *testing.T) {
 	bridge := NewSideEffectBridge()
 	einoRunner := &sideEffectEinoRunner{bridge: bridge}
 	rt := New(Dependencies{
-		Workspace:    workspace,
-		Sessions:     local.New(workspace),
-		EinoRunner:   einoRunner,
-		SideEffects:  bridge,
-		NewSessionID: func() string { return "sess_eino" },
+		Workspace:                    workspace,
+		Sessions:                     local.New(workspace),
+		EinoRunner:                   einoRunner,
+		AuthorizationContextProvider: testAuthorizationContextProvider,
+		SideEffects:                  bridge,
+		NewSessionID:                 func() string { return "sess_eino" },
 	})
 	if _, err := rt.Start(context.Background(), StartOptions{}); err != nil {
 		t.Fatal(err)
@@ -359,10 +432,11 @@ func TestRuntimeEinoModePersistsPartialEventsOnRunnerError(t *testing.T) {
 	workspace := t.TempDir()
 	store := local.New(workspace)
 	rt := New(Dependencies{
-		Workspace:    workspace,
-		Sessions:     store,
-		EinoRunner:   &fakeEinoRunner{events: []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, "", "partial answer", nil)}, err: fmt.Errorf("runner failed")},
-		NewSessionID: func() string { return "sess_eino" },
+		Workspace:                    workspace,
+		Sessions:                     store,
+		EinoRunner:                   &fakeEinoRunner{events: []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, "", "partial answer", nil)}, err: fmt.Errorf("runner failed")},
+		AuthorizationContextProvider: testAuthorizationContextProvider,
+		NewSessionID:                 func() string { return "sess_eino" },
 	})
 	if _, err := rt.Start(context.Background(), StartOptions{}); err != nil {
 		t.Fatal(err)
@@ -492,10 +566,14 @@ func hasMessage(events []protocol.Event, eventType protocol.EventType, message s
 }
 
 type fakeEinoRunner struct {
-	tools       []RunnerToolInfo
-	events      []protocol.Event
-	lastHistory []protocol.Event
-	err         error
+	tools              []RunnerToolInfo
+	events             []protocol.Event
+	lastHistory        []protocol.Event
+	authorization      protocol.AuthorizationContext
+	authorizationBound bool
+	sideEffectSession  string
+	runCalls           int
+	err                error
 }
 
 type fakeToolExecutor struct {
@@ -562,7 +640,10 @@ func (r *fakeEinoRunner) ToolInventory(context.Context) ([]RunnerToolInfo, error
 	return append([]RunnerToolInfo(nil), r.tools...), nil
 }
 
-func (r *fakeEinoRunner) Run(_ context.Context, input EinoRunInput) ([]protocol.Event, error) {
+func (r *fakeEinoRunner) Run(ctx context.Context, input EinoRunInput) ([]protocol.Event, error) {
+	r.runCalls++
+	r.authorization, r.authorizationBound = protocol.AuthorizationContextFrom(ctx)
+	r.sideEffectSession = sideEffectSessionID(ctx)
 	if len(r.events) == 0 {
 		return nil, fmt.Errorf("fake Eino runner does not execute")
 	}
@@ -573,6 +654,27 @@ func (r *fakeEinoRunner) Run(_ context.Context, input EinoRunInput) ([]protocol.
 		events = append(events, event)
 	}
 	return events, r.err
+}
+
+func testAuthorizationContextProvider(_ context.Context, sessionID string) (protocol.AuthorizationContext, error) {
+	return testAuthorizationContext(sessionID), nil
+}
+
+func testAuthorizationContext(sessionID string) protocol.AuthorizationContext {
+	return protocol.AuthorizationContext{
+		Version:              protocol.SecurityContractVersion,
+		TenantID:             "local",
+		KnowledgeBaseID:      "default",
+		PrincipalID:          "local-user",
+		SessionID:            sessionID,
+		RequestID:            "request-1",
+		AgentID:              "agent-1",
+		TaskID:               "task-1",
+		AuthorizationModelID: "local-v1",
+		IdentityWatermark:    "identity-v1",
+		ACLWatermark:         "acl-v1",
+		Consistency:          protocol.ConsistencyHigherConsistency,
+	}
 }
 
 func must(t *testing.T, err error) {

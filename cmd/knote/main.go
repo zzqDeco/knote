@@ -11,6 +11,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	einotools "github.com/zzqDeco/knote/internal/eino/tools"
+	"github.com/zzqDeco/knote/internal/knowledge/authorized/fixture"
 	"github.com/zzqDeco/knote/internal/knowledge/kag"
 	"github.com/zzqDeco/knote/internal/knowledge/versioned"
 	"github.com/zzqDeco/knote/internal/protocol"
@@ -86,14 +87,35 @@ func newRuntime(ctx context.Context, workspacePath string, resumeID string) (run
 		RuntimeDir:  repoCfg.KAG.RuntimeDir,
 	}
 	knowledgeService := versioned.New(versioned.Options{Workspace: workspace, Repo: repo, Versions: repo, Backend: kagClient, Mode: knowledgeMode})
+	permissionedService, err := fixture.New(kagClient)
+	if err != nil {
+		return nil, nil, err
+	}
+	principal, err := permissionedPrincipal()
+	if err != nil {
+		return nil, nil, err
+	}
+	permissionedQuery := func(ctx context.Context, request protocol.QueryRequest) (einotools.PermissionedQueryResult, error) {
+		result, err := permissionedService.Query(ctx, request)
+		if err != nil {
+			return einotools.PermissionedQueryResult{}, err
+		}
+		return einotools.PermissionedQueryResult{
+			Answer:          result.Generation.Answer,
+			Mode:            result.Generation.Mode,
+			EvidencePackage: result.Evidence,
+		}, nil
+	}
 	sideEffects := runtime.NewSideEffectBridge()
 	approvedEinoTools := einotools.ByNameWithOptions(einotools.Options{
-		Service:        knowledgeService,
-		SideEffectGate: func(context.Context, einotools.SideEffectRequest) error { return nil },
+		Service:           knowledgeService,
+		PermissionedQuery: permissionedQuery,
+		SideEffectGate:    func(context.Context, einotools.SideEffectRequest) error { return nil },
 	})
 	einoTools := einotools.NewWithOptions(einotools.Options{
-		Service:        knowledgeService,
-		SideEffectGate: newEinoSideEffectGate(sideEffects, approvedEinoTools),
+		Service:           knowledgeService,
+		PermissionedQuery: permissionedQuery,
+		SideEffectGate:    newEinoSideEffectGate(sideEffects, approvedEinoTools),
 	})
 	toolExecutor := runtimeeino.NewToolExecutor(einoTools)
 	einoRunner, err := newEinoRunner(ctx, repoCfg, einoTools)
@@ -109,9 +131,15 @@ func newRuntime(ctx context.Context, workspacePath string, resumeID string) (run
 		Knowledge:     knowledgeService,
 		RunnerMode:    runtime.RunnerModeEino,
 		EinoRunner:    einoRunner,
-		SideEffects:   sideEffects,
-		ToolExecutor:  toolExecutor,
-		NewSessionID:  local.NewSessionID,
+		AuthorizationContextProvider: func(ctx context.Context, sessionID string) (protocol.AuthorizationContext, error) {
+			if err := ctx.Err(); err != nil {
+				return protocol.AuthorizationContext{}, err
+			}
+			return fixture.Authorization(principal, sessionID), nil
+		},
+		SideEffects:  sideEffects,
+		ToolExecutor: toolExecutor,
+		NewSessionID: local.NewSessionID,
 	})
 	events, err := rt.Start(ctx, runtime.StartOptions{ResumeID: resumeID})
 	return rt, events, err

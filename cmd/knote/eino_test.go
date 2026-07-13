@@ -71,6 +71,25 @@ func TestNewEinoRunnerUsesOpenAIEnvironmentOverrides(t *testing.T) {
 	}
 }
 
+func TestPermissionedPrincipalUsesTrustedRuntimeEnvironment(t *testing.T) {
+	t.Setenv(permissionedPrincipalEnv, "")
+	principal, err := permissionedPrincipal()
+	if err != nil || principal != "alice" {
+		t.Fatalf("default principal = %q, %v; want alice", principal, err)
+	}
+
+	t.Setenv(permissionedPrincipalEnv, "bob")
+	principal, err = permissionedPrincipal()
+	if err != nil || principal != "bob" {
+		t.Fatalf("configured principal = %q, %v; want bob", principal, err)
+	}
+
+	t.Setenv(permissionedPrincipalEnv, "mallory")
+	if _, err := permissionedPrincipal(); err == nil || !strings.Contains(err.Error(), permissionedPrincipalEnv) {
+		t.Fatalf("unknown principal should fail closed, got %v", err)
+	}
+}
+
 func clearEinoEnv(t *testing.T) {
 	t.Helper()
 	for _, name := range []string{
@@ -81,6 +100,7 @@ func clearEinoEnv(t *testing.T) {
 		"KNOTE_EINO_REASONING_EFFORT",
 		"KNOTE_EINO_MODEL_PROFILE",
 		"KNOTE_RUNTIME_MODE",
+		permissionedPrincipalEnv,
 		"OPENAI_MODEL",
 		"OPENAI_API_KEY",
 		"OPENAI_BASE_URL",
