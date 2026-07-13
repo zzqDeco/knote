@@ -273,6 +273,14 @@ def real_graph_authorization() -> dict[str, object]:
 
 
 class AdapterTest(unittest.TestCase):
+    def test_read_artifact_file_rejects_oversized_input_with_a_bounded_read(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "oversized.json"
+            path.write_bytes(b"123456789")
+            with self.assertRaises(adapter.AdapterRequestError):
+                adapter.read_artifact_file(path, root, "oversized fixture", 8)
+
     def test_fake_health(self) -> None:
         env = os.environ.copy()
         env["KNOTE_KAG_FAKE"] = "1"

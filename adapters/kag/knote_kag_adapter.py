@@ -149,6 +149,8 @@ PROJECTION_ID_RE = re.compile(r"prj_[0-9a-f]{32}\Z")
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 MAX_GRAPH_BINDING_FILE_BYTES = 64 << 20
 MAX_GRAPH_BINDING_LINE_BYTES = 1 << 20
+MAX_ARTIFACT_CURRENT_POINTER_BYTES = 64 << 10
+MAX_ARTIFACT_BUNDLE_MANIFEST_BYTES = 4 << 20
 
 FAKE_INTRO_ID = "res_00000000000000000000000000000001"
 FAKE_DENIED_CANARY_ID = "res_00000000000000000000000000000002"
@@ -1372,7 +1374,7 @@ def require_artifact_directory(path: Path, field: str) -> None:
         )
 
 
-def read_artifact_file(path: Path, root: Path, field: str) -> bytes:
+def read_artifact_file(path: Path, root: Path, field: str, max_bytes: int) -> bytes:
     try:
         resolved_root = root.resolve(strict=True)
         resolved = path.resolve(strict=True)
@@ -1396,11 +1398,17 @@ def read_artifact_file(path: Path, root: Path, field: str) -> bytes:
             break
         current = current.parent
     try:
-        return path.read_bytes()
+        with path.open("rb") as stream:
+            data = stream.read(max_bytes + 1)
     except OSError as exc:
         raise AdapterRequestError(
             f"cannot read {field}: {exc}", INVALID_GRAPH_BINDING_CODE
         ) from exc
+    if len(data) > max_bytes:
+        raise AdapterRequestError(
+            f"{field} exceeds the file size limit", INVALID_GRAPH_BINDING_CODE
+        )
+    return data
 
 
 def decode_artifact_object(data: bytes, field: str) -> dict[str, Any]:
@@ -1465,7 +1473,12 @@ def verified_jsonl_rows(
             f"{field} exceeds the graph binding file limit",
             INVALID_GRAPH_BINDING_CODE,
         )
-    data = read_artifact_file(bundle_dir / descriptor["path"], bundle_dir, field)
+    data = read_artifact_file(
+        bundle_dir / descriptor["path"],
+        bundle_dir,
+        field,
+        MAX_GRAPH_BINDING_FILE_BYTES,
+    )
     if hashlib.sha256(data).hexdigest() != descriptor["sha256"]:
         raise AdapterRequestError(
             f"{field} digest does not match the bundle manifest",
@@ -1667,7 +1680,10 @@ def _load_current_graph_contract(
     require_artifact_directory(artifacts_dir, "artifacts directory")
     require_artifact_directory(bundles_dir, "artifact bundles directory")
     current_data = read_artifact_file(
-        artifacts_dir / "current.json", artifacts_dir, "artifact current pointer"
+        artifacts_dir / "current.json",
+        artifacts_dir,
+        "artifact current pointer",
+        MAX_ARTIFACT_CURRENT_POINTER_BYTES,
     )
     current = decode_artifact_object(current_data, "artifact current pointer")
     validate_exact_fields(current, CURRENT_POINTER_FIELDS, "artifact current pointer")
@@ -1686,7 +1702,10 @@ def _load_current_graph_contract(
     bundle_dir = bundles_dir / projection_id
     require_artifact_directory(bundle_dir, "selected artifact bundle")
     manifest_data = read_artifact_file(
-        bundle_dir / "manifest.json", bundle_dir, "artifact bundle manifest"
+        bundle_dir / "manifest.json",
+        bundle_dir,
+        "artifact bundle manifest",
+        MAX_ARTIFACT_BUNDLE_MANIFEST_BYTES,
     )
     if hashlib.sha256(manifest_data).hexdigest() != manifest_digest:
         raise AdapterRequestError("artifact bundle manifest digest does not match current pointer", INVALID_GRAPH_BINDING_CODE)

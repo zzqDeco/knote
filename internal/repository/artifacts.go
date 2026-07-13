@@ -47,8 +47,24 @@ func CanonicalArtifactFiles(set ArtifactSet) ([]ArtifactFilePayload, error) {
 		return nil, fmt.Errorf("graph bindings require a declared graph binding contract version")
 	}
 	if set.BundleManifest.GraphBindingContractVersion != 0 {
+		if set.BundleManifest.GraphBindingContractVersion != protocol.GraphBindingContractVersion {
+			return nil, fmt.Errorf(
+				"unsupported graph binding contract version %d",
+				set.BundleManifest.GraphBindingContractVersion,
+			)
+		}
 		if err := protocol.ValidateGraphResourceBindings(graphBindings); err != nil {
 			return nil, err
+		}
+		versions := graphBindings[0].Resource.Versions
+		if versions.Source != set.BundleManifest.SourceSnapshot.Version {
+			return nil, fmt.Errorf("graph binding source version does not match bundle manifest")
+		}
+		if versions.ACL != set.BundleManifest.AuthorizationVersion {
+			return nil, fmt.Errorf("graph binding ACL version does not match bundle manifest")
+		}
+		if versions.Projection != set.BundleManifest.ProjectionVersion {
+			return nil, fmt.Errorf("graph binding projection version does not match bundle manifest")
 		}
 		if err := protocol.ValidateClaimTripleBindings(graphBindings, claimBindings); err != nil {
 			return nil, err
