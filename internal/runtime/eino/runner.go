@@ -111,6 +111,9 @@ func (r *Runner) Run(ctx context.Context, input runtime.EinoRunInput) ([]protoco
 				events = append(events, protocol.NewEvent(protocol.EventError, input.SessionID, generic.Error(), nil))
 				return events, generic
 			}
+			if allowUnboundAssistant {
+				classifySafeToolAssistantEvents(projected)
+			}
 		}
 		events = append(events, projected...)
 	}
@@ -233,6 +236,49 @@ func hasAssistantOutput(events []protocol.Event) bool {
 		}
 	}
 	return false
+}
+
+func classifySafeToolAssistantEvents(events []protocol.Event) {
+	for index := range events {
+		event := &events[index]
+		switch event.Type {
+		case protocol.EventToolComplete:
+			toolName := eventToolName(event.Payload)
+			if toolName == "" || permissionedToolName(toolName) {
+				continue
+			}
+		case protocol.EventAssistantDone:
+		default:
+			continue
+		}
+		event.Payload = payloadWithReplayClass(event.Payload)
+	}
+}
+
+func payloadWithReplayClass(payload any) any {
+	switch value := payload.(type) {
+	case nil:
+		return map[string]string{runtime.SafeToolAssistantReplayClassKey: runtime.SafeToolAssistantReplayClassV1}
+	case map[string]string:
+		out := make(map[string]string, len(value)+1)
+		for key, item := range value {
+			out[key] = item
+		}
+		out[runtime.SafeToolAssistantReplayClassKey] = runtime.SafeToolAssistantReplayClassV1
+		return out
+	case map[string]any:
+		out := make(map[string]any, len(value)+1)
+		for key, item := range value {
+			out[key] = item
+		}
+		out[runtime.SafeToolAssistantReplayClassKey] = runtime.SafeToolAssistantReplayClassV1
+		return out
+	default:
+		return map[string]any{
+			runtime.SafeToolAssistantReplayClassKey: runtime.SafeToolAssistantReplayClassV1,
+			"value":                                 payload,
+		}
+	}
 }
 
 func bindProjectedEvents(events []protocol.Event, binding *protocol.ProtectedContentBinding) {

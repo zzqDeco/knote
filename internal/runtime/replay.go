@@ -19,6 +19,13 @@ type ProtectedContentAuthorizer func(
 	binding protocol.ProtectedContentBinding,
 ) error
 
+const (
+	// SafeToolAssistantReplayClassKey and V1 are persisted wire values shared
+	// by the safe Eino producer and permissioned replay validator.
+	SafeToolAssistantReplayClassKey = "replay_class"
+	SafeToolAssistantReplayClassV1  = "safe-tool-assistant/v1"
+)
+
 type replayBlock struct {
 	binding protocol.ProtectedContentBinding
 	valid   bool
@@ -64,27 +71,94 @@ func (m *Manager) filterPersistedEvents(
 	filtered := make([]protocol.Event, 0, len(events))
 	permissionedReplay := m.deps.AuthorizationContextProvider != nil
 	slashTurn := false
+	turnSessionID := ""
+	classifiedSafeTool := false
+	permissionedTurn := false
 	for _, event := range events {
 		if event.Type == protocol.EventUserMessage {
 			slashTurn = strings.HasPrefix(strings.TrimSpace(event.Message), "/")
+			turnSessionID = event.SessionID
+			classifiedSafeTool = false
+			permissionedTurn = false
 		}
 		if event.ProtectedContent != nil {
 			slashTurn = false
+			permissionedTurn = true
 			if allowed[event.ProtectedContent.BlockID] {
 				filtered = append(filtered, event)
 			}
 			continue
 		}
+		if permissionedReplayToolEvent(event) {
+			permissionedTurn = true
+		}
+		if classifiedSafeToolReplayEvent(event, turnSessionID, current.SessionID) {
+			classifiedSafeTool = true
+		}
 		unprotectedSlash := slashReplayEvent(event, slashTurn)
-		if permissionedReplay && legacyProtectedEvent(event) && !unprotectedSlash {
+		safeToolAssistant := classifiedSafeToolAssistantReplayEvent(
+			event,
+			turnSessionID,
+			current.SessionID,
+			classifiedSafeTool,
+			permissionedTurn,
+			slashTurn,
+		)
+		if event.Type == protocol.EventAssistantDone || event.Type == protocol.EventError {
+			classifiedSafeTool = false
+			if unprotectedSlash {
+				slashTurn = false
+			}
+		}
+		if permissionedReplay && legacyProtectedEvent(event) && !unprotectedSlash && !safeToolAssistant {
 			continue
 		}
 		filtered = append(filtered, event)
-		if unprotectedSlash && (event.Type == protocol.EventAssistantDone || event.Type == protocol.EventError) {
-			slashTurn = false
-		}
 	}
 	return filtered
+}
+
+func classifiedSafeToolReplayEvent(event protocol.Event, turnSessionID, currentSessionID string) bool {
+	if event.Type != protocol.EventToolComplete ||
+		turnSessionID == "" ||
+		turnSessionID != currentSessionID ||
+		event.SessionID != turnSessionID ||
+		eventPayloadValue(event.Payload, SafeToolAssistantReplayClassKey) != SafeToolAssistantReplayClassV1 {
+		return false
+	}
+	toolName := eventToolName(event.Payload)
+	return toolName != "" && !permissionedToolName(toolName)
+}
+
+func classifiedSafeToolAssistantReplayEvent(
+	event protocol.Event,
+	turnSessionID string,
+	currentSessionID string,
+	classifiedSafeTool bool,
+	permissionedTurn bool,
+	slashTurn bool,
+) bool {
+	return event.Type == protocol.EventAssistantDone &&
+		classifiedSafeTool &&
+		!permissionedTurn &&
+		!slashTurn &&
+		turnSessionID != "" &&
+		turnSessionID == currentSessionID &&
+		event.SessionID == turnSessionID &&
+		eventPayloadValue(event.Payload, SafeToolAssistantReplayClassKey) == SafeToolAssistantReplayClassV1
+}
+
+func permissionedReplayToolEvent(event protocol.Event) bool {
+	switch event.Type {
+	case protocol.EventToolStart, protocol.EventToolProgress, protocol.EventToolComplete, protocol.EventToolError:
+		return permissionedToolName(eventToolName(event.Payload))
+	default:
+		return false
+	}
+}
+
+func permissionedToolName(toolName string) bool {
+	return toolName == einotools.NameQuery || toolName == einotools.NameExplain
 }
 
 func slashReplayEvent(event protocol.Event, slashTurn bool) bool {
@@ -107,8 +181,7 @@ func legacyProtectedEvent(event protocol.Event) bool {
 	case protocol.EventAssistantDelta, protocol.EventAssistantDone, protocol.EventError:
 		return true
 	case protocol.EventToolStart, protocol.EventToolProgress, protocol.EventToolComplete, protocol.EventToolError:
-		toolName := eventToolName(event.Payload)
-		return toolName == einotools.NameQuery || toolName == einotools.NameExplain
+		return permissionedToolName(eventToolName(event.Payload))
 	default:
 		return false
 	}

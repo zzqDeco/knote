@@ -281,6 +281,83 @@ func TestRunnerAllowsSafeNonPermissionedToolAnswerInAuthorizationContext(t *test
 		if event.Type == protocol.EventError || event.ProtectedContent != nil {
 			t.Fatalf("safe non-permissioned turn was rejected or protected: %+v", events)
 		}
+		if event.Type == protocol.EventToolComplete || event.Type == protocol.EventAssistantDone {
+			if got := eventPayloadString(event.Payload, "replay_class"); got != "safe-tool-assistant/v1" {
+				t.Fatalf("safe replay class = %q, want safe-tool-assistant/v1: %+v", got, event)
+			}
+		}
+	}
+}
+
+func TestRunnerPersistsLoadsAndResumesSafeNonPermissionedToolAnswer(t *testing.T) {
+	workspace := t.TempDir()
+	authorization := testEinoAuthorization("sess_safe_replay")
+	store := local.New(workspace)
+	provider := func(_ context.Context, sessionID string) (protocol.AuthorizationContext, error) {
+		current := authorization
+		current.SessionID = sessionID
+		return current, nil
+	}
+	newExecutor := func() *fakeExecutor {
+		return &fakeExecutor{events: []*adk.AgentEvent{
+			adk.EventFromMessage(schema.AssistantMessage("", []schema.ToolCall{{
+				ID: "call_diff", Function: schema.FunctionCall{Name: "knote_diff", Arguments: `{}`},
+			}}), nil, schema.Assistant, ""),
+			adk.EventFromMessage(schema.ToolMessage("SAFE_PERSISTED_TOOL_CANARY", "call_diff", schema.WithToolName("knote_diff")), nil, schema.Tool, "knote_diff"),
+			adk.EventFromMessage(schema.AssistantMessage("SAFE_PERSISTED_ANSWER_CANARY", nil), nil, schema.Assistant, ""),
+		}}
+	}
+
+	firstExecutor := newExecutor()
+	manager := runtime.New(runtime.Dependencies{
+		Workspace:                    workspace,
+		Sessions:                     store,
+		EinoRunner:                   NewRunner(Options{Executor: firstExecutor}),
+		AuthorizationContextProvider: provider,
+		NewSessionID:                 func() string { return authorization.SessionID },
+	})
+	if _, err := manager.Start(context.Background(), runtime.StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	produced := manager.SendMessage(context.Background(), "compare versions")
+	if !hasEventMessage(produced, protocol.EventAssistantDone, "SAFE_PERSISTED_ANSWER_CANARY") {
+		t.Fatalf("safe answer was not produced: %+v", produced)
+	}
+	raw, err := store.Load(context.Background(), authorization.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	persisted := false
+	for _, event := range raw {
+		if event.Message == "SAFE_PERSISTED_ANSWER_CANARY" {
+			persisted = true
+			if eventPayloadString(event.Payload, "replay_class") != "safe-tool-assistant/v1" {
+				t.Fatalf("safe replay class did not survive persistence: %+v", event)
+			}
+		}
+	}
+	if !persisted {
+		t.Fatalf("safe answer was not persisted: %+v", raw)
+	}
+
+	resumeExecutor := newExecutor()
+	resumed := runtime.New(runtime.Dependencies{
+		Workspace:                    workspace,
+		Sessions:                     store,
+		EinoRunner:                   NewRunner(Options{Executor: resumeExecutor}),
+		AuthorizationContextProvider: provider,
+		NewSessionID:                 func() string { return "sess_other" },
+	})
+	replayed, err := resumed.Start(context.Background(), runtime.StartOptions{ResumeID: authorization.SessionID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasEventMessage(replayed, protocol.EventAssistantDone, "SAFE_PERSISTED_ANSWER_CANARY") {
+		t.Fatalf("safe answer was dropped during resume: %+v", replayed)
+	}
+	resumed.SendMessage(context.Background(), "follow up")
+	if got := messageContents(resumeExecutor.messages); strings.Join(got, "|") != "compare versions|SAFE_PERSISTED_ANSWER_CANARY|follow up" {
+		t.Fatalf("loadHistory dropped or changed the safe answer: %+v", got)
 	}
 }
 
@@ -309,6 +386,9 @@ func TestRunnerBindsAllPermissionedToolOutputsAndAnswerToOneBlock(t *testing.T) 
 		}
 		if event.ProtectedContent == nil {
 			t.Fatalf("permissioned ADK event has no protected binding: %+v", event)
+		}
+		if eventPayloadString(event.Payload, "replay_class") != "" {
+			t.Fatalf("permissioned ADK event received a safe replay class: %+v", event)
 		}
 		if blockID == "" {
 			blockID = event.ProtectedContent.BlockID
@@ -558,6 +638,9 @@ func TestRunnerFailsPermissionedOutputClosedAndSanitizesErrors(t *testing.T) {
 				t.Fatalf("permissioned ADK error = %v, events=%+v", err, events)
 			}
 			for _, event := range events {
+				if eventPayloadString(event.Payload, "replay_class") != "" {
+					t.Fatalf("failed permissioned flow received a safe replay class: %+v", events)
+				}
 				if strings.Contains(event.Message, "MALFORMED_OUTPUT_CANARY") ||
 					strings.Contains(event.Message, "SAFE_TOOL_BEFORE_MALFORMED_CANARY") ||
 					strings.Contains(event.Message, "MIXED_UNBOUND_ANSWER_CANARY") ||
@@ -688,6 +771,15 @@ func hasEvent(events []protocol.Event, eventType protocol.EventType) bool {
 	return false
 }
 
+func hasEventMessage(events []protocol.Event, eventType protocol.EventType, message string) bool {
+	for _, event := range events {
+		if event.Type == eventType && event.Message == message {
+			return true
+		}
+	}
+	return false
+}
+
 func countEvents(events []protocol.Event, eventType protocol.EventType) int {
 	count := 0
 	for _, event := range events {
@@ -715,4 +807,16 @@ func messageContents(messages []*schema.Message) []string {
 		}
 	}
 	return out
+}
+
+func eventPayloadString(payload any, key string) string {
+	switch value := payload.(type) {
+	case map[string]string:
+		return strings.TrimSpace(value[key])
+	case map[string]any:
+		item, _ := value[key].(string)
+		return strings.TrimSpace(item)
+	default:
+		return ""
+	}
 }

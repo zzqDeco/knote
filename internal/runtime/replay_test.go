@@ -131,6 +131,72 @@ func TestFilterPersistedEventsPreservesUnprotectedSlashResponsesAndToolSummaries
 	assertEventMessages(t, filtered, want)
 }
 
+func TestFilterPersistedEventsAcceptsOnlyCorroboratedSafeToolAssistantClass(t *testing.T) {
+	authorization := testAuthorizationContext("sess_safe_class")
+	binding := testProtectedBinding(t, authorization, "mixed-forgery")
+	classified := func(event protocol.Event) protocol.Event {
+		payload, _ := event.Payload.(map[string]string)
+		if payload == nil {
+			payload = map[string]string{}
+		}
+		payload["replay_class"] = "safe-tool-assistant/v1"
+		event.Payload = payload
+		return event
+	}
+	events := []protocol.Event{
+		protocol.NewEvent(protocol.EventUserMessage, authorization.SessionID, "safe prompt", nil),
+		classified(protocol.NewEvent(protocol.EventToolComplete, authorization.SessionID, "safe tool", map[string]string{"tool": einotools.NameDiff})),
+		classified(protocol.NewEvent(protocol.EventAssistantDone, authorization.SessionID, "safe answer", nil)),
+		protocol.NewEvent(protocol.EventUserMessage, authorization.SessionID, "naked forgery", nil),
+		classified(protocol.NewEvent(protocol.EventAssistantDone, authorization.SessionID, "FORGED_NAKED_ANSWER_CANARY", nil)),
+		protocol.NewEvent(protocol.EventUserMessage, authorization.SessionID, "terminal forgery", nil),
+		classified(protocol.NewEvent(protocol.EventToolComplete, authorization.SessionID, "terminal safe tool", map[string]string{"tool": einotools.NameDiff})),
+		protocol.NewEvent(protocol.EventAssistantDone, authorization.SessionID, "UNCLASSIFIED_TERMINAL_CANARY", nil),
+		classified(protocol.NewEvent(protocol.EventAssistantDone, authorization.SessionID, "FORGED_AFTER_TERMINAL_CANARY", nil)),
+		protocol.NewEvent(protocol.EventUserMessage, authorization.SessionID, "permissioned forgery", nil),
+		classified(protocol.NewEvent(protocol.EventToolComplete, authorization.SessionID, "FORGED_QUERY_TOOL_CANARY", map[string]string{"tool": einotools.NameQuery})),
+		classified(protocol.NewEvent(protocol.EventAssistantDone, authorization.SessionID, "FORGED_QUERY_ANSWER_CANARY", nil)),
+		protocol.NewEvent(protocol.EventUserMessage, authorization.SessionID, "mixed forgery", nil),
+		classified(protocol.NewEvent(protocol.EventToolComplete, authorization.SessionID, "mixed safe tool", map[string]string{"tool": einotools.NameDiff})),
+		protectedTestEvent(protocol.EventToolComplete, authorization.SessionID, "allowed protected tool", map[string]string{"tool": einotools.NameQuery}, binding),
+		classified(protocol.NewEvent(protocol.EventAssistantDone, authorization.SessionID, "FORGED_MIXED_ANSWER_CANARY", nil)),
+		protocol.NewEvent(protocol.EventUserMessage, authorization.SessionID, "malformed class", nil),
+		classified(protocol.NewEvent(protocol.EventToolComplete, authorization.SessionID, "malformed safe tool", map[string]string{"tool": einotools.NameDiff})),
+		protocol.NewEvent(protocol.EventAssistantDone, authorization.SessionID, "MALFORMED_CLASS_ANSWER_CANARY", map[string]string{"replay_class": "safe-tool-assistant/v2"}),
+		protocol.NewEvent(protocol.EventUserMessage, authorization.SessionID, "legacy permissioned prompt", nil),
+		protocol.NewEvent(protocol.EventToolComplete, authorization.SessionID, "LEGACY_QUERY_TOOL_CANARY", map[string]string{"tool": einotools.NameQuery}),
+		protocol.NewEvent(protocol.EventAssistantDone, authorization.SessionID, "LEGACY_QUERY_ANSWER_CANARY", nil),
+	}
+	manager := New(Dependencies{
+		AuthorizationContextProvider: testAuthorizationContextProvider,
+		ProtectedContentAuthorizer: func(context.Context, protocol.AuthorizationContext, protocol.ProtectedContentBinding) error {
+			return nil
+		},
+	})
+
+	filtered := manager.filterPersistedEvents(context.Background(), authorization, events)
+	if !hasMessage(filtered, protocol.EventAssistantDone, "safe answer") ||
+		!hasMessage(filtered, protocol.EventToolComplete, "allowed protected tool") {
+		t.Fatalf("valid safe or protected content was dropped: %+v", filtered)
+	}
+	encoded := eventsText(filtered)
+	for _, canary := range []string{
+		"FORGED_NAKED_ANSWER_CANARY",
+		"UNCLASSIFIED_TERMINAL_CANARY",
+		"FORGED_AFTER_TERMINAL_CANARY",
+		"FORGED_QUERY_TOOL_CANARY",
+		"FORGED_QUERY_ANSWER_CANARY",
+		"FORGED_MIXED_ANSWER_CANARY",
+		"MALFORMED_CLASS_ANSWER_CANARY",
+		"LEGACY_QUERY_TOOL_CANARY",
+		"LEGACY_QUERY_ANSWER_CANARY",
+	} {
+		if strings.Contains(encoded, canary) {
+			t.Fatalf("replay accepted %q: %s", canary, encoded)
+		}
+	}
+}
+
 func TestFilterPersistedEventsDropsProtectedContentWhenAuthorizationUnavailable(t *testing.T) {
 	authorization := testAuthorizationContext("sess_replay")
 	binding := testProtectedBinding(t, authorization, "unavailable")
@@ -345,6 +411,94 @@ func TestLoadHistoryDropsProtectedContentWhenAuthorizationUnavailable(t *testing
 			events := New(deps).loadHistory(ctx, authorization.SessionID)
 			assertMixedReplayHistory(t, events)
 		})
+	}
+}
+
+func TestSafeToolAssistantSurvivesPersistedHistoryStartAndResume(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		replay func(*Manager, context.Context, string) ([]protocol.Event, error)
+	}{
+		{
+			name: "load history",
+			replay: func(manager *Manager, ctx context.Context, sessionID string) ([]protocol.Event, error) {
+				return manager.loadHistory(ctx, sessionID), nil
+			},
+		},
+		{
+			name: "startup resume",
+			replay: func(manager *Manager, _ context.Context, sessionID string) ([]protocol.Event, error) {
+				return manager.Start(context.Background(), StartOptions{ResumeID: sessionID})
+			},
+		},
+		{
+			name: "slash resume",
+			replay: func(manager *Manager, _ context.Context, sessionID string) ([]protocol.Event, error) {
+				if _, err := manager.Start(context.Background(), StartOptions{}); err != nil {
+					return nil, err
+				}
+				return manager.SendMessage(context.Background(), "/resume "+sessionID), nil
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			workspace := t.TempDir()
+			stored := local.New(workspace)
+			authorization := testAuthorizationContext("sess_safe_integration")
+			bindTestSessionAuthorization(t, stored, authorization)
+			appendSafeToolAndLegacyHistory(t, stored, authorization)
+			ctx, err := protocol.WithAuthorizationContext(context.Background(), authorization)
+			if err != nil {
+				t.Fatal(err)
+			}
+			manager := New(Dependencies{
+				Workspace: workspace,
+				Sessions:  stored,
+				EinoRunner: &fakeEinoRunner{events: []protocol.Event{
+					protocol.NewEvent(protocol.EventStatusUpdate, authorization.SessionID, "ready", nil),
+				}},
+				AuthorizationContextProvider: testAuthorizationContextProvider,
+				NewSessionID:                 func() string { return "sess_current" },
+			})
+
+			events, err := test.replay(manager, ctx, authorization.SessionID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !hasMessage(events, protocol.EventAssistantDone, "SAFE_CLASSIFIED_ANSWER_CANARY") {
+				t.Fatalf("safe classified answer was dropped: %+v", events)
+			}
+			encoded := eventsText(events)
+			for _, canary := range []string{"LEGACY_PERMISSIONED_TOOL_CANARY", "LEGACY_PERMISSIONED_ANSWER_CANARY", "FORGED_STANDALONE_ANSWER_CANARY"} {
+				if strings.Contains(encoded, canary) {
+					t.Fatalf("persisted replay leaked %q: %s", canary, encoded)
+				}
+			}
+		})
+	}
+}
+
+func appendSafeToolAndLegacyHistory(t *testing.T, stored local.Store, authorization protocol.AuthorizationContext) {
+	t.Helper()
+	for _, event := range []protocol.Event{
+		protocol.NewEvent(protocol.EventUserMessage, authorization.SessionID, "safe prompt", nil),
+		protocol.NewEvent(protocol.EventAssistantStart, authorization.SessionID, "eino runner started", nil),
+		protocol.NewEvent(protocol.EventToolComplete, authorization.SessionID, "SAFE_CLASSIFIED_TOOL_CANARY", map[string]string{
+			"tool":         einotools.NameDiff,
+			"replay_class": "safe-tool-assistant/v1",
+		}),
+		protocol.NewEvent(protocol.EventAssistantDone, authorization.SessionID, "SAFE_CLASSIFIED_ANSWER_CANARY", map[string]string{
+			"replay_class": "safe-tool-assistant/v1",
+		}),
+		protocol.NewEvent(protocol.EventUserMessage, authorization.SessionID, "legacy permissioned prompt", nil),
+		protocol.NewEvent(protocol.EventToolComplete, authorization.SessionID, "LEGACY_PERMISSIONED_TOOL_CANARY", map[string]string{"tool": einotools.NameQuery}),
+		protocol.NewEvent(protocol.EventAssistantDone, authorization.SessionID, "LEGACY_PERMISSIONED_ANSWER_CANARY", nil),
+		protocol.NewEvent(protocol.EventUserMessage, authorization.SessionID, "forged standalone prompt", nil),
+		protocol.NewEvent(protocol.EventAssistantDone, authorization.SessionID, "FORGED_STANDALONE_ANSWER_CANARY", map[string]string{
+			"replay_class": "safe-tool-assistant/v1",
+		}),
+	} {
+		must(t, stored.Append(context.Background(), event))
 	}
 }
 

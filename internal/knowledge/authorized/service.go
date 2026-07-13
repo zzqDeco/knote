@@ -120,11 +120,10 @@ func (s *Service) Query(ctx context.Context, request protocol.QueryRequest) (Que
 		)
 		if snapshot, ok := s.cache.get(cacheKey); ok {
 			cached, err := s.revalidateCached(ctx, request, snapshot.result)
-			if err != nil || !s.cache.containsRevision(cacheKey, snapshot.revision) {
-				s.cache.deleteIfRevision(cacheKey, snapshot.revision)
-				return QueryResult{}, ErrProtectedContentUnavailable
+			if err == nil && s.cache.containsRevision(cacheKey, snapshot.revision) {
+				return cached, nil
 			}
-			return cached, nil
+			s.cache.deleteIfRevision(cacheKey, snapshot.revision)
 		}
 	}
 	authorization := request.Authorization
