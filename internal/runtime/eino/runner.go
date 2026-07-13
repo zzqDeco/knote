@@ -131,7 +131,13 @@ func protectedBindingFromAgentEvents(
 		if err != nil {
 			return nil, true, err
 		}
-		if !ok || !permissionedToolName(toolName) {
+		if !ok {
+			continue
+		}
+		if authorized && toolName == "" {
+			return nil, true, errors.New("permissioned run received unnamed tool output")
+		}
+		if !permissionedToolName(toolName) {
 			continue
 		}
 		if !authorized {
@@ -199,6 +205,7 @@ func bindProjectedEvents(events []protocol.Event, binding *protocol.ProtectedCon
 		sanitizePermissionedErrors(events[index : index+1])
 		if event.Type == protocol.EventAssistantDone ||
 			event.Type == protocol.EventError ||
+			event.Type == protocol.EventApprovalRequest ||
 			((event.Type == protocol.EventToolComplete || event.Type == protocol.EventToolError) && permissionedToolName(eventToolName(event.Payload))) {
 			copy := *binding
 			event.ProtectedContent = &copy

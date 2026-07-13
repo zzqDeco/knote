@@ -50,7 +50,7 @@ func TestAuthorizeProtectedContentRechecksDirectAndGroupRevocationsWithStaleWate
 			if err != nil {
 				t.Fatal(err)
 			}
-			service := revocationTestService(t, local, nil, time.Now)
+			service := revocationTestService(t, local, nil, time.Now, revocationTestItem(document, "STALE_WATERMARK_CONTENT_CANARY"))
 
 			before, err := service.AuthorizeProtectedContent(context.Background(), authorization, binding)
 			if err != nil || !before.Allowed() {
@@ -81,7 +81,7 @@ func TestAuthorizeProtectedContentUsesCurrentModelAndHigherConsistency(t *testin
 	authorizer := &queryTestAuthorizer{}
 	service := revocationTestService(t, authorizer, nil, func() time.Time {
 		return time.Date(2026, 7, 13, 8, 0, 0, 0, time.UTC)
-	})
+	}, revocationTestItem(document, "MODEL_CONTENT_CANARY"))
 
 	report, err := service.AuthorizeProtectedContent(context.Background(), current, binding)
 	if err != nil {
@@ -90,12 +90,13 @@ func TestAuthorizeProtectedContentUsesCurrentModelAndHigherConsistency(t *testin
 	if !report.Allowed() || report.Consistency != protocol.ConsistencyHigherConsistency {
 		t.Fatalf("live authorization report = %#v", report)
 	}
-	if len(authorizer.calls) != 1 {
+	if len(authorizer.calls) != 2 {
 		t.Fatalf("live authorization calls = %d", len(authorizer.calls))
 	}
-	call := authorizer.calls[0]
-	if call.AuthorizationModelID != current.AuthorizationModelID || call.Consistency != authz.ConsistencyHigherConsistency {
-		t.Fatalf("live authorization request = %#v", call)
+	for _, call := range authorizer.calls {
+		if call.AuthorizationModelID != current.AuthorizationModelID || call.Consistency != authz.ConsistencyHigherConsistency {
+			t.Fatalf("live authorization request = %#v", call)
+		}
 	}
 }
 
@@ -356,6 +357,92 @@ func TestAuthorizeProtectedContentRejectsChangedChunkAuthorizationBoundaryHandle
 	}
 }
 
+func TestAuthorizeProtectedContentWithoutCacheRejectsExactHandleAndBoundaryDrift(t *testing.T) {
+	authorization := queryTestAuthorization("alice", "request-nil-cache-drift")
+	document := queryTestDocument(queryTestModelID, "content", "projection-v1")
+	changedDocument := document
+	changedDocument.Versions.Content = "content-v2"
+	parent := queryTestDocument(queryTestModelID, "parent", "projection-v1")
+	chunk := queryTestChunk(queryTestOtherID, parent, "chunk")
+	changedParent := parent
+	changedParent.Versions.Content = "content-v2"
+
+	for _, test := range []struct {
+		name     string
+		resource protocol.ResourceHandle
+		boundary protocol.ResourceHandle
+		loaded   protocol.EvidenceItem
+	}{
+		{name: "exact handle", resource: document, boundary: document, loaded: queryTestItem(changedDocument)},
+		{name: "authorization boundary", resource: chunk, boundary: parent, loaded: queryTestChunkItem(chunk, changedParent)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			binding, err := protocol.NewProtectedContentBindingFromResources(
+				authorization.SessionID,
+				authorization.RequestID,
+				[]protocol.ProtectedResourceBinding{{Resource: test.resource, AuthorizationResource: test.boundary}},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			authorizer := &queryTestAuthorizer{}
+			loader := &queryTestLoader{items: map[protocol.ResourceID]protocol.EvidenceItem{
+				test.resource.ResourceID: test.loaded,
+			}}
+			service, err := New(Options{
+				KAG: &queryTestKAG{}, Authorizer: authorizer, Loader: loader,
+				RetrieveLimit: 10, EvidenceLimit: 2, Now: time.Now,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := service.AuthorizeProtectedContent(context.Background(), authorization, binding); !errors.Is(err, ErrProtectedContentUnavailable) {
+				t.Fatalf("nil-cache %s drift remained replayable: %v", test.name, err)
+			}
+			if len(loader.calls) != 1 || len(authorizer.calls) != 1 {
+				t.Fatalf("nil-cache %s checks: authz=%d load=%d", test.name, len(authorizer.calls), len(loader.calls))
+			}
+		})
+	}
+}
+
+func TestAuthorizeProtectedContentRechecksLiveAuthorizationAfterExactReload(t *testing.T) {
+	document := queryTestDocument(queryTestModelID, "content", "projection-v1")
+	authorization := queryTestAuthorization("alice", "request-revoked-during-load")
+	binding := revocationTestBinding(t, authorization, document)
+	events := []string{}
+	revoked := false
+	authorizer := &queryTestAuthorizer{
+		events: &events,
+		decide: func(_ int, request authz.BatchCheckRequest) ([]authz.Decision, error) {
+			return queryTestDecisions(request, func(authz.BatchCheckItem) bool { return !revoked }), nil
+		},
+	}
+	loader := &queryTestLoader{
+		events: &events,
+		load: func([]protocol.ResourceHandle) ([]protocol.EvidenceItem, error) {
+			revoked = true
+			return []protocol.EvidenceItem{queryTestItem(document)}, nil
+		},
+	}
+	service, err := New(Options{
+		KAG: &queryTestKAG{}, Authorizer: authorizer, Loader: loader,
+		RetrieveLimit: 10, EvidenceLimit: 2, Now: time.Now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := service.AuthorizeProtectedContent(context.Background(), authorization, binding)
+	if !errors.Is(err, ErrProtectedContentUnavailable) || report.AllowedCount != 0 || report.DeniedCount != 1 {
+		t.Fatalf("authorization revoked during exact reload = %#v, %v", report, err)
+	}
+	if got := strings.Join(events, ","); got != "authz,load,authz" {
+		t.Fatalf("revocation check order = %q", got)
+	}
+}
+
 func TestAuthorizeProtectedContentRejectsTombstoneIntroducedDuringExactLoad(t *testing.T) {
 	document := queryTestDocument(queryTestModelID, "content", "projection-v1")
 	cache := mustQueryCache(t, 2)
@@ -467,10 +554,15 @@ func revocationTestService(
 	authorizer authz.BatchChecker,
 	cache *QueryCache,
 	now func() time.Time,
+	loaded ...protocol.EvidenceItem,
 ) *Service {
 	t.Helper()
+	items := make(map[protocol.ResourceID]protocol.EvidenceItem, len(loaded))
+	for _, item := range loaded {
+		items[item.Resource.ResourceID] = item
+	}
 	service, err := New(Options{
-		KAG: &queryTestKAG{}, Authorizer: authorizer, Loader: &queryTestLoader{}, Cache: cache,
+		KAG: &queryTestKAG{}, Authorizer: authorizer, Loader: &queryTestLoader{items: items}, Cache: cache,
 		RetrieverVersion: "retriever-v1", PromptVersion: "prompt-v1",
 		RetrieveLimit: 10, EvidenceLimit: 2, Now: now,
 	})
@@ -478,4 +570,15 @@ func revocationTestService(
 		t.Fatal(err)
 	}
 	return service
+}
+
+func revocationTestItem(resource protocol.ResourceHandle, content string) protocol.EvidenceItem {
+	return protocol.EvidenceItem{
+		Resource: resource, Content: content, Derivation: protocol.DerivationAnySupport,
+		Supports: []protocol.ProvenanceSupport{{
+			SupportID: "support-" + string(resource.ResourceID), Resource: resource,
+			Evidence: []protocol.ResourceHandle{resource}, Complete: true,
+		}},
+		Citation: protocol.Citation{Handle: "citation-" + string(resource.ResourceID), Resource: resource},
+	}
 }

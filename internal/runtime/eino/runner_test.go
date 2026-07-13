@@ -11,6 +11,7 @@ import (
 	"github.com/cloudwego/eino/schema"
 
 	"github.com/zzqDeco/knote/internal/protocol"
+	"github.com/zzqDeco/knote/internal/repository/local"
 	"github.com/zzqDeco/knote/internal/runtime"
 )
 
@@ -73,6 +74,29 @@ func TestRunnerProjectsExecutorEvents(t *testing.T) {
 	if got := lastMessage(events, protocol.EventAssistantDone); got != "assistant answer" {
 		t.Fatalf("unexpected assistant answer %q in %+v", got, events)
 	}
+}
+
+func TestRunnerPreservesUnnamedToolOutputWithoutAuthorization(t *testing.T) {
+	runner := NewRunner(Options{Executor: &fakeExecutor{events: []*adk.AgentEvent{
+		adk.EventFromMessage(schema.ToolMessage("NON_PERMISSIONED_TOOL_CANARY", "call_1"), nil, schema.Tool, ""),
+	}}})
+	events, err := runner.Run(context.Background(), runtime.EinoRunInput{SessionID: "s1", Message: "question"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		if event.Type != protocol.EventToolComplete {
+			continue
+		}
+		if event.Message != "NON_PERMISSIONED_TOOL_CANARY" || eventToolName(event.Payload) != "eino_tool" {
+			t.Fatalf("unnamed non-permissioned tool output changed: %+v", event)
+		}
+		if event.ProtectedContent != nil {
+			t.Fatalf("non-permissioned tool output was protected: %+v", event)
+		}
+		return
+	}
+	t.Fatalf("unnamed non-permissioned tool output was not projected: %+v", events)
 }
 
 func TestRunnerProjectsStreamingAndInterruptEvents(t *testing.T) {
@@ -164,6 +188,81 @@ func TestRunnerBindsAllPermissionedToolOutputsAndAnswerToOneBlock(t *testing.T) 
 	}
 }
 
+func TestRunnerBindsPermissionedInterruptForRevocationReplay(t *testing.T) {
+	workspace := t.TempDir()
+	authorization := testEinoAuthorization("sess_eino")
+	evidencePackage := testEinoEvidencePackage(t, authorization, "sources/approval.md", "APPROVAL_CONTENT_CANARY")
+	runner := NewRunner(Options{Executor: &fakeExecutor{events: []*adk.AgentEvent{
+		adk.EventFromMessage(schema.ToolMessage(testPermissionedToolOutput(t, evidencePackage, "answer"), "call_1", schema.WithToolName("knote_query")), nil, schema.Tool, "knote_query"),
+		{
+			Action: &adk.AgentAction{Interrupted: &adk.InterruptInfo{InterruptContexts: []*adk.InterruptCtx{
+				{ID: "agent:test", Info: "PERMISSIONED_APPROVAL_CANARY", IsRootCause: true},
+			}}},
+		},
+	}}})
+	store := local.New(workspace)
+	provider := func(_ context.Context, sessionID string) (protocol.AuthorizationContext, error) {
+		current := authorization
+		current.SessionID = sessionID
+		return current, nil
+	}
+	manager := runtime.New(runtime.Dependencies{
+		Workspace:                    workspace,
+		Sessions:                     store,
+		EinoRunner:                   runner,
+		AuthorizationContextProvider: provider,
+		NewSessionID:                 func() string { return authorization.SessionID },
+	})
+	if _, err := manager.Start(context.Background(), runtime.StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	produced := manager.SendMessage(context.Background(), "question")
+	var blockID string
+	boundTypes := map[protocol.EventType]bool{}
+	for _, event := range produced {
+		if event.Type != protocol.EventToolComplete && event.Type != protocol.EventApprovalRequest {
+			continue
+		}
+		if event.ProtectedContent == nil {
+			t.Fatalf("permissioned tool or approval event has no replay binding: %+v", event)
+		}
+		if blockID == "" {
+			blockID = event.ProtectedContent.BlockID
+		} else if event.ProtectedContent.BlockID != blockID {
+			t.Fatalf("permissioned approval used a different replay block: %+v", produced)
+		}
+		boundTypes[event.Type] = true
+	}
+	if blockID == "" || !boundTypes[protocol.EventToolComplete] || !boundTypes[protocol.EventApprovalRequest] {
+		t.Fatalf("permissioned tool and approval were not both replay-bound: %+v", produced)
+	}
+
+	authorizationCalls := 0
+	replayManager := runtime.New(runtime.Dependencies{
+		Workspace:                    workspace,
+		Sessions:                     store,
+		EinoRunner:                   runner,
+		AuthorizationContextProvider: provider,
+		ProtectedContentAuthorizer: func(context.Context, protocol.AuthorizationContext, protocol.ProtectedContentBinding) error {
+			authorizationCalls++
+			return errors.New("revoked")
+		},
+		NewSessionID: func() string { return "sess_other" },
+	})
+	replayed, err := replayManager.Start(context.Background(), runtime.StartOptions{ResumeID: authorization.SessionID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if authorizationCalls != 1 {
+		t.Fatalf("protected replay authorization calls = %d, want 1", authorizationCalls)
+	}
+	for _, event := range replayed {
+		if strings.Contains(event.Message, "PERMISSIONED_APPROVAL_CANARY") || strings.Contains(event.Message, "APPROVAL_CONTENT_CANARY") {
+			t.Fatalf("revoked permissioned interrupt replay leaked protected content: %+v", replayed)
+		}
+	}
+}
+
 func TestRunnerFailsPermissionedOutputClosedAndSanitizesErrors(t *testing.T) {
 	authorization := testEinoAuthorization("sess_eino")
 	ctx, err := protocol.WithAuthorizationContext(context.Background(), authorization)
@@ -190,6 +289,12 @@ func TestRunnerFailsPermissionedOutputClosedAndSanitizesErrors(t *testing.T) {
 			},
 		},
 		{
+			name: "unnamed tool output",
+			executor: &fakeExecutor{events: []*adk.AgentEvent{
+				adk.EventFromMessage(schema.ToolMessage(testPermissionedToolOutput(t, testEinoEvidencePackage(t, authorization, "sources/unnamed.md", "UNNAMED_CONTENT_CANARY"), "UNNAMED_OUTPUT_CANARY"), "call_1"), nil, schema.Tool, ""),
+			}},
+		},
+		{
 			name:     "executor error without evidence",
 			executor: &fakeExecutor{err: errors.New("CONTEXT_ERROR_CANARY")},
 		},
@@ -208,6 +313,8 @@ func TestRunnerFailsPermissionedOutputClosedAndSanitizesErrors(t *testing.T) {
 			}
 			for _, event := range events {
 				if strings.Contains(event.Message, "MALFORMED_OUTPUT_CANARY") ||
+					strings.Contains(event.Message, "UNNAMED_CONTENT_CANARY") ||
+					strings.Contains(event.Message, "UNNAMED_OUTPUT_CANARY") ||
 					strings.Contains(event.Message, "EXECUTOR_ERROR_CANARY") ||
 					strings.Contains(event.Message, "CONTEXT_ERROR_CANARY") ||
 					strings.Contains(event.Message, "UNBOUND_ANSWER_CANARY") {

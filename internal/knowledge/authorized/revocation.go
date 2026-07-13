@@ -90,7 +90,7 @@ func (s *Service) AuthorizeProtectedContent(
 	current protocol.AuthorizationContext,
 	binding protocol.ProtectedContentBinding,
 ) (LiveAuthorizationReport, error) {
-	if s == nil {
+	if s == nil || s.loader == nil {
 		return LiveAuthorizationReport{}, ErrProtectedContentUnavailable
 	}
 	if err := binding.ValidateFor(current); err != nil {
@@ -104,27 +104,29 @@ func (s *Service) AuthorizeProtectedContent(
 	if err != nil || !report.Allowed() {
 		return report, ErrProtectedContentUnavailable
 	}
-	if s.cache != nil {
-		handles := make([]protocol.ResourceHandle, len(binding.Resources))
-		for index, resource := range binding.Resources {
-			handles[index] = resource.Resource
-		}
-		loaded, err := s.loadExact(ctx, current, handles)
-		if err != nil {
+	handles := make([]protocol.ResourceHandle, len(binding.Resources))
+	for index, resource := range binding.Resources {
+		handles[index] = resource.Resource
+	}
+	loaded, err := s.loadExact(ctx, current, handles)
+	if err != nil {
+		return report, ErrProtectedContentUnavailable
+	}
+	_, boundaries, _, err := collectEvidenceHandles(current, loaded)
+	if err != nil {
+		return report, ErrProtectedContentUnavailable
+	}
+	for _, resource := range binding.Resources {
+		if boundaries[resource.Resource.ResourceID] != resource.AuthorizationResource {
 			return report, ErrProtectedContentUnavailable
 		}
-		_, boundaries, _, err := collectEvidenceHandles(current, loaded)
-		if err != nil {
-			return report, ErrProtectedContentUnavailable
-		}
-		for _, resource := range binding.Resources {
-			if boundaries[resource.Resource.ResourceID] != resource.AuthorizationResource {
-				return report, ErrProtectedContentUnavailable
-			}
-		}
-		if s.cache.containsInvalidatedResource(resourceIDs) {
-			return report, ErrProtectedContentUnavailable
-		}
+	}
+	report, err = s.liveAuthorizationReport(ctx, current, binding, "replay")
+	if err != nil || !report.Allowed() {
+		return report, ErrProtectedContentUnavailable
+	}
+	if s.cache != nil && s.cache.containsInvalidatedResource(resourceIDs) {
+		return report, ErrProtectedContentUnavailable
 	}
 	return report, nil
 }
