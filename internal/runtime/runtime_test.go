@@ -190,30 +190,78 @@ func TestRuntimeEinoMessagePropagatesTrustedAuthorization(t *testing.T) {
 	}
 }
 
-func TestRuntimeEinoMessageFailsClosedWhenAuthorizationProviderFails(t *testing.T) {
-	workspace := t.TempDir()
-	runner := &fakeEinoRunner{events: []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, "", "must not run", nil)}}
-	rt := New(Dependencies{
-		Workspace:  workspace,
-		Sessions:   local.New(workspace),
-		EinoRunner: runner,
-		AuthorizationContextProvider: func(context.Context, string) (protocol.AuthorizationContext, error) {
-			return protocol.AuthorizationContext{}, fmt.Errorf("identity provider unavailable")
+func TestRuntimeEinoMessageDoesNotPersistUntrustedPrompts(t *testing.T) {
+	tests := []struct {
+		name      string
+		firstAuth func(string) (protocol.AuthorizationContext, error)
+		wantError string
+	}{
+		{
+			name: "provider failure",
+			firstAuth: func(string) (protocol.AuthorizationContext, error) {
+				return protocol.AuthorizationContext{}, fmt.Errorf("identity provider unavailable")
+			},
+			wantError: "authorization context provider: identity provider unavailable",
 		},
-		NewSessionID: func() string { return "sess_eino" },
-	})
-	if _, err := rt.Start(context.Background(), StartOptions{}); err != nil {
-		t.Fatal(err)
+		{
+			name: "invalid trusted context",
+			firstAuth: func(sessionID string) (protocol.AuthorizationContext, error) {
+				authorization := testAuthorizationContext(sessionID)
+				authorization.PrincipalID = ""
+				return authorization, nil
+			},
+			wantError: "authorization execution context: principal_id is required",
+		},
 	}
-	events := rt.SendMessage(context.Background(), "hello")
-	if runner.runCalls != 0 {
-		t.Fatalf("Eino runner called %d times after authorization failure", runner.runCalls)
-	}
-	if !hasMessage(events, protocol.EventError, "authorization context provider: identity provider unavailable") {
-		t.Fatalf("authorization provider failure was not surfaced: %+v", events)
-	}
-	if hasEvent(events, protocol.EventAssistantDone) {
-		t.Fatalf("authorization failure returned runner output: %+v", events)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			workspace := t.TempDir()
+			store := local.New(workspace)
+			runner := &fakeEinoRunner{events: []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, "", "authorized answer", nil)}}
+			providerCalls := 0
+			rt := New(Dependencies{
+				Workspace:  workspace,
+				Sessions:   store,
+				EinoRunner: runner,
+				AuthorizationContextProvider: func(_ context.Context, sessionID string) (protocol.AuthorizationContext, error) {
+					providerCalls++
+					if providerCalls == 1 {
+						return tt.firstAuth(sessionID)
+					}
+					authorization := testAuthorizationContext(sessionID)
+					authorization.RequestID = fmt.Sprintf("request-%d", providerCalls)
+					return authorization, nil
+				},
+				NewSessionID: func() string { return "sess_eino" },
+			})
+			if _, err := rt.Start(context.Background(), StartOptions{}); err != nil {
+				t.Fatal(err)
+			}
+
+			events := rt.SendMessage(context.Background(), "untrusted prompt")
+			if runner.runCalls != 0 {
+				t.Fatalf("Eino runner called %d times after authorization failure", runner.runCalls)
+			}
+			if !hasMessage(events, protocol.EventError, tt.wantError) {
+				t.Fatalf("authorization failure was not surfaced: %+v", events)
+			}
+			persisted, err := store.Load(context.Background(), "sess_eino")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if hasMessage(persisted, protocol.EventUserMessage, "untrusted prompt") {
+				t.Fatalf("untrusted prompt was persisted: %+v", persisted)
+			}
+
+			events = rt.SendMessage(context.Background(), "authorized prompt")
+			if hasEvent(events, protocol.EventError) || runner.runCalls != 1 {
+				t.Fatalf("subsequent authorized request failed: %+v", events)
+			}
+			if hasMessage(runner.lastHistory, protocol.EventUserMessage, "untrusted prompt") {
+				t.Fatalf("untrusted prompt reached later authorized history: %+v", runner.lastHistory)
+			}
+		})
 	}
 }
 

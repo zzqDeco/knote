@@ -166,12 +166,12 @@ func (m *Manager) SendMessage(ctx context.Context, input string) []protocol.Even
 	authorization, err := authorizationProvider.authorizationContext(ctx, einoSession.ID)
 	if err != nil {
 		events = append(events, protocol.NewEvent(protocol.EventError, einoSession.ID, err.Error(), nil))
-		return m.persistEmitAndReturn(events)
+		return m.emitAndReturn(events)
 	}
 	runCtx, err := protocol.WithAuthorizationContext(ctx, authorization)
 	if err != nil {
 		events = append(events, protocol.NewEvent(protocol.EventError, einoSession.ID, err.Error(), nil))
-		return m.persistEmitAndReturn(events)
+		return m.emitAndReturn(events)
 	}
 	if err := m.bindAuthorizationContext(einoSession.ID, authorization); err != nil {
 		events = append(events, protocol.NewEvent(protocol.EventError, einoSession.ID, err.Error(), nil))
