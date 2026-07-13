@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -31,7 +32,9 @@ func TestPrimitiveClientActualFakeAdapterRoundTrip(t *testing.T) {
 	}
 	t.Setenv("KNOTE_PYTHON", pythonForTest())
 
-	retrieved, err := client.Retrieve(context.Background(), RetrieveRequest{Query: "What is knote?", Limit: 3})
+	retrieved, err := client.Retrieve(context.Background(), RetrieveRequest{
+		Authorization: testFakeAuthorizationContext(), Query: "What is knote?", Limit: 3,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -40,7 +43,9 @@ func TestPrimitiveClientActualFakeAdapterRoundTrip(t *testing.T) {
 		t.Fatal("fake fixture must expose a candidate for authorization filtering")
 	}
 
-	expanded, err := client.Expand(context.Background(), ExpandRequest{Frontier: []CandidateHandle{intro}, Limit: 10})
+	expanded, err := client.Expand(context.Background(), ExpandRequest{
+		Authorization: testFakeAuthorizationContext(), Frontier: []CandidateHandle{intro}, Limit: 10,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -50,7 +55,8 @@ func TestPrimitiveClientActualFakeAdapterRoundTrip(t *testing.T) {
 	}
 
 	generated, err := client.Generate(context.Background(), GenerateRequest{
-		Question: "What is knote?",
+		Authorization: testFakeAuthorizationContext(),
+		Question:      "What is knote?",
 		Evidence: []AuthorizedEvidence{
 			{Resource: intro.Resource, Content: "knote is local-first.", CitationHandle: "cite-intro"},
 			{Resource: local.Resource, Content: "Its runtime can authorize graph stages before generation.", CitationHandle: "cite-local"},
@@ -84,9 +90,15 @@ func TestPrimitiveClientActualRealAdapterReturnsUnsupportedBeforeKAGSetup(t *tes
 		Resource: candidate.Resource, Content: "allowed body", CitationHandle: "citation-1",
 	}
 
-	_, retrieveErr := client.Retrieve(context.Background(), RetrieveRequest{Query: "knote", Limit: 10})
-	_, expandErr := client.Expand(context.Background(), ExpandRequest{Frontier: []CandidateHandle{candidate}, Limit: 10})
-	_, generateErr := client.Generate(context.Background(), GenerateRequest{Question: "knote", Evidence: []AuthorizedEvidence{evidence}})
+	_, retrieveErr := client.Retrieve(context.Background(), RetrieveRequest{
+		Authorization: testAuthorizationContext(), Query: "knote", Limit: 10,
+	})
+	_, expandErr := client.Expand(context.Background(), ExpandRequest{
+		Authorization: testAuthorizationContext(), Frontier: []CandidateHandle{candidate}, Limit: 10,
+	})
+	_, generateErr := client.Generate(context.Background(), GenerateRequest{
+		Authorization: testAuthorizationContext(), Question: "knote", Evidence: []AuthorizedEvidence{evidence},
+	})
 	for method, err := range map[string]error{
 		"kag.retrieve": retrieveErr,
 		"kag.expand":   expandErr,
@@ -126,7 +138,9 @@ print(json.dumps({"id": req["id"], "type": "result", "data": data}))
 	t.Setenv("KNOTE_PYTHON", pythonForTest())
 	client := Client{AdapterPath: adapter, Workspace: workspace}
 
-	retrieved, err := client.Retrieve(context.Background(), RetrieveRequest{Query: "knote", Limit: 40})
+	retrieved, err := client.Retrieve(context.Background(), RetrieveRequest{
+		Authorization: testAuthorizationContext(), Query: "knote", Limit: 40,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,7 +148,9 @@ print(json.dumps({"id": req["id"], "type": "result", "data": data}))
 		t.Fatalf("unexpected retrieve result: %#v", retrieved)
 	}
 
-	expanded, err := client.Expand(context.Background(), ExpandRequest{Frontier: retrieved.Candidates, Limit: 40})
+	expanded, err := client.Expand(context.Background(), ExpandRequest{
+		Authorization: testAuthorizationContext(), Frontier: retrieved.Candidates, Limit: 40,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,7 +159,8 @@ print(json.dumps({"id": req["id"], "type": "result", "data": data}))
 	}
 
 	generated, err := client.Generate(context.Background(), GenerateRequest{
-		Question: "knote",
+		Authorization: testAuthorizationContext(),
+		Question:      "knote",
 		Evidence: []AuthorizedEvidence{{
 			Resource: testPrimitiveResource(testResourceA), Content: "allowed body", CitationHandle: "citation-1",
 		}},
@@ -158,8 +175,9 @@ print(json.dumps({"id": req["id"], "type": "result", "data": data}))
 
 func TestExpandRejectsForeignFrontierSource(t *testing.T) {
 	req := ExpandRequest{
-		Frontier: []CandidateHandle{{Resource: testPrimitiveResource(testResourceA), Score: 0.9}},
-		Limit:    10,
+		Authorization: testAuthorizationContext(),
+		Frontier:      []CandidateHandle{{Resource: testPrimitiveResource(testResourceA), Score: 0.9}},
+		Limit:         10,
 	}
 	result := ExpandResult{
 		Mode:       "fake",
@@ -168,6 +186,182 @@ func TestExpandRejectsForeignFrontierSource(t *testing.T) {
 	}
 	if err := result.ValidateFor(req); err == nil {
 		t.Fatal("foreign frontier source should fail")
+	}
+}
+
+func TestPrimitiveRequestsRequireTrustedAuthorizationBeforeAdapterExecution(t *testing.T) {
+	candidate := CandidateHandle{Resource: testPrimitiveResource(testResourceA), Score: 0.9}
+	evidence := AuthorizedEvidence{
+		Resource: candidate.Resource, Content: "allowed body", CitationHandle: "citation-1",
+	}
+	tests := []struct {
+		name string
+		call func() error
+	}{
+		{
+			name: "retrieve",
+			call: func() error {
+				_, err := (Client{}).Retrieve(context.Background(), RetrieveRequest{Query: "knote", Limit: 10})
+				return err
+			},
+		},
+		{
+			name: "expand",
+			call: func() error {
+				_, err := (Client{}).Expand(context.Background(), ExpandRequest{
+					Frontier: []CandidateHandle{candidate}, Limit: 10,
+				})
+				return err
+			},
+		},
+		{
+			name: "generate",
+			call: func() error {
+				_, err := (Client{}).Generate(context.Background(), GenerateRequest{
+					Question: "knote", Evidence: []AuthorizedEvidence{evidence},
+				})
+				return err
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := test.call()
+			if err == nil || !strings.Contains(err.Error(), "authorization:") {
+				t.Fatalf("request should fail authorization validation before adapter execution, got %v", err)
+			}
+		})
+	}
+}
+
+func TestPrimitiveResourceScopeFailsClosed(t *testing.T) {
+	auth := testAuthorizationContext()
+	foreignTenant := testPrimitiveResource(testResourceA)
+	foreignTenant.TenantID = "other-tenant"
+	foreignKnowledgeBase := testPrimitiveResource(testResourceA)
+	foreignKnowledgeBase.KnowledgeBaseID = "other-kb"
+
+	for name, resource := range map[string]protocol.ResourceHandle{
+		"foreign tenant":         foreignTenant,
+		"foreign knowledge base": foreignKnowledgeBase,
+	} {
+		t.Run("retrieve candidate "+name, func(t *testing.T) {
+			result := RetrieveResult{
+				Mode: "fake", Candidates: []CandidateHandle{{Resource: resource, Score: 0.9}},
+			}
+			if err := result.ValidateFor(RetrieveRequest{
+				Authorization: auth, Query: "knote", Limit: 10,
+			}); err == nil {
+				t.Fatal("out-of-scope retrieve candidate should fail")
+			}
+		})
+
+		t.Run("expand frontier "+name, func(t *testing.T) {
+			req := ExpandRequest{
+				Authorization: auth,
+				Frontier:      []CandidateHandle{{Resource: resource, Score: 0.9}},
+				Limit:         10,
+			}
+			if err := req.Validate(); err == nil {
+				t.Fatal("out-of-scope authorized frontier should fail")
+			}
+		})
+
+		t.Run("expand candidate "+name, func(t *testing.T) {
+			frontier := testPrimitiveResource(testResourceA)
+			target := resource
+			target.ResourceID = testResourceB
+			target.AuthorizationResourceID = testResourceB
+			target.AuthorizationID = "document:" + string(testResourceB)
+			result := ExpandResult{
+				Mode:       "fake",
+				Candidates: []CandidateHandle{{Resource: target, Score: 0.8}},
+				Expansions: []ExpansionHandle{{FromResourceID: testResourceA, ToResourceID: testResourceB, Hop: 1}},
+			}
+			if err := result.ValidateFor(ExpandRequest{
+				Authorization: auth,
+				Frontier:      []CandidateHandle{{Resource: frontier, Score: 0.9}},
+				Limit:         10,
+			}); err == nil {
+				t.Fatal("out-of-scope expansion candidate should fail")
+			}
+		})
+
+		t.Run("generate evidence "+name, func(t *testing.T) {
+			req := GenerateRequest{
+				Authorization: auth,
+				Question:      "knote",
+				Evidence: []AuthorizedEvidence{{
+					Resource: resource, Content: "allowed body", CitationHandle: "citation-1",
+				}},
+			}
+			if err := req.Validate(); err == nil {
+				t.Fatal("out-of-scope generation evidence should fail")
+			}
+		})
+	}
+}
+
+func TestExpandBindsCandidatesToAuthorizedFrontierProjection(t *testing.T) {
+	frontier := testPrimitiveResource(testResourceA)
+	target := testPrimitiveResource(testResourceB)
+	target.Versions.Projection = "projection-v2"
+	req := ExpandRequest{
+		Authorization: testAuthorizationContext(),
+		Frontier:      []CandidateHandle{{Resource: frontier, Score: 0.9}},
+		Limit:         10,
+	}
+	result := ExpandResult{
+		Mode:       "fake",
+		Candidates: []CandidateHandle{{Resource: target, Score: 0.8}},
+		Expansions: []ExpansionHandle{{FromResourceID: testResourceA, ToResourceID: testResourceB, Hop: 1}},
+	}
+	if err := result.ValidateFor(req); err == nil || !strings.Contains(err.Error(), "projection") {
+		t.Fatalf("cross-projection expansion candidate should fail, got %v", err)
+	}
+}
+
+func TestPrimitiveRequestsRejectMixedProjectionSets(t *testing.T) {
+	auth := testAuthorizationContext()
+	first := testPrimitiveResource(testResourceA)
+	second := testPrimitiveResource(testResourceB)
+	second.Versions.Projection = "projection-v2"
+
+	retrieve := RetrieveResult{
+		Mode: "fake",
+		Candidates: []CandidateHandle{
+			{Resource: first, Score: 0.9},
+			{Resource: second, Score: 0.8},
+		},
+	}
+	if err := retrieve.ValidateFor(RetrieveRequest{
+		Authorization: auth, Query: "knote", Limit: 10,
+	}); err == nil || !strings.Contains(err.Error(), "projection") {
+		t.Fatalf("mixed-projection retrieve candidates should fail, got %v", err)
+	}
+
+	expand := ExpandRequest{
+		Authorization: auth,
+		Frontier: []CandidateHandle{
+			{Resource: first, Score: 0.9},
+			{Resource: second, Score: 0.8},
+		},
+		Limit: 10,
+	}
+	if err := expand.Validate(); err == nil || !strings.Contains(err.Error(), "projection") {
+		t.Fatalf("mixed-projection expansion frontier should fail, got %v", err)
+	}
+
+	generate := GenerateRequest{
+		Authorization: auth,
+		Question:      "knote",
+		Evidence: []AuthorizedEvidence{
+			{Resource: first, Content: "allowed body", CitationHandle: "citation-1"},
+			{Resource: second, Content: "allowed body", CitationHandle: "citation-2"},
+		},
+	}
+	if err := generate.Validate(); err == nil || !strings.Contains(err.Error(), "projection") {
+		t.Fatalf("mixed-projection generation evidence should fail, got %v", err)
 	}
 }
 
@@ -212,7 +406,9 @@ print(json.dumps({"id": req["id"], "type": "result", "message": "protected body"
 	t.Setenv("KNOTE_PYTHON", pythonForTest())
 	client := Client{AdapterPath: adapter, Workspace: workspace}
 
-	if _, err := client.Retrieve(context.Background(), RetrieveRequest{Query: "knote", Limit: 40}); err == nil {
+	if _, err := client.Retrieve(context.Background(), RetrieveRequest{
+		Authorization: testAuthorizationContext(), Query: "knote", Limit: 40,
+	}); err == nil {
 		t.Fatal("primitive result with top-level leak fields should fail strict frame decoding")
 	}
 }
@@ -227,9 +423,20 @@ func TestPrimitiveDecodeRejectsTopLevelMessage(t *testing.T) {
 	}
 }
 
+func TestPrimitiveDecodeRejectsTrailingJSON(t *testing.T) {
+	response := Response{
+		Type: "result",
+		raw:  []byte(`{"id":"req","type":"result","data":{"mode":"fake","candidates":[]}} {"leak":true}`),
+	}
+	if _, err := decodePrimitive[RetrieveResult](response); err == nil {
+		t.Fatal("trailing JSON must fail strict primitive decoding")
+	}
+}
+
 func TestGenerateRejectsForeignCitationAndTrace(t *testing.T) {
 	req := GenerateRequest{
-		Question: "knote",
+		Authorization: testAuthorizationContext(),
+		Question:      "knote",
 		Evidence: []AuthorizedEvidence{{
 			Resource: testPrimitiveResource(testResourceA), Content: "allowed body", CitationHandle: "citation-1",
 		}},
@@ -256,7 +463,9 @@ print(json.dumps({"id": req["id"], "type": "error", "code": "unsupported_primiti
 	t.Setenv("KNOTE_PYTHON", pythonForTest())
 	client := Client{AdapterPath: adapter, Workspace: workspace}
 
-	_, err := client.Retrieve(context.Background(), RetrieveRequest{Query: "knote", Limit: 10})
+	_, err := client.Retrieve(context.Background(), RetrieveRequest{
+		Authorization: testAuthorizationContext(), Query: "knote", Limit: 10,
+	})
 	if err == nil {
 		t.Fatal("unsupported primitive should fail")
 	}
@@ -276,7 +485,9 @@ func TestPrimitiveClientCancellationReturnsContextError(t *testing.T) {
 		cancel()
 	}()
 
-	_, err := client.Retrieve(ctx, RetrieveRequest{Query: "knote", Limit: 10})
+	_, err := client.Retrieve(ctx, RetrieveRequest{
+		Authorization: testAuthorizationContext(), Query: "knote", Limit: 10,
+	})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected context canceled, got %T: %v", err, err)
 	}
@@ -290,7 +501,9 @@ func TestPrimitiveClientDeadlineReturnsContextError(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
 
-	_, err := client.Retrieve(ctx, RetrieveRequest{Query: "knote", Limit: 10})
+	_, err := client.Retrieve(ctx, RetrieveRequest{
+		Authorization: testAuthorizationContext(), Query: "knote", Limit: 10,
+	})
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("expected context deadline exceeded, got %T: %v", err, err)
 	}
@@ -309,7 +522,9 @@ time.sleep(5)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
 
-	_, err := client.Retrieve(ctx, RetrieveRequest{Query: "knote", Limit: 10})
+	_, err := client.Retrieve(ctx, RetrieveRequest{
+		Authorization: testAuthorizationContext(), Query: "knote", Limit: 10,
+	})
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("context deadline should take precedence over an early adapter error, got %T: %v", err, err)
 	}
@@ -317,17 +532,24 @@ time.sleep(5)
 
 func TestPrimitiveRequestsFailClosedBeforeAdapterExecution(t *testing.T) {
 	client := Client{}
-	if _, err := client.Retrieve(context.Background(), RetrieveRequest{Query: "", Limit: 10}); err == nil {
+	if _, err := client.Retrieve(context.Background(), RetrieveRequest{
+		Authorization: testAuthorizationContext(), Query: "", Limit: 10,
+	}); err == nil {
 		t.Fatal("empty query should fail")
 	}
-	if _, err := client.Expand(context.Background(), ExpandRequest{Limit: 10}); err == nil {
+	if _, err := client.Expand(context.Background(), ExpandRequest{
+		Authorization: testAuthorizationContext(), Limit: 10,
+	}); err == nil {
 		t.Fatal("empty authorized frontier should fail")
 	}
-	if _, err := client.Generate(context.Background(), GenerateRequest{Question: "knote"}); err == nil {
+	if _, err := client.Generate(context.Background(), GenerateRequest{
+		Authorization: testAuthorizationContext(), Question: "knote",
+	}); err == nil {
 		t.Fatal("empty authorized evidence should fail")
 	}
 	if _, err := client.Generate(context.Background(), GenerateRequest{
-		Question: "knote",
+		Authorization: testAuthorizationContext(),
+		Question:      "knote",
 		Evidence: []AuthorizedEvidence{{
 			Resource: testPrimitiveResource(testResourceA), Content: "wrong body", CitationHandle: "citation-1",
 		}},
@@ -335,7 +557,8 @@ func TestPrimitiveRequestsFailClosedBeforeAdapterExecution(t *testing.T) {
 		t.Fatal("evidence body not bound to its resource digest should fail before adapter execution")
 	}
 	if _, err := client.Generate(context.Background(), GenerateRequest{
-		Question: "knote",
+		Authorization: testAuthorizationContext(),
+		Question:      "knote",
 		Evidence: []AuthorizedEvidence{
 			{Resource: testPrimitiveResource(testResourceA), Content: "allowed body", CitationHandle: "citation-1"},
 			{Resource: testPrimitiveResource(testResourceB), Content: "allowed body", CitationHandle: "citation-1"},
@@ -356,6 +579,30 @@ func testPrimitiveResource(resourceID protocol.ResourceID) protocol.ResourceHand
 			Index: "index-v1", Graph: "graph-v1", Projection: "projection-v1",
 		},
 	}
+}
+
+func testAuthorizationContext() protocol.AuthorizationContext {
+	return protocol.AuthorizationContext{
+		Version:              protocol.SecurityContractVersion,
+		TenantID:             "local",
+		KnowledgeBaseID:      "default",
+		PrincipalID:          "local-user",
+		SessionID:            "session-1",
+		RequestID:            "request-1",
+		AgentID:              "agent-1",
+		TaskID:               "task-1",
+		AuthorizationModelID: "local-v1",
+		IdentityWatermark:    "identity-v1",
+		ACLWatermark:         "acl-v1",
+		Consistency:          protocol.ConsistencyHigherConsistency,
+	}
+}
+
+func testFakeAuthorizationContext() protocol.AuthorizationContext {
+	authorization := testAuthorizationContext()
+	authorization.TenantID = "tenant_fake"
+	authorization.KnowledgeBaseID = "kb_fake"
+	return authorization
 }
 
 func candidateByID(t *testing.T, candidates []CandidateHandle, resourceID protocol.ResourceID) CandidateHandle {

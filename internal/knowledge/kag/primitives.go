@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"strings"
 
@@ -43,11 +44,15 @@ func (h CandidateHandle) Validate() error {
 }
 
 type RetrieveRequest struct {
-	Query string `json:"query"`
-	Limit int    `json:"limit"`
+	Authorization protocol.AuthorizationContext `json:"authorization"`
+	Query         string                        `json:"query"`
+	Limit         int                           `json:"limit"`
 }
 
 func (r RetrieveRequest) Validate() error {
+	if err := r.Authorization.Validate(); err != nil {
+		return fmt.Errorf("authorization: %w", err)
+	}
 	if strings.TrimSpace(r.Query) == "" {
 		return fmt.Errorf("query is required")
 	}
@@ -60,25 +65,32 @@ type RetrieveResult struct {
 }
 
 func (r RetrieveResult) ValidateFor(req RetrieveRequest) error {
+	if err := req.Validate(); err != nil {
+		return fmt.Errorf("retrieve request: %w", err)
+	}
 	if strings.TrimSpace(r.Mode) == "" {
 		return fmt.Errorf("retrieve mode is required")
 	}
-	return validateCandidates(r.Candidates, req.Limit)
+	return validateCandidatesForAuthorization(r.Candidates, req.Limit, req.Authorization)
 }
 
 type ExpandRequest struct {
-	Frontier []CandidateHandle `json:"frontier"`
-	Limit    int               `json:"limit"`
+	Authorization protocol.AuthorizationContext `json:"authorization"`
+	Frontier      []CandidateHandle             `json:"frontier"`
+	Limit         int                           `json:"limit"`
 }
 
 func (r ExpandRequest) Validate() error {
+	if err := r.Authorization.Validate(); err != nil {
+		return fmt.Errorf("authorization: %w", err)
+	}
 	if len(r.Frontier) == 0 {
 		return fmt.Errorf("authorized frontier is required")
 	}
 	if err := validatePrimitiveLimit(r.Limit); err != nil {
 		return err
 	}
-	return validateCandidates(r.Frontier, len(r.Frontier))
+	return validateCandidatesForAuthorization(r.Frontier, len(r.Frontier), r.Authorization)
 }
 
 type ExpansionHandle struct {
@@ -107,10 +119,13 @@ type ExpandResult struct {
 }
 
 func (r ExpandResult) ValidateFor(req ExpandRequest) error {
+	if err := req.Validate(); err != nil {
+		return fmt.Errorf("expand request: %w", err)
+	}
 	if strings.TrimSpace(r.Mode) == "" {
 		return fmt.Errorf("expand mode is required")
 	}
-	if err := validateCandidates(r.Candidates, req.Limit); err != nil {
+	if err := validateCandidatesForAuthorization(r.Candidates, req.Limit, req.Authorization); err != nil {
 		return err
 	}
 	frontier := make(map[protocol.ResourceID]protocol.ResourceHandle, len(req.Frontier))
@@ -132,6 +147,17 @@ func (r ExpandResult) ValidateFor(req ExpandRequest) error {
 		}
 		if _, ok := targets[expansion.ToResourceID]; !ok {
 			return fmt.Errorf("expansion target %s has no candidate handle", expansion.ToResourceID)
+		}
+		source := frontier[expansion.FromResourceID]
+		target := targets[expansion.ToResourceID]
+		if target.Versions.Projection != source.Versions.Projection {
+			return fmt.Errorf(
+				"expansion target %s projection %q does not match authorized frontier source %s projection %q",
+				expansion.ToResourceID,
+				target.Versions.Projection,
+				expansion.FromResourceID,
+				source.Versions.Projection,
+			)
 		}
 		key := fmt.Sprintf("%s\x00%d\x00%s", expansion.FromResourceID, expansion.Hop, expansion.ToResourceID)
 		if _, duplicate := seenEdges[key]; duplicate {
@@ -174,11 +200,15 @@ func (e AuthorizedEvidence) Validate() error {
 }
 
 type GenerateRequest struct {
-	Question string               `json:"question"`
-	Evidence []AuthorizedEvidence `json:"evidence"`
+	Authorization protocol.AuthorizationContext `json:"authorization"`
+	Question      string                        `json:"question"`
+	Evidence      []AuthorizedEvidence          `json:"evidence"`
 }
 
 func (r GenerateRequest) Validate() error {
+	if err := r.Authorization.Validate(); err != nil {
+		return fmt.Errorf("authorization: %w", err)
+	}
 	if strings.TrimSpace(r.Question) == "" {
 		return fmt.Errorf("question is required")
 	}
@@ -187,9 +217,18 @@ func (r GenerateRequest) Validate() error {
 	}
 	seen := make(map[protocol.ResourceID]struct{}, len(r.Evidence))
 	seenCitations := make(map[string]struct{}, len(r.Evidence))
+	projection := ""
 	for index, evidence := range r.Evidence {
 		if err := evidence.Validate(); err != nil {
 			return fmt.Errorf("evidence %d: %w", index, err)
+		}
+		if err := validateResourceForAuthorization(evidence.Resource, r.Authorization); err != nil {
+			return fmt.Errorf("evidence %d: %w", index, err)
+		}
+		if projection == "" {
+			projection = evidence.Resource.Versions.Projection
+		} else if evidence.Resource.Versions.Projection != projection {
+			return fmt.Errorf("evidence %d projection %q does not match request projection %q", index, evidence.Resource.Versions.Projection, projection)
 		}
 		if _, duplicate := seen[evidence.Resource.ResourceID]; duplicate {
 			return fmt.Errorf("duplicate evidence resource %s", evidence.Resource.ResourceID)
@@ -222,6 +261,9 @@ type GenerateResult struct {
 }
 
 func (r GenerateResult) ValidateFor(req GenerateRequest) error {
+	if err := req.Validate(); err != nil {
+		return fmt.Errorf("generate request: %w", err)
+	}
 	if strings.TrimSpace(r.Mode) == "" {
 		return fmt.Errorf("generate mode is required")
 	}
@@ -267,7 +309,11 @@ func (c Client) Retrieve(ctx context.Context, req RetrieveRequest) (RetrieveResu
 	if err := req.Validate(); err != nil {
 		return RetrieveResult{}, err
 	}
-	response, err := c.call(ctx, "kag.retrieve", c.params(map[string]any{"query": req.Query, "limit": req.Limit}))
+	params, err := structParams(req)
+	if err != nil {
+		return RetrieveResult{}, err
+	}
+	response, err := c.call(ctx, "kag.retrieve", c.params(params))
 	if err != nil {
 		return RetrieveResult{}, err
 	}
@@ -335,6 +381,9 @@ func decodePrimitive[T any](response Response) (T, error) {
 		if err := decoder.Decode(&frame); err != nil {
 			return value, err
 		}
+		if err := requireJSONEOF(decoder); err != nil {
+			return value, err
+		}
 		if frame.Type != "result" {
 			return value, fmt.Errorf("primitive response must be a result frame")
 		}
@@ -355,7 +404,21 @@ func decodePrimitive[T any](response Response) (T, error) {
 	if err := decoder.Decode(&value); err != nil {
 		return value, err
 	}
+	if err := requireJSONEOF(decoder); err != nil {
+		return value, err
+	}
 	return value, nil
+}
+
+func requireJSONEOF(decoder *json.Decoder) error {
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return fmt.Errorf("primitive response contains trailing JSON")
+		}
+		return err
+	}
+	return nil
 }
 
 func structParams(value any) (map[string]any, error) {
@@ -387,6 +450,51 @@ func validateCandidates(candidates []CandidateHandle, limit int) error {
 		if index > 0 && candidateLess(candidate, candidates[index-1]) {
 			return fmt.Errorf("candidates are not deterministically sorted")
 		}
+	}
+	return nil
+}
+
+func validateCandidatesForAuthorization(
+	candidates []CandidateHandle,
+	limit int,
+	authorization protocol.AuthorizationContext,
+) error {
+	if err := validateCandidates(candidates, limit); err != nil {
+		return err
+	}
+	projection := ""
+	for index, candidate := range candidates {
+		if err := validateResourceForAuthorization(candidate.Resource, authorization); err != nil {
+			return fmt.Errorf("candidate %d: %w", index, err)
+		}
+		if projection == "" {
+			projection = candidate.Resource.Versions.Projection
+		} else if candidate.Resource.Versions.Projection != projection {
+			return fmt.Errorf("candidate %d projection %q does not match candidate set projection %q", index, candidate.Resource.Versions.Projection, projection)
+		}
+	}
+	return nil
+}
+
+func validateResourceForAuthorization(
+	resource protocol.ResourceHandle,
+	authorization protocol.AuthorizationContext,
+) error {
+	if resource.TenantID != authorization.TenantID {
+		return fmt.Errorf(
+			"resource %s tenant %q is outside authorized tenant %q",
+			resource.ResourceID,
+			resource.TenantID,
+			authorization.TenantID,
+		)
+	}
+	if resource.KnowledgeBaseID != authorization.KnowledgeBaseID {
+		return fmt.Errorf(
+			"resource %s knowledge base %q is outside authorized knowledge base %q",
+			resource.ResourceID,
+			resource.KnowledgeBaseID,
+			authorization.KnowledgeBaseID,
+		)
 	}
 	return nil
 }

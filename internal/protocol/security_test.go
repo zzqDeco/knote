@@ -46,6 +46,30 @@ func TestAuthorizationContextRoundTripAndValidation(t *testing.T) {
 	}
 }
 
+func TestAuthorizationContextRequiresEverySecurityBinding(t *testing.T) {
+	auth := testAuthorizationContext()
+	tests := map[string]func(*AuthorizationContext){
+		"version":                 func(value *AuthorizationContext) { value.Version = "" },
+		"tenant":                  func(value *AuthorizationContext) { value.TenantID = "" },
+		"knowledge base":          func(value *AuthorizationContext) { value.KnowledgeBaseID = "" },
+		"principal":               func(value *AuthorizationContext) { value.PrincipalID = "" },
+		"session":                 func(value *AuthorizationContext) { value.SessionID = "" },
+		"request":                 func(value *AuthorizationContext) { value.RequestID = "" },
+		"authorization model":     func(value *AuthorizationContext) { value.AuthorizationModelID = "" },
+		"identity watermark":      func(value *AuthorizationContext) { value.IdentityWatermark = "" },
+		"authorization watermark": func(value *AuthorizationContext) { value.ACLWatermark = "" },
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			invalid := auth
+			mutate(&invalid)
+			if err := invalid.Validate(); err == nil {
+				t.Fatalf("missing %s should fail", name)
+			}
+		})
+	}
+}
+
 func TestStableResourceIDIgnoresMutableVersions(t *testing.T) {
 	id, err := NewStableResourceID("local", "default", ResourceDocument, "sources/intro.md")
 	if err != nil {
@@ -82,6 +106,34 @@ func TestContentDigestBindsCanonicalContent(t *testing.T) {
 	}
 	if err := ContentDigest("sha256:not-a-digest").Validate(); err == nil {
 		t.Fatal("malformed content digest should fail")
+	}
+}
+
+func TestResourceHandleValidatesAuthorizationScope(t *testing.T) {
+	auth := testAuthorizationContext()
+	id, err := NewStableResourceID(auth.TenantID, auth.KnowledgeBaseID, ResourceDocument, "sources/intro.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resource := testResourceHandle(t, id)
+	if err := resource.ValidateFor(auth); err != nil {
+		t.Fatalf("validate scoped resource: %v", err)
+	}
+
+	crossTenant := resource
+	crossTenant.TenantID = "other-tenant"
+	if err := crossTenant.ValidateFor(auth); err == nil {
+		t.Fatal("cross-tenant resource should fail")
+	}
+	crossKnowledgeBase := resource
+	crossKnowledgeBase.KnowledgeBaseID = "other-kb"
+	if err := crossKnowledgeBase.ValidateFor(auth); err == nil {
+		t.Fatal("cross-knowledge-base resource should fail")
+	}
+	invalidAuth := auth
+	invalidAuth.RequestID = ""
+	if err := resource.ValidateFor(invalidAuth); err == nil {
+		t.Fatal("resource validation with an incomplete authorization context should fail")
 	}
 }
 
@@ -133,6 +185,46 @@ func TestAuthorizationDecisionFailsClosed(t *testing.T) {
 	decision.CheckedAt = time.Time{}
 	if err := decision.Validate(); err == nil {
 		t.Fatal("decision without checked_at should fail validation")
+	}
+}
+
+func TestAuthorizationDecisionValidatesContextBinding(t *testing.T) {
+	auth := testAuthorizationContext()
+	id, err := NewStableResourceID(auth.TenantID, auth.KnowledgeBaseID, ResourceDocument, "sources/intro.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision := testDecision(t, id)
+	if err := decision.ValidateFor(auth); err != nil {
+		t.Fatalf("validate context-bound decision: %v", err)
+	}
+
+	tests := map[string]func(*AuthorizationDecision){
+		"request":             func(value *AuthorizationDecision) { value.RequestID = "other-request" },
+		"session":             func(value *AuthorizationDecision) { value.SessionID = "other-session" },
+		"principal":           func(value *AuthorizationDecision) { value.PrincipalID = "other-user" },
+		"agent":               func(value *AuthorizationDecision) { value.AgentID = "other-agent" },
+		"task":                func(value *AuthorizationDecision) { value.TaskID = "other-task" },
+		"authorization model": func(value *AuthorizationDecision) { value.AuthorizationModelID = "model-v0" },
+		"identity watermark":  func(value *AuthorizationDecision) { value.IdentityWatermark = "identity-v0" },
+		"acl watermark":       func(value *AuthorizationDecision) { value.ACLWatermark = "acl-v0" },
+		"consistency":         func(value *AuthorizationDecision) { value.Consistency = ConsistencyMinimizeLatency },
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			stale := decision
+			mutate(&stale)
+			if err := stale.ValidateFor(auth); err == nil {
+				t.Fatalf("decision with a stale %s binding should fail", name)
+			}
+		})
+	}
+
+	crossScope := decision
+	crossScope.Resource.TenantID = "other-tenant"
+	crossScope.AuthorizationResource = crossScope.Resource
+	if err := crossScope.ValidateFor(auth); err == nil {
+		t.Fatal("cross-scope decision should fail")
 	}
 }
 
@@ -330,6 +422,49 @@ func TestEvidencePackageBinding(t *testing.T) {
 	mismatched.Items[0].Content = "denied content paired with an allowed handle"
 	if err := mismatched.ValidateFor(auth); err == nil {
 		t.Fatal("content not bound to the authorized handle should fail")
+	}
+	mismatched = pkg
+	mismatched.Items = append([]EvidenceItem(nil), pkg.Items...)
+	mismatched.Items[0].Citation.Resource.Versions.Content = "content-v0"
+	if err := mismatched.ValidateFor(auth); err == nil {
+		t.Fatal("citation with a stale resource handle should fail")
+	}
+}
+
+func TestEvidencePackageRejectsDuplicateBindings(t *testing.T) {
+	auth := testAuthorizationContext()
+	firstID, err := NewStableResourceID(auth.TenantID, auth.KnowledgeBaseID, ResourceDocument, "sources/intro.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := testResourceHandle(t, firstID)
+	pkg := testEvidencePackage(t, auth, first)
+
+	duplicateResource := pkg
+	duplicateResource.Items = append(append([]EvidenceItem(nil), pkg.Items...), pkg.Items[0])
+	if err := duplicateResource.ValidateFor(auth); err == nil {
+		t.Fatal("duplicate evidence resources should fail")
+	}
+
+	secondID, err := NewStableResourceID(auth.TenantID, auth.KnowledgeBaseID, ResourceDocument, "sources/other.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := testResourceHandle(t, secondID)
+	duplicateDecision := pkg
+	duplicateDecision.Decisions = append(append([]AuthorizationDecision(nil), pkg.Decisions...), pkg.Decisions[0])
+	if err := duplicateDecision.ValidateFor(auth); err == nil {
+		t.Fatal("duplicate decisions for one resource should fail")
+	}
+
+	secondDecision := testDecision(t, secondID)
+	secondPackage := testEvidencePackage(t, auth, second)
+	duplicateCitation := pkg
+	duplicateCitation.Items = append(append([]EvidenceItem(nil), pkg.Items...), secondPackage.Items[0])
+	duplicateCitation.Items[1].Citation.Handle = pkg.Items[0].Citation.Handle
+	duplicateCitation.Decisions = append(append([]AuthorizationDecision(nil), pkg.Decisions...), secondDecision)
+	if err := duplicateCitation.ValidateFor(auth); err == nil {
+		t.Fatal("duplicate citation handles should fail")
 	}
 }
 
@@ -534,6 +669,43 @@ func testAuthorizationContext() AuthorizationContext {
 		IdentityWatermark:    "identity-v1",
 		ACLWatermark:         "acl-v1",
 		Consistency:          ConsistencyHigherConsistency,
+	}
+}
+
+func testEvidencePackage(t *testing.T, auth AuthorizationContext, resource ResourceHandle) EvidencePackage {
+	t.Helper()
+	fingerprint, err := NewVisibilityFingerprint(auth, resource.Versions.Projection)
+	if err != nil {
+		t.Fatalf("visibility fingerprint: %v", err)
+	}
+	return EvidencePackage{
+		Version:               SecurityContractVersion,
+		TenantID:              auth.TenantID,
+		KnowledgeBaseID:       auth.KnowledgeBaseID,
+		PrincipalID:           auth.PrincipalID,
+		SessionID:             auth.SessionID,
+		RequestID:             auth.RequestID,
+		AgentID:               auth.AgentID,
+		TaskID:                auth.TaskID,
+		AuthorizationModelID:  auth.AuthorizationModelID,
+		IdentityWatermark:     auth.IdentityWatermark,
+		ACLWatermark:          auth.ACLWatermark,
+		Consistency:           auth.Consistency,
+		ProjectionVersion:     resource.Versions.Projection,
+		VisibilityFingerprint: fingerprint,
+		Items: []EvidenceItem{{
+			Resource:   resource,
+			Content:    "authorized content",
+			Derivation: DerivationAnySupport,
+			Supports: []ProvenanceSupport{{
+				SupportID: "support-" + string(resource.ResourceID),
+				Resource:  resource,
+				Evidence:  []ResourceHandle{resource},
+				Complete:  true,
+			}},
+			Citation: Citation{Handle: "citation-" + string(resource.ResourceID), Resource: resource},
+		}},
+		Decisions: []AuthorizationDecision{testDecision(t, resource.ResourceID)},
 	}
 }
 
