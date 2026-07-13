@@ -163,19 +163,22 @@ func (m *Manager) SendMessage(ctx context.Context, input string) []protocol.Even
 	if strings.HasPrefix(input, "/") {
 		return m.handleSlash(ctx, einoSession.ID, input)
 	}
-	authorization, err := authorizationProvider.authorizationContext(ctx, einoSession.ID)
-	if err != nil {
-		events = append(events, protocol.NewEvent(protocol.EventError, einoSession.ID, err.Error(), nil))
-		return m.emitAndReturn(events)
-	}
-	runCtx, err := protocol.WithAuthorizationContext(ctx, authorization)
-	if err != nil {
-		events = append(events, protocol.NewEvent(protocol.EventError, einoSession.ID, err.Error(), nil))
-		return m.emitAndReturn(events)
-	}
-	if err := m.bindAuthorizationContext(einoSession.ID, authorization); err != nil {
-		events = append(events, protocol.NewEvent(protocol.EventError, einoSession.ID, err.Error(), nil))
-		return m.emitAndReturn(events)
+	runCtx := ctx
+	if authorizationProvider != nil {
+		authorization, err := authorizationProvider.authorizationContext(ctx, einoSession.ID)
+		if err != nil {
+			events = append(events, protocol.NewEvent(protocol.EventError, einoSession.ID, err.Error(), nil))
+			return m.emitAndReturn(events)
+		}
+		runCtx, err = protocol.WithAuthorizationContext(ctx, authorization)
+		if err != nil {
+			events = append(events, protocol.NewEvent(protocol.EventError, einoSession.ID, err.Error(), nil))
+			return m.emitAndReturn(events)
+		}
+		if err := m.bindAuthorizationContext(einoSession.ID, authorization); err != nil {
+			events = append(events, protocol.NewEvent(protocol.EventError, einoSession.ID, err.Error(), nil))
+			return m.emitAndReturn(events)
+		}
 	}
 	history := m.loadHistory(ctx, einoSession.ID)
 	if m.deps.SideEffects != nil {

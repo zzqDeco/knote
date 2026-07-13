@@ -87,7 +87,7 @@ func newRuntime(ctx context.Context, workspacePath string, resumeID string) (run
 		RuntimeDir:  repoCfg.KAG.RuntimeDir,
 	}
 	knowledgeService := versioned.New(versioned.Options{Workspace: workspace, Repo: repo, Versions: repo, Backend: kagClient, Mode: knowledgeMode})
-	principal, err := permissionedPrincipal()
+	authorizationProvider, err := permissionedAuthorizationProvider(repoCfg.KAG.Fake)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -128,23 +128,18 @@ func newRuntime(ctx context.Context, workspacePath string, resumeID string) (run
 		return nil, nil, err
 	}
 	rt := runtime.New(runtime.Dependencies{
-		Workspace:     workspace,
-		Config:        repoCfg,
-		Sessions:      repo,
-		Versions:      repo,
-		WorkspaceRepo: repo,
-		Knowledge:     knowledgeService,
-		RunnerMode:    runtime.RunnerModeEino,
-		EinoRunner:    einoRunner,
-		AuthorizationContextProvider: func(ctx context.Context, sessionID string) (protocol.AuthorizationContext, error) {
-			if err := ctx.Err(); err != nil {
-				return protocol.AuthorizationContext{}, err
-			}
-			return fixture.Authorization(principal, sessionID), nil
-		},
-		SideEffects:  sideEffects,
-		ToolExecutor: toolExecutor,
-		NewSessionID: local.NewSessionID,
+		Workspace:                    workspace,
+		Config:                       repoCfg,
+		Sessions:                     repo,
+		Versions:                     repo,
+		WorkspaceRepo:                repo,
+		Knowledge:                    knowledgeService,
+		RunnerMode:                   runtime.RunnerModeEino,
+		EinoRunner:                   einoRunner,
+		AuthorizationContextProvider: authorizationProvider,
+		SideEffects:                  sideEffects,
+		ToolExecutor:                 toolExecutor,
+		NewSessionID:                 local.NewSessionID,
 	})
 	events, err := rt.Start(ctx, runtime.StartOptions{ResumeID: resumeID})
 	return rt, events, err

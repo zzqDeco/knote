@@ -92,6 +92,27 @@ func TestPermissionedPrincipalUsesTrustedRuntimeEnvironment(t *testing.T) {
 	}
 }
 
+func TestPermissionedAuthorizationProviderOnlyEnablesFakeMode(t *testing.T) {
+	t.Setenv(permissionedPrincipalEnv, "mallory")
+	provider, err := permissionedAuthorizationProvider(false)
+	if err != nil || provider != nil {
+		t.Fatalf("real-mode provider = %v, %v; want nil", provider, err)
+	}
+	if _, err := permissionedAuthorizationProvider(true); err == nil {
+		t.Fatal("fake mode accepted an unknown fixture principal")
+	}
+
+	t.Setenv(permissionedPrincipalEnv, "bob")
+	provider, err = permissionedAuthorizationProvider(true)
+	if err != nil || provider == nil {
+		t.Fatalf("fake-mode provider = %v, %v; want configured provider", provider, err)
+	}
+	authorization, err := provider(context.Background(), "sess_fake")
+	if err != nil || authorization.PrincipalID != "bob" || authorization.SessionID != "sess_fake" {
+		t.Fatalf("fake-mode authorization = %+v, %v", authorization, err)
+	}
+}
+
 func TestPermissionedToolsAreNotSelectedWithoutImplementedPrimitives(t *testing.T) {
 	service := versioned.New(versioned.Options{})
 	all := einotools.New(service)
@@ -101,21 +122,36 @@ func TestPermissionedToolsAreNotSelectedWithoutImplementedPrimitives(t *testing.
 		if err != nil {
 			t.Fatal(err)
 		}
-		if info.Name == einotools.NameQuery || info.Name == einotools.NameExplain {
+		if info.Name == einotools.NameQuery || info.Name == einotools.NameExplain || info.Name == einotools.NameEval {
 			t.Fatalf("real mode selected unsupported permissioned tool %s", info.Name)
 		}
 	}
-	if got, want := len(realMode), len(all)-2; got != want {
+	if got, want := len(realMode), len(all)-3; got != want {
 		t.Fatalf("real-mode tool count = %d, want %d", got, want)
 	}
-	if got := len(permissionedTools(all, true)); got != len(all) {
-		t.Fatalf("fake mode tool count = %d, want %d", got, len(all))
+	fakeMode := permissionedTools(all, true)
+	if got, want := len(fakeMode), len(all)-1; got != want {
+		t.Fatalf("fake mode tool count = %d, want %d", got, want)
+	}
+	for _, candidate := range fakeMode {
+		info, err := candidate.Info(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Name == einotools.NameEval {
+			t.Fatal("fake mode retained eval before authorized explain is implemented")
+		}
 	}
 
 	registry := einotools.ByName(service)
 	permissionedToolMap(registry, false)
-	if registry[einotools.NameQuery] != nil || registry[einotools.NameExplain] != nil {
-		t.Fatal("real-mode approved registry retained query or explain")
+	if registry[einotools.NameQuery] != nil || registry[einotools.NameExplain] != nil || registry[einotools.NameEval] != nil {
+		t.Fatal("real-mode approved registry retained query, explain, or eval")
+	}
+	registry = einotools.ByName(service)
+	permissionedToolMap(registry, true)
+	if registry[einotools.NameEval] != nil || registry[einotools.NameQuery] == nil || registry[einotools.NameExplain] == nil {
+		t.Fatal("fake-mode approved registry did not retain only authorized knowledge tools")
 	}
 }
 

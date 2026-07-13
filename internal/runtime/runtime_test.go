@@ -106,11 +106,10 @@ func TestRuntimeEinoModeStartsAndSendsThroughBridge(t *testing.T) {
 	store := local.New(workspace)
 	einoRunner := &fakeEinoRunner{events: []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, "", "hello from eino", nil)}}
 	rt := New(Dependencies{
-		Workspace:                    workspace,
-		Sessions:                     store,
-		EinoRunner:                   einoRunner,
-		AuthorizationContextProvider: testAuthorizationContextProvider,
-		NewSessionID:                 func() string { return "sess_eino" },
+		Workspace:    workspace,
+		Sessions:     store,
+		EinoRunner:   einoRunner,
+		NewSessionID: func() string { return "sess_eino" },
 	})
 	initial, err := rt.Start(context.Background(), StartOptions{})
 	if err != nil {
@@ -137,6 +136,9 @@ func TestRuntimeEinoModeStartsAndSendsThroughBridge(t *testing.T) {
 	}
 	if !hasEvent(loaded, protocol.EventUserMessage) || !hasEvent(loaded, protocol.EventAssistantDone) {
 		t.Fatalf("Eino events were not persisted: %+v", loaded)
+	}
+	if einoRunner.authorizationBound {
+		t.Fatalf("legacy runtime unexpectedly bound authorization: %+v", einoRunner.authorization)
 	}
 	info, err := rt.RunnerInfo(context.Background())
 	if err != nil {
