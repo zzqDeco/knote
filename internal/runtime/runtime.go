@@ -29,19 +29,22 @@ type Runtime interface {
 }
 
 type Dependencies struct {
-	Workspace     string
-	Config        repository.Config
-	SettingsYAML  string
-	Sessions      repository.Sessions
-	Versions      repository.Versions
-	WorkspaceRepo repository.Workspace
-	Knowledge     versioned.Service
-	RunnerMode    RunnerMode
-	EinoRunner    EinoRunner
-	SideEffects   *SideEffectBridge
-	ToolExecutor  ToolExecutor
-	NewSessionID  func() string
+	Workspace                    string
+	Config                       repository.Config
+	SettingsYAML                 string
+	Sessions                     repository.Sessions
+	Versions                     repository.Versions
+	WorkspaceRepo                repository.Workspace
+	Knowledge                    versioned.Service
+	RunnerMode                   RunnerMode
+	EinoRunner                   EinoRunner
+	AuthorizationContextProvider AuthorizationContextProvider
+	SideEffects                  *SideEffectBridge
+	ToolExecutor                 ToolExecutor
+	NewSessionID                 func() string
 }
+
+type AuthorizationContextProvider func(ctx context.Context, sessionID string) (protocol.AuthorizationContext, error)
 
 type StartOptions struct {
 	ResumeID string
@@ -84,11 +87,12 @@ type ToolExecutor interface {
 type EventSubscriber func([]protocol.Event)
 
 type Manager struct {
-	mu          sync.Mutex
-	deps        Dependencies
-	einoSession protocol.SessionInfo
-	subscribers map[int]EventSubscriber
-	nextSubID   int
+	mu                   sync.Mutex
+	deps                 Dependencies
+	einoSession          protocol.SessionInfo
+	authorizationBinding *authorizationBinding
+	subscribers          map[int]EventSubscriber
+	nextSubID            int
 }
 
 var _ Runtime = (*Manager)(nil)
@@ -103,6 +107,10 @@ func New(deps Dependencies) *Manager {
 
 func (m *Manager) Start(ctx context.Context, opts StartOptions) ([]protocol.Event, error) {
 	m.mu.Lock()
+	if strings.TrimSpace(opts.ResumeID) != "" && m.deps.AuthorizationContextProvider != nil {
+		m.mu.Unlock()
+		return nil, permissionedResumeError()
+	}
 	if m.einoSession.ID != "" {
 		sessionID := m.einoSession.ID
 		m.mu.Unlock()
@@ -124,6 +132,7 @@ func (m *Manager) Start(ctx context.Context, opts StartOptions) ([]protocol.Even
 	}
 	info, loaded := m.newEinoSessionLocked(ctx, opts.ResumeID)
 	m.einoSession = info
+	m.authorizationBinding = nil
 	m.mu.Unlock()
 	events := []protocol.Event{
 		protocol.NewEvent(protocol.EventGatewayReady, info.ID, "knote runtime ready", nil),
@@ -145,6 +154,7 @@ func (m *Manager) SendMessage(ctx context.Context, input string) []protocol.Even
 	m.mu.Lock()
 	einoSession := m.einoSession
 	einoRunner := m.deps.EinoRunner
+	authorizationProvider := m.deps.AuthorizationContextProvider
 	m.mu.Unlock()
 	if einoSession.ID == "" {
 		return m.emitAndReturn(m.runtimeError("runtime has not started"))
@@ -153,10 +163,26 @@ func (m *Manager) SendMessage(ctx context.Context, input string) []protocol.Even
 	if strings.HasPrefix(input, "/") {
 		return m.handleSlash(ctx, einoSession.ID, input)
 	}
-	history := m.loadHistory(ctx, einoSession.ID)
 	runCtx := ctx
+	if authorizationProvider != nil {
+		authorization, err := authorizationProvider.authorizationContext(ctx, einoSession.ID)
+		if err != nil {
+			events = append(events, protocol.NewEvent(protocol.EventError, einoSession.ID, err.Error(), nil))
+			return m.emitAndReturn(events)
+		}
+		runCtx, err = protocol.WithAuthorizationContext(ctx, authorization)
+		if err != nil {
+			events = append(events, protocol.NewEvent(protocol.EventError, einoSession.ID, err.Error(), nil))
+			return m.emitAndReturn(events)
+		}
+		if err := m.bindAuthorizationContext(einoSession.ID, authorization); err != nil {
+			events = append(events, protocol.NewEvent(protocol.EventError, einoSession.ID, err.Error(), nil))
+			return m.emitAndReturn(events)
+		}
+	}
+	history := m.loadHistory(ctx, einoSession.ID)
 	if m.deps.SideEffects != nil {
-		runCtx = withSideEffectSession(ctx, einoSession.ID)
+		runCtx = withSideEffectSession(runCtx, einoSession.ID)
 	}
 	runnerEvents, err := einoRunner.Run(runCtx, EinoRunInput{SessionID: einoSession.ID, Message: input, History: history})
 	events = append(events, runnerEvents...)

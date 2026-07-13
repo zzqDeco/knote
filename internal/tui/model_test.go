@@ -126,10 +126,10 @@ func TestResumeDoesNotReviveStaleConfirmation(t *testing.T) {
 		t.Fatalf("resume revived stale confirmation: %+v", model.pendingConfirm)
 	}
 
-	model.composer.SetValue("/eval")
+	model.composer.SetValue("/build")
 	updateModel(t, &model, tea.KeyMsg{Type: tea.KeyEnter})
-	if model.pendingConfirm == nil || model.pendingConfirm.Action != "eval" {
-		t.Fatalf("/eval after resume did not create a fresh confirmation: %+v", model.pendingConfirm)
+	if model.pendingConfirm == nil || model.pendingConfirm.Action != "build" {
+		t.Fatalf("/build after resume did not create a fresh confirmation: %+v", model.pendingConfirm)
 	}
 }
 

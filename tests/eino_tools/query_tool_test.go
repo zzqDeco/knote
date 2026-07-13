@@ -9,8 +9,10 @@ import (
 	"testing"
 
 	einotools "github.com/zzqDeco/knote/internal/eino/tools"
+	"github.com/zzqDeco/knote/internal/knowledge/authorized/fixture"
 	"github.com/zzqDeco/knote/internal/knowledge/kag"
 	"github.com/zzqDeco/knote/internal/knowledge/versioned"
+	"github.com/zzqDeco/knote/internal/protocol"
 	"github.com/zzqDeco/knote/internal/repository/local"
 )
 
@@ -71,6 +73,63 @@ func TestQueryToolUsesFakeKAGBackend(t *testing.T) {
 	}
 	if !strings.Contains(decoded.Answer, "Fake KAG answer") || decoded.AdapterError != "" {
 		t.Fatalf("query tool did not use fake KAG backend: %+v", decoded)
+	}
+}
+
+func TestPermissionedQueryToolIsolatesFakeEvidenceByPrincipal(t *testing.T) {
+	root := repoRoot(t)
+	backend := kag.Client{
+		AdapterPath: filepath.Join(root, "adapters", "kag", "knote_kag_adapter.py"),
+		Workspace:   root,
+		Fake:        true,
+	}
+	permissioned, err := fixture.New(backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	query := func(ctx context.Context, request protocol.QueryRequest) (einotools.PermissionedQueryResult, error) {
+		result, err := permissioned.Query(ctx, request)
+		if err != nil {
+			return einotools.PermissionedQueryResult{}, err
+		}
+		return einotools.PermissionedQueryResult{
+			Answer: result.Generation.Answer, Mode: result.Generation.Mode, EvidencePackage: result.Evidence,
+		}, nil
+	}
+	legacy := versioned.New(versioned.Options{Workspace: root, Backend: backend, Mode: versioned.ModeFake})
+	tool := einotools.ByNameWithOptions(einotools.Options{Service: legacy, PermissionedQuery: query})[einotools.NameQuery]
+
+	for _, test := range []struct {
+		principal string
+		wantItems int
+	}{
+		{principal: fixture.Alice, wantItems: 2},
+		{principal: fixture.Bob, wantItems: 1},
+	} {
+		authorization := fixture.Authorization(test.principal, "session-"+test.principal)
+		ctx, err := protocol.WithAuthorizationContext(context.Background(), authorization)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out, err := tool.InvokableRun(ctx, `{"question":"what is knote?"}`)
+		if err != nil {
+			t.Fatalf("%s query failed: %v", test.principal, err)
+		}
+		if strings.Contains(out, "DENIED CANARY") {
+			t.Fatalf("%s result leaked denied canary: %s", test.principal, out)
+		}
+		var decoded struct {
+			EvidencePackage protocol.EvidencePackage `json:"evidence_package"`
+		}
+		if err := json.Unmarshal([]byte(out), &decoded); err != nil {
+			t.Fatalf("decode %s query result: %v", test.principal, err)
+		}
+		if got := len(decoded.EvidencePackage.Items); got != test.wantItems {
+			t.Fatalf("%s evidence items = %d, want %d", test.principal, got, test.wantItems)
+		}
+		if err := decoded.EvidencePackage.ValidateFor(authorization); err != nil {
+			t.Fatalf("%s evidence package is invalid: %v", test.principal, err)
+		}
 	}
 }
 

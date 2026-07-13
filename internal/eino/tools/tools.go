@@ -36,9 +36,18 @@ type SideEffectRequest struct {
 
 type SideEffectGate func(ctx context.Context, req SideEffectRequest) error
 
+type PermissionedQueryResult struct {
+	Answer          string
+	Mode            string
+	EvidencePackage protocol.EvidencePackage
+}
+
+type PermissionedQuery func(ctx context.Context, req protocol.QueryRequest) (PermissionedQueryResult, error)
+
 type Options struct {
-	Service        versioned.Service
-	SideEffectGate SideEffectGate
+	Service           versioned.Service
+	PermissionedQuery PermissionedQuery
+	SideEffectGate    SideEffectGate
 }
 
 func New(svc versioned.Service) []einotool.InvokableTool {
@@ -48,8 +57,8 @@ func New(svc versioned.Service) []einotool.InvokableTool {
 func NewWithOptions(opts Options) []einotool.InvokableTool {
 	return []einotool.InvokableTool{
 		buildTool(opts),
-		queryTool(opts.Service),
-		explainTool(opts.Service),
+		queryTool(opts),
+		explainTool(opts),
 		evalTool(opts),
 		diffTool(opts.Service),
 		versionsTool(opts.Service),
@@ -122,7 +131,7 @@ func buildTool(opts Options) einotool.InvokableTool {
 	}
 }
 
-func queryTool(svc versioned.Service) einotool.InvokableTool {
+func queryTool(opts Options) einotool.InvokableTool {
 	return &invokable{
 		info: toolInfo(NameQuery, "Ask the current knote knowledge base a question.", params(map[string]*schema.ParameterInfo{
 			"question": stringParam("Natural language question to answer.", true),
@@ -135,7 +144,10 @@ func queryTool(svc versioned.Service) einotool.InvokableTool {
 			if strings.TrimSpace(req.Question) == "" {
 				return nil, fmt.Errorf("question is required")
 			}
-			answer, err := svc.Query(ctx, req.Question)
+			if opts.PermissionedQuery != nil {
+				return runPermissionedQuery(ctx, opts.PermissionedQuery, req.Question)
+			}
+			answer, err := opts.Service.Query(ctx, req.Question)
 			if err != nil {
 				return nil, err
 			}
@@ -144,7 +156,7 @@ func queryTool(svc versioned.Service) einotool.InvokableTool {
 	}
 }
 
-func explainTool(svc versioned.Service) einotool.InvokableTool {
+func explainTool(opts Options) einotool.InvokableTool {
 	return &invokable{
 		info: toolInfo(NameExplain, "Explain an answer with KAG evidence for the current knote knowledge base.", params(map[string]*schema.ParameterInfo{
 			"question": stringParam("Natural language question to explain.", true),
@@ -157,13 +169,35 @@ func explainTool(svc versioned.Service) einotool.InvokableTool {
 			if strings.TrimSpace(req.Question) == "" {
 				return nil, fmt.Errorf("question is required")
 			}
-			answer, err := svc.Explain(ctx, req.Question)
+			if opts.PermissionedQuery != nil {
+				return runPermissionedQuery(ctx, opts.PermissionedQuery, req.Question)
+			}
+			answer, err := opts.Service.Explain(ctx, req.Question)
 			if err != nil {
 				return nil, err
 			}
 			return answerResult(answer), nil
 		},
 	}
+}
+
+func runPermissionedQuery(ctx context.Context, query PermissionedQuery, question string) (permissionedAnswerResult, error) {
+	authorization, ok := protocol.AuthorizationContextFrom(ctx)
+	if !ok {
+		return permissionedAnswerResult{}, fmt.Errorf("permissioned query requires trusted authorization context")
+	}
+	result, err := query(ctx, protocol.QueryRequest{
+		Question:      question,
+		Authorization: authorization,
+	})
+	if err != nil {
+		return permissionedAnswerResult{}, err
+	}
+	return permissionedAnswerResult{
+		Answer:          result.Answer,
+		Mode:            result.Mode,
+		EvidencePackage: result.EvidencePackage,
+	}, nil
 }
 
 func evalTool(opts Options) einotool.InvokableTool {
@@ -404,6 +438,12 @@ type answerResult struct {
 	AuthorizationObject  string         `json:"authz_object,omitempty"`
 	AuthorizationVersion string         `json:"authz_version,omitempty"`
 	AdapterError         string         `json:"adapter_error,omitempty"`
+}
+
+type permissionedAnswerResult struct {
+	Answer          string                   `json:"answer"`
+	Mode            string                   `json:"mode,omitempty"`
+	EvidencePackage protocol.EvidencePackage `json:"evidence_package"`
 }
 
 type evalReportResult struct {

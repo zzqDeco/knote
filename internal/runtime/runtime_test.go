@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/zzqDeco/knote/internal/protocol"
+	"github.com/zzqDeco/knote/internal/repository"
 	"github.com/zzqDeco/knote/internal/repository/local"
 )
 
@@ -136,6 +137,9 @@ func TestRuntimeEinoModeStartsAndSendsThroughBridge(t *testing.T) {
 	if !hasEvent(loaded, protocol.EventUserMessage) || !hasEvent(loaded, protocol.EventAssistantDone) {
 		t.Fatalf("Eino events were not persisted: %+v", loaded)
 	}
+	if einoRunner.authorizationBound {
+		t.Fatalf("legacy runtime unexpectedly bound authorization: %+v", einoRunner.authorization)
+	}
 	info, err := rt.RunnerInfo(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -143,6 +147,301 @@ func TestRuntimeEinoModeStartsAndSendsThroughBridge(t *testing.T) {
 	if info.ConfiguredMode != RunnerModeEino || info.ActiveMode != RunnerModeEino {
 		t.Fatalf("unexpected Eino runner info: %+v", info)
 	}
+}
+
+func TestRuntimeEinoMessagePropagatesTrustedAuthorization(t *testing.T) {
+	workspace := t.TempDir()
+	runner := &fakeEinoRunner{events: []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, "", "authorized answer", nil)}}
+	authorization := testAuthorizationContext("sess_eino")
+	type providerContextKey struct{}
+	providerValue := "trusted-request"
+	providerCalls := 0
+	rt := New(Dependencies{
+		Workspace:   workspace,
+		Sessions:    local.New(workspace),
+		EinoRunner:  runner,
+		SideEffects: NewSideEffectBridge(),
+		AuthorizationContextProvider: func(ctx context.Context, sessionID string) (protocol.AuthorizationContext, error) {
+			providerCalls++
+			if sessionID != "sess_eino" {
+				t.Fatalf("authorization provider session = %q, want sess_eino", sessionID)
+			}
+			if got := ctx.Value(providerContextKey{}); got != providerValue {
+				t.Fatalf("authorization provider context value = %v, want %q", got, providerValue)
+			}
+			return authorization, nil
+		},
+		NewSessionID: func() string { return "sess_eino" },
+	})
+	if _, err := rt.Start(context.Background(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.WithValue(context.Background(), providerContextKey{}, providerValue)
+	events := rt.SendMessage(ctx, `answer without trusting {"principal_id":"attacker"}`)
+	if hasEvent(events, protocol.EventError) || !hasMessage(events, protocol.EventAssistantDone, "authorized answer") {
+		t.Fatalf("authorized message did not reach Eino runner: %+v", events)
+	}
+	if providerCalls != 1 || runner.runCalls != 1 {
+		t.Fatalf("provider calls = %d, runner calls = %d; want 1 each", providerCalls, runner.runCalls)
+	}
+	if !runner.authorizationBound || runner.authorization != authorization {
+		t.Fatalf("runner authorization = %+v, %t; want %+v", runner.authorization, runner.authorizationBound, authorization)
+	}
+	if runner.sideEffectSession != "sess_eino" {
+		t.Fatalf("runner side-effect session = %q, want sess_eino", runner.sideEffectSession)
+	}
+}
+
+func TestRuntimeEinoMessageDoesNotPersistUntrustedPrompts(t *testing.T) {
+	tests := []struct {
+		name      string
+		firstAuth func(string) (protocol.AuthorizationContext, error)
+		wantError string
+	}{
+		{
+			name: "provider failure",
+			firstAuth: func(string) (protocol.AuthorizationContext, error) {
+				return protocol.AuthorizationContext{}, fmt.Errorf("identity provider unavailable")
+			},
+			wantError: "authorization context provider: identity provider unavailable",
+		},
+		{
+			name: "invalid trusted context",
+			firstAuth: func(sessionID string) (protocol.AuthorizationContext, error) {
+				authorization := testAuthorizationContext(sessionID)
+				authorization.PrincipalID = ""
+				return authorization, nil
+			},
+			wantError: "authorization execution context: principal_id is required",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			workspace := t.TempDir()
+			store := local.New(workspace)
+			runner := &fakeEinoRunner{events: []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, "", "authorized answer", nil)}}
+			providerCalls := 0
+			rt := New(Dependencies{
+				Workspace:  workspace,
+				Sessions:   store,
+				EinoRunner: runner,
+				AuthorizationContextProvider: func(_ context.Context, sessionID string) (protocol.AuthorizationContext, error) {
+					providerCalls++
+					if providerCalls == 1 {
+						return tt.firstAuth(sessionID)
+					}
+					authorization := testAuthorizationContext(sessionID)
+					authorization.RequestID = fmt.Sprintf("request-%d", providerCalls)
+					return authorization, nil
+				},
+				NewSessionID: func() string { return "sess_eino" },
+			})
+			if _, err := rt.Start(context.Background(), StartOptions{}); err != nil {
+				t.Fatal(err)
+			}
+
+			events := rt.SendMessage(context.Background(), "untrusted prompt")
+			if runner.runCalls != 0 {
+				t.Fatalf("Eino runner called %d times after authorization failure", runner.runCalls)
+			}
+			if !hasMessage(events, protocol.EventError, tt.wantError) {
+				t.Fatalf("authorization failure was not surfaced: %+v", events)
+			}
+			persisted, err := store.Load(context.Background(), "sess_eino")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if hasMessage(persisted, protocol.EventUserMessage, "untrusted prompt") {
+				t.Fatalf("untrusted prompt was persisted: %+v", persisted)
+			}
+
+			events = rt.SendMessage(context.Background(), "authorized prompt")
+			if hasEvent(events, protocol.EventError) || runner.runCalls != 1 {
+				t.Fatalf("subsequent authorized request failed: %+v", events)
+			}
+			if hasMessage(runner.lastHistory, protocol.EventUserMessage, "untrusted prompt") {
+				t.Fatalf("untrusted prompt reached later authorized history: %+v", runner.lastHistory)
+			}
+		})
+	}
+}
+
+func TestRuntimeEinoSessionRejectsAuthorizationBindingChangesBeforeHistoryOrRunner(t *testing.T) {
+	workspace := t.TempDir()
+	store := &trackingSessionStore{Sessions: local.New(workspace)}
+	runner := &fakeEinoRunner{events: []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, "", "authorized answer", nil)}}
+	sessionIDs := []string{"sess_first", "sess_second"}
+	nextSession := 0
+	firstSessionRequests := 0
+	rt := New(Dependencies{
+		Workspace:  workspace,
+		Sessions:   store,
+		EinoRunner: runner,
+		NewSessionID: func() string {
+			sessionID := sessionIDs[nextSession]
+			nextSession++
+			return sessionID
+		},
+		AuthorizationContextProvider: func(_ context.Context, sessionID string) (protocol.AuthorizationContext, error) {
+			authorization := testAuthorizationContext(sessionID)
+			if sessionID == "sess_first" {
+				firstSessionRequests++
+				authorization.RequestID = fmt.Sprintf("request-%d", firstSessionRequests)
+				if firstSessionRequests == 3 {
+					authorization.PrincipalID = "other-user"
+				}
+			} else {
+				authorization.RequestID = "request-new-session"
+				authorization.PrincipalID = "other-user"
+			}
+			return authorization, nil
+		},
+	})
+	if _, err := rt.Start(context.Background(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	for _, message := range []string{"first", "same binding, new request id"} {
+		if events := rt.SendMessage(context.Background(), message); hasEvent(events, protocol.EventError) {
+			t.Fatalf("authorized request %q failed: %+v", message, events)
+		}
+	}
+
+	loadCalls := store.loadCalls
+	runCalls := runner.runCalls
+	events := rt.SendMessage(context.Background(), "cross-principal request")
+	if !hasMessage(events, protocol.EventError, `authorization context changed for live session "sess_first"`) {
+		t.Fatalf("authorization binding change was not rejected: %+v", events)
+	}
+	if store.loadCalls != loadCalls {
+		t.Fatalf("history loads = %d after binding rejection, want %d", store.loadCalls, loadCalls)
+	}
+	if runner.runCalls != runCalls {
+		t.Fatalf("runner calls = %d after binding rejection, want %d", runner.runCalls, runCalls)
+	}
+	persisted, err := store.Sessions.Load(context.Background(), "sess_first")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasMessage(persisted, protocol.EventUserMessage, "cross-principal request") {
+		t.Fatalf("rejected request was persisted into the bound session: %+v", persisted)
+	}
+
+	_ = rt.SendMessage(context.Background(), "/new")
+	events = rt.SendMessage(context.Background(), "new principal, new session")
+	if hasEvent(events, protocol.EventError) || !hasMessage(events, protocol.EventAssistantDone, "authorized answer") {
+		t.Fatalf("/new did not reset the authorization binding: %+v", events)
+	}
+}
+
+func TestRuntimeStartResumeFailsClosedWithAuthorizationProvider(t *testing.T) {
+	workspace := t.TempDir()
+	stored := local.New(workspace)
+	must(t, stored.Append(context.Background(), protocol.NewEvent(protocol.EventAssistantDone, "sess_legacy", "old answer", nil)))
+	store := &trackingSessionStore{Sessions: stored}
+	rt := New(Dependencies{
+		Workspace:                    workspace,
+		Sessions:                     store,
+		EinoRunner:                   &fakeEinoRunner{events: []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, "", "new answer", nil)}},
+		AuthorizationContextProvider: testAuthorizationContextProvider,
+		NewSessionID:                 func() string { return "sess_current" },
+	})
+	var emitted []protocol.Event
+	rt.Subscribe(func(events []protocol.Event) { emitted = append(emitted, events...) })
+	events, err := rt.Start(context.Background(), StartOptions{ResumeID: "sess_legacy"})
+	if err == nil || err.Error() != permissionedResumeErrorMessage {
+		t.Fatalf("permissioned start resume error = %v, want %q", err, permissionedResumeErrorMessage)
+	}
+	if len(events) != 0 || len(emitted) != 0 {
+		t.Fatalf("permissioned start resume emitted events: returned=%+v emitted=%+v", events, emitted)
+	}
+	if store.loadCalls != 0 {
+		t.Fatalf("permissioned start resume loaded history %d times", store.loadCalls)
+	}
+	if rt.SessionID() != "" {
+		t.Fatalf("permissioned start resume changed live session to %q", rt.SessionID())
+	}
+}
+
+func TestRuntimeSlashResumeFailsClosedWithAuthorizationProvider(t *testing.T) {
+	workspace := t.TempDir()
+	stored := local.New(workspace)
+	must(t, stored.Append(context.Background(), protocol.NewEvent(protocol.EventAssistantDone, "sess_legacy", "old answer", nil)))
+	store := &trackingSessionStore{Sessions: stored}
+	runner := &fakeEinoRunner{events: []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, "", "new answer", nil)}}
+	rt := New(Dependencies{
+		Workspace:                    workspace,
+		Sessions:                     store,
+		EinoRunner:                   runner,
+		AuthorizationContextProvider: testAuthorizationContextProvider,
+		NewSessionID:                 func() string { return "sess_current" },
+	})
+	if _, err := rt.Start(context.Background(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	var emitted []protocol.Event
+	rt.Subscribe(func(events []protocol.Event) { emitted = append(emitted, events...) })
+	events := rt.SendMessage(context.Background(), "/resume sess_legacy")
+	if !hasMessage(events, protocol.EventError, permissionedResumeErrorMessage) {
+		t.Fatalf("permissioned slash resume did not return fail-closed error: %+v", events)
+	}
+	if hasMessage(events, protocol.EventAssistantDone, "old answer") || hasMessage(emitted, protocol.EventAssistantDone, "old answer") {
+		t.Fatalf("permissioned slash resume replayed old answer: returned=%+v emitted=%+v", events, emitted)
+	}
+	if store.loadCalls != 0 || runner.runCalls != 0 {
+		t.Fatalf("permissioned slash resume reached history/runner: loads=%d runs=%d", store.loadCalls, runner.runCalls)
+	}
+	if rt.SessionID() != "sess_current" {
+		t.Fatalf("permissioned slash resume changed live session to %q", rt.SessionID())
+	}
+}
+
+func TestRuntimeResumeWithoutAuthorizationProviderPreservesLegacyReplay(t *testing.T) {
+	t.Run("start option", func(t *testing.T) {
+		workspace := t.TempDir()
+		stored := local.New(workspace)
+		must(t, stored.Append(context.Background(), protocol.NewEvent(protocol.EventAssistantDone, "sess_legacy", "old answer", nil)))
+		store := &trackingSessionStore{Sessions: stored}
+		rt := New(Dependencies{
+			Workspace:    workspace,
+			Sessions:     store,
+			EinoRunner:   &fakeEinoRunner{events: []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, "", "new answer", nil)}},
+			NewSessionID: func() string { return "sess_current" },
+		})
+		events, err := rt.Start(context.Background(), StartOptions{ResumeID: "sess_legacy"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !hasMessage(events, protocol.EventAssistantDone, "old answer") || rt.SessionID() != "sess_legacy" {
+			t.Fatalf("legacy start resume was not preserved: session=%q events=%+v", rt.SessionID(), events)
+		}
+		if store.loadCalls != 1 {
+			t.Fatalf("legacy start resume history loads = %d, want 1", store.loadCalls)
+		}
+	})
+
+	t.Run("slash command", func(t *testing.T) {
+		workspace := t.TempDir()
+		stored := local.New(workspace)
+		must(t, stored.Append(context.Background(), protocol.NewEvent(protocol.EventAssistantDone, "sess_legacy", "old answer", nil)))
+		store := &trackingSessionStore{Sessions: stored}
+		rt := New(Dependencies{
+			Workspace:    workspace,
+			Sessions:     store,
+			EinoRunner:   &fakeEinoRunner{events: []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, "", "new answer", nil)}},
+			NewSessionID: func() string { return "sess_current" },
+		})
+		if _, err := rt.Start(context.Background(), StartOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		events := rt.SendMessage(context.Background(), "/resume sess_legacy")
+		if !hasMessage(events, protocol.EventAssistantDone, "old answer") || rt.SessionID() != "sess_legacy" {
+			t.Fatalf("legacy slash resume was not preserved: session=%q events=%+v", rt.SessionID(), events)
+		}
+		if store.loadCalls != 1 {
+			t.Fatalf("legacy slash resume history loads = %d, want 1", store.loadCalls)
+		}
+	})
 }
 
 func TestRuntimeEinoCurrentSessionInfoRefreshesWorkspaceStatus(t *testing.T) {
@@ -178,17 +477,40 @@ func TestRuntimeEinoCurrentSessionInfoRefreshesWorkspaceStatus(t *testing.T) {
 	}
 }
 
+func TestRuntimeEvalSlashFailsClosedBeforeToolExecution(t *testing.T) {
+	workspace := t.TempDir()
+	executor := &fakeToolExecutor{}
+	rt := New(Dependencies{
+		Workspace:    workspace,
+		Sessions:     local.New(workspace),
+		EinoRunner:   &fakeEinoRunner{events: []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, "", "natural answer", nil)}},
+		ToolExecutor: executor,
+		NewSessionID: func() string { return "sess_eino" },
+	})
+	if _, err := rt.Start(context.Background(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	events := rt.SendMessage(context.Background(), "/eval")
+	if !hasMessage(events, protocol.EventError, "eval is unavailable until authorized explain is implemented") {
+		t.Fatalf("disabled eval did not fail closed: %+v", events)
+	}
+	if executor.calls != 0 {
+		t.Fatalf("disabled eval invoked the tool executor %d times", executor.calls)
+	}
+}
+
 func TestRuntimeEinoModeConfirmsSideEffectTool(t *testing.T) {
 	workspace := t.TempDir()
 	store := local.New(workspace)
 	bridge := NewSideEffectBridge()
 	einoRunner := &sideEffectEinoRunner{bridge: bridge}
 	rt := New(Dependencies{
-		Workspace:    workspace,
-		Sessions:     store,
-		EinoRunner:   einoRunner,
-		SideEffects:  bridge,
-		NewSessionID: func() string { return "sess_eino" },
+		Workspace:                    workspace,
+		Sessions:                     store,
+		EinoRunner:                   einoRunner,
+		AuthorizationContextProvider: testAuthorizationContextProvider,
+		SideEffects:                  bridge,
+		NewSessionID:                 func() string { return "sess_eino" },
 	})
 	if _, err := rt.Start(context.Background(), StartOptions{}); err != nil {
 		t.Fatal(err)
@@ -288,11 +610,12 @@ func TestRuntimeEinoModeRejectsSideEffectTool(t *testing.T) {
 	bridge := NewSideEffectBridge()
 	einoRunner := &sideEffectEinoRunner{bridge: bridge}
 	rt := New(Dependencies{
-		Workspace:    workspace,
-		Sessions:     local.New(workspace),
-		EinoRunner:   einoRunner,
-		SideEffects:  bridge,
-		NewSessionID: func() string { return "sess_eino" },
+		Workspace:                    workspace,
+		Sessions:                     local.New(workspace),
+		EinoRunner:                   einoRunner,
+		AuthorizationContextProvider: testAuthorizationContextProvider,
+		SideEffects:                  bridge,
+		NewSessionID:                 func() string { return "sess_eino" },
 	})
 	if _, err := rt.Start(context.Background(), StartOptions{}); err != nil {
 		t.Fatal(err)
@@ -359,10 +682,11 @@ func TestRuntimeEinoModePersistsPartialEventsOnRunnerError(t *testing.T) {
 	workspace := t.TempDir()
 	store := local.New(workspace)
 	rt := New(Dependencies{
-		Workspace:    workspace,
-		Sessions:     store,
-		EinoRunner:   &fakeEinoRunner{events: []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, "", "partial answer", nil)}, err: fmt.Errorf("runner failed")},
-		NewSessionID: func() string { return "sess_eino" },
+		Workspace:                    workspace,
+		Sessions:                     store,
+		EinoRunner:                   &fakeEinoRunner{events: []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, "", "partial answer", nil)}, err: fmt.Errorf("runner failed")},
+		AuthorizationContextProvider: testAuthorizationContextProvider,
+		NewSessionID:                 func() string { return "sess_eino" },
 	})
 	if _, err := rt.Start(context.Background(), StartOptions{}); err != nil {
 		t.Fatal(err)
@@ -492,10 +816,24 @@ func hasMessage(events []protocol.Event, eventType protocol.EventType, message s
 }
 
 type fakeEinoRunner struct {
-	tools       []RunnerToolInfo
-	events      []protocol.Event
-	lastHistory []protocol.Event
-	err         error
+	tools              []RunnerToolInfo
+	events             []protocol.Event
+	lastHistory        []protocol.Event
+	authorization      protocol.AuthorizationContext
+	authorizationBound bool
+	sideEffectSession  string
+	runCalls           int
+	err                error
+}
+
+type trackingSessionStore struct {
+	repository.Sessions
+	loadCalls int
+}
+
+func (s *trackingSessionStore) Load(ctx context.Context, sessionID string) ([]protocol.Event, error) {
+	s.loadCalls++
+	return s.Sessions.Load(ctx, sessionID)
 }
 
 type fakeToolExecutor struct {
@@ -562,7 +900,10 @@ func (r *fakeEinoRunner) ToolInventory(context.Context) ([]RunnerToolInfo, error
 	return append([]RunnerToolInfo(nil), r.tools...), nil
 }
 
-func (r *fakeEinoRunner) Run(_ context.Context, input EinoRunInput) ([]protocol.Event, error) {
+func (r *fakeEinoRunner) Run(ctx context.Context, input EinoRunInput) ([]protocol.Event, error) {
+	r.runCalls++
+	r.authorization, r.authorizationBound = protocol.AuthorizationContextFrom(ctx)
+	r.sideEffectSession = sideEffectSessionID(ctx)
 	if len(r.events) == 0 {
 		return nil, fmt.Errorf("fake Eino runner does not execute")
 	}
@@ -573,6 +914,27 @@ func (r *fakeEinoRunner) Run(_ context.Context, input EinoRunInput) ([]protocol.
 		events = append(events, event)
 	}
 	return events, r.err
+}
+
+func testAuthorizationContextProvider(_ context.Context, sessionID string) (protocol.AuthorizationContext, error) {
+	return testAuthorizationContext(sessionID), nil
+}
+
+func testAuthorizationContext(sessionID string) protocol.AuthorizationContext {
+	return protocol.AuthorizationContext{
+		Version:              protocol.SecurityContractVersion,
+		TenantID:             "local",
+		KnowledgeBaseID:      "default",
+		PrincipalID:          "local-user",
+		SessionID:            sessionID,
+		RequestID:            "request-1",
+		AgentID:              "agent-1",
+		TaskID:               "task-1",
+		AuthorizationModelID: "local-v1",
+		IdentityWatermark:    "identity-v1",
+		ACLWatermark:         "acl-v1",
+		Consistency:          protocol.ConsistencyHigherConsistency,
+	}
 }
 
 func must(t *testing.T, err error) {

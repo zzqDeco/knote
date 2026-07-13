@@ -1,0 +1,178 @@
+package fixture
+
+import (
+	"context"
+	"fmt"
+	"sync/atomic"
+	"time"
+
+	"github.com/zzqDeco/knote/internal/authz"
+	"github.com/zzqDeco/knote/internal/knowledge/authorized"
+	"github.com/zzqDeco/knote/internal/knowledge/kag"
+	"github.com/zzqDeco/knote/internal/protocol"
+)
+
+const (
+	Alice = "alice"
+	Bob   = "bob"
+
+	TenantID             = "tenant_fake"
+	KnowledgeBaseID      = "kb_fake"
+	AuthorizationModelID = "01GAHCE4YVKPQEKZQHT2R89MQV"
+
+	introResourceID        protocol.ResourceID = "res_00000000000000000000000000000001"
+	deniedCanaryResourceID protocol.ResourceID = "res_00000000000000000000000000000002"
+	overviewResourceID     protocol.ResourceID = "res_00000000000000000000000000000003"
+
+	introContent        = "knote is local-first."
+	deniedCanaryContent = "DENIED CANARY BODY must never cross the authorization boundary"
+	overviewContent     = "knote exposes a versioned knowledge workflow."
+
+	fakeOrganization   = "organization:tenant_fake"
+	fakePrivateReaders = "group:fixture-private-readers"
+	fakeSharedReaders  = "group:fixture-shared-readers"
+)
+
+var requestSequence atomic.Uint64
+
+// New returns a deterministic Phase 1 service for the fake KAG retrieve
+// projection. Graph expansion is deliberately disabled because the fake claim
+// objects are outside the document-only authorization boundary.
+func New(backend kag.PrimitiveBackend) (*authorized.Service, error) {
+	authorizer, err := authz.NewLocalAuthorizer(AuthorizationModelID, fixtureTuples())
+	if err != nil {
+		return nil, fmt.Errorf("create fixture authorizer: %w", err)
+	}
+	loader := exactEvidenceLoader{items: fixtureEvidence()}
+	service, err := authorized.New(authorized.Options{
+		KAG:           backend,
+		Authorizer:    authorizer,
+		Loader:        loader,
+		RetrieveLimit: 3,
+		EvidenceLimit: 3,
+		ExpandLimit:   0,
+		Now: func() time.Time {
+			return time.Date(2026, time.July, 13, 0, 0, 0, 0, time.UTC)
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("create fixture service: %w", err)
+	}
+	return service, nil
+}
+
+// Authorization creates a request-scoped authorization context. Each call
+// receives a distinct request ID, including concurrent calls.
+func Authorization(principal, sessionID string) protocol.AuthorizationContext {
+	requestID := fmt.Sprintf("request_fixture_%020d", requestSequence.Add(1))
+	return protocol.AuthorizationContext{
+		Version:              protocol.SecurityContractVersion,
+		TenantID:             TenantID,
+		KnowledgeBaseID:      KnowledgeBaseID,
+		PrincipalID:          principal,
+		SessionID:            sessionID,
+		RequestID:            requestID,
+		AuthorizationModelID: AuthorizationModelID,
+		IdentityWatermark:    "identity_fake_v1",
+		ACLWatermark:         "acl_fake_v1",
+		Consistency:          protocol.ConsistencyHigherConsistency,
+	}
+}
+
+func fixtureTuples() []authz.Tuple {
+	intro := fixtureResource(introResourceID, introContent).AuthorizationID
+	canary := fixtureResource(deniedCanaryResourceID, deniedCanaryContent).AuthorizationID
+	overview := fixtureResource(overviewResourceID, overviewContent).AuthorizationID
+	return []authz.Tuple{
+		{User: "user:" + Alice, Relation: authz.RelationMember, Object: fakePrivateReaders},
+		{User: "user:" + Alice, Relation: authz.RelationMember, Object: fakeSharedReaders},
+		{User: "user:" + Bob, Relation: authz.RelationMember, Object: fakeSharedReaders},
+		{User: fakePrivateReaders + "#" + authz.RelationMember, Relation: authz.RelationMember, Object: fakeOrganization},
+		{User: fakeSharedReaders + "#" + authz.RelationMember, Relation: authz.RelationMember, Object: fakeOrganization},
+		{User: fakeOrganization, Relation: authz.RelationOrganization, Object: intro},
+		{User: fakePrivateReaders + "#" + authz.RelationMember, Relation: authz.RelationViewer, Object: intro},
+		{User: fakeOrganization, Relation: authz.RelationOrganization, Object: canary},
+		{User: fakeOrganization, Relation: authz.RelationOrganization, Object: overview},
+		{User: fakeSharedReaders + "#" + authz.RelationMember, Relation: authz.RelationViewer, Object: overview},
+	}
+}
+
+func fixtureEvidence() map[protocol.ResourceID]protocol.EvidenceItem {
+	return map[protocol.ResourceID]protocol.EvidenceItem{
+		introResourceID:        fixtureItem(introResourceID, introContent, "cite_intro"),
+		deniedCanaryResourceID: fixtureItem(deniedCanaryResourceID, deniedCanaryContent, "cite_denied_canary"),
+		overviewResourceID:     fixtureItem(overviewResourceID, overviewContent, "cite_overview"),
+	}
+}
+
+func fixtureItem(id protocol.ResourceID, content, citation string) protocol.EvidenceItem {
+	resource := fixtureResource(id, content)
+	return protocol.EvidenceItem{
+		Resource:   resource,
+		Content:    content,
+		Derivation: protocol.DerivationAnySupport,
+		Supports: []protocol.ProvenanceSupport{{
+			SupportID: "support_" + string(id),
+			Resource:  resource,
+			Evidence:  []protocol.ResourceHandle{resource},
+			Complete:  true,
+		}},
+		Citation: protocol.Citation{Handle: citation, Resource: resource},
+	}
+}
+
+func fixtureResource(id protocol.ResourceID, content string) protocol.ResourceHandle {
+	return protocol.ResourceHandle{
+		ResourceID:              id,
+		Type:                    protocol.ResourceDocument,
+		TenantID:                TenantID,
+		KnowledgeBaseID:         KnowledgeBaseID,
+		AuthorizationID:         "document:" + string(id),
+		AuthorizationResourceID: id,
+		ContentDigest:           protocol.NewContentDigest(content),
+		Versions: protocol.ResourceVersions{
+			Source:     "source_fake_v1",
+			Content:    "content_fake_v1",
+			ACL:        "acl_fake_v1",
+			Index:      "index_fake_v1",
+			Graph:      "graph_fake_v1",
+			Projection: "projection_fake_v1",
+		},
+		ServingState: protocol.ServingActive,
+	}
+}
+
+type exactEvidenceLoader struct {
+	items map[protocol.ResourceID]protocol.EvidenceItem
+}
+
+func (l exactEvidenceLoader) Load(ctx context.Context, handles []protocol.ResourceHandle) ([]protocol.EvidenceItem, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("fixture evidence load requires a context")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	items := make([]protocol.EvidenceItem, len(handles))
+	for index, handle := range handles {
+		item, ok := l.items[handle.ResourceID]
+		if !ok {
+			return nil, fmt.Errorf("resource %s is not in the fake retrieve fixture", handle.ResourceID)
+		}
+		if item.Resource != handle {
+			return nil, fmt.Errorf("resource %s does not match the exact fake retrieve handle", handle.ResourceID)
+		}
+		items[index] = cloneEvidenceItem(item)
+	}
+	return items, nil
+}
+
+func cloneEvidenceItem(item protocol.EvidenceItem) protocol.EvidenceItem {
+	clone := item
+	clone.Supports = make([]protocol.ProvenanceSupport, len(item.Supports))
+	for index, support := range item.Supports {
+		clone.Supports[index] = support
+		clone.Supports[index].Evidence = append([]protocol.ResourceHandle(nil), support.Evidence...)
+	}
+	return clone
+}

@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os/exec"
 	"strings"
 	"testing"
@@ -131,6 +132,132 @@ func TestToolsRejectMalformedUnknownAndMissingArguments(t *testing.T) {
 	}
 }
 
+func TestPermissionedQueryAuthorizationCannotComeFromToolJSON(t *testing.T) {
+	svc := &fakeService{}
+	callbackCalls := 0
+	registry := ByNameWithOptions(Options{
+		Service: svc,
+		PermissionedQuery: func(context.Context, protocol.QueryRequest) (PermissionedQueryResult, error) {
+			callbackCalls++
+			return PermissionedQueryResult{}, nil
+		},
+	})
+
+	_, err := registry[NameQuery].InvokableRun(context.Background(), `{
+		"question":"what is knote?",
+		"authorization":{"principal_id":"tool-controlled"}
+	}`)
+	if err == nil || !strings.Contains(err.Error(), "unknown field") {
+		t.Fatalf("tool-supplied authorization should be rejected, err=%v", err)
+	}
+	if callbackCalls != 0 || svc.queryCalls != 0 {
+		t.Fatalf("rejected tool authorization reached query path: callback=%d legacy=%d", callbackCalls, svc.queryCalls)
+	}
+}
+
+func TestPermissionedQueryRequiresTrustedAuthorizationContext(t *testing.T) {
+	svc := &fakeService{}
+	callbackCalls := 0
+	registry := ByNameWithOptions(Options{
+		Service: svc,
+		PermissionedQuery: func(context.Context, protocol.QueryRequest) (PermissionedQueryResult, error) {
+			callbackCalls++
+			return PermissionedQueryResult{}, nil
+		},
+	})
+
+	for _, name := range []string{NameQuery, NameExplain} {
+		_, err := registry[name].InvokableRun(context.Background(), `{"question":"why?"}`)
+		if err == nil || !strings.Contains(err.Error(), "trusted authorization context") {
+			t.Fatalf("%s should fail closed without trusted authorization, err=%v", name, err)
+		}
+	}
+	if callbackCalls != 0 || svc.queryCalls != 0 || svc.explainCalls != 0 {
+		t.Fatalf("missing authorization reached a query path: callback=%d query=%d explain=%d", callbackCalls, svc.queryCalls, svc.explainCalls)
+	}
+}
+
+func TestQueryAndExplainUsePermissionedCallback(t *testing.T) {
+	svc := &fakeService{}
+	authorization := toolTestAuthorization()
+	ctx, err := protocol.WithAuthorizationContext(context.Background(), authorization)
+	if err != nil {
+		t.Fatalf("bind authorization context: %v", err)
+	}
+	evidence := protocol.EvidencePackage{
+		Version:         protocol.SecurityContractVersion,
+		TenantID:        authorization.TenantID,
+		KnowledgeBaseID: authorization.KnowledgeBaseID,
+		PrincipalID:     authorization.PrincipalID,
+		RequestID:       authorization.RequestID,
+	}
+	var requests []protocol.QueryRequest
+	registry := ByNameWithOptions(Options{
+		Service: svc,
+		PermissionedQuery: func(_ context.Context, req protocol.QueryRequest) (PermissionedQueryResult, error) {
+			requests = append(requests, req)
+			return PermissionedQueryResult{
+				Answer:          "permissioned: " + req.Question,
+				Mode:            "authorized",
+				EvidencePackage: evidence,
+			}, nil
+		},
+	})
+
+	for _, tc := range []struct {
+		name     string
+		question string
+	}{
+		{name: NameQuery, question: "what is knote?"},
+		{name: NameExplain, question: "why?"},
+	} {
+		result := runJSONWithContext(t, ctx, registry[tc.name], `{"question":"`+tc.question+`"}`)
+		if result["answer"] != "permissioned: "+tc.question || result["mode"] != "authorized" {
+			t.Fatalf("unexpected %s result: %+v", tc.name, result)
+		}
+		packageJSON, ok := result["evidence_package"].(map[string]any)
+		if !ok || packageJSON["tenant_id"] != authorization.TenantID || packageJSON["request_id"] != authorization.RequestID {
+			t.Fatalf("%s did not return structured evidence package: %+v", tc.name, result)
+		}
+	}
+	if len(requests) != 2 {
+		t.Fatalf("permissioned callback calls = %d, want 2", len(requests))
+	}
+	for _, req := range requests {
+		if req.Authorization != authorization {
+			t.Fatalf("callback authorization = %+v, want trusted context %+v", req.Authorization, authorization)
+		}
+	}
+	if svc.queryCalls != 0 || svc.explainCalls != 0 {
+		t.Fatalf("permissioned tools called legacy service: query=%d explain=%d", svc.queryCalls, svc.explainCalls)
+	}
+}
+
+func TestPermissionedCallbackErrorsDoNotFallBackToLegacyService(t *testing.T) {
+	svc := &fakeService{}
+	ctx, err := protocol.WithAuthorizationContext(context.Background(), toolTestAuthorization())
+	if err != nil {
+		t.Fatalf("bind authorization context: %v", err)
+	}
+	wantErr := errors.New("permission denied")
+	registry := ByNameWithOptions(Options{
+		Service: svc,
+		PermissionedQuery: func(context.Context, protocol.QueryRequest) (PermissionedQueryResult, error) {
+			return PermissionedQueryResult{}, wantErr
+		},
+	})
+
+	for _, name := range []string{NameQuery, NameExplain} {
+		_, err := registry[name].InvokableRun(ctx, `{"question":"restricted"}`)
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("%s error = %v, want %v", name, err, wantErr)
+		}
+	}
+	if svc.queryCalls != 0 || svc.explainCalls != 0 {
+		t.Fatalf("callback error fell back to legacy service: query=%d explain=%d", svc.queryCalls, svc.explainCalls)
+	}
+}
+
 func TestMutatingToolsRequireSideEffectGate(t *testing.T) {
 	svc := &fakeService{}
 	registry := ByName(svc)
@@ -174,7 +301,12 @@ func TestEinoToolsPackageImportBoundary(t *testing.T) {
 
 func runJSON(t *testing.T, tool einotool.InvokableTool, args string) map[string]any {
 	t.Helper()
-	out, err := tool.InvokableRun(context.Background(), args)
+	return runJSONWithContext(t, context.Background(), tool, args)
+}
+
+func runJSONWithContext(t *testing.T, ctx context.Context, tool einotool.InvokableTool, args string) map[string]any {
+	t.Helper()
+	out, err := tool.InvokableRun(ctx, args)
 	if err != nil {
 		t.Fatalf("InvokableRun failed: %v", err)
 	}
@@ -196,7 +328,9 @@ func hasGateAction(requests []SideEffectRequest, action string) bool {
 
 type fakeService struct {
 	buildCalled     bool
+	queryCalls      int
 	queryQuestion   string
+	explainCalls    int
 	explainQuestion string
 	evalCalled      bool
 	diffRef         string
@@ -217,6 +351,7 @@ func (s *fakeService) Build(context.Context) (versioned.BuildResult, error) {
 }
 
 func (s *fakeService) Query(_ context.Context, question string) (versioned.Answer, error) {
+	s.queryCalls++
 	s.queryQuestion = question
 	return versioned.Answer{
 		Answer:   "query: " + question,
@@ -226,6 +361,7 @@ func (s *fakeService) Query(_ context.Context, question string) (versioned.Answe
 }
 
 func (s *fakeService) Explain(_ context.Context, question string) (versioned.Explanation, error) {
+	s.explainCalls++
 	s.explainQuestion = question
 	return versioned.Answer{
 		Answer:      "explain: " + question,
@@ -277,4 +413,21 @@ func (*fakeService) Status(context.Context) (repository.Status, error) {
 
 func (*fakeService) Mode() versioned.Mode {
 	return versioned.ModeFake
+}
+
+func toolTestAuthorization() protocol.AuthorizationContext {
+	return protocol.AuthorizationContext{
+		Version:              protocol.SecurityContractVersion,
+		TenantID:             "local",
+		KnowledgeBaseID:      "default",
+		PrincipalID:          "local-user",
+		SessionID:            "session-1",
+		RequestID:            "request-1",
+		AgentID:              "agent-1",
+		TaskID:               "task-1",
+		AuthorizationModelID: "local-v1",
+		IdentityWatermark:    "identity-v1",
+		ACLWatermark:         "acl-v1",
+		Consistency:          protocol.ConsistencyHigherConsistency,
+	}
 }
