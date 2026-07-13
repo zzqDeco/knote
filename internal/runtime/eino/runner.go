@@ -100,6 +100,11 @@ func (r *Runner) Run(ctx context.Context, input runtime.EinoRunInput) ([]protoco
 			bindProjectedEvents(projected, binding)
 		} else if permissionedContext {
 			sanitizePermissionedErrors(projected)
+			if hasAssistantOutput(projected) {
+				generic := fmt.Errorf("%s", protectedContentUnavailableMessage)
+				events = append(events, protocol.NewEvent(protocol.EventError, input.SessionID, generic.Error(), nil))
+				return events, generic
+			}
 		}
 		events = append(events, projected...)
 	}
@@ -174,6 +179,15 @@ func sanitizePermissionedErrors(events []protocol.Event) {
 		events[index].Message = protectedContentUnavailableMessage
 		events[index].Payload = nil
 	}
+}
+
+func hasAssistantOutput(events []protocol.Event) bool {
+	for _, event := range events {
+		if event.Type == protocol.EventAssistantDelta || event.Type == protocol.EventAssistantDone {
+			return true
+		}
+	}
+	return false
 }
 
 func bindProjectedEvents(events []protocol.Event, binding *protocol.ProtectedContentBinding) {

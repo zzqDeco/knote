@@ -193,6 +193,12 @@ func TestRunnerFailsPermissionedOutputClosedAndSanitizesErrors(t *testing.T) {
 			name:     "executor error without evidence",
 			executor: &fakeExecutor{err: errors.New("CONTEXT_ERROR_CANARY")},
 		},
+		{
+			name: "assistant answer without evidence",
+			executor: &fakeExecutor{events: []*adk.AgentEvent{
+				adk.EventFromMessage(schema.AssistantMessage("UNBOUND_ANSWER_CANARY", nil), nil, schema.Assistant, ""),
+			}},
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			runner := NewRunner(Options{Executor: test.executor})
@@ -203,8 +209,12 @@ func TestRunnerFailsPermissionedOutputClosedAndSanitizesErrors(t *testing.T) {
 			for _, event := range events {
 				if strings.Contains(event.Message, "MALFORMED_OUTPUT_CANARY") ||
 					strings.Contains(event.Message, "EXECUTOR_ERROR_CANARY") ||
-					strings.Contains(event.Message, "CONTEXT_ERROR_CANARY") {
+					strings.Contains(event.Message, "CONTEXT_ERROR_CANARY") ||
+					strings.Contains(event.Message, "UNBOUND_ANSWER_CANARY") {
 					t.Fatalf("permissioned ADK error leaked backend details: %+v", events)
+				}
+				if event.Type == protocol.EventAssistantDone {
+					t.Fatalf("permissioned ADK persisted an unbound assistant answer: %+v", events)
 				}
 			}
 		})
