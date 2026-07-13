@@ -28,23 +28,29 @@ type EvidenceLoader interface {
 }
 
 type Options struct {
-	KAG           kag.PrimitiveBackend
-	Authorizer    authz.BatchChecker
-	Loader        EvidenceLoader
-	RetrieveLimit int
-	EvidenceLimit int
-	ExpandLimit   int
-	Now           func() time.Time
+	KAG              kag.PrimitiveBackend
+	Authorizer       authz.BatchChecker
+	Loader           EvidenceLoader
+	Cache            *QueryCache
+	RetrieverVersion string
+	PromptVersion    string
+	RetrieveLimit    int
+	EvidenceLimit    int
+	ExpandLimit      int
+	Now              func() time.Time
 }
 
 type Service struct {
-	kag           kag.PrimitiveBackend
-	authorizer    authz.BatchChecker
-	loader        EvidenceLoader
-	retrieveLimit int
-	evidenceLimit int
-	expandLimit   int
-	now           func() time.Time
+	kag              kag.PrimitiveBackend
+	authorizer       authz.BatchChecker
+	loader           EvidenceLoader
+	cache            *QueryCache
+	retrieverVersion string
+	promptVersion    string
+	retrieveLimit    int
+	evidenceLimit    int
+	expandLimit      int
+	now              func() time.Time
 }
 
 type QueryResult struct {
@@ -61,6 +67,17 @@ func New(options Options) (*Service, error) {
 	}
 	if options.Loader == nil {
 		return nil, fmt.Errorf("authorized retrieval requires an evidence loader")
+	}
+	if options.Cache != nil {
+		if !options.Cache.initialized() {
+			return nil, fmt.Errorf("authorized query cache is not initialized")
+		}
+		if err := validateTextToken("retriever_version", options.RetrieverVersion); err != nil {
+			return nil, fmt.Errorf("authorized query cache: %w", err)
+		}
+		if err := validateTextToken("prompt_version", options.PromptVersion); err != nil {
+			return nil, fmt.Errorf("authorized query cache: %w", err)
+		}
 	}
 	if options.RetrieveLimit == 0 {
 		options.RetrieveLimit = defaultRetrieveLimit
@@ -81,7 +98,8 @@ func New(options Options) (*Service, error) {
 		options.Now = time.Now
 	}
 	return &Service{
-		kag: options.KAG, authorizer: options.Authorizer, loader: options.Loader,
+		kag: options.KAG, authorizer: options.Authorizer, loader: options.Loader, cache: options.Cache,
+		retrieverVersion: options.RetrieverVersion, promptVersion: options.PromptVersion,
 		retrieveLimit: options.RetrieveLimit, evidenceLimit: options.EvidenceLimit,
 		expandLimit: options.ExpandLimit, now: options.Now,
 	}, nil
@@ -93,6 +111,20 @@ func (s *Service) Query(ctx context.Context, request protocol.QueryRequest) (Que
 	}
 	if err := request.Validate(); err != nil {
 		return QueryResult{}, fmt.Errorf("authorized query: %w", err)
+	}
+	var cacheKey queryCacheKey
+	if s.cache != nil {
+		cacheKey = newQueryCacheKey(
+			request, s.retrieverVersion, s.promptVersion,
+			s.retrieveLimit, s.evidenceLimit, s.expandLimit,
+		)
+		if snapshot, ok := s.cache.get(cacheKey); ok {
+			if cached, valid := s.revalidateCached(ctx, request, snapshot.result); valid &&
+				s.cache.containsRevision(cacheKey, snapshot.revision) {
+				return cached, nil
+			}
+			s.cache.deleteIfRevision(cacheKey, snapshot.revision)
+		}
 	}
 	authorization := request.Authorization
 	retrieveRequest := kag.RetrieveRequest{
@@ -153,27 +185,133 @@ func (s *Service) Query(ctx context.Context, request protocol.QueryRequest) (Que
 	if err != nil {
 		return QueryResult{}, fmt.Errorf("authorized query load evidence: %w", err)
 	}
-	allHandles, boundaries, projection, err := collectEvidenceHandles(authorization, items)
+	checked, err := s.checkEvidence(ctx, authorization, "f", items)
 	if err != nil {
-		return QueryResult{}, fmt.Errorf("authorized query evidence: %w", err)
-	}
-
-	// This is the final evidence authorization check. No content-bearing or graph
-	// operation is allowed between this check and generation.
-	batch, err := s.checkObjects(ctx, authorization, "f", allHandles)
-	if err != nil {
+		if errors.Is(err, errNoEvidence) {
+			return QueryResult{}, errNoEvidence
+		}
 		return QueryResult{}, fmt.Errorf("authorized query final evidence check: %w", err)
 	}
+	// This is the final evidence authorization check. No content-bearing or graph
+	// operation is allowed between this check and generation.
 	checkedAt := s.now().UTC()
 	if checkedAt.IsZero() {
 		return QueryResult{}, fmt.Errorf("authorized query final evidence check returned a zero timestamp")
 	}
-	decisions := make([]protocol.AuthorizationDecision, len(allHandles))
-	for index, resource := range allHandles {
-		result := batch[resource.AuthorizationID]
-		if !result.allowed {
-			return QueryResult{}, errNoEvidence
+	evidencePackage, err := buildEvidencePackage(authorization, items, checked, checkedAt)
+	if err != nil {
+		return QueryResult{}, fmt.Errorf("authorized query evidence package: %w", err)
+	}
+
+	generateRequest := newGenerateRequest(authorization, request.Question, items)
+	generation, err := s.kag.Generate(ctx, generateRequest)
+	if err != nil {
+		return QueryResult{}, fmt.Errorf("authorized query generate: %w", err)
+	}
+	if err := generation.ValidateFor(generateRequest); err != nil {
+		return QueryResult{}, fmt.Errorf("authorized query generate result: %w", err)
+	}
+	result := QueryResult{Generation: generation, Evidence: evidencePackage}
+	if s.cache != nil {
+		s.cache.put(cacheKey, result)
+	}
+	return result, nil
+}
+
+type checkedEvidence struct {
+	handles    []protocol.ResourceHandle
+	boundaries map[protocol.ResourceID]protocol.ResourceHandle
+	projection string
+	objects    map[string]objectCheck
+}
+
+func (s *Service) revalidateCached(
+	ctx context.Context,
+	request protocol.QueryRequest,
+	cached QueryResult,
+) (QueryResult, bool) {
+	original := authorizationFromPackage(cached.Evidence)
+	if err := cached.Evidence.ValidateFor(original); err != nil {
+		return QueryResult{}, false
+	}
+	expectedFingerprint, err := protocol.NewVisibilityFingerprint(
+		request.Authorization,
+		cached.Evidence.ProjectionVersion,
+	)
+	if err != nil || expectedFingerprint != cached.Evidence.VisibilityFingerprint {
+		return QueryResult{}, false
+	}
+	originalGenerate := newGenerateRequest(original, request.Question, cached.Evidence.Items)
+	if err := cached.Generation.ValidateFor(originalGenerate); err != nil {
+		return QueryResult{}, false
+	}
+
+	if _, err := s.checkEvidence(ctx, request.Authorization, "cache", cached.Evidence.Items); err != nil {
+		return QueryResult{}, false
+	}
+	handles := make([]protocol.ResourceHandle, len(cached.Evidence.Items))
+	for index, item := range cached.Evidence.Items {
+		handles[index] = item.Resource
+	}
+	loaded, err := s.loadExact(ctx, request.Authorization, handles)
+	if err != nil || !reflect.DeepEqual(loaded, cached.Evidence.Items) {
+		return QueryResult{}, false
+	}
+	checked, err := s.checkEvidence(ctx, request.Authorization, "cache-final", loaded)
+	if err != nil {
+		return QueryResult{}, false
+	}
+	checkedAt := s.now().UTC()
+	if checkedAt.IsZero() {
+		return QueryResult{}, false
+	}
+	evidencePackage, err := buildEvidencePackage(request.Authorization, loaded, checked, checkedAt)
+	if err != nil {
+		return QueryResult{}, false
+	}
+	generateRequest := newGenerateRequest(request.Authorization, request.Question, loaded)
+	if err := cached.Generation.ValidateFor(generateRequest); err != nil {
+		return QueryResult{}, false
+	}
+	return QueryResult{
+		Generation: cloneGeneration(cached.Generation),
+		Evidence:   evidencePackage,
+	}, true
+}
+
+func (s *Service) checkEvidence(
+	ctx context.Context,
+	authorization protocol.AuthorizationContext,
+	stage string,
+	items []protocol.EvidenceItem,
+) (checkedEvidence, error) {
+	handles, boundaries, projection, err := collectEvidenceHandles(authorization, items)
+	if err != nil {
+		return checkedEvidence{}, err
+	}
+	objects, err := s.checkObjects(ctx, authorization, stage, handles)
+	if err != nil {
+		return checkedEvidence{}, err
+	}
+	for _, resource := range handles {
+		if !objects[resource.AuthorizationID].allowed {
+			return checkedEvidence{}, errNoEvidence
 		}
+	}
+	return checkedEvidence{
+		handles: handles, boundaries: boundaries, projection: projection, objects: objects,
+	}, nil
+}
+
+func buildEvidencePackage(
+	authorization protocol.AuthorizationContext,
+	items []protocol.EvidenceItem,
+	checked checkedEvidence,
+	checkedAt time.Time,
+) (protocol.EvidencePackage, error) {
+	decisions := make([]protocol.AuthorizationDecision, len(checked.handles))
+	for index, resource := range checked.handles {
+		result := checked.objects[resource.AuthorizationID]
 		decision := protocol.AuthorizationDecision{
 			CorrelationID:         result.correlationID,
 			RequestID:             authorization.RequestID,
@@ -183,7 +321,7 @@ func (s *Service) Query(ctx context.Context, request protocol.QueryRequest) (Que
 			TaskID:                authorization.TaskID,
 			Relation:              protocol.EvidenceReadRelation,
 			Resource:              resource,
-			AuthorizationResource: boundaries[resource.ResourceID],
+			AuthorizationResource: checked.boundaries[resource.ResourceID],
 			Outcome:               protocol.DecisionAllow,
 			AuthorizationModelID:  authorization.AuthorizationModelID,
 			IdentityWatermark:     authorization.IdentityWatermark,
@@ -192,15 +330,15 @@ func (s *Service) Query(ctx context.Context, request protocol.QueryRequest) (Que
 			CheckedAt:             checkedAt,
 		}
 		if err := decision.ValidateFor(authorization); err != nil {
-			return QueryResult{}, fmt.Errorf("authorized query decision for resource %s: %w", resource.ResourceID, err)
+			return protocol.EvidencePackage{}, fmt.Errorf("authorization decision for resource %s: %w", resource.ResourceID, err)
 		}
 		decisions[index] = decision
 	}
-	fingerprint, err := protocol.NewVisibilityFingerprint(authorization, projection)
+	fingerprint, err := protocol.NewVisibilityFingerprint(authorization, checked.projection)
 	if err != nil {
-		return QueryResult{}, fmt.Errorf("authorized query visibility fingerprint: %w", err)
+		return protocol.EvidencePackage{}, fmt.Errorf("visibility fingerprint: %w", err)
 	}
-	evidencePackage := protocol.EvidencePackage{
+	result := protocol.EvidencePackage{
 		Version:               protocol.SecurityContractVersion,
 		TenantID:              authorization.TenantID,
 		KnowledgeBaseID:       authorization.KnowledgeBaseID,
@@ -213,33 +351,33 @@ func (s *Service) Query(ctx context.Context, request protocol.QueryRequest) (Que
 		IdentityWatermark:     authorization.IdentityWatermark,
 		ACLWatermark:          authorization.ACLWatermark,
 		Consistency:           authorization.Consistency,
-		ProjectionVersion:     projection,
+		ProjectionVersion:     checked.projection,
 		VisibilityFingerprint: fingerprint,
-		Items:                 items,
+		Items:                 cloneEvidenceItems(items),
 		Decisions:             decisions,
 	}
-	if err := evidencePackage.ValidateFor(authorization); err != nil {
-		return QueryResult{}, fmt.Errorf("authorized query evidence package: %w", err)
+	if err := result.ValidateFor(authorization); err != nil {
+		return protocol.EvidencePackage{}, err
 	}
+	return result, nil
+}
 
-	generateRequest := kag.GenerateRequest{
+func newGenerateRequest(
+	authorization protocol.AuthorizationContext,
+	question string,
+	items []protocol.EvidenceItem,
+) kag.GenerateRequest {
+	request := kag.GenerateRequest{
 		Authorization: authorization,
-		Question:      request.Question,
+		Question:      question,
 		Evidence:      make([]kag.AuthorizedEvidence, len(items)),
 	}
 	for index, item := range items {
-		generateRequest.Evidence[index] = kag.AuthorizedEvidence{
+		request.Evidence[index] = kag.AuthorizedEvidence{
 			Resource: item.Resource, Content: item.Content, CitationHandle: item.Citation.Handle,
 		}
 	}
-	generation, err := s.kag.Generate(ctx, generateRequest)
-	if err != nil {
-		return QueryResult{}, fmt.Errorf("authorized query generate: %w", err)
-	}
-	if err := generation.ValidateFor(generateRequest); err != nil {
-		return QueryResult{}, fmt.Errorf("authorized query generate result: %w", err)
-	}
-	return QueryResult{Generation: generation, Evidence: evidencePackage}, nil
+	return request
 }
 
 func (s *Service) OpenCitation(
