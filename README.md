@@ -78,7 +78,9 @@ The adapter writes a sorted JSON corpus and generated starter config under `.kno
 
 ## Sessions
 
-Sessions are JSONL event logs under `.knote/sessions/`. `/clear` only clears the current TUI projection; it does not delete session history. `/new` creates a fresh session. `/resume` lists recent sessions, and `/resume <session-id>` replays one in the TUI.
+Sessions are JSONL event logs under `.knote/sessions/`. They are retained until the workspace owner removes them; `/clear` only clears the current TUI projection and does not delete history. knote creates the session directory with owner-only access (`0700`) and session data with owner-only access (`0600`) on filesystems that support POSIX permissions.
+
+Permissioned sessions also persist a metadata-only authorization envelope. Resume replays history only when the current tenant, knowledge base, principal, authorization model, identity and ACL watermarks, task scope, and consistency preference still match that envelope; missing or changed authorization fails closed before history is loaded. `/new` creates a fresh session, while `/resume` lists recent sessions and `/resume <session-id>` restores an authorized one. Revocation protects future access but cannot retract content that a user already viewed or copied.
 
 ## Runtime Layers
 

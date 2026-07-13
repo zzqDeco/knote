@@ -3,11 +3,16 @@ package runtime
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/zzqDeco/knote/internal/protocol"
+	"github.com/zzqDeco/knote/internal/repository"
 )
 
-const permissionedResumeErrorMessage = "resume is disabled when an authorization context provider is configured: persisted sessions do not contain a durable authorization envelope"
+const (
+	permissionedResumeErrorMessage   = "resume authorization failed"
+	sessionAuthorizationErrorMessage = "session authorization failed"
+)
 
 type authorizationBinding struct {
 	tenantID             string
@@ -36,17 +41,7 @@ func (provider AuthorizationContextProvider) authorizationContext(ctx context.Co
 }
 
 func (m *Manager) bindAuthorizationContext(sessionID string, authorization protocol.AuthorizationContext) error {
-	binding := authorizationBinding{
-		tenantID:             authorization.TenantID,
-		knowledgeBaseID:      authorization.KnowledgeBaseID,
-		principalID:          authorization.PrincipalID,
-		authorizationModelID: authorization.AuthorizationModelID,
-		identityWatermark:    authorization.IdentityWatermark,
-		aclWatermark:         authorization.ACLWatermark,
-		agentID:              authorization.AgentID,
-		taskID:               authorization.TaskID,
-		consistency:          authorization.Consistency,
-	}
+	binding := newAuthorizationBinding(authorization)
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -63,6 +58,61 @@ func (m *Manager) bindAuthorizationContext(sessionID string, authorization proto
 	return nil
 }
 
+func newAuthorizationBinding(authorization protocol.AuthorizationContext) authorizationBinding {
+	return authorizationBinding{
+		tenantID:             authorization.TenantID,
+		knowledgeBaseID:      authorization.KnowledgeBaseID,
+		principalID:          authorization.PrincipalID,
+		authorizationModelID: authorization.AuthorizationModelID,
+		identityWatermark:    authorization.IdentityWatermark,
+		aclWatermark:         authorization.ACLWatermark,
+		agentID:              authorization.AgentID,
+		taskID:               authorization.TaskID,
+		consistency:          authorization.Consistency,
+	}
+}
+
+func (m *Manager) bindSessionAuthorization(ctx context.Context, sessionID string, authorization protocol.AuthorizationContext) error {
+	if err := m.bindAuthorizationContext(sessionID, authorization); err != nil {
+		return err
+	}
+	sessions, ok := m.deps.Sessions.(repository.PermissionedSessions)
+	if !ok {
+		return sessionAuthorizationError()
+	}
+	envelope, err := protocol.NewSessionAuthorizationEnvelope(authorization, time.Now().UTC())
+	if err != nil {
+		return sessionAuthorizationError()
+	}
+	if err := sessions.BindAuthorization(ctx, envelope); err != nil {
+		return sessionAuthorizationError()
+	}
+	return nil
+}
+
+func (m *Manager) authorizeSessionResume(ctx context.Context, sessionID string) (protocol.AuthorizationContext, error) {
+	authorization, err := m.deps.AuthorizationContextProvider.authorizationContext(ctx, sessionID)
+	if err != nil {
+		return protocol.AuthorizationContext{}, permissionedResumeError()
+	}
+	sessions, ok := m.deps.Sessions.(repository.PermissionedSessions)
+	if !ok {
+		return protocol.AuthorizationContext{}, permissionedResumeError()
+	}
+	envelope, err := sessions.LoadAuthorization(ctx, sessionID)
+	if err != nil {
+		return protocol.AuthorizationContext{}, permissionedResumeError()
+	}
+	if err := envelope.ValidateFor(authorization); err != nil {
+		return protocol.AuthorizationContext{}, permissionedResumeError()
+	}
+	return authorization, nil
+}
+
 func permissionedResumeError() error {
 	return fmt.Errorf("%s", permissionedResumeErrorMessage)
+}
+
+func sessionAuthorizationError() error {
+	return fmt.Errorf("%s", sessionAuthorizationErrorMessage)
 }

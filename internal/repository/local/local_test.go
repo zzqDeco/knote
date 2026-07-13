@@ -19,6 +19,7 @@ import (
 func TestStoreImplementsRepositoryContracts(t *testing.T) {
 	var _ repository.Workspace = Store{}
 	var _ repository.Sessions = Store{}
+	var _ repository.PermissionedSessions = Store{}
 	var _ repository.Versions = Store{}
 }
 
@@ -114,6 +115,190 @@ func TestSessionsAppendLoadAndList(t *testing.T) {
 	}
 	if err := store.Append(ctx, protocol.NewEvent(protocol.EventUserMessage, "../escape", "bad", nil)); err == nil {
 		t.Fatal("session ids with path traversal should be rejected")
+	}
+}
+
+func TestSessionAuthorizationBindIsIdempotentAndPersistent(t *testing.T) {
+	ctx := context.Background()
+	workspace := t.TempDir()
+	store := New(workspace)
+	first := testSessionAuthorizationEnvelope(t, "sess_one", "request-1", time.Unix(1, 0).UTC())
+
+	if err := store.BindAuthorization(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(workspace, ".knote", "sessions", "sess_one.authorization.json")
+	before := mustRead(t, path)
+	expected, err := json.MarshalIndent(first, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before != string(append(expected, '\n')) {
+		t.Fatalf("authorization envelope is not deterministic:\n%s", before)
+	}
+	for _, forbidden := range []string{"request_id", "title", "body"} {
+		if strings.Contains(before, forbidden) {
+			t.Fatalf("authorization envelope contains forbidden field %q:\n%s", forbidden, before)
+		}
+	}
+
+	second := testSessionAuthorizationEnvelope(t, "sess_one", "request-2", time.Unix(2, 0).UTC())
+	if err := store.BindAuthorization(ctx, second); err != nil {
+		t.Fatalf("exact durable rebinding should be idempotent: %v", err)
+	}
+	if after := mustRead(t, path); after != before {
+		t.Fatalf("idempotent bind replaced the original envelope:\nbefore=%s\nafter=%s", before, after)
+	}
+
+	loaded, err := New(workspace).LoadAuthorization(ctx, "sess_one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded != first {
+		t.Fatalf("persisted envelope changed: got %+v want %+v", loaded, first)
+	}
+}
+
+func TestSessionAuthorizationBindRejectsMismatch(t *testing.T) {
+	ctx := context.Background()
+	workspace := t.TempDir()
+	store := New(workspace)
+	original := testSessionAuthorizationEnvelope(t, "sess_one", "request-1", time.Unix(1, 0).UTC())
+	if err := store.BindAuthorization(ctx, original); err != nil {
+		t.Fatal(err)
+	}
+
+	mismatch := original
+	mismatch.ACLWatermark = "acl-v2"
+	mismatch.BoundAt = time.Unix(2, 0).UTC()
+	if err := store.BindAuthorization(ctx, mismatch); err == nil {
+		t.Fatal("mismatched durable authorization binding was accepted")
+	}
+	loaded, err := store.LoadAuthorization(ctx, original.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded != original {
+		t.Fatalf("mismatched bind replaced original envelope: got %+v want %+v", loaded, original)
+	}
+}
+
+func TestSessionAuthorizationBindIsCreateOnceConcurrently(t *testing.T) {
+	ctx := context.Background()
+	workspace := t.TempDir()
+	store := New(workspace)
+	first := testSessionAuthorizationEnvelope(t, "sess_one", "request-1", time.Unix(1, 0).UTC())
+	second := first
+	second.PrincipalID = "principal-2"
+	second.BoundAt = time.Unix(2, 0).UTC()
+
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	for _, envelope := range []protocol.SessionAuthorizationEnvelope{first, second} {
+		go func() {
+			<-start
+			results <- store.BindAuthorization(ctx, envelope)
+		}()
+	}
+	close(start)
+	successes := 0
+	for range 2 {
+		if err := <-results; err == nil {
+			successes++
+		}
+	}
+	if successes != 1 {
+		t.Fatalf("concurrent mismatched binds succeeded %d times, want exactly one", successes)
+	}
+	loaded, err := store.LoadAuthorization(ctx, "sess_one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded != first && loaded != second {
+		t.Fatalf("persisted envelope was not either complete candidate: %+v", loaded)
+	}
+}
+
+func TestSessionAuthorizationMissingAndPathValidation(t *testing.T) {
+	ctx := context.Background()
+	store := New(t.TempDir())
+	if _, err := store.LoadAuthorization(ctx, "missing"); err != repository.ErrSessionAuthorizationEnvelopeNotFound {
+		t.Fatalf("missing envelope error = %v, want stable not-found error", err)
+	}
+
+	invalidIDs := []string{"", " ", ".", "..", "../escape", "nested/session", `nested\session`, "line\nbreak"}
+	for _, sessionID := range invalidIDs {
+		t.Run(fmt.Sprintf("load_%q", sessionID), func(t *testing.T) {
+			if _, err := store.LoadAuthorization(ctx, sessionID); err == nil {
+				t.Fatal("invalid session id was accepted")
+			}
+		})
+		t.Run(fmt.Sprintf("bind_%q", sessionID), func(t *testing.T) {
+			envelope := testSessionAuthorizationEnvelope(t, "valid", "request-1", time.Unix(1, 0).UTC())
+			envelope.SessionID = sessionID
+			if err := store.BindAuthorization(ctx, envelope); err == nil {
+				t.Fatal("invalid session id was accepted")
+			}
+		})
+	}
+}
+
+func TestSessionStoragePermissionsArePrivateAndCorrectedOnAccess(t *testing.T) {
+	ctx := context.Background()
+	workspace := t.TempDir()
+	store := New(workspace)
+	envelope := testSessionAuthorizationEnvelope(t, "sess_one", "request-1", time.Unix(1, 0).UTC())
+	if err := store.BindAuthorization(ctx, envelope); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Append(ctx, protocol.NewEvent(protocol.EventUserMessage, "sess_one", "hello", nil)); err != nil {
+		t.Fatal(err)
+	}
+
+	dir := filepath.Join(workspace, ".knote", "sessions")
+	eventPath := filepath.Join(dir, "sess_one.jsonl")
+	envelopePath := filepath.Join(dir, "sess_one.authorization.json")
+	assertPermissions(t, dir, 0o700)
+	assertPermissions(t, eventPath, 0o600)
+	assertPermissions(t, envelopePath, 0o600)
+
+	for path, mode := range map[string]os.FileMode{dir: 0o755, eventPath: 0o644, envelopePath: 0o644} {
+		if err := os.Chmod(path, mode); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := store.LoadAuthorization(ctx, "sess_one"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Load(ctx, "sess_one"); err != nil {
+		t.Fatal(err)
+	}
+	assertPermissions(t, dir, 0o700)
+	assertPermissions(t, eventPath, 0o600)
+	assertPermissions(t, envelopePath, 0o600)
+}
+
+func TestSessionAuthorizationLoadRejectsUnknownFields(t *testing.T) {
+	ctx := context.Background()
+	workspace := t.TempDir()
+	envelope := testSessionAuthorizationEnvelope(t, "sess_one", "request-1", time.Unix(1, 0).UTC())
+	data, err := json.Marshal(envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stored map[string]any
+	if err := json.Unmarshal(data, &stored); err != nil {
+		t.Fatal(err)
+	}
+	stored["title"] = "must not be persisted"
+	data, err = json.Marshal(stored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(workspace, ".knote", "sessions", "sess_one.authorization.json"), string(data))
+
+	if _, err := New(workspace).LoadAuthorization(ctx, "sess_one"); err == nil {
+		t.Fatal("unknown content field was accepted")
 	}
 }
 
@@ -935,6 +1120,40 @@ func sourcePaths(sources []repository.Source) []string {
 		paths = append(paths, source.Path)
 	}
 	return paths
+}
+
+func testSessionAuthorizationEnvelope(t *testing.T, sessionID, requestID string, boundAt time.Time) protocol.SessionAuthorizationEnvelope {
+	t.Helper()
+	auth := protocol.AuthorizationContext{
+		Version:              protocol.SecurityContractVersion,
+		TenantID:             "tenant-1",
+		KnowledgeBaseID:      "kb-1",
+		PrincipalID:          "principal-1",
+		SessionID:            sessionID,
+		RequestID:            requestID,
+		AuthorizationModelID: "model-1",
+		IdentityWatermark:    "identity-v1",
+		ACLWatermark:         "acl-v1",
+		AgentID:              "agent-1",
+		TaskID:               "task-1",
+		Consistency:          protocol.ConsistencyHigherConsistency,
+	}
+	envelope, err := protocol.NewSessionAuthorizationEnvelope(auth, boundAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return envelope
+}
+
+func assertPermissions(t *testing.T, path string, want os.FileMode) {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != want {
+		t.Fatalf("%s permissions = %04o, want %04o", path, got, want)
+	}
 }
 
 func initRepo(t *testing.T) string {

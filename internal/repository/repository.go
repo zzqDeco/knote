@@ -9,8 +9,9 @@ import (
 )
 
 var (
-	ErrRemoteNotImplemented         = errors.New("remote repository is not implemented")
-	ErrArtifactPublicationStaleBase = errors.New("artifact publication base is stale")
+	ErrRemoteNotImplemented                 = errors.New("remote repository is not implemented")
+	ErrArtifactPublicationStaleBase         = errors.New("artifact publication base is stale")
+	ErrSessionAuthorizationEnvelopeNotFound = errors.New("session authorization envelope not found")
 )
 
 // ArtifactPublicationBase identifies the public artifact pointer that a
@@ -64,6 +65,12 @@ type Sessions interface {
 	Append(ctx context.Context, event protocol.Event) error
 	Load(ctx context.Context, sessionID string) ([]protocol.Event, error)
 	List(ctx context.Context, limit int) ([]SessionSummary, error)
+}
+
+type PermissionedSessions interface {
+	Sessions
+	BindAuthorization(ctx context.Context, envelope protocol.SessionAuthorizationEnvelope) error
+	LoadAuthorization(ctx context.Context, sessionID string) (protocol.SessionAuthorizationEnvelope, error)
 }
 
 type Versions interface {

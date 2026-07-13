@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/zzqDeco/knote/internal/protocol"
 	"github.com/zzqDeco/knote/internal/repository"
@@ -151,6 +152,7 @@ func TestRuntimeEinoModeStartsAndSendsThroughBridge(t *testing.T) {
 
 func TestRuntimeEinoMessagePropagatesTrustedAuthorization(t *testing.T) {
 	workspace := t.TempDir()
+	store := local.New(workspace)
 	runner := &fakeEinoRunner{events: []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, "", "authorized answer", nil)}}
 	authorization := testAuthorizationContext("sess_eino")
 	type providerContextKey struct{}
@@ -158,7 +160,7 @@ func TestRuntimeEinoMessagePropagatesTrustedAuthorization(t *testing.T) {
 	providerCalls := 0
 	rt := New(Dependencies{
 		Workspace:   workspace,
-		Sessions:    local.New(workspace),
+		Sessions:    store,
 		EinoRunner:  runner,
 		SideEffects: NewSideEffectBridge(),
 		AuthorizationContextProvider: func(ctx context.Context, sessionID string) (protocol.AuthorizationContext, error) {
@@ -189,6 +191,13 @@ func TestRuntimeEinoMessagePropagatesTrustedAuthorization(t *testing.T) {
 	}
 	if runner.sideEffectSession != "sess_eino" {
 		t.Fatalf("runner side-effect session = %q, want sess_eino", runner.sideEffectSession)
+	}
+	envelope, err := store.LoadAuthorization(context.Background(), "sess_eino")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := envelope.ValidateFor(authorization); err != nil {
+		t.Fatalf("persisted session authorization envelope did not match request: %v", err)
 	}
 }
 
@@ -267,6 +276,36 @@ func TestRuntimeEinoMessageDoesNotPersistUntrustedPrompts(t *testing.T) {
 	}
 }
 
+func TestRuntimeEinoMessageFailsClosedWithoutPermissionedSessionStorage(t *testing.T) {
+	workspace := t.TempDir()
+	stored := local.New(workspace)
+	runner := &fakeEinoRunner{events: []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, "", "authorized answer", nil)}}
+	rt := New(Dependencies{
+		Workspace:                    workspace,
+		Sessions:                     sessionsOnlyStore{Sessions: stored},
+		EinoRunner:                   runner,
+		AuthorizationContextProvider: testAuthorizationContextProvider,
+		NewSessionID:                 func() string { return "sess_eino" },
+	})
+	if _, err := rt.Start(context.Background(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	events := rt.SendMessage(context.Background(), "protected prompt")
+	if !hasMessage(events, protocol.EventError, sessionAuthorizationErrorMessage) {
+		t.Fatalf("missing permissioned session storage error = %+v", events)
+	}
+	if runner.runCalls != 0 {
+		t.Fatalf("runner called %d times without durable session authorization", runner.runCalls)
+	}
+	persisted, err := stored.Load(context.Background(), "sess_eino")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasMessage(persisted, protocol.EventUserMessage, "protected prompt") {
+		t.Fatalf("protected prompt persisted without durable session authorization: %+v", persisted)
+	}
+}
+
 func TestRuntimeEinoSessionRejectsAuthorizationBindingChangesBeforeHistoryOrRunner(t *testing.T) {
 	workspace := t.TempDir()
 	store := &trackingSessionStore{Sessions: local.New(workspace)}
@@ -334,7 +373,7 @@ func TestRuntimeEinoSessionRejectsAuthorizationBindingChangesBeforeHistoryOrRunn
 	}
 }
 
-func TestRuntimeStartResumeFailsClosedWithAuthorizationProvider(t *testing.T) {
+func TestRuntimeStartResumeFailsClosedWithoutAuthorizationEnvelope(t *testing.T) {
 	workspace := t.TempDir()
 	stored := local.New(workspace)
 	must(t, stored.Append(context.Background(), protocol.NewEvent(protocol.EventAssistantDone, "sess_legacy", "old answer", nil)))
@@ -363,7 +402,78 @@ func TestRuntimeStartResumeFailsClosedWithAuthorizationProvider(t *testing.T) {
 	}
 }
 
-func TestRuntimeSlashResumeFailsClosedWithAuthorizationProvider(t *testing.T) {
+func TestRuntimeStartResumeReplaysHistoryForMatchingAuthorizationEnvelope(t *testing.T) {
+	workspace := t.TempDir()
+	stored := local.New(workspace)
+	authorization := testAuthorizationContext("sess_authorized")
+	bindTestSessionAuthorization(t, stored, authorization)
+	must(t, stored.Append(context.Background(), protocol.NewEvent(protocol.EventAssistantDone, "sess_authorized", "old answer", nil)))
+	store := &trackingSessionStore{Sessions: stored}
+	rt := New(Dependencies{
+		Workspace:  workspace,
+		Sessions:   store,
+		EinoRunner: &fakeEinoRunner{events: []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, "", "new answer", nil)}},
+		AuthorizationContextProvider: func(_ context.Context, sessionID string) (protocol.AuthorizationContext, error) {
+			current := testAuthorizationContext(sessionID)
+			current.RequestID = "request-resume"
+			return current, nil
+		},
+		NewSessionID: func() string { return "sess_current" },
+	})
+	events, err := rt.Start(context.Background(), StartOptions{ResumeID: "sess_authorized"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasMessage(events, protocol.EventAssistantDone, "old answer") || rt.SessionID() != "sess_authorized" {
+		t.Fatalf("permissioned start resume did not replay matching history: session=%q events=%+v", rt.SessionID(), events)
+	}
+	if store.loadCalls != 1 || store.authorizationLoadCalls != 1 {
+		t.Fatalf("permissioned start resume loads = history:%d envelope:%d, want 1 each", store.loadCalls, store.authorizationLoadCalls)
+	}
+}
+
+func TestRuntimeStartResumeRejectsChangedAuthorizationBeforeHistoryLoad(t *testing.T) {
+	tests := []struct {
+		name   string
+		change func(*protocol.AuthorizationContext)
+	}{
+		{name: "principal", change: func(auth *protocol.AuthorizationContext) { auth.PrincipalID = "other-user" }},
+		{name: "authorization model", change: func(auth *protocol.AuthorizationContext) { auth.AuthorizationModelID = "local-v2" }},
+		{name: "identity watermark", change: func(auth *protocol.AuthorizationContext) { auth.IdentityWatermark = "identity-v2" }},
+		{name: "acl watermark", change: func(auth *protocol.AuthorizationContext) { auth.ACLWatermark = "acl-v2" }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			workspace := t.TempDir()
+			stored := local.New(workspace)
+			bindTestSessionAuthorization(t, stored, testAuthorizationContext("sess_authorized"))
+			must(t, stored.Append(context.Background(), protocol.NewEvent(protocol.EventAssistantDone, "sess_authorized", "old answer", nil)))
+			store := &trackingSessionStore{Sessions: stored}
+			rt := New(Dependencies{
+				Workspace:  workspace,
+				Sessions:   store,
+				EinoRunner: &fakeEinoRunner{events: []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, "", "new answer", nil)}},
+				AuthorizationContextProvider: func(_ context.Context, sessionID string) (protocol.AuthorizationContext, error) {
+					authorization := testAuthorizationContext(sessionID)
+					tt.change(&authorization)
+					return authorization, nil
+				},
+			})
+			events, err := rt.Start(context.Background(), StartOptions{ResumeID: "sess_authorized"})
+			if err == nil || err.Error() != permissionedResumeErrorMessage {
+				t.Fatalf("changed authorization resume error = %v, want %q", err, permissionedResumeErrorMessage)
+			}
+			if len(events) != 0 || store.loadCalls != 0 || store.authorizationLoadCalls != 1 {
+				t.Fatalf("changed authorization reached history: events=%+v history=%d envelope=%d", events, store.loadCalls, store.authorizationLoadCalls)
+			}
+			if rt.SessionID() != "" {
+				t.Fatalf("changed authorization resume selected session %q", rt.SessionID())
+			}
+		})
+	}
+}
+
+func TestRuntimeSlashResumeFailsClosedWithoutAuthorizationEnvelope(t *testing.T) {
 	workspace := t.TempDir()
 	stored := local.New(workspace)
 	must(t, stored.Append(context.Background(), protocol.NewEvent(protocol.EventAssistantDone, "sess_legacy", "old answer", nil)))
@@ -393,6 +503,32 @@ func TestRuntimeSlashResumeFailsClosedWithAuthorizationProvider(t *testing.T) {
 	}
 	if rt.SessionID() != "sess_current" {
 		t.Fatalf("permissioned slash resume changed live session to %q", rt.SessionID())
+	}
+}
+
+func TestRuntimeSlashResumeReplaysHistoryForMatchingAuthorizationEnvelope(t *testing.T) {
+	workspace := t.TempDir()
+	stored := local.New(workspace)
+	bindTestSessionAuthorization(t, stored, testAuthorizationContext("sess_authorized"))
+	must(t, stored.Append(context.Background(), protocol.NewEvent(protocol.EventAssistantDone, "sess_authorized", "old answer", nil)))
+	store := &trackingSessionStore{Sessions: stored}
+	runner := &fakeEinoRunner{events: []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, "", "new answer", nil)}}
+	rt := New(Dependencies{
+		Workspace:                    workspace,
+		Sessions:                     store,
+		EinoRunner:                   runner,
+		AuthorizationContextProvider: testAuthorizationContextProvider,
+		NewSessionID:                 func() string { return "sess_current" },
+	})
+	if _, err := rt.Start(context.Background(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	events := rt.SendMessage(context.Background(), "/resume sess_authorized")
+	if !hasMessage(events, protocol.EventAssistantDone, "old answer") || hasEvent(events, protocol.EventError) {
+		t.Fatalf("permissioned slash resume did not replay matching history: %+v", events)
+	}
+	if rt.SessionID() != "sess_authorized" || store.loadCalls != 1 || store.authorizationLoadCalls != 1 {
+		t.Fatalf("permissioned slash resume state = session:%q history:%d envelope:%d", rt.SessionID(), store.loadCalls, store.authorizationLoadCalls)
 	}
 }
 
@@ -828,12 +964,36 @@ type fakeEinoRunner struct {
 
 type trackingSessionStore struct {
 	repository.Sessions
-	loadCalls int
+	loadCalls              int
+	authorizationLoadCalls int
+	authorizationBindCalls int
+}
+
+type sessionsOnlyStore struct {
+	repository.Sessions
 }
 
 func (s *trackingSessionStore) Load(ctx context.Context, sessionID string) ([]protocol.Event, error) {
 	s.loadCalls++
 	return s.Sessions.Load(ctx, sessionID)
+}
+
+func (s *trackingSessionStore) BindAuthorization(ctx context.Context, envelope protocol.SessionAuthorizationEnvelope) error {
+	s.authorizationBindCalls++
+	sessions, ok := s.Sessions.(repository.PermissionedSessions)
+	if !ok {
+		return repository.ErrSessionAuthorizationEnvelopeNotFound
+	}
+	return sessions.BindAuthorization(ctx, envelope)
+}
+
+func (s *trackingSessionStore) LoadAuthorization(ctx context.Context, sessionID string) (protocol.SessionAuthorizationEnvelope, error) {
+	s.authorizationLoadCalls++
+	sessions, ok := s.Sessions.(repository.PermissionedSessions)
+	if !ok {
+		return protocol.SessionAuthorizationEnvelope{}, repository.ErrSessionAuthorizationEnvelopeNotFound
+	}
+	return sessions.LoadAuthorization(ctx, sessionID)
 }
 
 type fakeToolExecutor struct {
@@ -934,6 +1094,17 @@ func testAuthorizationContext(sessionID string) protocol.AuthorizationContext {
 		IdentityWatermark:    "identity-v1",
 		ACLWatermark:         "acl-v1",
 		Consistency:          protocol.ConsistencyHigherConsistency,
+	}
+}
+
+func bindTestSessionAuthorization(t *testing.T, sessions repository.PermissionedSessions, authorization protocol.AuthorizationContext) {
+	t.Helper()
+	envelope, err := protocol.NewSessionAuthorizationEnvelope(authorization, time.Unix(1, 0).UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sessions.BindAuthorization(context.Background(), envelope); err != nil {
+		t.Fatal(err)
 	}
 }
 

@@ -116,15 +116,23 @@ func (m *Manager) newSession(ctx context.Context) []protocol.Event {
 }
 
 func (m *Manager) resumeSession(ctx context.Context, currentSessionID string, sessionID string) []protocol.Event {
-	if m.deps.AuthorizationContextProvider != nil {
-		return []protocol.Event{protocol.NewEvent(protocol.EventError, currentSessionID, permissionedResumeErrorMessage, nil)}
-	}
 	sessionID = strings.TrimSpace(sessionID)
 	if sessionID == "" {
+		if m.deps.AuthorizationContextProvider != nil {
+			return []protocol.Event{protocol.NewEvent(protocol.EventError, currentSessionID, permissionedResumeErrorMessage, nil)}
+		}
 		return m.sessionList(ctx, currentSessionID)
 	}
 	if m.deps.Sessions == nil {
 		return []protocol.Event{protocol.NewEvent(protocol.EventError, currentSessionID, "session storage is not configured", nil)}
+	}
+	var resumeAuthorization *protocol.AuthorizationContext
+	if m.deps.AuthorizationContextProvider != nil {
+		authorization, err := m.authorizeSessionResume(ctx, sessionID)
+		if err != nil {
+			return []protocol.Event{protocol.NewEvent(protocol.EventError, currentSessionID, permissionedResumeErrorMessage, nil)}
+		}
+		resumeAuthorization = &authorization
 	}
 	loaded, err := m.deps.Sessions.Load(ctx, sessionID)
 	if err != nil {
@@ -149,7 +157,12 @@ func (m *Manager) resumeSession(ctx context.Context, currentSessionID string, se
 	}
 	m.mu.Lock()
 	m.einoSession = info
-	m.authorizationBinding = nil
+	if resumeAuthorization == nil {
+		m.authorizationBinding = nil
+	} else {
+		binding := newAuthorizationBinding(*resumeAuthorization)
+		m.authorizationBinding = &binding
+	}
 	m.mu.Unlock()
 	infoEvent := protocol.NewEvent(protocol.EventSessionInfo, sessionID, "session resumed", info)
 	m.persist([]protocol.Event{infoEvent})

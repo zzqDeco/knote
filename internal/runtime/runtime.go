@@ -107,10 +107,6 @@ func New(deps Dependencies) *Manager {
 
 func (m *Manager) Start(ctx context.Context, opts StartOptions) ([]protocol.Event, error) {
 	m.mu.Lock()
-	if strings.TrimSpace(opts.ResumeID) != "" && m.deps.AuthorizationContextProvider != nil {
-		m.mu.Unlock()
-		return nil, permissionedResumeError()
-	}
 	if m.einoSession.ID != "" {
 		sessionID := m.einoSession.ID
 		m.mu.Unlock()
@@ -130,9 +126,24 @@ func (m *Manager) Start(ctx context.Context, opts StartOptions) ([]protocol.Even
 		m.mu.Unlock()
 		return nil, err
 	}
-	info, loaded := m.newEinoSessionLocked(ctx, opts.ResumeID)
+	resumeID := strings.TrimSpace(opts.ResumeID)
+	var resumeAuthorization *protocol.AuthorizationContext
+	if resumeID != "" && m.deps.AuthorizationContextProvider != nil {
+		authorization, err := m.authorizeSessionResume(ctx, resumeID)
+		if err != nil {
+			m.mu.Unlock()
+			return nil, err
+		}
+		resumeAuthorization = &authorization
+	}
+	info, loaded := m.newEinoSessionLocked(ctx, resumeID)
 	m.einoSession = info
-	m.authorizationBinding = nil
+	if resumeAuthorization == nil {
+		m.authorizationBinding = nil
+	} else {
+		binding := newAuthorizationBinding(*resumeAuthorization)
+		m.authorizationBinding = &binding
+	}
 	m.mu.Unlock()
 	events := []protocol.Event{
 		protocol.NewEvent(protocol.EventGatewayReady, info.ID, "knote runtime ready", nil),
@@ -175,7 +186,7 @@ func (m *Manager) SendMessage(ctx context.Context, input string) []protocol.Even
 			events = append(events, protocol.NewEvent(protocol.EventError, einoSession.ID, err.Error(), nil))
 			return m.emitAndReturn(events)
 		}
-		if err := m.bindAuthorizationContext(einoSession.ID, authorization); err != nil {
+		if err := m.bindSessionAuthorization(ctx, einoSession.ID, authorization); err != nil {
 			events = append(events, protocol.NewEvent(protocol.EventError, einoSession.ID, err.Error(), nil))
 			return m.emitAndReturn(events)
 		}
