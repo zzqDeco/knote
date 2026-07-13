@@ -159,6 +159,66 @@ func TestSessionAuthorizationBindIsIdempotentAndPersistent(t *testing.T) {
 	}
 }
 
+func TestSessionAuthorizationListReturnsOnlyValidCompanionsInSessionIDOrder(t *testing.T) {
+	ctx := context.Background()
+	workspace := t.TempDir()
+	store := New(workspace)
+
+	missing, err := store.ListAuthorization(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if missing != nil {
+		t.Fatalf("missing session directory returned envelopes: %+v", missing)
+	}
+
+	sessZ := testSessionAuthorizationEnvelope(t, "sess_z", "request-z", time.Unix(2, 0).UTC())
+	sessA := testSessionAuthorizationEnvelope(t, "sess_a", "request-a", time.Unix(1, 0).UTC())
+	if err := store.BindAuthorization(ctx, sessZ); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.BindAuthorization(ctx, sessA); err != nil {
+		t.Fatal(err)
+	}
+
+	dir := filepath.Join(workspace, ".knote", "sessions")
+	corruptHistoryPath := filepath.Join(dir, "sess_a.jsonl")
+	mustWrite(t, corruptHistoryPath, "not-jsonl\n")
+	mustWrite(t, filepath.Join(dir, "sess_legacy.jsonl"), "also-not-jsonl\n")
+	mustWrite(t, filepath.Join(dir, "sess_malformed.authorization.json"), "{not-json\n")
+	mustWrite(t, filepath.Join(dir, "..authorization.json"), "{}\n")
+	wrongPath := testSessionAuthorizationEnvelope(t, "sess_other", "request-other", time.Unix(3, 0).UTC())
+	wrongPathJSON, err := json.Marshal(wrongPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(dir, "sess_wrong.authorization.json"), string(wrongPathJSON))
+
+	validPath := filepath.Join(dir, "sess_a.authorization.json")
+	malformedPath := filepath.Join(dir, "sess_malformed.authorization.json")
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(validPath, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(malformedPath, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	envelopes, err := store.ListAuthorization(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(envelopes) != 2 || envelopes[0] != sessA || envelopes[1] != sessZ {
+		t.Fatalf("authorization envelopes were not filtered and sorted: %+v", envelopes)
+	}
+	assertPermissions(t, dir, 0o700)
+	assertPermissions(t, validPath, 0o600)
+	assertPermissions(t, malformedPath, 0o600)
+	assertPermissions(t, corruptHistoryPath, 0o644)
+}
+
 func TestSessionAuthorizationBindRejectsMismatch(t *testing.T) {
 	ctx := context.Background()
 	workspace := t.TempDir()
@@ -216,6 +276,43 @@ func TestSessionAuthorizationBindIsCreateOnceConcurrently(t *testing.T) {
 	}
 	if loaded != first && loaded != second {
 		t.Fatalf("persisted envelope was not either complete candidate: %+v", loaded)
+	}
+}
+
+func TestSessionAuthorizationBindIsIdempotentConcurrently(t *testing.T) {
+	ctx := context.Background()
+	workspace := t.TempDir()
+	store := New(workspace)
+	first := testSessionAuthorizationEnvelope(t, "sess_one", "request-1", time.Unix(1, 0).UTC())
+	second := testSessionAuthorizationEnvelope(t, "sess_one", "request-2", time.Unix(2, 0).UTC())
+
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	for _, envelope := range []protocol.SessionAuthorizationEnvelope{first, second} {
+		go func() {
+			<-start
+			results <- store.BindAuthorization(ctx, envelope)
+		}()
+	}
+	close(start)
+	for range 2 {
+		if err := <-results; err != nil {
+			t.Fatalf("concurrent idempotent bind failed: %v", err)
+		}
+	}
+	loaded, err := store.LoadAuthorization(ctx, "sess_one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded != first && loaded != second {
+		t.Fatalf("persisted envelope was not either complete candidate: %+v", loaded)
+	}
+	envelopes, err := store.ListAuthorization(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(envelopes) != 1 || envelopes[0] != loaded {
+		t.Fatalf("concurrent bind created multiple envelopes: %+v", envelopes)
 	}
 }
 

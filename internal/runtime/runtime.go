@@ -183,6 +183,12 @@ func (m *Manager) SendMessage(ctx context.Context, input string) []protocol.Even
 		return m.emitAndReturn(m.runtimeError("runtime has not started"))
 	}
 	events := []protocol.Event{protocol.NewEvent(protocol.EventUserMessage, einoSession.ID, input, nil)}
+	if strings.HasPrefix(input, "/") {
+		command, _ := parseSlash(input)
+		if command == "new" {
+			return m.handleSlash(ctx, einoSession.ID, input)
+		}
+	}
 	runCtx := ctx
 	if authorizationProvider != nil {
 		authorization, err := authorizationProvider.authorizationContext(ctx, einoSession.ID)

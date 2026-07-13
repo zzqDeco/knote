@@ -9,12 +9,17 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
 	"github.com/zzqDeco/knote/internal/protocol"
 	"github.com/zzqDeco/knote/internal/repository"
 )
+
+const sessionAuthorizationSuffix = ".authorization.json"
+
+var sessionAuthorizationMu sync.RWMutex
 
 func NewSessionID() string {
 	return "sess_" + time.Now().UTC().Format("20060102T150405.000000000")
@@ -125,7 +130,7 @@ func sessionPath(workspace string, sessionID string) string {
 }
 
 func sessionAuthorizationPath(workspace string, sessionID string) string {
-	return filepath.Join(sessionsDirectory(workspace), sessionID+".authorization.json")
+	return filepath.Join(sessionsDirectory(workspace), sessionID+sessionAuthorizationSuffix)
 }
 
 func sessionsDirectory(workspace string) string {
@@ -155,6 +160,9 @@ func validateSessionID(sessionID string) error {
 }
 
 func bindSessionAuthorization(workspace string, envelope protocol.SessionAuthorizationEnvelope) error {
+	sessionAuthorizationMu.Lock()
+	defer sessionAuthorizationMu.Unlock()
+
 	if err := envelope.Validate(); err != nil {
 		return err
 	}
@@ -165,7 +173,7 @@ func bindSessionAuthorization(workspace string, envelope protocol.SessionAuthori
 		return err
 	}
 
-	existing, err := loadSessionAuthorization(workspace, envelope.SessionID)
+	existing, err := loadSessionAuthorizationLocked(workspace, envelope.SessionID)
 	if err == nil {
 		return validateSameAuthorizationBinding(existing, envelope)
 	}
@@ -185,7 +193,7 @@ func bindSessionAuthorization(workspace string, envelope protocol.SessionAuthori
 	if created {
 		return nil
 	}
-	existing, err = loadSessionAuthorization(workspace, envelope.SessionID)
+	existing, err = loadSessionAuthorizationLocked(workspace, envelope.SessionID)
 	if err != nil {
 		return err
 	}
@@ -193,6 +201,12 @@ func bindSessionAuthorization(workspace string, envelope protocol.SessionAuthori
 }
 
 func loadSessionAuthorization(workspace string, sessionID string) (protocol.SessionAuthorizationEnvelope, error) {
+	sessionAuthorizationMu.RLock()
+	defer sessionAuthorizationMu.RUnlock()
+	return loadSessionAuthorizationLocked(workspace, sessionID)
+}
+
+func loadSessionAuthorizationLocked(workspace string, sessionID string) (protocol.SessionAuthorizationEnvelope, error) {
 	if err := validateSessionID(sessionID); err != nil {
 		return protocol.SessionAuthorizationEnvelope{}, err
 	}
@@ -234,37 +248,72 @@ func loadSessionAuthorization(workspace string, sessionID string) (protocol.Sess
 	return envelope, nil
 }
 
-func createSessionAuthorization(path string, data []byte) (bool, error) {
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".authorization-*.tmp")
+func listSessionAuthorization(workspace string) ([]protocol.SessionAuthorizationEnvelope, error) {
+	sessionAuthorizationMu.RLock()
+	defer sessionAuthorizationMu.RUnlock()
+
+	if err := secureSessionDirectory(workspace, false); err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	entries, err := os.ReadDir(sessionsDirectory(workspace))
 	if err != nil {
-		return false, err
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
 	}
-	tmpPath := tmp.Name()
-	defer os.Remove(tmpPath)
-	if err := tmp.Chmod(0o600); err != nil {
-		_ = tmp.Close()
-		return false, err
+	var envelopes []protocol.SessionAuthorizationEnvelope
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), sessionAuthorizationSuffix) {
+			continue
+		}
+		sessionID := strings.TrimSuffix(entry.Name(), sessionAuthorizationSuffix)
+		if err := validateSessionID(sessionID); err != nil {
+			continue
+		}
+		envelope, err := loadSessionAuthorizationLocked(workspace, sessionID)
+		if err != nil {
+			continue
+		}
+		envelopes = append(envelopes, envelope)
 	}
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		return false, err
-	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return false, err
-	}
-	if err := tmp.Close(); err != nil {
-		return false, err
-	}
-	if err := os.Link(tmpPath, path); err != nil {
+	sort.Slice(envelopes, func(i, j int) bool {
+		return envelopes[i].SessionID < envelopes[j].SessionID
+	})
+	return envelopes, nil
+}
+
+func createSessionAuthorization(path string, data []byte) (bool, error) {
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
 		if os.IsExist(err) {
 			return false, nil
 		}
 		return false, err
 	}
-	if err := os.Chmod(path, 0o600); err != nil {
+	complete := false
+	defer func() {
+		if !complete {
+			_ = file.Close()
+			_ = os.Remove(path)
+		}
+	}()
+	if err := file.Chmod(0o600); err != nil {
 		return false, err
 	}
+	if _, err := file.Write(data); err != nil {
+		return false, err
+	}
+	if err := file.Sync(); err != nil {
+		return false, err
+	}
+	if err := file.Close(); err != nil {
+		return false, err
+	}
+	complete = true
 	return true, nil
 }
 

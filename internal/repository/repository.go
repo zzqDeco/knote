@@ -71,6 +71,7 @@ type PermissionedSessions interface {
 	Sessions
 	BindAuthorization(ctx context.Context, envelope protocol.SessionAuthorizationEnvelope) error
 	LoadAuthorization(ctx context.Context, sessionID string) (protocol.SessionAuthorizationEnvelope, error)
+	ListAuthorization(ctx context.Context) ([]protocol.SessionAuthorizationEnvelope, error)
 }
 
 type Versions interface {

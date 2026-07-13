@@ -20,7 +20,6 @@ func (m *Manager) handleSlash(ctx context.Context, sessionID string, input strin
 	cmd, arg := parseSlash(input)
 	switch cmd {
 	case "new":
-		m.persist([]protocol.Event{userEvent})
 		events := append([]protocol.Event{userEvent}, m.newSession(ctx)...)
 		m.emit(events)
 		return events
@@ -177,39 +176,47 @@ func (m *Manager) sessionList(ctx context.Context, sessionID string) []protocol.
 	if m.deps.Sessions == nil {
 		return []protocol.Event{protocol.NewEvent(protocol.EventError, sessionID, "session storage is not configured", nil)}
 	}
-	limit := 10
-	var authorization protocol.AuthorizationContext
-	var permissioned repository.PermissionedSessions
-	if m.deps.AuthorizationContextProvider != nil {
-		var ok bool
-		authorization, ok = protocol.AuthorizationContextFrom(ctx)
+	var summaries []repository.SessionSummary
+	if m.deps.AuthorizationContextProvider == nil {
+		var err error
+		summaries, err = m.deps.Sessions.List(ctx, 10)
+		if err != nil {
+			return []protocol.Event{protocol.NewEvent(protocol.EventError, sessionID, "list sessions failed: "+err.Error(), nil)}
+		}
+	} else {
+		if _, ok := protocol.AuthorizationContextFrom(ctx); !ok {
+			return []protocol.Event{protocol.NewEvent(protocol.EventError, sessionID, sessionAuthorizationErrorMessage, nil)}
+		}
+		permissioned, ok := m.deps.Sessions.(repository.PermissionedSessions)
 		if !ok {
 			return []protocol.Event{protocol.NewEvent(protocol.EventError, sessionID, sessionAuthorizationErrorMessage, nil)}
 		}
-		permissioned, ok = m.deps.Sessions.(repository.PermissionedSessions)
-		if !ok {
-			return []protocol.Event{protocol.NewEvent(protocol.EventError, sessionID, sessionAuthorizationErrorMessage, nil)}
+		envelopes, err := permissioned.ListAuthorization(ctx)
+		if err != nil {
+			return []protocol.Event{protocol.NewEvent(protocol.EventError, sessionID, "list sessions failed", nil)}
 		}
-		limit = 0
-	}
-	summaries, err := m.deps.Sessions.List(ctx, limit)
-	if err != nil {
-		return []protocol.Event{protocol.NewEvent(protocol.EventError, sessionID, "list sessions failed: "+err.Error(), nil)}
-	}
-	if m.deps.AuthorizationContextProvider != nil {
-		filtered := make([]repository.SessionSummary, 0, len(summaries))
-		for _, summary := range summaries {
-			envelope, err := permissioned.LoadAuthorization(ctx, summary.ID)
+		for _, envelope := range envelopes {
+			targetAuthorization, err := m.deps.AuthorizationContextProvider.authorizationContext(ctx, envelope.SessionID)
+			if err != nil || envelope.ValidateFor(targetAuthorization) != nil {
+				continue
+			}
+			events, err := m.deps.Sessions.Load(ctx, envelope.SessionID)
 			if err != nil {
 				continue
 			}
-			candidate := authorization
-			candidate.SessionID = summary.ID
-			if err := envelope.ValidateFor(candidate); err == nil {
-				filtered = append(filtered, summary)
+			summary := repository.SessionSummary{ID: envelope.SessionID, EventCount: len(events)}
+			if len(events) > 0 {
+				summary.LastEventAt = events[len(events)-1].CreatedAt.UTC()
+				summary.UpdatedAt = summary.LastEventAt
 			}
+			summaries = append(summaries, summary)
 		}
-		summaries = filtered
+		sort.Slice(summaries, func(i, j int) bool {
+			if !summaries[i].UpdatedAt.Equal(summaries[j].UpdatedAt) {
+				return summaries[i].UpdatedAt.After(summaries[j].UpdatedAt)
+			}
+			return summaries[i].ID > summaries[j].ID
+		})
 		if len(summaries) > 10 {
 			summaries = summaries[:10]
 		}
