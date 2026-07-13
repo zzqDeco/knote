@@ -875,6 +875,31 @@ func TestServiceBuildSkipsBlankSourcesOnlyFromKAGCorpus(t *testing.T) {
 	}
 }
 
+func TestCanonicalProjectionVersionIncludesGraphBindingContract(t *testing.T) {
+	scope := catalog.Scope{TenantID: "tenant", KnowledgeBaseID: "knowledge-base"}
+	snapshot, err := catalog.NewSourceSnapshot(scope, "workspace", "source-v1", "domain", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := canonicalProjectionVersion(scope, snapshot.Ref(), "acl-v1", "build-v1", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	graphBound, err := canonicalProjectionVersion(
+		scope,
+		snapshot.Ref(),
+		"acl-v1",
+		"build-v1",
+		protocol.GraphBindingContractVersion,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if graphBound == legacy {
+		t.Fatalf("graph binding contract reused legacy projection version %s", graphBound)
+	}
+}
+
 func TestServiceBuildFailsClosedWhenKAGCorpusHasOnlyBlankSources(t *testing.T) {
 	ctx := context.Background()
 	repo := newMemoryRepo()

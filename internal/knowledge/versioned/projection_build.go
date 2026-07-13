@@ -141,7 +141,13 @@ func (s service) prepareArtifactProjection(ctx context.Context) (repository.Arti
 	if err != nil {
 		return repository.ArtifactSet{}, projectionBuild{}, err
 	}
-	projectionVersion, err := canonicalProjectionVersion(scope, snapshot.Ref(), aclVersion, buildConfigVersion)
+	projectionVersion, err := canonicalProjectionVersion(
+		scope,
+		snapshot.Ref(),
+		aclVersion,
+		buildConfigVersion,
+		protocol.GraphBindingContractVersion,
+	)
 	if err != nil {
 		return repository.ArtifactSet{}, projectionBuild{}, err
 	}
@@ -457,18 +463,21 @@ func canonicalProjectionVersion(
 	snapshot catalog.SourceSnapshotRef,
 	aclVersion string,
 	buildConfigVersion string,
+	graphBindingContractVersion int,
 ) (string, error) {
 	payload := struct {
-		Schema      string                    `json:"schema"`
-		Scope       catalog.Scope             `json:"scope"`
-		Snapshot    catalog.SourceSnapshotRef `json:"source_snapshot"`
-		ACL         string                    `json:"acl_version"`
-		BuildConfig string                    `json:"build_config_version"`
-		Index       string                    `json:"index_version"`
-		Graph       string                    `json:"graph_version"`
+		Schema                      string                    `json:"schema"`
+		Scope                       catalog.Scope             `json:"scope"`
+		Snapshot                    catalog.SourceSnapshotRef `json:"source_snapshot"`
+		ACL                         string                    `json:"acl_version"`
+		BuildConfig                 string                    `json:"build_config_version"`
+		Index                       string                    `json:"index_version"`
+		Graph                       string                    `json:"graph_version"`
+		GraphBindingContractVersion int                       `json:"graph_binding_contract_version,omitempty"`
 	}{
 		Schema: projectionSchema, Scope: scope, Snapshot: snapshot, ACL: aclVersion,
 		BuildConfig: buildConfigVersion, Index: "index-v1", Graph: "graph-v1",
+		GraphBindingContractVersion: graphBindingContractVersion,
 	}
 	data, err := json.Marshal(payload)
 	if err != nil {
