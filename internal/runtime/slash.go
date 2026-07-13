@@ -40,7 +40,7 @@ func (m *Manager) routeSlash(ctx context.Context, sessionID string, cmd string, 
 	case "build":
 		return m.invokeTool(ctx, sessionID, tools.NameBuild, "{}")
 	case "eval":
-		return m.invokeTool(ctx, sessionID, tools.NameEval, "{}")
+		return []protocol.Event{protocol.NewEvent(protocol.EventError, sessionID, "eval is unavailable until authorized explain is implemented", nil)}
 	case "diff":
 		return m.invokeTool(ctx, sessionID, tools.NameDiff, jsonArgs(map[string]any{"ref": strings.TrimSpace(arg)}))
 	case "versions":
@@ -437,7 +437,6 @@ const helpText = `Commands:
 /commit     commit current knowledge version
 /release    tag a release version
 /checkout   checkout a version or branch
-/eval       run a basic evaluation
 /tasks      show runtime tasks
 /status     show git status
 /clear      clear the current TUI transcript view

@@ -477,6 +477,28 @@ func TestRuntimeEinoCurrentSessionInfoRefreshesWorkspaceStatus(t *testing.T) {
 	}
 }
 
+func TestRuntimeEvalSlashFailsClosedBeforeToolExecution(t *testing.T) {
+	workspace := t.TempDir()
+	executor := &fakeToolExecutor{}
+	rt := New(Dependencies{
+		Workspace:    workspace,
+		Sessions:     local.New(workspace),
+		EinoRunner:   &fakeEinoRunner{events: []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, "", "natural answer", nil)}},
+		ToolExecutor: executor,
+		NewSessionID: func() string { return "sess_eino" },
+	})
+	if _, err := rt.Start(context.Background(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	events := rt.SendMessage(context.Background(), "/eval")
+	if !hasMessage(events, protocol.EventError, "eval is unavailable until authorized explain is implemented") {
+		t.Fatalf("disabled eval did not fail closed: %+v", events)
+	}
+	if executor.calls != 0 {
+		t.Fatalf("disabled eval invoked the tool executor %d times", executor.calls)
+	}
+}
+
 func TestRuntimeEinoModeConfirmsSideEffectTool(t *testing.T) {
 	workspace := t.TempDir()
 	store := local.New(workspace)
