@@ -228,6 +228,51 @@ func TestQueryFailsClosedOnMalformedBatchResults(t *testing.T) {
 	}
 }
 
+func TestQueryChunksFinalAuthorizationChecks(t *testing.T) {
+	resources := make([]protocol.ResourceHandle, authz.MaxBatchChecks+1)
+	supports := make([]protocol.ProvenanceSupport, len(resources))
+	for index := range resources {
+		id := protocol.ResourceID(fmt.Sprintf("res_%032x", index+1))
+		resources[index] = queryTestDocument(id, "content", "projection-v1")
+		supports[index] = protocol.ProvenanceSupport{
+			SupportID: fmt.Sprintf("support-%03d", index),
+			Resource:  resources[index],
+			Evidence:  []protocol.ResourceHandle{resources[index]},
+			Complete:  true,
+		}
+	}
+	item := protocol.EvidenceItem{
+		Resource: resources[0], Content: "content", Derivation: protocol.DerivationAllRequired,
+		Supports: supports,
+		Citation: protocol.Citation{Handle: "citation-large-provenance", Resource: resources[0]},
+	}
+	backend := &queryTestKAG{retrieveResult: queryTestRetrieve(resources[0])}
+	authorizer := &queryTestAuthorizer{}
+	loader := &queryTestLoader{items: map[protocol.ResourceID]protocol.EvidenceItem{resources[0].ResourceID: item}}
+	service := queryTestService(t, backend, authorizer, loader, 0, 1)
+	result, err := service.Query(context.Background(), protocol.QueryRequest{
+		Question: "q", Authorization: queryTestAuthorization("alice", "request-large-provenance"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := len(authorizer.calls), 3; got != want {
+		t.Fatalf("authorization calls = %d, want %d", got, want)
+	}
+	if got, want := len(authorizer.calls[1].Checks), authz.MaxBatchChecks; got != want {
+		t.Fatalf("first final batch size = %d, want %d", got, want)
+	}
+	if got, want := len(authorizer.calls[2].Checks), 1; got != want {
+		t.Fatalf("second final batch size = %d, want %d", got, want)
+	}
+	if got, want := len(result.Evidence.Decisions), len(resources); got != want {
+		t.Fatalf("evidence decisions = %d, want %d", got, want)
+	}
+	if backend.generateCalls != 1 {
+		t.Fatalf("generate calls = %d, want 1", backend.generateCalls)
+	}
+}
+
 func TestQueryRejectsInvalidRetrievalBeforeAuthorization(t *testing.T) {
 	valid := queryTestDocument(queryTestModelID, "a", "projection-v1")
 	crossTenant := valid
@@ -431,8 +476,13 @@ func TestOpenCitationReauthorizesChunkBoundary(t *testing.T) {
 	if !reflect.DeepEqual(opened, chunkItem) {
 		t.Fatalf("opened citation = %#v", opened)
 	}
-	if len(authorizer.calls) != 1 || len(authorizer.calls[0].Checks) != 1 || authorizer.calls[0].Checks[0].Object != parent.AuthorizationID {
+	if len(authorizer.calls) != 2 {
 		t.Fatalf("live citation checks = %#v", authorizer.calls)
+	}
+	for _, call := range authorizer.calls {
+		if len(call.Checks) != 1 || call.Checks[0].Object != parent.AuthorizationID {
+			t.Fatalf("live citation checks = %#v", authorizer.calls)
+		}
 	}
 	if len(loader.calls) != 1 || !reflect.DeepEqual(loader.calls[0], []protocol.ResourceHandle{chunk}) {
 		t.Fatalf("citation loader calls = %#v", loader.calls)
@@ -481,6 +531,20 @@ func TestOpenCitationFailsClosed(t *testing.T) {
 		})
 	}
 
+	t.Run("revoked after load", func(t *testing.T) {
+		authorizer := &queryTestAuthorizer{decide: func(call int, request authz.BatchCheckRequest) ([]authz.Decision, error) {
+			return queryTestDecisions(request, func(authz.BatchCheckItem) bool { return call == 0 }), nil
+		}}
+		loader := &queryTestLoader{items: baseLoader.items}
+		service := queryTestService(t, &queryTestKAG{}, authorizer, loader, 0, 2)
+		if _, err := service.OpenCitation(context.Background(), current, result.Evidence, item.Citation.Handle); err == nil {
+			t.Fatal("citation revoked after loading should fail")
+		}
+		if len(loader.calls) != 1 || len(authorizer.calls) != 2 {
+			t.Fatalf("citation revocation events: authz=%d load=%d", len(authorizer.calls), len(loader.calls))
+		}
+	})
+
 	t.Run("mutated loader item", func(t *testing.T) {
 		authorizer := &queryTestAuthorizer{}
 		loader := &queryTestLoader{load: func([]protocol.ResourceHandle) ([]protocol.EvidenceItem, error) {
@@ -500,6 +564,8 @@ func TestOpenCitationFailsClosed(t *testing.T) {
 		func(value *protocol.AuthorizationContext) { value.TenantID = "other" },
 		func(value *protocol.AuthorizationContext) { value.KnowledgeBaseID = "other" },
 		func(value *protocol.AuthorizationContext) { value.PrincipalID = "bob" },
+		func(value *protocol.AuthorizationContext) { value.AgentID = "agent-2" },
+		func(value *protocol.AuthorizationContext) { value.TaskID = "task-2" },
 		func(value *protocol.AuthorizationContext) { value.AuthorizationModelID = "01ARZ3NDEKTSV4RRFFQ69G5FAA" },
 		func(value *protocol.AuthorizationContext) { value.IdentityWatermark = "identity-v2" },
 		func(value *protocol.AuthorizationContext) { value.ACLWatermark = "acl-v2" },

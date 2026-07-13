@@ -294,6 +294,15 @@ func (s *Service) OpenCitation(
 	if !reflect.DeepEqual(loaded[0], *cited) {
 		return protocol.EvidenceItem{}, fmt.Errorf("open citation loader changed the cited evidence item")
 	}
+	checked, err = s.checkObjects(ctx, current, "c-final", liveHandles)
+	if err != nil {
+		return protocol.EvidenceItem{}, fmt.Errorf("open citation final authorization check: %w", err)
+	}
+	for _, resource := range liveHandles {
+		if !checked[resource.AuthorizationID].allowed {
+			return protocol.EvidenceItem{}, fmt.Errorf("open citation final authorization check denied resource %s", resource.ResourceID)
+		}
+	}
 	return loaded[0], nil
 }
 
@@ -356,54 +365,57 @@ func (s *Service) checkObjects(
 	if len(objects) == 0 {
 		return nil, fmt.Errorf("authorization check requires at least one resource")
 	}
-	if len(objects) > authz.MaxBatchChecks {
-		return nil, fmt.Errorf("authorization check has %d objects; maximum is %d", len(objects), authz.MaxBatchChecks)
-	}
-	request := authz.BatchCheckRequest{
-		AuthorizationModelID: authorization.AuthorizationModelID,
-		Consistency:          consistency,
-		Checks:               make([]authz.BatchCheckItem, len(objects)),
-	}
-	expected := make(map[string]string, len(objects))
-	for index, object := range objects {
-		correlationID := deterministicCorrelationID(stage, index, object)
-		request.Checks[index] = authz.BatchCheckItem{
-			CorrelationID: correlationID,
-			User:          "user:" + authorization.PrincipalID,
-			Relation:      authz.RelationCanView,
-			Object:        object,
-		}
-		expected[correlationID] = object
-	}
-	if err := request.Validate(); err != nil {
-		return nil, fmt.Errorf("batch request: %w", err)
-	}
-	decisions, err := s.authorizer.BatchCheck(ctx, request)
-	if err != nil {
-		return nil, fmt.Errorf("batch check: %w", err)
-	}
-	if len(decisions) != len(request.Checks) {
-		return nil, fmt.Errorf("batch check returned %d decisions for %d checks", len(decisions), len(request.Checks))
-	}
 	result := make(map[string]objectCheck, len(objects))
-	seenDecisions := make(map[string]struct{}, len(decisions))
-	for _, decision := range decisions {
-		object, ok := expected[decision.CorrelationID]
-		if !ok {
-			return nil, fmt.Errorf("batch check returned unexpected correlation_id %q", decision.CorrelationID)
+	for start := 0; start < len(objects); start += authz.MaxBatchChecks {
+		end := start + authz.MaxBatchChecks
+		if end > len(objects) {
+			end = len(objects)
 		}
-		if _, duplicate := seenDecisions[decision.CorrelationID]; duplicate {
-			return nil, fmt.Errorf("batch check returned duplicate correlation_id %q", decision.CorrelationID)
+		request := authz.BatchCheckRequest{
+			AuthorizationModelID: authorization.AuthorizationModelID,
+			Consistency:          consistency,
+			Checks:               make([]authz.BatchCheckItem, end-start),
 		}
-		seenDecisions[decision.CorrelationID] = struct{}{}
-		if decision.AuthorizationModelID != authorization.AuthorizationModelID {
-			return nil, fmt.Errorf("batch check correlation_id %q returned authorization model %q", decision.CorrelationID, decision.AuthorizationModelID)
+		expected := make(map[string]string, len(request.Checks))
+		for index, object := range objects[start:end] {
+			correlationID := deterministicCorrelationID(stage, start+index, object)
+			request.Checks[index] = authz.BatchCheckItem{
+				CorrelationID: correlationID,
+				User:          "user:" + authorization.PrincipalID,
+				Relation:      authz.RelationCanView,
+				Object:        object,
+			}
+			expected[correlationID] = object
 		}
-		result[object] = objectCheck{correlationID: decision.CorrelationID, allowed: decision.Allowed}
-	}
-	for _, check := range request.Checks {
-		if _, ok := seenDecisions[check.CorrelationID]; !ok {
-			return nil, fmt.Errorf("batch check omitted correlation_id %q", check.CorrelationID)
+		if err := request.Validate(); err != nil {
+			return nil, fmt.Errorf("batch request: %w", err)
+		}
+		decisions, err := s.authorizer.BatchCheck(ctx, request)
+		if err != nil {
+			return nil, fmt.Errorf("batch check: %w", err)
+		}
+		if len(decisions) != len(request.Checks) {
+			return nil, fmt.Errorf("batch check returned %d decisions for %d checks", len(decisions), len(request.Checks))
+		}
+		seenDecisions := make(map[string]struct{}, len(decisions))
+		for _, decision := range decisions {
+			object, ok := expected[decision.CorrelationID]
+			if !ok {
+				return nil, fmt.Errorf("batch check returned unexpected correlation_id %q", decision.CorrelationID)
+			}
+			if _, duplicate := seenDecisions[decision.CorrelationID]; duplicate {
+				return nil, fmt.Errorf("batch check returned duplicate correlation_id %q", decision.CorrelationID)
+			}
+			seenDecisions[decision.CorrelationID] = struct{}{}
+			if decision.AuthorizationModelID != authorization.AuthorizationModelID {
+				return nil, fmt.Errorf("batch check correlation_id %q returned authorization model %q", decision.CorrelationID, decision.AuthorizationModelID)
+			}
+			result[object] = objectCheck{correlationID: decision.CorrelationID, allowed: decision.Allowed}
+		}
+		for _, check := range request.Checks {
+			if _, ok := seenDecisions[check.CorrelationID]; !ok {
+				return nil, fmt.Errorf("batch check omitted correlation_id %q", check.CorrelationID)
+			}
 		}
 	}
 	return result, nil
@@ -644,6 +656,8 @@ func validateCurrentCitationContext(current, original protocol.AuthorizationCont
 		{"tenant_id", current.TenantID, original.TenantID},
 		{"knowledge_base_id", current.KnowledgeBaseID, original.KnowledgeBaseID},
 		{"principal_id", current.PrincipalID, original.PrincipalID},
+		{"agent_id", current.AgentID, original.AgentID},
+		{"task_id", current.TaskID, original.TaskID},
 		{"authorization_model_id", current.AuthorizationModelID, original.AuthorizationModelID},
 		{"identity_watermark", current.IdentityWatermark, original.IdentityWatermark},
 		{"acl_watermark", current.ACLWatermark, original.ACLWatermark},
