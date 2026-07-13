@@ -583,6 +583,9 @@ func TestOpenCitationReauthorizesChunkBoundary(t *testing.T) {
 		if len(call.Checks) != 1 || call.Checks[0].Object != parent.AuthorizationID {
 			t.Fatalf("live citation checks = %#v", authorizer.calls)
 		}
+		if call.Consistency != authz.ConsistencyHigherConsistency {
+			t.Fatalf("live citation consistency = %q", call.Consistency)
+		}
 	}
 	if len(loader.calls) != 1 || !reflect.DeepEqual(loader.calls[0], []protocol.ResourceHandle{chunk}) {
 		t.Fatalf("citation loader calls = %#v", loader.calls)
@@ -612,7 +615,7 @@ func TestOpenCitationFailsClosed(t *testing.T) {
 			return queryTestDecisions(request, func(authz.BatchCheckItem) bool { return false }), nil
 		}},
 		{name: "error", decide: func(authz.BatchCheckRequest) ([]authz.Decision, error) {
-			return nil, errors.New("authorization unavailable")
+			return nil, errors.New("AUTHORIZATION_CANARY")
 		}},
 		{name: "missing", decide: func(authz.BatchCheckRequest) ([]authz.Decision, error) { return nil, nil }},
 	} {
@@ -622,8 +625,10 @@ func TestOpenCitationFailsClosed(t *testing.T) {
 			}}
 			loader := &queryTestLoader{items: baseLoader.items}
 			service := queryTestService(t, &queryTestKAG{}, authorizer, loader, 0, 2)
-			if _, err := service.OpenCitation(context.Background(), current, result.Evidence, item.Citation.Handle); err == nil {
+			if _, err := service.OpenCitation(context.Background(), current, result.Evidence, item.Citation.Handle); !errors.Is(err, ErrCitationUnavailable) {
 				t.Fatalf("%s citation authorization should fail", test.name)
+			} else if strings.Contains(err.Error(), "AUTHORIZATION_CANARY") || strings.Contains(err.Error(), string(document.ResourceID)) {
+				t.Fatalf("%s citation error leaked protected metadata: %v", test.name, err)
 			}
 			if len(loader.calls) != 0 {
 				t.Fatalf("%s citation reached loader", test.name)
@@ -667,10 +672,6 @@ func TestOpenCitationFailsClosed(t *testing.T) {
 		func(value *protocol.AuthorizationContext) { value.SessionID = "session-2" },
 		func(value *protocol.AuthorizationContext) { value.AgentID = "agent-2" },
 		func(value *protocol.AuthorizationContext) { value.TaskID = "task-2" },
-		func(value *protocol.AuthorizationContext) { value.AuthorizationModelID = "01ARZ3NDEKTSV4RRFFQ69G5FAA" },
-		func(value *protocol.AuthorizationContext) { value.IdentityWatermark = "identity-v2" },
-		func(value *protocol.AuthorizationContext) { value.ACLWatermark = "acl-v2" },
-		func(value *protocol.AuthorizationContext) { value.Consistency = protocol.ConsistencyMinimizeLatency },
 	} {
 		mismatched := current
 		mutate(&mismatched)
@@ -681,6 +682,53 @@ func TestOpenCitationFailsClosed(t *testing.T) {
 	}
 	if _, err := baseService.OpenCitation(context.Background(), current, result.Evidence, "unknown"); err == nil {
 		t.Fatal("unknown citation should fail")
+	}
+}
+
+func TestOpenCitationUsesCurrentModelWithStaleWatermarks(t *testing.T) {
+	document := queryTestDocument(queryTestModelID, "content", "projection-v1")
+	item := queryTestItem(document)
+	original := queryTestAuthorization("alice", "request-original-model")
+	baseService := queryTestService(
+		t,
+		&queryTestKAG{retrieveResult: queryTestRetrieve(document)},
+		&queryTestAuthorizer{},
+		&queryTestLoader{items: map[protocol.ResourceID]protocol.EvidenceItem{document.ResourceID: item}},
+		0,
+		2,
+	)
+	result, err := baseService.Query(context.Background(), protocol.QueryRequest{Question: "q", Authorization: original})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	current := original
+	current.RequestID = "request-current-model"
+	current.AuthorizationModelID = "01ARZ3NDEKTSV4RRFFQ69G5FAA"
+	current.Consistency = protocol.ConsistencyMinimizeLatency
+	authorizer := &queryTestAuthorizer{}
+	service := queryTestService(
+		t,
+		&queryTestKAG{},
+		authorizer,
+		&queryTestLoader{items: map[protocol.ResourceID]protocol.EvidenceItem{document.ResourceID: item}},
+		0,
+		2,
+	)
+	opened, err := service.OpenCitation(context.Background(), current, result.Evidence, item.Citation.Handle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(opened, item) {
+		t.Fatalf("opened citation = %#v", opened)
+	}
+	if len(authorizer.calls) != 2 {
+		t.Fatalf("current-model citation checks = %d", len(authorizer.calls))
+	}
+	for _, call := range authorizer.calls {
+		if call.AuthorizationModelID != current.AuthorizationModelID || call.Consistency != authz.ConsistencyHigherConsistency {
+			t.Fatalf("current-model citation check = %#v", call)
+		}
 	}
 }
 

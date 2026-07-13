@@ -133,9 +133,11 @@ func (c *QueryCache) get(key queryCacheKey) (queryCacheSnapshot, bool) {
 	return queryCacheSnapshot{revision: entry.revision, result: cloneQueryResult(entry.result)}, true
 }
 
-func (c *QueryCache) put(key queryCacheKey, result QueryResult) {
+// put returns false when a revocation tombstone prevents this result from
+// becoming current. Service uses the result to fail an in-flight query closed.
+func (c *QueryCache) put(key queryCacheKey, result QueryResult) bool {
 	if c == nil {
-		return
+		return false
 	}
 	cloned := cloneQueryResult(result)
 	resourceIDs := queryResultResourceIDs(cloned)
@@ -143,11 +145,11 @@ func (c *QueryCache) put(key queryCacheKey, result QueryResult) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.disabled {
-		return
+		return false
 	}
 	for resourceID := range resourceIDs {
 		if _, revoked := c.invalidated[resourceID]; revoked {
-			return
+			return false
 		}
 	}
 	c.nextRevision++
@@ -157,6 +159,7 @@ func (c *QueryCache) put(key queryCacheKey, result QueryResult) {
 	c.entries[key] = queryCacheEntry{
 		revision: c.nextRevision, result: cloned, resourceIDs: resourceIDs,
 	}
+	return true
 }
 
 func (c *QueryCache) deleteIfRevision(key queryCacheKey, revision uint64) {
@@ -184,6 +187,23 @@ func (c *QueryCache) containsRevision(key queryCacheKey, revision uint64) bool {
 	}
 	entry, ok := c.entries[key]
 	return ok && entry.revision == revision
+}
+
+func (c *QueryCache) containsInvalidatedResource(resourceIDs []protocol.ResourceID) bool {
+	if c == nil {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.disabled {
+		return true
+	}
+	for _, resourceID := range resourceIDs {
+		if _, invalidated := c.invalidated[resourceID]; invalidated {
+			return true
+		}
+	}
+	return false
 }
 
 // InvalidateResource removes every entry whose evidence, provenance, decision,

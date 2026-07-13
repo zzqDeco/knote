@@ -202,6 +202,7 @@ func TestQueryCacheStaleWatermarkCannotBypassLiveRevocation(t *testing.T) {
 	cache := mustQueryCache(t, 8)
 	service := cacheTestService(t, backend, authorizer, loader, cache, "retriever-v1", "prompt-v1")
 	authorization := queryTestAuthorization("alice", "request-before-revoke")
+	authorization.Consistency = protocol.ConsistencyMinimizeLatency
 	request := protocol.QueryRequest{Question: "revoked question", Authorization: authorization}
 	if _, err := service.Query(context.Background(), request); err != nil {
 		t.Fatal(err)
@@ -210,14 +211,17 @@ func TestQueryCacheStaleWatermarkCannotBypassLiveRevocation(t *testing.T) {
 	allowed = false
 	request.Authorization.RequestID = "request-after-revoke"
 	_, err := service.Query(context.Background(), request)
-	if !errors.Is(err, errNoEvidence) {
+	if !errors.Is(err, ErrProtectedContentUnavailable) {
 		t.Fatalf("revoked cache result error = %v", err)
 	}
-	if strings.Contains(err.Error(), string(document.ResourceID)) || strings.Contains(err.Error(), "content") {
+	if strings.Contains(err.Error(), string(document.ResourceID)) {
 		t.Fatalf("revocation error leaked evidence: %v", err)
 	}
-	if backend.retrieveCalls != 2 || backend.generateCalls != 1 {
+	if backend.retrieveCalls != 1 || backend.generateCalls != 1 {
 		t.Fatalf("revoked hit returned or regenerated cached evidence: retrieve=%d generate=%d", backend.retrieveCalls, backend.generateCalls)
+	}
+	if got := authorizer.calls[len(authorizer.calls)-1].Consistency; got != authz.ConsistencyHigherConsistency {
+		t.Fatalf("cache live recheck consistency = %q", got)
 	}
 	if _, ok := cache.get(cacheTestKey(request, "retriever-v1", "prompt-v1")); ok {
 		t.Fatal("revoked cache entry was not evicted")
@@ -265,6 +269,7 @@ func TestQueryCacheReauthorizesLocalTupleRevocations(t *testing.T) {
 			service := cacheTestService(t, backend, local, loader, cache, "retriever-v1", "prompt-v1")
 			authorization := queryTestAuthorization(test.principal, "request-before")
 			authorization.AuthorizationModelID = cacheTestLocalModel
+			authorization.Consistency = protocol.ConsistencyMinimizeLatency
 			request := protocol.QueryRequest{Question: "tuple revoke", Authorization: authorization}
 			if _, err := service.Query(context.Background(), request); err != nil {
 				t.Fatal(err)
@@ -274,11 +279,15 @@ func TestQueryCacheReauthorizesLocalTupleRevocations(t *testing.T) {
 			}
 			request.Authorization.RequestID = "request-after"
 			_, err = service.Query(context.Background(), request)
-			if !errors.Is(err, errNoEvidence) {
+			if !errors.Is(err, ErrProtectedContentUnavailable) {
 				t.Fatalf("revoked tuple returned error %v", err)
 			}
-			if backend.generateCalls != 1 {
+			if backend.retrieveCalls != 1 || backend.generateCalls != 1 {
 				t.Fatalf("revoked tuple returned a cached answer")
+			}
+			if strings.Contains(err.Error(), test.principal) ||
+				strings.Contains(err.Error(), string(document.ResourceID)) {
+				t.Fatalf("revoked tuple error leaked metadata or content: %v", err)
 			}
 		})
 	}
@@ -321,11 +330,13 @@ func TestQueryCacheInvalidationMeasuresLatencyAndCoversProvenance(t *testing.T) 
 	if _, ok := cache.get(key); ok {
 		t.Fatal("provenance-bound cache entry survived parent revocation")
 	}
-	cache.put(key, QueryResult{
+	if accepted := cache.put(key, QueryResult{
 		Evidence: protocol.EvidencePackage{Items: []protocol.EvidenceItem{
 			queryTestChunkItem(chunk, parent),
 		}},
-	})
+	}); accepted {
+		t.Fatal("in-flight result was accepted after resource invalidation")
+	}
 	if _, ok := cache.get(key); ok {
 		t.Fatal("in-flight result repopulated a resource-invalidated cache entry")
 	}

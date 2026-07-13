@@ -35,30 +35,99 @@ const (
 
 var requestSequence atomic.Uint64
 
+type ApplicationOptions struct {
+	Cache            *authorized.QueryCache
+	RetrieverVersion string
+	PromptVersion    string
+}
+
+// Application exposes the fake permissioned service and its revocation path as
+// one wiring unit. Tuple mutation stands in for the future revocation transport.
+type Application struct {
+	Service     *authorized.Service
+	coordinator *authorized.RevocationCoordinator
+	authorizer  *authz.LocalAuthorizer
+}
+
 // New returns a deterministic Phase 1 service for the fake KAG retrieve
 // projection. Graph expansion is deliberately disabled because the fake claim
 // objects are outside the document-only authorization boundary.
 func New(backend kag.PrimitiveBackend) (*authorized.Service, error) {
+	service, _, err := newService(backend, ApplicationOptions{})
+	return service, err
+}
+
+func NewApplication(backend kag.PrimitiveBackend, options ApplicationOptions) (*Application, error) {
+	if options.Cache == nil {
+		return nil, fmt.Errorf("create fixture application: query cache is required")
+	}
+	service, authorizer, err := newService(backend, options)
+	if err != nil {
+		return nil, err
+	}
+	coordinator, err := authorized.NewRevocationCoordinator(service)
+	if err != nil {
+		return nil, fmt.Errorf("create fixture revocation coordinator: %w", err)
+	}
+	return &Application{Service: service, coordinator: coordinator, authorizer: authorizer}, nil
+}
+
+func (a *Application) AuthorizeProtectedContent(
+	ctx context.Context,
+	current protocol.AuthorizationContext,
+	binding protocol.ProtectedContentBinding,
+) error {
+	if a == nil || a.coordinator == nil {
+		return authorized.ErrProtectedContentUnavailable
+	}
+	_, err := a.coordinator.AuthorizeProtectedContent(ctx, current, binding)
+	return err
+}
+
+func (a *Application) Apply(
+	ctx context.Context,
+	request authorized.RevocationRequest,
+) (authorized.RevocationReport, error) {
+	if a == nil || a.coordinator == nil {
+		return authorized.RevocationReport{}, authorized.ErrRevocationUnavailable
+	}
+	return a.coordinator.Apply(ctx, request)
+}
+
+func (a *Application) RemoveTuple(tuple authz.Tuple) error {
+	if a == nil || a.authorizer == nil {
+		return fmt.Errorf("fixture application authorizer is unavailable")
+	}
+	return a.authorizer.RemoveTuple(tuple)
+}
+
+func newService(
+	backend kag.PrimitiveBackend,
+	options ApplicationOptions,
+) (*authorized.Service, *authz.LocalAuthorizer, error) {
 	authorizer, err := authz.NewLocalAuthorizer(AuthorizationModelID, fixtureTuples())
 	if err != nil {
-		return nil, fmt.Errorf("create fixture authorizer: %w", err)
+		return nil, nil, fmt.Errorf("create fixture authorizer: %w", err)
 	}
 	loader := exactEvidenceLoader{items: fixtureEvidence()}
 	service, err := authorized.New(authorized.Options{
-		KAG:           backend,
-		Authorizer:    authorizer,
-		Loader:        loader,
-		RetrieveLimit: 3,
-		EvidenceLimit: 3,
-		ExpandLimit:   0,
+		KAG:              backend,
+		Authorizer:       authorizer,
+		Loader:           loader,
+		Cache:            options.Cache,
+		RetrieverVersion: options.RetrieverVersion,
+		PromptVersion:    options.PromptVersion,
+		RetrieveLimit:    3,
+		EvidenceLimit:    3,
+		ExpandLimit:      0,
 		Now: func() time.Time {
 			return time.Date(2026, time.July, 13, 0, 0, 0, 0, time.UTC)
 		},
 	})
 	if err != nil {
-		return nil, fmt.Errorf("create fixture service: %w", err)
+		return nil, nil, fmt.Errorf("create fixture service: %w", err)
 	}
-	return service, nil
+	return service, authorizer, nil
 }
 
 // Authorization creates a request-scoped authorization context. Each call

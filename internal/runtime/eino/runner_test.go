@@ -40,7 +40,7 @@ func TestRunnerInventoryAndSkeletonRun(t *testing.T) {
 func TestRunnerProjectsExecutorEvents(t *testing.T) {
 	executor := &fakeExecutor{
 		events: []*adk.AgentEvent{
-			adk.EventFromMessage(schema.ToolMessage("tool output", "call_1", schema.WithToolName("knote_query")), nil, schema.Tool, "knote_query"),
+			adk.EventFromMessage(schema.ToolMessage("tool output", "call_1", schema.WithToolName("knote_diff")), nil, schema.Tool, "knote_diff"),
 			adk.EventFromMessage(schema.AssistantMessage("assistant answer", nil), nil, schema.Assistant, ""),
 		},
 	}
@@ -120,6 +120,111 @@ func TestRunnerKeepsPartialEventsOnExecutorError(t *testing.T) {
 	}
 	if got := lastMessage(events, protocol.EventAssistantDone); got != "partial answer" {
 		t.Fatalf("partial assistant output was not preserved: %q in %+v", got, events)
+	}
+}
+
+func TestRunnerBindsAllPermissionedToolOutputsAndAnswerToOneBlock(t *testing.T) {
+	authorization := testEinoAuthorization("sess_eino")
+	first := testEinoEvidencePackage(t, authorization, "sources/first.md", "FIRST_CONTENT_CANARY")
+	second := testEinoEvidencePackage(t, authorization, "sources/second.md", "SECOND_CONTENT_CANARY")
+	runner := NewRunner(Options{Executor: &fakeExecutor{events: []*adk.AgentEvent{
+		adk.EventFromMessage(schema.ToolMessage(testPermissionedToolOutput(t, second, "second"), "call_2", schema.WithToolName("knote_explain")), nil, schema.Tool, "knote_explain"),
+		adk.EventFromMessage(schema.ToolMessage(testPermissionedToolOutput(t, first, "first"), "call_1", schema.WithToolName("knote_query")), nil, schema.Tool, "knote_query"),
+		adk.EventFromMessage(schema.AssistantMessage("AUTHORIZED_ANSWER_CANARY", nil), nil, schema.Assistant, ""),
+	}}})
+	ctx, err := protocol.WithAuthorizationContext(context.Background(), authorization)
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := runner.Run(ctx, runtime.EinoRunInput{SessionID: authorization.SessionID, Message: "question"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var blockID string
+	bound := 0
+	for _, event := range events {
+		if event.Type != protocol.EventToolComplete && event.Type != protocol.EventAssistantDone {
+			continue
+		}
+		if event.ProtectedContent == nil {
+			t.Fatalf("permissioned ADK event has no protected binding: %+v", event)
+		}
+		if blockID == "" {
+			blockID = event.ProtectedContent.BlockID
+		} else if event.ProtectedContent.BlockID != blockID {
+			t.Fatalf("permissioned ADK events used different blocks: %+v", events)
+		}
+		if len(event.ProtectedContent.Resources) != 2 {
+			t.Fatalf("permissioned ADK block resources = %d", len(event.ProtectedContent.Resources))
+		}
+		bound++
+	}
+	if bound != 3 {
+		t.Fatalf("permissioned ADK bound events = %d in %+v", bound, events)
+	}
+}
+
+func TestRunnerFailsPermissionedOutputClosedAndSanitizesErrors(t *testing.T) {
+	authorization := testEinoAuthorization("sess_eino")
+	ctx, err := protocol.WithAuthorizationContext(context.Background(), authorization)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name     string
+		executor *fakeExecutor
+	}{
+		{
+			name: "missing evidence",
+			executor: &fakeExecutor{events: []*adk.AgentEvent{
+				adk.EventFromMessage(schema.ToolMessage(`{"answer":"MALFORMED_OUTPUT_CANARY"}`, "call_1", schema.WithToolName("knote_query")), nil, schema.Tool, "knote_query"),
+			}},
+		},
+		{
+			name: "executor error after evidence",
+			executor: &fakeExecutor{
+				events: []*adk.AgentEvent{
+					adk.EventFromMessage(schema.ToolMessage(testPermissionedToolOutput(t, testEinoEvidencePackage(t, authorization, "sources/error.md", "ERROR_CONTENT_CANARY"), "answer"), "call_1", schema.WithToolName("knote_query")), nil, schema.Tool, "knote_query"),
+				},
+				err: errors.New("EXECUTOR_ERROR_CANARY"),
+			},
+		},
+		{
+			name:     "executor error without evidence",
+			executor: &fakeExecutor{err: errors.New("CONTEXT_ERROR_CANARY")},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			runner := NewRunner(Options{Executor: test.executor})
+			events, err := runner.Run(ctx, runtime.EinoRunInput{SessionID: authorization.SessionID, Message: "question"})
+			if err == nil || err.Error() != protectedContentUnavailableMessage {
+				t.Fatalf("permissioned ADK error = %v, events=%+v", err, events)
+			}
+			for _, event := range events {
+				if strings.Contains(event.Message, "MALFORMED_OUTPUT_CANARY") ||
+					strings.Contains(event.Message, "EXECUTOR_ERROR_CANARY") ||
+					strings.Contains(event.Message, "CONTEXT_ERROR_CANARY") {
+					t.Fatalf("permissioned ADK error leaked backend details: %+v", events)
+				}
+			}
+		})
+	}
+}
+
+func TestRunnerRejectsPermissionedOutputWithoutAuthorizationContext(t *testing.T) {
+	authorization := testEinoAuthorization("sess_eino")
+	evidencePackage := testEinoEvidencePackage(t, authorization, "sources/no-context.md", "NO_CONTEXT_CONTENT_CANARY")
+	runner := NewRunner(Options{Executor: &fakeExecutor{events: []*adk.AgentEvent{
+		adk.EventFromMessage(schema.ToolMessage(testPermissionedToolOutput(t, evidencePackage, "NO_CONTEXT_ANSWER_CANARY"), "call_1", schema.WithToolName("knote_query")), nil, schema.Tool, "knote_query"),
+	}}})
+	events, err := runner.Run(context.Background(), runtime.EinoRunInput{SessionID: authorization.SessionID, Message: "question"})
+	if err == nil || err.Error() != protectedContentUnavailableMessage {
+		t.Fatalf("missing authorization error = %v, events=%+v", err, events)
+	}
+	for _, event := range events {
+		if strings.Contains(event.Message, "CANARY") {
+			t.Fatalf("missing authorization leaked permissioned output: %+v", events)
+		}
 	}
 }
 

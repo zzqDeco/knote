@@ -9,12 +9,63 @@ import (
 	einotool "github.com/cloudwego/eino/components/tool"
 
 	einotools "github.com/zzqDeco/knote/internal/eino/tools"
+	"github.com/zzqDeco/knote/internal/knowledge/authorized"
 	"github.com/zzqDeco/knote/internal/knowledge/authorized/fixture"
+	"github.com/zzqDeco/knote/internal/knowledge/kag"
 	"github.com/zzqDeco/knote/internal/protocol"
 	"github.com/zzqDeco/knote/internal/runtime"
 )
 
-const permissionedPrincipalEnv = "KNOTE_PERMISSIONED_PRINCIPAL"
+const (
+	permissionedPrincipalEnv     = "KNOTE_PERMISSIONED_PRINCIPAL"
+	permissionedQueryCacheSize   = 64
+	permissionedRetrieverVersion = "fixture-retriever-v1"
+	permissionedPromptVersion    = "fixture-prompt-v1"
+)
+
+type permissionedApplication struct {
+	fixture *fixture.Application
+}
+
+func newPermissionedApplication(enabled bool, backend kag.PrimitiveBackend) (*permissionedApplication, error) {
+	if !enabled {
+		return nil, nil
+	}
+	cache, err := authorized.NewQueryCache(permissionedQueryCacheSize)
+	if err != nil {
+		return nil, err
+	}
+	application, err := fixture.NewApplication(backend, fixture.ApplicationOptions{
+		Cache:            cache,
+		RetrieverVersion: permissionedRetrieverVersion,
+		PromptVersion:    permissionedPromptVersion,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &permissionedApplication{fixture: application}, nil
+}
+
+func (a *permissionedApplication) AuthorizeProtectedContent(
+	ctx context.Context,
+	current protocol.AuthorizationContext,
+	binding protocol.ProtectedContentBinding,
+) error {
+	if a == nil || a.fixture == nil {
+		return authorized.ErrProtectedContentUnavailable
+	}
+	return a.fixture.AuthorizeProtectedContent(ctx, current, binding)
+}
+
+func (a *permissionedApplication) ApplyRevocation(
+	ctx context.Context,
+	request authorized.RevocationRequest,
+) (authorized.RevocationReport, error) {
+	if a == nil || a.fixture == nil {
+		return authorized.RevocationReport{}, authorized.ErrRevocationUnavailable
+	}
+	return a.fixture.Apply(ctx, request)
+}
 
 func permissionedPrincipal() (string, error) {
 	principal := strings.TrimSpace(os.Getenv(permissionedPrincipalEnv))

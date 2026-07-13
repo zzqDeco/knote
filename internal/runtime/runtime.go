@@ -39,6 +39,7 @@ type Dependencies struct {
 	RunnerMode                   RunnerMode
 	EinoRunner                   EinoRunner
 	AuthorizationContextProvider AuthorizationContextProvider
+	ProtectedContentAuthorizer   ProtectedContentAuthorizer
 	SideEffects                  *SideEffectBridge
 	ToolExecutor                 ToolExecutor
 	NewSessionID                 func() string
@@ -147,6 +148,9 @@ func (m *Manager) Start(ctx context.Context, opts StartOptions) ([]protocol.Even
 			}
 			return nil, fmt.Errorf("resume failed: %w", err)
 		}
+		if resumeAuthorization != nil {
+			loaded = m.filterPersistedEvents(ctx, *resumeAuthorization, loaded)
+		}
 	}
 	info := m.newEinoSessionLocked(ctx, resumeID)
 	m.einoSession = info
@@ -209,7 +213,7 @@ func (m *Manager) SendMessage(ctx context.Context, input string) []protocol.Even
 	if strings.HasPrefix(input, "/") {
 		return m.handleSlash(runCtx, einoSession.ID, input)
 	}
-	history := m.loadHistory(ctx, einoSession.ID)
+	history := m.loadHistory(runCtx, einoSession.ID)
 	if m.deps.SideEffects != nil {
 		runCtx = withSideEffectSession(runCtx, einoSession.ID)
 	}
@@ -398,6 +402,13 @@ func (m *Manager) loadHistory(ctx context.Context, sessionID string) []protocol.
 	events, err := m.deps.Sessions.Load(ctx, sessionID)
 	if err != nil {
 		return nil
+	}
+	if m.deps.AuthorizationContextProvider != nil {
+		authorization, ok := protocol.AuthorizationContextFrom(ctx)
+		if !ok || authorization.SessionID != sessionID {
+			return nil
+		}
+		return m.filterPersistedEvents(ctx, authorization, events)
 	}
 	return events
 }

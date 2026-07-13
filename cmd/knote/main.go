@@ -11,7 +11,6 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	einotools "github.com/zzqDeco/knote/internal/eino/tools"
-	"github.com/zzqDeco/knote/internal/knowledge/authorized/fixture"
 	"github.com/zzqDeco/knote/internal/knowledge/kag"
 	"github.com/zzqDeco/knote/internal/knowledge/versioned"
 	"github.com/zzqDeco/knote/internal/protocol"
@@ -91,12 +90,14 @@ func newRuntime(ctx context.Context, workspacePath string, resumeID string) (run
 	if err != nil {
 		return nil, nil, err
 	}
+	permissionedApplication, err := newPermissionedApplication(repoCfg.KAG.Fake, kagClient)
+	if err != nil {
+		return nil, nil, err
+	}
 	var permissionedQuery einotools.PermissionedQuery
-	if repoCfg.KAG.Fake {
-		permissionedService, err := fixture.New(kagClient)
-		if err != nil {
-			return nil, nil, err
-		}
+	var protectedContentAuthorizer runtime.ProtectedContentAuthorizer
+	if permissionedApplication != nil {
+		permissionedService := permissionedApplication.fixture.Service
 		permissionedQuery = func(ctx context.Context, request protocol.QueryRequest) (einotools.PermissionedQueryResult, error) {
 			result, err := permissionedService.Query(ctx, request)
 			if err != nil {
@@ -108,6 +109,7 @@ func newRuntime(ctx context.Context, workspacePath string, resumeID string) (run
 				EvidencePackage: result.Evidence,
 			}, nil
 		}
+		protectedContentAuthorizer = permissionedApplication.AuthorizeProtectedContent
 	}
 	sideEffects := runtime.NewSideEffectBridge()
 	approvedEinoTools := einotools.ByNameWithOptions(einotools.Options{
@@ -137,6 +139,7 @@ func newRuntime(ctx context.Context, workspacePath string, resumeID string) (run
 		RunnerMode:                   runtime.RunnerModeEino,
 		EinoRunner:                   einoRunner,
 		AuthorizationContextProvider: authorizationProvider,
+		ProtectedContentAuthorizer:   protectedContentAuthorizer,
 		SideEffects:                  sideEffects,
 		ToolExecutor:                 toolExecutor,
 		NewSessionID:                 local.NewSessionID,

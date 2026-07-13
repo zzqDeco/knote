@@ -2,6 +2,7 @@ package eino
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -86,16 +87,109 @@ func (r *Runner) Run(ctx context.Context, input runtime.EinoRunInput) ([]protoco
 	messages = append(messages, schema.UserMessage(text))
 	events := []protocol.Event{protocol.NewEvent(protocol.EventAssistantStart, input.SessionID, "eino runner started", nil)}
 	agentEvents, err := executor.Run(ctx, messages)
+	_, permissionedContext := protocol.AuthorizationContextFrom(ctx)
+	binding, permissioned, bindingErr := protectedBindingFromAgentEvents(ctx, agentEvents)
+	if bindingErr != nil {
+		generic := fmt.Errorf("%s", protectedContentUnavailableMessage)
+		events = append(events, protocol.NewEvent(protocol.EventError, input.SessionID, generic.Error(), nil))
+		return events, generic
+	}
 	for _, event := range agentEvents {
-		events = append(events, projectEvent(input.SessionID, event)...)
+		projected := projectEvent(input.SessionID, event)
+		if permissioned {
+			bindProjectedEvents(projected, binding)
+		} else if permissionedContext {
+			sanitizePermissionedErrors(projected)
+		}
+		events = append(events, projected...)
 	}
 	if err != nil {
+		if permissionedContext {
+			return events, fmt.Errorf("%s", protectedContentUnavailableMessage)
+		}
 		return events, err
 	}
 	if len(events) == 1 {
 		events = append(events, protocol.NewEvent(protocol.EventStatusUpdate, input.SessionID, "Eino runner completed without response.", nil))
 	}
 	return events, nil
+}
+
+func protectedBindingFromAgentEvents(
+	ctx context.Context,
+	events []*adk.AgentEvent,
+) (*protocol.ProtectedContentBinding, bool, error) {
+	authorization, authorized := protocol.AuthorizationContextFrom(ctx)
+	var packages []protocol.EvidencePackage
+	for _, event := range events {
+		toolName, content, ok, err := permissionedAgentToolOutput(event)
+		if err != nil {
+			return nil, true, err
+		}
+		if !ok || !permissionedToolName(toolName) {
+			continue
+		}
+		if !authorized {
+			return nil, true, errors.New("permissioned tool output requires authorization")
+		}
+		evidencePackage, err := decodeEvidencePackage(content)
+		if err != nil {
+			return nil, true, err
+		}
+		packages = append(packages, evidencePackage)
+	}
+	if len(packages) == 0 {
+		return nil, false, nil
+	}
+	binding, err := protocol.NewProtectedContentBinding(authorization, packages...)
+	if err != nil {
+		return nil, true, err
+	}
+	return &binding, true, nil
+}
+
+func permissionedAgentToolOutput(event *adk.AgentEvent) (string, string, bool, error) {
+	if event == nil || event.Output == nil || event.Output.MessageOutput == nil || event.Output.MessageOutput.Role != schema.Tool {
+		return "", "", false, nil
+	}
+	toolName := strings.TrimSpace(event.Output.MessageOutput.ToolName)
+	if toolName != "" && !permissionedToolName(toolName) {
+		return toolName, "", true, nil
+	}
+	message, _, err := adk.GetMessage(event)
+	if err != nil {
+		return "", "", false, err
+	}
+	if toolName == "" && message != nil {
+		toolName = strings.TrimSpace(message.ToolName)
+	}
+	return toolName, messageContent(message), true, nil
+}
+
+func sanitizePermissionedErrors(events []protocol.Event) {
+	for index := range events {
+		if events[index].Type != protocol.EventError {
+			continue
+		}
+		events[index].Message = protectedContentUnavailableMessage
+		events[index].Payload = nil
+	}
+}
+
+func bindProjectedEvents(events []protocol.Event, binding *protocol.ProtectedContentBinding) {
+	if binding == nil {
+		return
+	}
+	for index := range events {
+		event := &events[index]
+		sanitizePermissionedErrors(events[index : index+1])
+		if event.Type == protocol.EventAssistantDone ||
+			event.Type == protocol.EventError ||
+			((event.Type == protocol.EventToolComplete || event.Type == protocol.EventToolError) && permissionedToolName(eventToolName(event.Payload))) {
+			copy := *binding
+			event.ProtectedContent = &copy
+		}
+	}
 }
 
 func (r *Runner) RunnerConfig(agent adk.Agent) adk.RunnerConfig {

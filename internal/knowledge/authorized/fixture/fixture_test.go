@@ -6,7 +6,10 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/zzqDeco/knote/internal/authz"
+	"github.com/zzqDeco/knote/internal/knowledge/authorized"
 	"github.com/zzqDeco/knote/internal/knowledge/kag"
 	"github.com/zzqDeco/knote/internal/protocol"
 )
@@ -109,6 +112,65 @@ func TestServiceRejectsChangedFakeRetrieveHandle(t *testing.T) {
 	}
 	if len(backend.generateRequests) != 0 {
 		t.Fatal("changed handle reached generation")
+	}
+}
+
+func TestApplicationRevocationHidesRevokedEvidenceWithoutPoisoningUnrelatedResources(t *testing.T) {
+	backend := &fakePrimitiveBackend{}
+	cache, err := authorized.NewQueryCache(8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	application, err := NewApplication(backend, ApplicationOptions{
+		Cache: cache, RetrieverVersion: "fixture-retriever-v1", PromptVersion: "fixture-prompt-v1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorization := Authorization(Alice, "session-revocation")
+	result, err := application.Service.Query(context.Background(), protocol.QueryRequest{
+		Question: "What is knote?", Authorization: authorization,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding, err := protocol.NewProtectedContentBinding(authorization, result.Evidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := application.AuthorizeProtectedContent(context.Background(), authorization, binding); err != nil {
+		t.Fatalf("protected content was denied before revocation: %v", err)
+	}
+	if err := application.RemoveTuple(authz.Tuple{
+		User: "user:" + Alice, Relation: authz.RelationMember, Object: fakePrivateReaders,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	report, err := application.Apply(context.Background(), authorized.RevocationRequest{
+		Authorization: authorization,
+		Binding:       binding,
+		ResourceIDs:   []protocol.ResourceID{introResourceID},
+		RevokedAt:     time.Now().Add(-time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.InvalidatedResourceCount != 1 || report.DeniedCount != 1 || report.AllowedCount != 1 {
+		t.Fatalf("fixture revocation report = %#v", report)
+	}
+	if err := application.AuthorizeProtectedContent(context.Background(), authorization, binding); !errors.Is(err, authorized.ErrProtectedContentUnavailable) {
+		t.Fatalf("revoked protected block remained visible: %v", err)
+	}
+
+	after, err := application.Service.Query(context.Background(), protocol.QueryRequest{
+		Question: "What is knote?", Authorization: authorization,
+	})
+	if err != nil {
+		t.Fatalf("unrelated authorized evidence was poisoned by revocation: %v", err)
+	}
+	assertResourceIDs(t, after.Evidence.Items, []protocol.ResourceID{overviewResourceID})
+	if strings.Contains(after.Generation.Answer, introContent) || strings.Contains(after.Generation.Answer, deniedCanaryContent) {
+		t.Fatalf("post-revocation answer leaked hidden content: %q", after.Generation.Answer)
 	}
 }
 

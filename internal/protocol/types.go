@@ -32,11 +32,12 @@ const (
 )
 
 type Event struct {
-	Type      EventType `json:"type"`
-	SessionID string    `json:"session_id,omitempty"`
-	Message   string    `json:"message,omitempty"`
-	Payload   any       `json:"payload,omitempty"`
-	CreatedAt time.Time `json:"created_at"`
+	Type             EventType                `json:"type"`
+	SessionID        string                   `json:"session_id,omitempty"`
+	Message          string                   `json:"message,omitempty"`
+	Payload          any                      `json:"payload,omitempty"`
+	ProtectedContent *ProtectedContentBinding `json:"protected_content,omitempty"`
+	CreatedAt        time.Time                `json:"created_at"`
 }
 
 func NewEvent(eventType EventType, sessionID, message string, payload any) Event {

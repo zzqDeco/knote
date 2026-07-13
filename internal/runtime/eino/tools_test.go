@@ -2,6 +2,8 @@ package eino
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -88,9 +90,98 @@ func TestToolExecutorRendersVersionsMessage(t *testing.T) {
 	}
 }
 
+func TestToolExecutorBindsPermissionedEvidenceAndAnswerToOneBlock(t *testing.T) {
+	authorization := testEinoAuthorization("sess_eino")
+	evidencePackage := testEinoEvidencePackage(t, authorization, "sources/allowed.md", "AUTHORIZED_CONTENT_CANARY")
+	executor := NewToolExecutor([]einotool.InvokableTool{
+		staticTool{name: einotools.NameQuery, out: testPermissionedToolOutput(t, evidencePackage, "AUTHORIZED_ANSWER_CANARY")},
+	})
+	ctx, err := protocol.WithAuthorizationContext(context.Background(), authorization)
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := executor.Invoke(ctx, authorization.SessionID, einotools.NameQuery, `{}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var blockID string
+	bound := 0
+	for _, event := range events {
+		if event.Type != protocol.EventToolStart && event.Type != protocol.EventToolComplete && event.Type != protocol.EventAssistantDone {
+			continue
+		}
+		if event.ProtectedContent == nil {
+			t.Fatalf("permissioned event has no protected binding: %+v", event)
+		}
+		if blockID == "" {
+			blockID = event.ProtectedContent.BlockID
+		} else if event.ProtectedContent.BlockID != blockID {
+			t.Fatalf("permissioned events used different blocks: %+v", events)
+		}
+		bound++
+	}
+	if bound != 3 || len(events[1].ProtectedContent.Resources) != 1 {
+		t.Fatalf("permissioned bound events = %d in %+v", bound, events)
+	}
+}
+
+func TestToolExecutorFailsPermissionedCallsClosedWithoutLeakingBackendDetails(t *testing.T) {
+	authorization := testEinoAuthorization("sess_eino")
+	ctx, err := protocol.WithAuthorizationContext(context.Background(), authorization)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name string
+		tool staticTool
+	}{
+		{name: "missing evidence", tool: staticTool{name: einotools.NameQuery, out: `{"answer":"MALFORMED_OUTPUT_CANARY"}`}},
+		{name: "backend error", tool: staticTool{name: einotools.NameExplain, err: errors.New("BACKEND_ERROR_CANARY")}},
+		{
+			name: "adapter error with evidence",
+			tool: staticTool{
+				name: einotools.NameQuery,
+				out:  testPermissionedToolFailureOutput(t, testEinoEvidencePackage(t, authorization, "sources/adapter-error.md", "ADAPTER_CONTENT_CANARY"), "ADAPTER_ERROR_CANARY"),
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			executor := NewToolExecutor([]einotool.InvokableTool{test.tool})
+			events, err := executor.Invoke(ctx, authorization.SessionID, test.tool.name, `{}`)
+			if err == nil || err.Error() != protectedContentUnavailableMessage {
+				t.Fatalf("permissioned tool error = %v, events=%+v", err, events)
+			}
+			if strings.Contains(fmt.Sprint(events), "CANARY") {
+				t.Fatalf("permissioned tool error leaked backend details: %+v", events)
+			}
+			if !hasToolMessage(events, protocol.EventToolError, protectedContentUnavailableMessage) {
+				t.Fatalf("permissioned tool error was not generic: %+v", events)
+			}
+		})
+	}
+}
+
+func TestToolExecutorRejectsPermissionedOutputWithoutAuthorizationContext(t *testing.T) {
+	authorization := testEinoAuthorization("sess_eino")
+	evidencePackage := testEinoEvidencePackage(t, authorization, "sources/no-context.md", "NO_CONTEXT_CONTENT_CANARY")
+	executor := NewToolExecutor([]einotool.InvokableTool{
+		staticTool{name: einotools.NameQuery, out: testPermissionedToolOutput(t, evidencePackage, "NO_CONTEXT_ANSWER_CANARY")},
+	})
+	events, err := executor.Invoke(context.Background(), authorization.SessionID, einotools.NameQuery, `{}`)
+	if err == nil || err.Error() != protectedContentUnavailableMessage {
+		t.Fatalf("missing authorization error = %v, events=%+v", err, events)
+	}
+	for _, event := range events {
+		if strings.Contains(event.Message, "CANARY") {
+			t.Fatalf("missing authorization leaked permissioned output: %+v", events)
+		}
+	}
+}
+
 type staticTool struct {
 	name string
 	out  string
+	err  error
 }
 
 func (t staticTool) Info(context.Context) (*schema.ToolInfo, error) {
@@ -98,7 +189,7 @@ func (t staticTool) Info(context.Context) (*schema.ToolInfo, error) {
 }
 
 func (t staticTool) InvokableRun(context.Context, string, ...einotool.Option) (string, error) {
-	return t.out, nil
+	return t.out, t.err
 }
 
 func hasToolEvent(events []protocol.Event, eventType protocol.EventType) bool {
