@@ -291,7 +291,14 @@ func (metadata ProtectedQueryMetadata) Validate() error {
 		}
 	}
 	debug := metadata.Debug
-	if debug.ProjectionVersion == "" && debug.VisibilityFingerprint == "" && debug.Plan == nil {
+	debugEmpty := debug.ProjectionVersion == "" && debug.VisibilityFingerprint == "" && debug.Plan == nil
+	if metadata.Trace.Outcome == ProtectedQueryOutcomeOK && debugEmpty {
+		return fmt.Errorf("protected query success requires debug binding metadata")
+	}
+	if metadata.Trace.Outcome != ProtectedQueryOutcomeOK && !debugEmpty {
+		return fmt.Errorf("protected query errors must not include debug binding metadata")
+	}
+	if debugEmpty {
 		return nil
 	}
 	if !validGraphProjectionVersion(debug.ProjectionVersion) || debug.VisibilityFingerprint.Validate() != nil || debug.Plan == nil {

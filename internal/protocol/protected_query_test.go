@@ -230,6 +230,52 @@ func TestProtectedQueryPublicErrorsAndMetadataHaveFixedSchema(t *testing.T) {
 	}
 }
 
+func TestProtectedQueryEnvelopeRequiresOutcomeScopedDebugMetadata(t *testing.T) {
+	plan := protectedQueryTestPlan(t)
+	planIdentity, err := NewProtectedTraversalPlanIdentity(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fingerprint, err := NewVisibilityFingerprint(protectedQueryTestAuthorization(), plan.ProjectionVersion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	debug := ProtectedQueryDebugMetadata{
+		ProjectionVersion: plan.ProjectionVersion, VisibilityFingerprint: fingerprint, Plan: &planIdentity,
+	}
+	metadata := func(outcome ProtectedQueryPublicOutcome) ProtectedQueryMetadata {
+		return ProtectedQueryMetadata{
+			Trace:   ProtectedQueryTraceMetadata{Operation: ProtectedQueryOperationQuery, Outcome: outcome},
+			Metrics: ProtectedQueryMetricsMetadata{Operation: ProtectedQueryOperationQuery, Outcome: outcome},
+			Audit:   ProtectedQueryAuditMetadata{Action: "protected_query", Decision: outcome},
+		}
+	}
+
+	success := ProtectedQueryEnvelope{
+		Version: ProtectedQueryContractVersion, Result: EmptyProtectedQueryVisibleResult(),
+		Metadata: metadata(ProtectedQueryOutcomeOK),
+	}
+	if err := success.Validate(); err == nil {
+		t.Fatal("protected query success accepted missing debug binding metadata")
+	}
+	success.Metadata.Debug = debug
+	if err := success.Validate(); err != nil {
+		t.Fatalf("protected query success rejected complete debug binding metadata: %v", err)
+	}
+
+	failure := ProtectedQueryEnvelope{
+		Version: ProtectedQueryContractVersion, Result: EmptyProtectedQueryVisibleResult(),
+		Error: NewProtectedQueryNotFoundError(), Metadata: metadata(ProtectedQueryOutcomeNotFound),
+	}
+	if err := failure.Validate(); err != nil {
+		t.Fatalf("protected query error rejected fixed empty debug metadata: %v", err)
+	}
+	failure.Metadata.Debug = debug
+	if err := failure.Validate(); err == nil {
+		t.Fatal("protected query error accepted debug binding metadata")
+	}
+}
+
 func TestProtectedQueryVisibleResultRequiresProtectedNextPageTokenStructure(t *testing.T) {
 	result := EmptyProtectedQueryVisibleResult()
 	result.Page.Items = []ProtectedQueryPageItem{{Value: "unexpected"}}
