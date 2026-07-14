@@ -199,6 +199,43 @@ def create(context):
 	}
 }
 
+func TestPrimitiveClientActualRealProviderPipeUsesUTF8(t *testing.T) {
+	repoRoot := primitiveTestRepoRoot(t)
+	workspace := t.TempDir()
+	writePrimitiveGraphContract(t, workspace)
+	provider := writePrimitiveProvider(t, workspace, `
+class Provider:
+    def retrieve(self, request):
+        if request["query"] != "\u6743\u9650\u68c0\u7d22":
+            raise RuntimeError("unexpected query")
+        return {"candidates": []}
+def create(context):
+    return Provider()
+`)
+	client := Client{
+		AdapterPath:          filepath.Join(repoRoot, "adapters", "kag", "knote_kag_adapter.py"),
+		Workspace:            workspace,
+		PermissionedProvider: provider,
+	}
+	t.Setenv("KNOTE_PYTHON", pythonForTest())
+	t.Setenv("KNOTE_KAG_FAKE", "")
+	t.Setenv("LC_ALL", "C")
+	t.Setenv("LANG", "C")
+	t.Setenv("PYTHONUTF8", "0")
+	t.Setenv("PYTHONCOERCECLOCALE", "0")
+	t.Setenv("PYTHONIOENCODING", "utf-8")
+
+	result, err := client.Retrieve(context.Background(), RetrieveRequest{
+		Authorization: testAuthorizationContext(), Query: "\u6743\u9650\u68c0\u7d22", Limit: 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Candidates) != 0 {
+		t.Fatalf("UTF-8 provider returned candidates: %+v", result.Candidates)
+	}
+}
+
 func TestPrimitiveClientActualRealProviderHonorsContextDeadline(t *testing.T) {
 	repoRoot := primitiveTestRepoRoot(t)
 	workspace := t.TempDir()
@@ -249,7 +286,7 @@ class Provider:
             sys.executable,
             "-c",
             "import os,time; time.sleep(0.25); open(os.environ['KNOTE_PROVIDER_COMPLETED'], 'w', encoding='utf-8').write('completed')",
-        ], close_fds=True)
+        ], close_fds=True, start_new_session=True)
         with open(os.environ["KNOTE_PROVIDER_STARTED"], "w", encoding="utf-8") as stream:
             stream.write("started")
         time.sleep(5)
@@ -296,6 +333,45 @@ def create(context):
 	time.Sleep(350 * time.Millisecond)
 	if _, err := os.Stat(completed); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("provider completed side effects after cancellation: %v", err)
+	}
+}
+
+func TestPrimitiveClientActualRealProviderReapsDetachedHelperAfterSuccess(t *testing.T) {
+	repoRoot := primitiveTestRepoRoot(t)
+	workspace := t.TempDir()
+	writePrimitiveGraphContract(t, workspace)
+	provider := writePrimitiveProvider(t, workspace, `
+import subprocess
+import sys
+class Provider:
+    def retrieve(self, request):
+        subprocess.Popen([
+            sys.executable,
+            "-c",
+            "import os,time; time.sleep(0.25); open(os.environ['KNOTE_PROVIDER_COMPLETED'], 'w', encoding='utf-8').write('completed')",
+        ], close_fds=True, start_new_session=True)
+        return {"candidates": []}
+def create(context):
+    return Provider()
+`)
+	completed := filepath.Join(workspace, "provider-completed")
+	t.Setenv("KNOTE_PROVIDER_COMPLETED", completed)
+	t.Setenv("KNOTE_PYTHON", pythonForTest())
+	t.Setenv("KNOTE_KAG_FAKE", "")
+	client := Client{
+		AdapterPath:          filepath.Join(repoRoot, "adapters", "kag", "knote_kag_adapter.py"),
+		Workspace:            workspace,
+		PermissionedProvider: provider,
+	}
+
+	if _, err := client.Retrieve(context.Background(), RetrieveRequest{
+		Authorization: testAuthorizationContext(), Query: "knote", Limit: 10,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(350 * time.Millisecond)
+	if _, err := os.Stat(completed); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("detached helper completed side effects after provider success: %v", err)
 	}
 }
 

@@ -1914,6 +1914,89 @@ def posix_process_exists(pid: int) -> bool:
     return True
 
 
+def posix_process_parents() -> dict[int, int]:
+    """Return a best-effort snapshot of the POSIX process parent graph."""
+    parents: dict[int, int] = {}
+    if sys.platform.startswith("linux"):
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                stat = (entry / "stat").read_text(encoding="ascii")
+                fields = stat[stat.rfind(")") + 2 :].split()
+                parents[int(entry.name)] = int(fields[1])
+            except (IndexError, OSError, ValueError):
+                continue
+        return parents
+
+    completed = subprocess.run(
+        ["/bin/ps", "-axo", "pid=,ppid="],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        encoding="ascii",
+        errors="strict",
+        timeout=1,
+        check=False,
+        close_fds=True,
+    )
+    if completed.returncode != 0:
+        raise OSError("provider process tree inspection failed")
+    for line in completed.stdout.splitlines():
+        fields = line.split()
+        if len(fields) != 2:
+            continue
+        try:
+            parents[int(fields[0])] = int(fields[1])
+        except ValueError:
+            continue
+    return parents
+
+
+def posix_descendant_pids(root_pid: int) -> set[int]:
+    parents = posix_process_parents()
+    descendants: set[int] = set()
+    changed = True
+    while changed:
+        changed = False
+        for pid, parent_pid in parents.items():
+            if pid in descendants or pid == root_pid:
+                continue
+            if parent_pid == root_pid or parent_pid in descendants:
+                descendants.add(pid)
+                changed = True
+    return descendants
+
+
+def kill_posix_pids(pids: set[int], exclude: set[int] | None = None) -> None:
+    excluded = exclude or set()
+    for pid in sorted(pids - excluded, reverse=True):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (PermissionError, ProcessLookupError):
+            pass
+
+
+def terminate_posix_descendants(
+    root_pid: int,
+    tracked: set[int] | None = None,
+    exclude: set[int] | None = None,
+) -> set[int]:
+    """Kill detached and ordinary descendants while the root still anchors them."""
+    observed = set(tracked or ())
+    excluded = exclude or set()
+    for _ in range(3):
+        try:
+            observed.update(posix_descendant_pids(root_pid))
+        except OSError:
+            pass
+        observed.difference_update(excluded)
+        kill_posix_pids(observed, excluded)
+        time.sleep(0.01)
+    return observed
+
+
 def windows_provider_guardian(parent_pid: int, runner_pid: int) -> int:
     import ctypes
 
@@ -2051,17 +2134,26 @@ def permissioned_provider_guardian(parent_pid: int, runner_pid: int) -> int:
     sys.stdout.write("ready\n")
     sys.stdout.flush()
     sys.stdout.close()
+    tracked: set[int] = set()
     while posix_process_exists(runner_pid):
+        try:
+            tracked.update(posix_descendant_pids(runner_pid))
+        except OSError:
+            pass
+        tracked.discard(os.getpid())
         if not posix_process_exists(parent_pid):
             try:
-                os.killpg(runner_pid, signal.SIGKILL)
+                os.kill(runner_pid, signal.SIGKILL)
             except ProcessLookupError:
-                try:
-                    os.kill(runner_pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+                pass
+            terminate_posix_descendants(
+                runner_pid,
+                tracked,
+                exclude={os.getpid()},
+            )
             return 0
         time.sleep(0.02)
+    kill_posix_pids(tracked, exclude={os.getpid()})
     return 0
 
 
@@ -2170,6 +2262,9 @@ def permissioned_provider_runner(response_path: str) -> int:
                 "response": normalized_response,
             }
 
+    if os.name != "nt":
+        terminate_posix_descendants(os.getpid(), exclude={_guardian.pid})
+
     try:
         encoded = json.dumps(
             envelope,
@@ -2200,6 +2295,11 @@ def terminate_provider_process_domain(process: subprocess.Popen[str]) -> None:
             except OSError:
                 pass
     else:
+        tracked: set[int] = set()
+        try:
+            tracked.update(posix_descendant_pids(process.pid))
+        except OSError:
+            pass
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
@@ -2208,6 +2308,7 @@ def terminate_provider_process_domain(process: subprocess.Popen[str]) -> None:
                     process.kill()
                 except OSError:
                     pass
+        kill_posix_pids(tracked)
     try:
         process.wait()
     except OSError:
@@ -2249,6 +2350,7 @@ def call_permissioned_provider(
                 ],
                 stdin=subprocess.PIPE,
                 text=True,
+                encoding="utf-8",
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 close_fds=True,
