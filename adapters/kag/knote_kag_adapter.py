@@ -1905,6 +1905,25 @@ def deny_provider_parent_fd_access() -> None:
         ) from exc
 
 
+def enable_linux_provider_subreaper() -> None:
+    """Keep daemonized provider descendants attached to the runner."""
+    if not sys.platform.startswith("linux"):
+        return
+
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    prctl = libc.prctl
+    prctl.restype = ctypes.c_int
+    if prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
+        raise OSError(ctypes.get_errno(), "prctl(PR_SET_CHILD_SUBREAPER) failed")
+    enabled = ctypes.c_int()
+    if prctl(37, ctypes.byref(enabled), 0, 0, 0) != 0:  # PR_GET_CHILD_SUBREAPER
+        raise OSError(ctypes.get_errno(), "prctl(PR_GET_CHILD_SUBREAPER) failed")
+    if enabled.value != 1:
+        raise OSError("provider runner did not become a child subreaper")
+
+
 def posix_process_exists(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -2215,6 +2234,7 @@ def permissioned_provider_runner(response_path: str, liveness_fd: int) -> int:
         return 1
 
     try:
+        enable_linux_provider_subreaper()
         _provider_job = create_windows_provider_job()
         _guardian = start_provider_guardian(liveness_fd)
     except BaseException:
