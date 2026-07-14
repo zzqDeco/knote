@@ -25,7 +25,7 @@ import (
 const (
 	localTenantID       = "local"
 	localSecurityDomain = "local"
-	projectionSchema    = "artifact-bundle-v2"
+	projectionSchema    = "artifact-bundle-v3"
 
 	maxKAGResourceFiles     = 4_096
 	maxKAGResourceFileBytes = 8 << 20
@@ -535,6 +535,19 @@ func canonicalProjectionVersion(
 	buildConfigVersion string,
 	graphBindingContractVersion int,
 ) (string, error) {
+	return canonicalProjectionVersionForSchema(
+		projectionSchema, scope, snapshot, aclVersion, buildConfigVersion, graphBindingContractVersion,
+	)
+}
+
+func canonicalProjectionVersionForSchema(
+	schema string,
+	scope catalog.Scope,
+	snapshot catalog.SourceSnapshotRef,
+	aclVersion string,
+	buildConfigVersion string,
+	graphBindingContractVersion int,
+) (string, error) {
 	payload := struct {
 		Schema                      string                    `json:"schema"`
 		Scope                       catalog.Scope             `json:"scope"`
@@ -545,7 +558,7 @@ func canonicalProjectionVersion(
 		Graph                       string                    `json:"graph_version"`
 		GraphBindingContractVersion int                       `json:"graph_binding_contract_version,omitempty"`
 	}{
-		Schema: projectionSchema, Scope: scope, Snapshot: snapshot, ACL: aclVersion,
+		Schema: schema, Scope: scope, Snapshot: snapshot, ACL: aclVersion,
 		BuildConfig: buildConfigVersion, Index: "index-v1", Graph: "graph-v1",
 		GraphBindingContractVersion: graphBindingContractVersion,
 	}

@@ -1479,6 +1479,73 @@ func TestDerivedArtifactRevocationHonorsAnySupportAlternatives(t *testing.T) {
 		}
 	})
 
+	t.Run("surviving alternatives are pruned before unrelated revocation", func(t *testing.T) {
+		scope := testScope()
+		snapshot := testSnapshot(t, scope, "source-v1", "sources/root.md")
+		document := published(testMetadata(
+			t, scope, protocol.ResourceDocument, "sources/root.md", "document", "source-v1",
+			"content-document-v1", "projection-v1", "", "doc:root",
+		))
+		entity := func(sourceKey string) ResourceMetadata {
+			metadata := testMetadata(
+				t, scope, protocol.ResourceEntity, sourceKey, sourceKey, "source-v1",
+				"content-"+sourceKey, "projection-v1", "", sourceKey,
+			)
+			metadata.Dependencies = []protocol.ResourceID{document.ResourceID}
+			return published(metadata)
+		}
+		supportA := entity("entity:a")
+		supportB := entity("entity:b")
+		unrelated := entity("entity:unrelated")
+		artifact := DerivedArtifact{
+			Metadata: testMetadata(
+				t, scope, protocol.ResourceDerivedArtifact, "artifact:summary", "artifact", "source-v1",
+				"content-artifact-v1", "projection-v1", "", "artifact:summary",
+			),
+			Kind: "summary",
+			Provenance: Provenance{DerivationMode: protocol.DerivationAnySupport, Supports: []Support{
+				{SupportID: "support-a", Evidence: []EvidenceRef{{ResourceID: supportA.ResourceID}}, Complete: true},
+				{SupportID: "support-b", Evidence: []EvidenceRef{{ResourceID: supportB.ResourceID}}, Complete: true},
+			}},
+		}
+		artifact.Metadata.Dependencies = []protocol.ResourceID{supportA.ResourceID, supportB.ResourceID}
+		materializeDerivedArtifactSecurity(t, &artifact, supportA, supportB)
+		artifact.Metadata = published(artifact.Metadata)
+		current := testProjection(t, scope, "projection-v1", snapshot.Ref(), []ResourceMetadata{
+			document, supportA, supportB, unrelated, artifact.Metadata,
+		})
+
+		firstRun := testRun(scope, current.Version, "projection-v2", snapshot.Ref())
+		firstPlan, err := PlanRevocations(firstRun, current, []protocol.ResourceID{supportA.ResourceID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		first, _, err := Replay(firstPlan, current, SuccessfulResults(firstPlan))
+		if err != nil {
+			t.Fatal(err)
+		}
+		carried := resourceByID(t, first, artifact.Metadata.ResourceID)
+		if !first.IsServing(carried.ResourceID) || len(carried.Dependencies) != 1 ||
+			carried.Dependencies[0] != supportB.ResourceID || carried.DerivedArtifactSecurity == nil ||
+			len(carried.DerivedArtifactSecurity.Supports) != 1 ||
+			carried.DerivedArtifactSecurity.Supports[0].SupportID != "support-b" {
+			t.Fatalf("dead any_support alternative was not pruned: %+v", carried)
+		}
+
+		secondRun := testRun(scope, first.Version, "projection-v3", snapshot.Ref())
+		secondPlan, err := PlanRevocations(secondRun, first, []protocol.ResourceID{unrelated.ResourceID})
+		if err != nil {
+			t.Fatalf("unrelated revocation failed after pruning a dead support: %v", err)
+		}
+		second, _, err := Replay(secondPlan, first, SuccessfulResults(secondPlan))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !second.IsServing(artifact.Metadata.ResourceID) || resourceByID(t, second, unrelated.ResourceID).ServingState != StateRevoked {
+			t.Fatal("unrelated revocation did not preserve the surviving derived artifact")
+		}
+	})
+
 	t.Run("alternatives revoked across runs", func(t *testing.T) {
 		scope := testScope()
 		documentA := Document{Metadata: testMetadata(t, scope, protocol.ResourceDocument, "sources/a.md", "a", "source-v1", "content-a-v1", "projection-v1", "", "doc:a"), Path: "sources/a.md"}
@@ -1505,6 +1572,75 @@ func TestDerivedArtifactRevocationHonorsAnySupportAlternatives(t *testing.T) {
 			t.Fatal("any_support artifact treated an already-revoked support as an unaffected alternative")
 		}
 	})
+}
+
+func TestPlanRevocationsTerminalizesQuarantinedLegacyDerivedArtifact(t *testing.T) {
+	scope := testScope()
+	snapshot := testSnapshot(t, scope, "source-v1", "sources/root.md")
+	document := published(testMetadata(
+		t, scope, protocol.ResourceDocument, "sources/root.md", "document", "source-v1",
+		"content-document-v1", "projection-v1", "", "doc:root",
+	))
+	entity := func(sourceKey string) ResourceMetadata {
+		metadata := testMetadata(
+			t, scope, protocol.ResourceEntity, sourceKey, sourceKey, "source-v1",
+			"content-"+sourceKey, "projection-v1", "", sourceKey,
+		)
+		metadata.Dependencies = []protocol.ResourceID{document.ResourceID}
+		return published(metadata)
+	}
+	support := entity("entity:support")
+	unrelated := entity("entity:unrelated")
+	legacy := published(testMetadata(
+		t, scope, protocol.ResourceDerivedArtifact, "artifact:legacy", "legacy", "source-v1",
+		"content-legacy-v1", "projection-v1", "", "artifact:legacy",
+	))
+	legacy.Dependencies = []protocol.ResourceID{support.ResourceID}
+	current := testProjection(t, scope, "projection-v1", snapshot.Ref(), []ResourceMetadata{
+		document, support, unrelated, legacy,
+	})
+
+	run := testRun(scope, current.Version, "projection-v2", snapshot.Ref())
+	plan, err := PlanRevocations(run, current, []protocol.ResourceID{unrelated.ResourceID})
+	if err != nil {
+		t.Fatalf("legacy quarantine blocked unrelated revocation: %v", err)
+	}
+	next, _, err := Replay(plan, current, SuccessfulResults(plan))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resourceByID(t, next, legacy.ResourceID).ServingState != StateRevoked ||
+		resourceByID(t, next, unrelated.ResourceID).ServingState != StateRevoked {
+		t.Fatal("revocation did not terminalize both the legacy artifact and selected resource")
+	}
+}
+
+func TestProjectionAllowsAllRequiredIncompleteSupportGroup(t *testing.T) {
+	scope := testScope()
+	snapshot := testSnapshot(t, scope, "source-v1", "sources/a.md")
+	document := Document{
+		Metadata: testMetadata(t, scope, protocol.ResourceDocument, "sources/a.md", "document", "source-v1", "content-v1", "projection-v1", "", "doc:a"),
+		Snapshot: snapshot.Ref(), Path: "sources/a.md",
+	}
+	artifact := DerivedArtifact{
+		Metadata: testMetadata(t, scope, protocol.ResourceDerivedArtifact, "artifact:summary", "artifact", "source-v1", "content-artifact-v1", "projection-v1", "", "artifact:summary"),
+		Kind:     "summary",
+		Provenance: Provenance{DerivationMode: protocol.DerivationAllRequired, Supports: []Support{{
+			SupportID: "required-document", Evidence: []EvidenceRef{document.EvidenceRef()}, Complete: false,
+		}}},
+	}
+	materializeDerivedArtifactSecurity(t, &artifact, document.Metadata)
+	resources, err := (Catalog{Documents: []Document{document}, DerivedArtifacts: []DerivedArtifact{artifact}}).ResourceMetadata()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := range resources {
+		resources[index] = published(resources[index])
+	}
+	projection := testProjection(t, scope, "projection-v1", snapshot.Ref(), resources)
+	if !projection.IsServing(artifact.Metadata.ResourceID) {
+		t.Fatal("all_required artifact with a partial required group was not serving")
+	}
 }
 
 func TestDerivedArtifactSecurityComparisonIgnoresIndependentCanonicalOrdering(t *testing.T) {

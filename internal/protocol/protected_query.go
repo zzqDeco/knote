@@ -175,6 +175,9 @@ func (result ProtectedQueryVisibleResult) Validate() error {
 		len(result.Page.Items) > MaxProtectedQueryPageLimit {
 		return fmt.Errorf("protected query public result exceeds its fixed limit")
 	}
+	if len(result.Page.Items) > result.Count || (!result.Exists && result.Page.NextPageToken != "") {
+		return fmt.Errorf("protected query page is inconsistent with the visible result")
+	}
 	for index, value := range result.Autocomplete {
 		if err := validateProtectedQueryPublicValue("autocomplete", value); err != nil {
 			return err

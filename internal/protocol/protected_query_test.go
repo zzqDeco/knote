@@ -232,6 +232,13 @@ func TestProtectedQueryPublicErrorsAndMetadataHaveFixedSchema(t *testing.T) {
 
 func TestProtectedQueryVisibleResultRequiresProtectedNextPageTokenStructure(t *testing.T) {
 	result := EmptyProtectedQueryVisibleResult()
+	result.Page.Items = []ProtectedQueryPageItem{{Value: "unexpected"}}
+	if err := result.Validate(); err == nil {
+		t.Fatal("visible result accepted page items when count and exists were empty")
+	}
+	result.Page.Items = []ProtectedQueryPageItem{}
+	result.Count = 1
+	result.Exists = true
 	result.Page.NextPageToken = "res_ffffffffffffffffffffffffffffffff"
 	if err := result.Validate(); err == nil {
 		t.Fatal("visible result accepted an internal resource ID as a next page token")
