@@ -2151,14 +2151,19 @@ def permissioned_provider_guardian(parent_pid: int, runner_pid: int, liveness_fd
             time.sleep(0.02)
         if parent_disappeared:
             try:
-                os.kill(runner_pid, signal.SIGKILL)
+                os.kill(runner_pid, signal.SIGSTOP)
             except ProcessLookupError:
                 pass
-            terminate_posix_descendants(
+            tracked = terminate_posix_descendants(
                 runner_pid,
                 tracked,
                 exclude={os.getpid()},
             )
+            try:
+                os.kill(runner_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            kill_posix_pids(tracked, exclude={os.getpid()})
             return 0
     kill_posix_pids(tracked, exclude={os.getpid()})
     return 0
