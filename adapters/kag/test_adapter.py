@@ -1108,7 +1108,7 @@ class AdapterTest(unittest.TestCase):
             )
 
             self.assertEqual(lines[-1]["type"], "error")
-            self.assertEqual(lines[-1]["code"], "unsupported_primitive")
+            self.assertEqual(lines[-1]["code"], "primitive_unavailable")
 
     def test_v1_claim_contract_upgrade_preserves_derivation_semantics(self) -> None:
         for derivation, want_support_count, want_group_size in (
@@ -1455,7 +1455,7 @@ def create(context):
                 str(row["resource"]["resource_id"]): str(row["graph_object_id"])
                 for row in graph_rows
             }
-            predicate_key = "pred_" + "5" * 32
+            predicate_key = "pred_a3b0b7f1948c58d586d3af99fee4704e"
             claim_rows = [
                 {
                     "version": adapter.GRAPH_BINDING_CONTRACT_VERSION,
@@ -1466,6 +1466,18 @@ def create(context):
                     "source_document": by_resource[str(source["resource_id"])],
                     "derivation": "all_required",
                     "provenance": [by_resource[str(source["resource_id"])]],
+                    "subject_resource_id": subject["resource_id"],
+                    "object_resource_id": target["resource_id"],
+                    "source_document_resource_id": source["resource_id"],
+                    "source_version": source["versions"]["source"],
+                    "provenance_resource_ids": [source["resource_id"]],
+                    "supports": [
+                        {
+                            "support_key": "sup_" + "6" * 32,
+                            "provenance": [by_resource[str(source["resource_id"])]],
+                            "provenance_resource_ids": [source["resource_id"]],
+                        }
+                    ],
                 }
             ]
             write_graph_contract_bundle(
