@@ -15,6 +15,7 @@ import json
 import math
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -72,6 +73,7 @@ PRIMITIVE_UNAVAILABLE_CODE = "primitive_unavailable"
 INVALID_PRIMITIVE_RESPONSE_CODE = "invalid_primitive_response"
 PERMISSIONED_PROVIDER_ENV = "KNOTE_KAG_PERMISSIONED_PROVIDER"
 PERMISSIONED_PROVIDER_RUNNER_ARG = "--permissioned-provider-runner"
+PERMISSIONED_PROVIDER_GUARDIAN_ARG = "--permissioned-provider-guardian"
 TEST_STAGE_SPY_ENV = "KNOTE_KAG_TEST_STAGE_SPY"
 TEST_DELAY_MS_ENV = "KNOTE_KAG_TEST_DELAY_MS"
 
@@ -1902,6 +1904,114 @@ def deny_provider_parent_fd_access() -> None:
         ) from exc
 
 
+def posix_process_exists(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return False
+    return True
+
+
+def windows_provider_guardian(parent_pid: int, runner_pid: int) -> int:
+    import ctypes
+
+    synchronize = 0x00100000
+    process_terminate = 0x0001
+    wait_object_0 = 0
+    wait_timeout = 258
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_bool, ctypes.c_uint32]
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+    kernel32.TerminateProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    kernel32.TerminateProcess.restype = ctypes.c_bool
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_bool
+
+    parent = kernel32.OpenProcess(synchronize, False, parent_pid)
+    runner = kernel32.OpenProcess(synchronize | process_terminate, False, runner_pid)
+    if not parent or not runner:
+        if parent:
+            kernel32.CloseHandle(parent)
+        if runner:
+            kernel32.CloseHandle(runner)
+        return 1
+    try:
+        sys.stdout.write("ready\n")
+        sys.stdout.flush()
+        sys.stdout.close()
+        while True:
+            parent_status = kernel32.WaitForSingleObject(parent, 20)
+            if parent_status == wait_object_0:
+                kernel32.TerminateProcess(runner, 1)
+                return 0
+            if parent_status != wait_timeout:
+                return 1
+            runner_status = kernel32.WaitForSingleObject(runner, 0)
+            if runner_status == wait_object_0:
+                return 0
+            if runner_status != wait_timeout:
+                return 1
+    finally:
+        kernel32.CloseHandle(parent)
+        kernel32.CloseHandle(runner)
+
+
+def permissioned_provider_guardian(parent_pid: int, runner_pid: int) -> int:
+    """Terminate the provider runner if its adapter parent disappears."""
+    if parent_pid <= 1 or runner_pid <= 1:
+        return 1
+    if os.name == "nt":
+        return windows_provider_guardian(parent_pid, runner_pid)
+    if not posix_process_exists(parent_pid) or not posix_process_exists(runner_pid):
+        return 1
+    sys.stdout.write("ready\n")
+    sys.stdout.flush()
+    sys.stdout.close()
+    while posix_process_exists(runner_pid):
+        if not posix_process_exists(parent_pid):
+            try:
+                os.kill(runner_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            return 0
+        time.sleep(0.02)
+    return 0
+
+
+def start_provider_guardian() -> subprocess.Popen[str]:
+    guardian = subprocess.Popen(
+        [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            PERMISSIONED_PROVIDER_GUARDIAN_ARG,
+            str(os.getppid()),
+            str(os.getpid()),
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        close_fds=True,
+    )
+    try:
+        ready = guardian.stdout.readline() if guardian.stdout is not None else ""
+    finally:
+        if guardian.stdout is not None:
+            guardian.stdout.close()
+    if ready != "ready\n" or guardian.poll() is not None:
+        try:
+            guardian.kill()
+        except OSError:
+            pass
+        guardian.wait()
+        raise OSError("provider guardian failed to start")
+    return guardian
+
+
 def permissioned_provider_runner(response_path: str) -> int:
     """Run provider code without inheriting the adapter's output descriptors."""
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
@@ -1910,6 +2020,12 @@ def permissioned_provider_runner(response_path: str) -> int:
     try:
         response_fd = os.open(response_path, flags, 0o600)
     except OSError:
+        return 1
+
+    try:
+        _guardian = start_provider_guardian()
+    except BaseException:
+        os.close(response_fd)
         return 1
 
     envelope: dict[str, Any] = {"version": 1, "status": "unavailable"}
@@ -2836,4 +2952,6 @@ def main() -> int:
 if __name__ == "__main__":
     if len(sys.argv) == 3 and sys.argv[1] == PERMISSIONED_PROVIDER_RUNNER_ARG:
         raise SystemExit(permissioned_provider_runner(sys.argv[2]))
+    if len(sys.argv) == 4 and sys.argv[1] == PERMISSIONED_PROVIDER_GUARDIAN_ARG:
+        raise SystemExit(permissioned_provider_guardian(int(sys.argv[2]), int(sys.argv[3])))
     raise SystemExit(main())

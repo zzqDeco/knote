@@ -7,7 +7,6 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -198,9 +197,6 @@ def create(context):
 }
 
 func TestPrimitiveClientActualRealProviderStopsAfterCancellation(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("adapter process-group cancellation is Unix-specific")
-	}
 	repoRoot := primitiveTestRepoRoot(t)
 	workspace := t.TempDir()
 	writePrimitiveGraphContract(t, workspace)
@@ -209,6 +205,8 @@ import os
 import time
 class Provider:
     def retrieve(self, request):
+        if hasattr(os, "setsid"):
+            os.setsid()
         with open(os.environ["KNOTE_PROVIDER_STARTED"], "w", encoding="utf-8") as stream:
             stream.write("started")
         time.sleep(0.25)
