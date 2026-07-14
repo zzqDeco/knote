@@ -45,8 +45,15 @@ func NewClaimPredicateKey(sourceIdentity string) (ClaimPredicateKey, error) {
 	if err := validateToken("predicate source identity", sourceIdentity); err != nil {
 		return "", err
 	}
+	if !isSupportedClaimPredicateSourceKey(ClaimPredicateSourceKey(sourceIdentity)) {
+		return "", fmt.Errorf("unsupported predicate source identity")
+	}
+	return claimPredicateKeyForSource(sourceIdentity), nil
+}
+
+func claimPredicateKeyForSource(sourceIdentity string) ClaimPredicateKey {
 	digest := sha256.Sum256([]byte(sourceIdentity))
-	return ClaimPredicateKey("pred_" + hex.EncodeToString(digest[:16])), nil
+	return ClaimPredicateKey("pred_" + hex.EncodeToString(digest[:16]))
 }
 
 func (key ClaimPredicateKey) Validate() error {
@@ -56,6 +63,9 @@ func (key ClaimPredicateKey) Validate() error {
 	}
 	if _, err := hex.DecodeString(strings.TrimPrefix(value, "pred_")); err != nil {
 		return fmt.Errorf("predicate_key must be hexadecimal: %w", err)
+	}
+	if !isSupportedClaimPredicateKey(key) {
+		return fmt.Errorf("predicate_key is not declared by the active allowlist")
 	}
 	return nil
 }
@@ -103,17 +113,23 @@ func (b GraphResourceBinding) Validate() error {
 	return nil
 }
 
-// ClaimTripleBinding carries only opaque graph identities. PredicateKey is a
-// digest-derived key, never a user supplied relation label or property name.
+// ClaimTripleBinding retains projection-scoped graph identities alongside the
+// stable body-free resource identities needed to reconcile source-backed
+// Claims. PredicateKey is never a user supplied relation label or property.
 type ClaimTripleBinding struct {
-	Version        int               `json:"version"`
-	Claim          GraphObjectID     `json:"claim"`
-	Subject        GraphObjectID     `json:"subject"`
-	PredicateKey   ClaimPredicateKey `json:"predicate_key"`
-	Object         GraphObjectID     `json:"object"`
-	SourceDocument GraphObjectID     `json:"source_document"`
-	Derivation     DerivationMode    `json:"derivation"`
-	Provenance     []GraphObjectID   `json:"provenance"`
+	Version                  int               `json:"version"`
+	Claim                    GraphObjectID     `json:"claim"`
+	Subject                  GraphObjectID     `json:"subject"`
+	PredicateKey             ClaimPredicateKey `json:"predicate_key"`
+	Object                   GraphObjectID     `json:"object"`
+	SourceDocument           GraphObjectID     `json:"source_document"`
+	Derivation               DerivationMode    `json:"derivation"`
+	Provenance               []GraphObjectID   `json:"provenance"`
+	SubjectResourceID        ResourceID        `json:"subject_resource_id"`
+	ObjectResourceID         ResourceID        `json:"object_resource_id"`
+	SourceDocumentResourceID ResourceID        `json:"source_document_resource_id"`
+	SourceVersion            string            `json:"source_version"`
+	ProvenanceResourceIDs    []ResourceID      `json:"provenance_resource_ids"`
 }
 
 func (b ClaimTripleBinding) Validate() error {
@@ -130,10 +146,22 @@ func (b ClaimTripleBinding) Validate() error {
 	if err := b.PredicateKey.Validate(); err != nil {
 		return err
 	}
+	for name, id := range map[string]ResourceID{
+		"subject_resource_id":         b.SubjectResourceID,
+		"object_resource_id":          b.ObjectResourceID,
+		"source_document_resource_id": b.SourceDocumentResourceID,
+	} {
+		if err := id.Validate(); err != nil {
+			return fmt.Errorf("%s: %w", name, err)
+		}
+	}
+	if err := validateToken("source_version", b.SourceVersion); err != nil {
+		return err
+	}
 	if b.Derivation != DerivationAnySupport && b.Derivation != DerivationAllRequired {
 		return fmt.Errorf("unsupported claim derivation %q", b.Derivation)
 	}
-	if len(b.Provenance) == 0 {
+	if len(b.Provenance) == 0 || len(b.ProvenanceResourceIDs) == 0 {
 		return fmt.Errorf("claim binding provenance is required")
 	}
 	for index, id := range b.Provenance {
@@ -142,6 +170,14 @@ func (b ClaimTripleBinding) Validate() error {
 		}
 		if index > 0 && b.Provenance[index-1] >= id {
 			return fmt.Errorf("claim binding provenance must be unique and sorted")
+		}
+	}
+	for index, id := range b.ProvenanceResourceIDs {
+		if err := id.Validate(); err != nil {
+			return fmt.Errorf("provenance_resource_ids %d: %w", index, err)
+		}
+		if index > 0 && b.ProvenanceResourceIDs[index-1] >= id {
+			return fmt.Errorf("claim binding provenance_resource_ids must be unique and sorted")
 		}
 	}
 	return nil
@@ -214,16 +250,28 @@ func ValidateClaimTripleBindings(resources []GraphResourceBinding, claims []Clai
 		if err != nil {
 			return fmt.Errorf("claim binding %d: %w", index, err)
 		}
-		if _, err := requireBoundGraphResource(byGraphObject, claim.Subject, ResourceEntity, "subject"); err != nil {
+		subject, err := requireBoundGraphResource(byGraphObject, claim.Subject, ResourceEntity, "subject")
+		if err != nil {
 			return fmt.Errorf("claim binding %d: %w", index, err)
 		}
-		if _, err := requireBoundGraphResource(byGraphObject, claim.Object, ResourceEntity, "object"); err != nil {
+		if subject.ResourceID != claim.SubjectResourceID {
+			return fmt.Errorf("claim binding %d subject resource identity does not match its graph binding", index)
+		}
+		object, err := requireBoundGraphResource(byGraphObject, claim.Object, ResourceEntity, "object")
+		if err != nil {
 			return fmt.Errorf("claim binding %d: %w", index, err)
+		}
+		if object.ResourceID != claim.ObjectResourceID {
+			return fmt.Errorf("claim binding %d object resource identity does not match its graph binding", index)
 		}
 		source, err := requireBoundGraphResource(byGraphObject, claim.SourceDocument, ResourceDocument, "source_document")
 		if err != nil {
 			return fmt.Errorf("claim binding %d: %w", index, err)
 		}
+		if source.ResourceID != claim.SourceDocumentResourceID || source.Versions.Source != claim.SourceVersion {
+			return fmt.Errorf("claim binding %d source identity or version does not match its graph binding", index)
+		}
+		provenanceResources := make(map[ResourceID]struct{}, len(claim.Provenance))
 		for supportIndex, supportID := range claim.Provenance {
 			support, ok := byGraphObject[supportID]
 			if !ok {
@@ -234,6 +282,15 @@ func ValidateClaimTripleBindings(resources []GraphResourceBinding, claims []Clai
 			}
 			if support.ResourceID != source.ResourceID && support.AuthorizationResourceID != source.ResourceID {
 				return fmt.Errorf("claim binding %d provenance %d is outside source document %s", index, supportIndex, source.ResourceID)
+			}
+			provenanceResources[support.ResourceID] = struct{}{}
+		}
+		if len(provenanceResources) != len(claim.ProvenanceResourceIDs) {
+			return fmt.Errorf("claim binding %d stable provenance does not match its graph bindings", index)
+		}
+		for _, resourceID := range claim.ProvenanceResourceIDs {
+			if _, ok := provenanceResources[resourceID]; !ok {
+				return fmt.Errorf("claim binding %d stable provenance does not match its graph bindings", index)
 			}
 		}
 		if claimResource.TenantID != source.TenantID || claimResource.KnowledgeBaseID != source.KnowledgeBaseID {

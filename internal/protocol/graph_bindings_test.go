@@ -92,6 +92,9 @@ func TestClaimTripleBindingsRequireOpaqueSourceBackedGraphIdentities(t *testing.
 		Version: GraphBindingContractVersion, Claim: byResource[claim.ResourceID],
 		Subject: byResource[subject.ResourceID], PredicateKey: predicate, Object: byResource[object.ResourceID],
 		SourceDocument: byResource[document.ResourceID], Derivation: DerivationAllRequired, Provenance: provenance,
+		SubjectResourceID: subject.ResourceID, ObjectResourceID: object.ResourceID,
+		SourceDocumentResourceID: document.ResourceID, SourceVersion: document.Versions.Source,
+		ProvenanceResourceIDs: []ResourceID{chunk.ResourceID},
 	}
 	if err := ValidateClaimTripleBindings(resources, []ClaimTripleBinding{claimBinding}); err != nil {
 		t.Fatal(err)
@@ -106,6 +109,21 @@ func TestClaimTripleBindingsRequireOpaqueSourceBackedGraphIdentities(t *testing.
 	rawPredicate.PredicateKey = "located_in"
 	if err := ValidateClaimTripleBindings(resources, []ClaimTripleBinding{rawPredicate}); err == nil {
 		t.Fatal("raw relation label was accepted as predicate_key")
+	}
+	unknownOpaquePredicate := claimBinding
+	unknownOpaquePredicate.PredicateKey = "pred_ffffffffffffffffffffffffffffffff"
+	if err := ValidateClaimTripleBindings(resources, []ClaimTripleBinding{unknownOpaquePredicate}); err == nil {
+		t.Fatal("undeclared opaque predicate was accepted")
+	}
+	mismatchedStableIdentity := claimBinding
+	mismatchedStableIdentity.SubjectResourceID = object.ResourceID
+	if err := ValidateClaimTripleBindings(resources, []ClaimTripleBinding{mismatchedStableIdentity}); err == nil {
+		t.Fatal("mismatched stable subject identity was accepted")
+	}
+	staleSource := claimBinding
+	staleSource.SourceVersion = "source_v0"
+	if err := ValidateClaimTripleBindings(resources, []ClaimTripleBinding{staleSource}); err == nil {
+		t.Fatal("stale claim source version was accepted")
 	}
 }
 
