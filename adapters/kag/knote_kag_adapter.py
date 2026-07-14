@@ -1868,6 +1868,29 @@ def permissioned_provider_context(
     }
 
 
+@contextmanager
+def suppress_provider_output() -> Any:
+    """Discard Python and file-descriptor output across untrusted provider calls."""
+    saved_stdout = os.dup(1)
+    saved_stderr = os.dup(2)
+    null_fd = os.open(os.devnull, os.O_WRONLY)
+    captured_stdout = StringIO()
+    captured_stderr = StringIO()
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os.dup2(null_fd, 1)
+        os.dup2(null_fd, 2)
+        with redirect_stdout(captured_stdout), redirect_stderr(captured_stderr):
+            yield
+    finally:
+        os.dup2(saved_stdout, 1)
+        os.dup2(saved_stderr, 2)
+        os.close(null_fd)
+        os.close(saved_stdout)
+        os.close(saved_stderr)
+
+
 def load_permissioned_provider(context: dict[str, Any]) -> Any:
     spec = os.environ.get(PERMISSIONED_PROVIDER_ENV, "").strip()
     if not PROVIDER_SPEC_RE.fullmatch(spec):
@@ -1876,14 +1899,12 @@ def load_permissioned_provider(context: dict[str, Any]) -> Any:
             PRIMITIVE_UNAVAILABLE_CODE,
         )
     module_name, factory_name = spec.split(":", 1)
-    captured_stdout = StringIO()
-    captured_stderr = StringIO()
     try:
-        with redirect_stdout(captured_stdout), redirect_stderr(captured_stderr):
+        with suppress_provider_output():
             module = importlib.import_module(module_name)
             factory = getattr(module, factory_name)
             provider = factory(dict(context))
-    except Exception as exc:
+    except BaseException as exc:
         raise AdapterRequestError(
             "permissioned primitive provider is unavailable",
             PRIMITIVE_UNAVAILABLE_CODE,
@@ -1894,18 +1915,16 @@ def load_permissioned_provider(context: dict[str, Any]) -> Any:
 def call_permissioned_provider(
     provider: Any, method: str, request: dict[str, Any]
 ) -> dict[str, Any]:
-    operation = getattr(provider, method, None)
-    if not callable(operation):
-        raise AdapterRequestError(
-            "permissioned primitive provider capability is unavailable",
-            PRIMITIVE_UNAVAILABLE_CODE,
-        )
-    captured_stdout = StringIO()
-    captured_stderr = StringIO()
     try:
-        with redirect_stdout(captured_stdout), redirect_stderr(captured_stderr):
+        with suppress_provider_output():
+            operation = getattr(provider, method, None)
+            if not callable(operation):
+                raise AdapterRequestError(
+                    "permissioned primitive provider capability is unavailable",
+                    PRIMITIVE_UNAVAILABLE_CODE,
+                )
             response = operation(deepcopy(request))
-    except Exception as exc:
+    except BaseException as exc:
         raise AdapterRequestError(
             "permissioned primitive provider call failed",
             PRIMITIVE_UNAVAILABLE_CODE,
@@ -1948,13 +1967,16 @@ def real_retrieve(
             "projection_version": projection_version,
         },
     )
-    validate_exact_fields(response, frozenset({"candidates"}), "provider retrieve response")
-    values = response.get("candidates")
-    if not isinstance(values, list) or len(values) > limit:
+    try:
+        validate_exact_fields(response, frozenset({"candidates"}), "provider retrieve response")
+        values = response.get("candidates")
+        if not isinstance(values, list) or len(values) > limit:
+            raise AdapterRequestError("invalid provider retrieve candidate set")
+    except AdapterRequestError as exc:
         raise AdapterRequestError(
             "permissioned retrieve provider returned an invalid candidate set",
             INVALID_PRIMITIVE_RESPONSE_CODE,
-        )
+        ) from exc
     candidates: list[dict[str, Any]] = []
     seen: set[str] = set()
     for index, value in enumerate(values):

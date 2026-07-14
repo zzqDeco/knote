@@ -1057,6 +1057,8 @@ class Provider:
         log("retrieve")
         print(os.environ["KNOTE_PROVIDER_CANARY"])
         print(os.environ["KNOTE_PROVIDER_CANARY"], file=sys.stderr)
+        os.write(1, (os.environ["KNOTE_PROVIDER_CANARY"] + "\n").encode())
+        os.write(2, (os.environ["KNOTE_PROVIDER_CANARY"] + "\n").encode())
         return {"candidates": [{"graph_object_id": os.environ["KNOTE_PROVIDER_GRAPH_ID"], "score": 0.91}]}
 
     def generate(self, request):
@@ -1064,6 +1066,8 @@ class Provider:
         assert [item["content"] for item in request["evidence"]] == ["permissioned body"]
         print(os.environ["KNOTE_PROVIDER_CANARY"])
         print(os.environ["KNOTE_PROVIDER_CANARY"], file=sys.stderr)
+        os.write(1, (os.environ["KNOTE_PROVIDER_CANARY"] + "\n").encode())
+        os.write(2, (os.environ["KNOTE_PROVIDER_CANARY"] + "\n").encode())
         return {"answer": "authorized provider answer"}
 
 def create(context):
@@ -1342,6 +1346,77 @@ def create(context):
             self.assertNotIn(canary, proc.stdout)
             self.assertNotIn(canary, proc.stderr)
 
+    def test_real_provider_top_level_response_is_typed_without_echo(self) -> None:
+        canary = "PROTECTED TOP LEVEL PROVIDER FIELD"
+        provider_source = r'''
+import os
+class Provider:
+    def retrieve(self, request):
+        return {"candidates": [], os.environ["KNOTE_PROVIDER_CANARY"]: "protected body"}
+def create(context):
+    return Provider()
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            write_graph_contract_bundle(workspace)
+            env = write_permissioned_provider_module(workspace, provider_source)
+            env["KNOTE_PROVIDER_CANARY"] = canary
+            proc, lines = call_adapter(
+                {
+                    "id": "top-level-provider-field",
+                    "method": "kag.retrieve",
+                    "params": {
+                        "workspace": str(workspace),
+                        "authorization": real_graph_authorization(),
+                        "query": "knote",
+                        "limit": 10,
+                    },
+                },
+                fake=False,
+                extra_env=env,
+            )
+            self.assertEqual(lines[-1]["type"], "error")
+            self.assertEqual(lines[-1]["code"], "invalid_primitive_response")
+            self.assertNotIn(canary, proc.stdout)
+            self.assertNotIn(canary, proc.stderr)
+
+    def test_real_provider_lazy_capability_failure_is_typed_and_suppressed(self) -> None:
+        canary = "PROTECTED LAZY PROVIDER CAPABILITY CANARY"
+        provider_source = r'''
+import os
+class Provider:
+    @property
+    def retrieve(self):
+        os.write(1, (os.environ["KNOTE_PROVIDER_CANARY"] + "\n").encode())
+        os.write(2, (os.environ["KNOTE_PROVIDER_CANARY"] + "\n").encode())
+        raise RuntimeError(os.environ["KNOTE_PROVIDER_CANARY"])
+def create(context):
+    return Provider()
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            write_graph_contract_bundle(workspace)
+            env = write_permissioned_provider_module(workspace, provider_source)
+            env["KNOTE_PROVIDER_CANARY"] = canary
+            proc, lines = call_adapter(
+                {
+                    "id": "lazy-provider-capability",
+                    "method": "kag.retrieve",
+                    "params": {
+                        "workspace": str(workspace),
+                        "authorization": real_graph_authorization(),
+                        "query": "knote",
+                        "limit": 10,
+                    },
+                },
+                fake=False,
+                extra_env=env,
+            )
+            self.assertEqual(lines[-1]["type"], "error")
+            self.assertEqual(lines[-1]["code"], "primitive_unavailable")
+            self.assertNotIn(canary, proc.stdout)
+            self.assertNotIn(canary, proc.stderr)
+
     def test_real_provider_failure_is_typed_and_does_not_echo_protected_output(self) -> None:
         canary = "PROTECTED PROVIDER FAILURE CANARY"
         provider_source = r'''
@@ -1351,7 +1426,9 @@ class Provider:
     def retrieve(self, request):
         print(os.environ["KNOTE_PROVIDER_CANARY"])
         print(os.environ["KNOTE_PROVIDER_CANARY"], file=sys.stderr)
-        raise RuntimeError(os.environ["KNOTE_PROVIDER_CANARY"])
+        os.write(1, (os.environ["KNOTE_PROVIDER_CANARY"] + "\n").encode())
+        os.write(2, (os.environ["KNOTE_PROVIDER_CANARY"] + "\n").encode())
+        raise SystemExit(os.environ["KNOTE_PROVIDER_CANARY"])
 def create(context):
     return Provider()
 '''
