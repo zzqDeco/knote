@@ -1960,8 +1960,88 @@ def windows_provider_guardian(parent_pid: int, runner_pid: int) -> int:
         kernel32.CloseHandle(runner)
 
 
+def create_windows_provider_job() -> int | None:
+    """Bind the runner and descendants to a kill-on-runner-exit Windows job."""
+    if os.name != "nt":
+        return None
+
+    import ctypes
+    from ctypes import wintypes
+
+    class JobObjectBasicLimitInformation(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_longlong),
+            ("PerJobUserTimeLimit", ctypes.c_longlong),
+            ("LimitFlags", wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD),
+        ]
+
+    class IOCounters(ctypes.Structure):
+        _fields_ = [
+            ("ReadOperationCount", ctypes.c_ulonglong),
+            ("WriteOperationCount", ctypes.c_ulonglong),
+            ("OtherOperationCount", ctypes.c_ulonglong),
+            ("ReadTransferCount", ctypes.c_ulonglong),
+            ("WriteTransferCount", ctypes.c_ulonglong),
+            ("OtherTransferCount", ctypes.c_ulonglong),
+        ]
+
+    class JobObjectExtendedLimitInformation(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", JobObjectBasicLimitInformation),
+            ("IoInfo", IOCounters),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    job_object_extended_limit_information = 9
+    job_object_limit_kill_on_job_close = 0x00002000
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+    kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    kernel32.SetInformationJobObject.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    ]
+    kernel32.SetInformationJobObject.restype = wintypes.BOOL
+    kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    job = kernel32.CreateJobObjectW(None, None)
+    if not job:
+        raise OSError(ctypes.get_last_error(), "CreateJobObjectW failed")
+    limits = JobObjectExtendedLimitInformation()
+    limits.BasicLimitInformation.LimitFlags = job_object_limit_kill_on_job_close
+    if not kernel32.SetInformationJobObject(
+        job,
+        job_object_extended_limit_information,
+        ctypes.byref(limits),
+        ctypes.sizeof(limits),
+    ):
+        error_code = ctypes.get_last_error()
+        kernel32.CloseHandle(job)
+        raise OSError(error_code, "SetInformationJobObject failed")
+    if not kernel32.AssignProcessToJobObject(job, kernel32.GetCurrentProcess()):
+        error_code = ctypes.get_last_error()
+        kernel32.CloseHandle(job)
+        raise OSError(error_code, "AssignProcessToJobObject failed")
+    return int(job)
+
+
 def permissioned_provider_guardian(parent_pid: int, runner_pid: int) -> int:
-    """Terminate the provider runner if its adapter parent disappears."""
+    """Terminate the provider process domain if its adapter parent disappears."""
     if parent_pid <= 1 or runner_pid <= 1:
         return 1
     if os.name == "nt":
@@ -1974,9 +2054,12 @@ def permissioned_provider_guardian(parent_pid: int, runner_pid: int) -> int:
     while posix_process_exists(runner_pid):
         if not posix_process_exists(parent_pid):
             try:
-                os.kill(runner_pid, signal.SIGKILL)
+                os.killpg(runner_pid, signal.SIGKILL)
             except ProcessLookupError:
-                pass
+                try:
+                    os.kill(runner_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
             return 0
         time.sleep(0.02)
     return 0
@@ -2023,6 +2106,7 @@ def permissioned_provider_runner(response_path: str) -> int:
         return 1
 
     try:
+        _provider_job = create_windows_provider_job()
         _guardian = start_provider_guardian()
     except BaseException:
         os.close(response_fd)
@@ -2107,6 +2191,29 @@ def permissioned_provider_runner(response_path: str) -> int:
     return 0
 
 
+def terminate_provider_process_domain(process: subprocess.Popen[str]) -> None:
+    """Kill and reap the runner plus every descendant in its execution domain."""
+    if os.name == "nt":
+        if process.poll() is None:
+            try:
+                process.kill()
+            except OSError:
+                pass
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            if process.poll() is None:
+                try:
+                    process.kill()
+                except OSError:
+                    pass
+    try:
+        process.wait()
+    except OSError:
+        pass
+
+
 def call_permissioned_provider(
     context: dict[str, Any], method: str, request: dict[str, Any]
 ) -> dict[str, Any]:
@@ -2131,28 +2238,34 @@ def call_permissioned_provider(
     deny_provider_parent_fd_access()
     with tempfile.TemporaryDirectory(prefix="knote-kag-provider-") as directory:
         response_path = Path(directory) / "response.json"
+        process: subprocess.Popen[str] | None = None
         try:
-            completed = subprocess.run(
+            process = subprocess.Popen(
                 [
                     sys.executable,
                     str(Path(__file__).resolve()),
                     PERMISSIONED_PROVIDER_RUNNER_ARG,
                     str(response_path),
                 ],
-                input=payload,
+                stdin=subprocess.PIPE,
                 text=True,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                timeout=PROVIDER_RUNNER_TIMEOUT_SECONDS,
-                check=False,
                 close_fds=True,
+                start_new_session=os.name != "nt",
             )
+            process.communicate(payload, timeout=PROVIDER_RUNNER_TIMEOUT_SECONDS)
         except (OSError, subprocess.TimeoutExpired) as exc:
+            if process is not None:
+                terminate_provider_process_domain(process)
             raise AdapterRequestError(
                 "permissioned primitive provider call failed",
                 PRIMITIVE_UNAVAILABLE_CODE,
             ) from exc
-        if completed.returncode != 0 or not response_path.is_file():
+        finally:
+            if process is not None and process.poll() is not None:
+                terminate_provider_process_domain(process)
+        if process.returncode != 0 or not response_path.is_file():
             raise AdapterRequestError(
                 "permissioned primitive provider call failed",
                 PRIMITIVE_UNAVAILABLE_CODE,
@@ -2264,9 +2377,9 @@ def real_retrieve(
             or graph_object_id in seen
             or isinstance(score, bool)
             or not isinstance(score, (int, float))
-            or not math.isfinite(score)
             or score < 0
             or score > 1
+            or not math.isfinite(score)
         ):
             raise AdapterRequestError(
                 "permissioned retrieve provider returned an invalid candidate",

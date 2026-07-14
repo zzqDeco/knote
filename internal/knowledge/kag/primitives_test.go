@@ -166,6 +166,39 @@ func TestPrimitiveClientActualRealAdapterReturnsTypedProviderUnavailable(t *test
 	}
 }
 
+func TestPrimitiveClientActualRealAdapterRejectsOversizedProviderScore(t *testing.T) {
+	repoRoot := primitiveTestRepoRoot(t)
+	workspace := t.TempDir()
+	resource := writePrimitiveGraphContract(t, workspace)
+	graphObjectID, err := protocol.NewGraphObjectID(resource.Versions.Projection, resource.ResourceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := writePrimitiveProvider(t, workspace, `
+import os
+class Provider:
+    def retrieve(self, request):
+        return {"candidates": [{"graph_object_id": os.environ["KNOTE_TEST_GRAPH_ID"], "score": 10**309}]}
+def create(context):
+    return Provider()
+`)
+	client := Client{
+		AdapterPath:          filepath.Join(repoRoot, "adapters", "kag", "knote_kag_adapter.py"),
+		Workspace:            workspace,
+		PermissionedProvider: provider,
+	}
+	t.Setenv("KNOTE_PYTHON", pythonForTest())
+	t.Setenv("KNOTE_KAG_FAKE", "")
+	t.Setenv("KNOTE_TEST_GRAPH_ID", string(graphObjectID))
+
+	_, err = client.Retrieve(context.Background(), RetrieveRequest{
+		Authorization: testAuthorizationContext(), Query: "knote", Limit: 10,
+	})
+	if !errors.Is(err, ErrInvalidPrimitiveResponse) || !IsInvalidPrimitiveResponse(err) {
+		t.Fatalf("oversized provider score error = %T %v", err, err)
+	}
+}
+
 func TestPrimitiveClientActualRealProviderHonorsContextDeadline(t *testing.T) {
 	repoRoot := primitiveTestRepoRoot(t)
 	workspace := t.TempDir()
@@ -202,16 +235,24 @@ func TestPrimitiveClientActualRealProviderStopsAfterCancellation(t *testing.T) {
 	writePrimitiveGraphContract(t, workspace)
 	provider := writePrimitiveProvider(t, workspace, `
 import os
+import subprocess
+import sys
 import time
 class Provider:
     def retrieve(self, request):
         if hasattr(os, "setsid"):
-            os.setsid()
+            try:
+                os.setsid()
+            except OSError:
+                pass
+        subprocess.Popen([
+            sys.executable,
+            "-c",
+            "import os,time; time.sleep(0.25); open(os.environ['KNOTE_PROVIDER_COMPLETED'], 'w', encoding='utf-8').write('completed')",
+        ], close_fds=True)
         with open(os.environ["KNOTE_PROVIDER_STARTED"], "w", encoding="utf-8") as stream:
             stream.write("started")
-        time.sleep(0.25)
-        with open(os.environ["KNOTE_PROVIDER_COMPLETED"], "w", encoding="utf-8") as stream:
-            stream.write("completed")
+        time.sleep(5)
         return {"candidates": []}
 def create(context):
     return Provider()
