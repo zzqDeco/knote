@@ -127,7 +127,8 @@ func TestCanonicalTypesPinProvenanceToDocumentVersions(t *testing.T) {
 	claimMetadata := testMetadata(t, scope, protocol.ResourceClaim, "sources/a.md#claim:0", "claim", "source-v2", "content-claim-v2", "projection-v2", "", "claim:a:0")
 	claim := Claim{
 		Metadata: claimMetadata, SourceDocument: document.VersionRef(),
-		Text: "A source-scoped claim", Confidence: "high", Provenance: provenance,
+		BindingState: ClaimBindingUnbound,
+		Text:         "A source-scoped claim", Confidence: "high", Provenance: provenance,
 	}
 	if claim.Metadata.AuthorizationResourceID != claim.Metadata.ResourceID {
 		t.Fatal("claim authorization should be independent from its source document")
@@ -543,6 +544,7 @@ func TestCatalogRejectsUnresolvedCrossResourceReferences(t *testing.T) {
 	}
 	claim := Claim{
 		Metadata:       testMetadata(t, scope, protocol.ResourceClaim, "sources/a.md#claim:0", "claim", "source-v2", "content-claim-v2", "projection-v2", "", "claim:a:0"),
+		BindingState:   ClaimBindingUnbound,
 		SourceDocument: document.VersionRef(),
 		Text:           "claim",
 		Provenance:     provenance,
@@ -634,6 +636,7 @@ func TestCatalogRejectsClaimEvidenceAttributedToAnotherDocument(t *testing.T) {
 	}
 	claim := Claim{
 		Metadata:       testMetadata(t, scope, protocol.ResourceClaim, "claim:a", "claim", "source-v2", "content-claim-v2", "projection-v2", "", "claim:a"),
+		BindingState:   ClaimBindingUnbound,
 		SourceDocument: documentA.VersionRef(),
 		Text:           "claim from document A",
 		Provenance: Provenance{DerivationMode: protocol.DerivationAnySupport, Supports: []Support{{
@@ -1226,6 +1229,7 @@ func TestRevocationCascadesThroughCanonicalDependencies(t *testing.T) {
 	}
 	claim := Claim{
 		Metadata:       testMetadata(t, scope, protocol.ResourceClaim, "claim:a", "claim", "source-v1", "content-claim-v1", "projection-v1", "", "claim:a"),
+		BindingState:   ClaimBindingUnbound,
 		SourceDocument: document.VersionRef(), Text: "claim", Provenance: provenance("claim-support", chunk.EvidenceRef()),
 	}
 	entity := Entity{

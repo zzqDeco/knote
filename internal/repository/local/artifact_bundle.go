@@ -300,6 +300,7 @@ func (s Store) ReadCurrentArtifactManifest(ctx context.Context) (protocol.Artifa
 	if err := verifyStagedArtifactBundle(bundleDir, manifest, manifestData); err != nil {
 		return protocol.ArtifactBundleManifest{}, err
 	}
+	files := make(map[string][]byte, len(manifest.Files))
 	for _, file := range manifest.Files {
 		data, err := os.ReadFile(filepath.Join(bundleDir, file.Path))
 		if err != nil {
@@ -309,6 +310,7 @@ func (s Store) ReadCurrentArtifactManifest(ctx context.Context) (protocol.Artifa
 		if got := hex.EncodeToString(sum[:]); got != file.SHA256 || int64(len(data)) != file.SizeBytes {
 			return protocol.ArtifactBundleManifest{}, fmt.Errorf("artifact bundle file %q does not match manifest", file.Path)
 		}
+		files[file.Path] = data
 		if file.Path == "projection.json" {
 			var projection struct {
 				Version string `json:"version"`
@@ -320,6 +322,9 @@ func (s Store) ReadCurrentArtifactManifest(ctx context.Context) (protocol.Artifa
 				return protocol.ArtifactBundleManifest{}, fmt.Errorf("artifact projection does not match bundle manifest")
 			}
 		}
+	}
+	if err := repository.ValidateGraphArtifactPayloads(manifest, files); err != nil {
+		return protocol.ArtifactBundleManifest{}, err
 	}
 	return manifest, nil
 }

@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/zzqDeco/knote/internal/catalog"
 	"github.com/zzqDeco/knote/internal/protocol"
 	"github.com/zzqDeco/knote/internal/repository"
 )
@@ -1142,31 +1143,48 @@ func TestArtifactBundleReadRejectsSymlinkedBundlesParent(t *testing.T) {
 func testBundleArtifactSet(t *testing.T, projectionID, summary string) repository.ArtifactSet {
 	t.Helper()
 	generatedAt := time.Unix(42, 0).UTC()
-	resourceID := protocol.ResourceID("res_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-	handle := protocol.ResourceHandle{
-		ResourceID: resourceID, Type: protocol.ResourceDocument, TenantID: "local", KnowledgeBaseID: "test",
-		AuthorizationID: "document:" + string(resourceID), AuthorizationResourceID: resourceID,
-		ContentDigest: protocol.NewContentDigest(summary),
-		Versions: protocol.ResourceVersions{
-			Source: "src_0123456789abcdef01234567", Content: "content_test_v1",
-			ACL: "authz_0123456789abcdef01234567", Index: "index_" + projectionID,
-			Graph: "graph_" + projectionID, Projection: projectionID,
-		},
-		ServingState: protocol.ServingActive,
+	scope := catalog.Scope{TenantID: "local", KnowledgeBaseID: "test"}
+	resourceID, err := protocol.NewStableResourceID(scope.TenantID, scope.KnowledgeBaseID, protocol.ResourceDocument, "sources/test.md")
+	if err != nil {
+		t.Fatal(err)
 	}
-	binding, err := protocol.NewGraphResourceBinding(handle)
+	versions := protocol.ResourceVersions{
+		Source: "src_0123456789abcdef01234567", Content: "content_test_v1",
+		ACL: "authz_0123456789abcdef01234567", Index: "index_" + projectionID,
+		Graph: "graph_" + projectionID, Projection: projectionID,
+	}
+	metadata, err := catalog.NewResourceMetadata(
+		scope, protocol.ResourceDocument, "sources/test.md", "document:"+string(resourceID), resourceID,
+		protocol.NewContentDigest(summary), versions, catalog.SensitivityInternal, "local",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata.ServingState = catalog.StatePublished
+	metadata.ProjectionStatus = catalog.SucceededProjectionStatus()
+	snapshot := catalog.SourceSnapshotRef{
+		Scope: scope, SourceID: "workspace", Version: versions.Source, SecurityDomain: "local",
+		Digest: protocol.ContentDigest("sha256:" + strings.Repeat("1", 64)), DocumentCount: 1,
+	}
+	projection, err := catalog.NewProjection(scope, projectionID, snapshot, catalog.StatePublished, []catalog.ResourceMetadata{metadata})
+	if err != nil {
+		t.Fatal(err)
+	}
+	graphBindings, claimBindings, err := catalog.ProjectionGraphBindings(projection)
 	if err != nil {
 		t.Fatal(err)
 	}
 	manifest := protocol.ArtifactManifest{
-		Version: 1, Workspace: "test", GeneratedAt: generatedAt, SourceCount: 1, SummaryCount: 1,
+		Version: 1, Workspace: "test", GeneratedAt: generatedAt, SourceCount: 1,
+		DocumentCount: 1, SummaryCount: 1,
 	}
 	set := repository.ArtifactSet{
-		Manifest:      manifest,
+		Manifest: manifest,
+		Documents: []protocol.Document{{
+			DocumentID: string(resourceID), Path: "sources/test.md", ContentHash: "content-test", Mtime: time.Unix(0, 0).UTC(),
+		}},
 		Summaries:     []protocol.Summary{{SummaryID: "summary", Text: summary, EvidenceChunkIDs: []string{}}},
-		GraphBindings: []protocol.GraphResourceBinding{binding},
-		ClaimBindings: []protocol.ClaimTripleBinding{},
-		BuildReport:   "# report\n",
+		GraphBindings: graphBindings, ClaimBindings: claimBindings, BuildReport: "# report\n",
 		BundleManifest: protocol.ArtifactBundleManifest{
 			Version: 2, ProjectionID: projectionID, ProjectionVersion: projectionID,
 			Namespace:                   "KnoteKB__" + projectionID,
@@ -1180,8 +1198,12 @@ func testBundleArtifactSet(t *testing.T, projectionID, summary string) repositor
 			GeneratedAt: generatedAt, Compatibility: manifest,
 		},
 	}
-	set.ProjectionJSON = []byte(fmt.Sprintf("{\"version\":%q}\n", projectionID))
-	set.ProjectionResourceCount = 1
+	projectionJSON, err := json.MarshalIndent(projection, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	set.ProjectionJSON = append(projectionJSON, '\n')
+	set.ProjectionResourceCount = len(projection.Resources)
 	payloads, err := repository.CanonicalArtifactFiles(set)
 	if err != nil {
 		t.Fatal(err)

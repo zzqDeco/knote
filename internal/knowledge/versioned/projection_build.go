@@ -180,6 +180,11 @@ func (s service) prepareArtifactProjection(ctx context.Context) (repository.Arti
 			Title:       titleFromContent(string(source.data)), Mtime: time.Unix(0, 0).UTC(),
 		}
 		set.Documents = append(set.Documents, doc)
+		documentRef := catalog.DocumentVersionRef{
+			ResourceID: documentID, SourceVersion: documentMetadata.Versions.Source,
+			ContentVersion: documentMetadata.Versions.Content, ACLVersion: documentMetadata.Versions.ACL,
+			ProjectionVersion: documentMetadata.Versions.Projection,
+		}
 		chunks := splitChunks(string(source.data), 1000)
 		evidenceChunkIDs := make([]string, 0, len(chunks))
 		entityDependencies := make([]protocol.ResourceID, 0, len(chunks))
@@ -222,7 +227,24 @@ func (s service) prepareArtifactProjection(ctx context.Context) (repository.Arti
 			if err != nil {
 				return repository.ArtifactSet{}, projectionBuild{}, err
 			}
-			claimMetadata.Dependencies = []protocol.ResourceID{chunkID}
+			claimMetadata.Dependencies = []protocol.ResourceID{documentID, chunkID}
+			sort.Slice(claimMetadata.Dependencies, func(i, j int) bool {
+				return claimMetadata.Dependencies[i] < claimMetadata.Dependencies[j]
+			})
+			claimMetadata.ClaimRecord = &catalog.ClaimProjectionRecord{
+				BindingState:   catalog.ClaimBindingUnbound,
+				SourceDocument: documentRef,
+				Provenance: catalog.Provenance{
+					DerivationMode: protocol.DerivationAnySupport,
+					Supports: []catalog.Support{{
+						SupportID: "support-" + string(chunkID), Complete: true,
+						Evidence: []catalog.EvidenceRef{{
+							ResourceID: chunkID, Type: protocol.ResourceChunk,
+							Versions: chunkMetadata.Versions, Document: documentRef,
+						}},
+					}},
+				},
+			}
 			resources = append(resources, claimMetadata)
 			set.Claims = append(set.Claims, protocol.Claim{
 				ClaimID: string(claimID), Text: claimText, Confidence: "medium",
@@ -290,27 +312,11 @@ func (s service) prepareArtifactProjection(ctx context.Context) (repository.Arti
 		resource.ProjectionStatus = catalog.SucceededProjectionStatus()
 		publishedResources[i] = resource
 	}
-	set.GraphBindings = make([]protocol.GraphResourceBinding, 0, len(publishedResources))
-	for _, resource := range publishedResources {
-		handle, err := resource.ServingHandle()
-		if err != nil {
-			return repository.ArtifactSet{}, projectionBuild{}, err
-		}
-		binding, err := protocol.NewGraphResourceBinding(handle)
-		if err != nil {
-			return repository.ArtifactSet{}, projectionBuild{}, err
-		}
-		set.GraphBindings = append(set.GraphBindings, binding)
-	}
-	protocol.SortGraphResourceBindings(set.GraphBindings)
-	if err := protocol.ValidateGraphResourceBindings(set.GraphBindings); err != nil {
+	publicProjection, err := catalog.NewProjection(scope, projectionVersion, snapshot.Ref(), catalog.StatePublished, publishedResources)
+	if err != nil {
 		return repository.ArtifactSet{}, projectionBuild{}, err
 	}
-	// Synthetic Phase 1 claims have no semantic subject/predicate/object
-	// identity. Emit an explicit empty file instead of fabricating graph facts;
-	// issue #58 populates source-backed claim bindings.
-	set.ClaimBindings = []protocol.ClaimTripleBinding{}
-	publicProjection, err := catalog.NewProjection(scope, projectionVersion, snapshot.Ref(), catalog.StatePublished, publishedResources)
+	set.GraphBindings, set.ClaimBindings, err = catalog.ProjectionGraphBindings(publicProjection)
 	if err != nil {
 		return repository.ArtifactSet{}, projectionBuild{}, err
 	}
@@ -1069,6 +1075,15 @@ func nextProjectionRunIdentity(store *catalog.ProjectionStore, projectionVersion
 		if err != nil {
 			return "", "", err
 		}
+		if run.State == catalog.RunSucceeded {
+			pointer, pointerErr := store.ServingPointer()
+			if pointerErr != nil {
+				return "", "", pointerErr
+			}
+			if pointer.ProjectionVersion != projectionVersion || pointer.RunID != runID {
+				continue
+			}
+		}
 		if run.State != catalog.RunFailed {
 			return runID, idempotencyKey, nil
 		}
@@ -1164,9 +1179,48 @@ func (s service) executeProjectionBuild(ctx context.Context, artifacts repositor
 		return nil, err
 	}
 	if err := s.repo.PublishArtifacts(ctx, build.publicationBase, artifacts.BundleManifest); err != nil {
+		committed, reconcileErr := s.reconcileArtifactPublicationFailure(ctx, build, artifacts.BundleManifest)
+		if committed {
+			return buildData, nil
+		}
+		if reconcileErr != nil {
+			return nil, fmt.Errorf("publish artifact serving pointer: %v; restore Catalog serving projection: %w", err, reconcileErr)
+		}
 		return nil, fmt.Errorf("publish artifact serving pointer: %w", err)
 	}
 	return buildData, nil
+}
+
+func (s service) reconcileArtifactPublicationFailure(
+	ctx context.Context,
+	build projectionBuild,
+	candidate protocol.ArtifactBundleManifest,
+) (bool, error) {
+	selected, selectedErr := s.repo.ReadCurrentArtifactManifest(ctx)
+	if selectedErr == nil && selected.ProjectionVersion == candidate.ProjectionVersion {
+		return true, nil
+	}
+	baseStillSelected := selectedErr == nil && selected.ProjectionVersion == build.base.Version
+	if errors.Is(selectedErr, repository.ErrArtifactCurrentNotFound) && build.publicationBase.Absent {
+		baseStillSelected = true
+	}
+	if !baseStillSelected {
+		if selectedErr != nil {
+			return false, selectedErr
+		}
+		return false, repository.ErrArtifactPublicationStaleBase
+	}
+	if err := build.store.RollbackServing(build.plan, build.base); err != nil {
+		return false, err
+	}
+	serving, err := build.store.ServingProjection()
+	if err != nil {
+		return false, err
+	}
+	if serving.Scope != build.base.Scope || serving.Version != build.base.Version {
+		return false, catalog.ErrStaleServingPointer
+	}
+	return false, nil
 }
 
 func (s service) buildPreparedKAGCorpus(ctx context.Context, artifacts repository.ArtifactSet, corpus []kag.CorpusRecord) (kag.Response, error) {

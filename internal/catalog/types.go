@@ -1,7 +1,9 @@
 package catalog
 
 import (
+	"errors"
 	"fmt"
+	"reflect"
 	"sort"
 	"strings"
 	"unicode"
@@ -151,6 +153,7 @@ type ResourceMetadata struct {
 	Sensitivity             Sensitivity               `json:"sensitivity"`
 	SecurityDomain          string                    `json:"security_domain"`
 	Dependencies            []protocol.ResourceID     `json:"dependencies,omitempty"`
+	ClaimRecord             *ClaimProjectionRecord    `json:"claim_record,omitempty"`
 }
 
 func NewResourceMetadata(
@@ -236,6 +239,23 @@ func (m ResourceMetadata) Validate() error {
 	}
 	if err := validateToken("security_domain", m.SecurityDomain); err != nil {
 		return err
+	}
+	if m.Type == protocol.ResourceClaim {
+		if m.ClaimRecord != nil {
+			if err := m.ClaimRecord.Validate(); err != nil {
+				return err
+			}
+			if m.Versions.Source != m.ClaimRecord.SourceDocument.SourceVersion ||
+				m.Versions.ACL != m.ClaimRecord.SourceDocument.ACLVersion ||
+				m.Versions.Projection != m.ClaimRecord.SourceDocument.ProjectionVersion {
+				return ErrInvalidClaimRecord
+			}
+			if err := validateProvenanceVersions(m, m.ClaimRecord.Provenance); err != nil {
+				return ErrInvalidClaimRecord
+			}
+		}
+	} else if m.ClaimRecord != nil {
+		return ErrInvalidClaimRecord
 	}
 	for i, dependency := range m.Dependencies {
 		if err := dependency.Validate(); err != nil {
@@ -370,10 +390,22 @@ func (p Provenance) Validate() error {
 		if p.DerivationMode == protocol.DerivationAnySupport && !support.Complete {
 			return fmt.Errorf("any_support requires every support to be independently complete")
 		}
+		seenEvidence := make(map[struct {
+			document protocol.ResourceID
+			resource protocol.ResourceID
+		}]struct{}, len(support.Evidence))
 		for _, evidence := range support.Evidence {
 			if err := evidence.Validate(); err != nil {
 				return fmt.Errorf("support %s: %w", support.SupportID, err)
 			}
+			key := struct {
+				document protocol.ResourceID
+				resource protocol.ResourceID
+			}{document: evidence.Document.ResourceID, resource: evidence.ResourceID}
+			if _, duplicate := seenEvidence[key]; duplicate {
+				return fmt.Errorf("support %s contains duplicate evidence", support.SupportID)
+			}
+			seenEvidence[key] = struct{}{}
 		}
 	}
 	return nil
@@ -395,6 +427,88 @@ func (p Provenance) normalized() Provenance {
 		return out.Supports[i].SupportID < out.Supports[j].SupportID
 	})
 	return out
+}
+
+var ErrInvalidClaimRecord = errors.New("invalid catalog claim record")
+
+type ClaimBindingState string
+
+const (
+	ClaimBindingUnbound      ClaimBindingState = "unbound"
+	ClaimBindingSourceBacked ClaimBindingState = "source_backed"
+)
+
+// ClaimProjectionRecord is the body-free Claim record persisted in a Catalog
+// projection. Unbound Phase 1 text claims retain source provenance but cannot
+// become graph resources or ClaimTripleBindings.
+type ClaimProjectionRecord struct {
+	BindingState      ClaimBindingState          `json:"binding_state"`
+	SubjectResourceID protocol.ResourceID        `json:"subject_resource_id,omitempty"`
+	PredicateKey      protocol.ClaimPredicateKey `json:"predicate_key,omitempty"`
+	ObjectResourceID  protocol.ResourceID        `json:"object_resource_id,omitempty"`
+	SourceDocument    DocumentVersionRef         `json:"source_document"`
+	Provenance        Provenance                 `json:"provenance"`
+}
+
+func (r ClaimProjectionRecord) Validate() error {
+	if err := r.validate(); err != nil {
+		return ErrInvalidClaimRecord
+	}
+	if !reflect.DeepEqual(r, r.normalized()) {
+		return ErrInvalidClaimRecord
+	}
+	return nil
+}
+
+func (r ClaimProjectionRecord) validate() error {
+	if err := r.SourceDocument.Validate(); err != nil {
+		return err
+	}
+	if err := r.Provenance.Validate(); err != nil {
+		return err
+	}
+	for _, support := range r.Provenance.Supports {
+		for _, evidence := range support.Evidence {
+			if evidence.Document != r.SourceDocument {
+				return ErrInvalidClaimRecord
+			}
+		}
+	}
+	switch r.BindingState {
+	case ClaimBindingUnbound:
+		if r.SubjectResourceID != "" || r.PredicateKey != "" || r.ObjectResourceID != "" {
+			return ErrInvalidClaimRecord
+		}
+	case ClaimBindingSourceBacked:
+		if err := r.SubjectResourceID.Validate(); err != nil {
+			return err
+		}
+		if err := r.PredicateKey.Validate(); err != nil {
+			return err
+		}
+		if err := r.ObjectResourceID.Validate(); err != nil {
+			return err
+		}
+		for _, support := range r.Provenance.Supports {
+			for _, evidence := range support.Evidence {
+				if evidence.Type != protocol.ResourceDocument && evidence.Type != protocol.ResourceChunk {
+					return ErrInvalidClaimRecord
+				}
+			}
+		}
+	default:
+		return ErrInvalidClaimRecord
+	}
+	return nil
+}
+
+func (r ClaimProjectionRecord) normalized() ClaimProjectionRecord {
+	r.Provenance = r.Provenance.normalized()
+	return r
+}
+
+func (r ClaimProjectionRecord) IsSourceBacked() bool {
+	return r.BindingState == ClaimBindingSourceBacked
 }
 
 type Document struct {
@@ -507,11 +621,15 @@ func (e Entity) Validate() error {
 }
 
 type Claim struct {
-	Metadata       ResourceMetadata   `json:"metadata"`
-	SourceDocument DocumentVersionRef `json:"source_document"`
-	Text           string             `json:"text"`
-	Confidence     string             `json:"confidence,omitempty"`
-	Provenance     Provenance         `json:"provenance"`
+	Metadata          ResourceMetadata           `json:"metadata"`
+	BindingState      ClaimBindingState          `json:"binding_state"`
+	SubjectResourceID protocol.ResourceID        `json:"subject_resource_id,omitempty"`
+	PredicateKey      protocol.ClaimPredicateKey `json:"predicate_key,omitempty"`
+	ObjectResourceID  protocol.ResourceID        `json:"object_resource_id,omitempty"`
+	SourceDocument    DocumentVersionRef         `json:"source_document"`
+	Text              string                     `json:"text"`
+	Confidence        string                     `json:"confidence,omitempty"`
+	Provenance        Provenance                 `json:"provenance"`
 }
 
 func (c Claim) Validate() error {
@@ -535,6 +653,13 @@ func (c Claim) Validate() error {
 	if err := c.Provenance.Validate(); err != nil {
 		return err
 	}
+	record := c.projectionRecord().normalized()
+	if err := record.Validate(); err != nil {
+		return err
+	}
+	if c.Metadata.ClaimRecord != nil && !reflect.DeepEqual(c.Metadata.ClaimRecord, &record) {
+		return ErrInvalidClaimRecord
+	}
 	if err := validateProvenanceVersions(c.Metadata, c.Provenance); err != nil {
 		return err
 	}
@@ -546,6 +671,14 @@ func (c Claim) Validate() error {
 		}
 	}
 	return nil
+}
+
+func (c Claim) projectionRecord() ClaimProjectionRecord {
+	return ClaimProjectionRecord{
+		BindingState: c.BindingState, SubjectResourceID: c.SubjectResourceID,
+		PredicateKey: c.PredicateKey, ObjectResourceID: c.ObjectResourceID,
+		SourceDocument: c.SourceDocument, Provenance: c.Provenance,
+	}
 }
 
 type DerivedArtifact struct {
@@ -620,6 +753,8 @@ func (c Catalog) Canonical() (Catalog, error) {
 	}
 	for i := range out.Claims {
 		out.Claims[i].Provenance = out.Claims[i].Provenance.normalized()
+		record := out.Claims[i].projectionRecord().normalized()
+		out.Claims[i].Metadata.ClaimRecord = &record
 	}
 	for i := range out.DerivedArtifacts {
 		out.DerivedArtifacts[i].Provenance = out.DerivedArtifacts[i].EffectiveProvenance().normalized()
@@ -683,7 +818,16 @@ func (c Catalog) ResourceMetadata() ([]ResourceMetadata, error) {
 			return nil, fmt.Errorf("claim %s: %w", claim.Metadata.ResourceID, err)
 		}
 		dependencies := append(provenanceDependencies(claim.Provenance), claim.SourceDocument.ResourceID)
-		metadata, err := metadataWithDependencies(claim.Metadata, dependencies)
+		if claim.BindingState == ClaimBindingSourceBacked {
+			dependencies = append(dependencies, claim.SubjectResourceID, claim.ObjectResourceID)
+		}
+		metadata := claim.Metadata
+		record := claim.projectionRecord().normalized()
+		if metadata.ClaimRecord != nil && !reflect.DeepEqual(metadata.ClaimRecord, &record) {
+			return nil, fmt.Errorf("claim %s: %w", claim.Metadata.ResourceID, ErrInvalidClaimRecord)
+		}
+		metadata.ClaimRecord = &record
+		metadata, err := metadataWithDependencies(metadata, dependencies)
 		if err != nil {
 			return nil, fmt.Errorf("claim %s: %w", claim.Metadata.ResourceID, err)
 		}
@@ -791,6 +935,14 @@ func (c Catalog) validateReferences(resources []ResourceMetadata) error {
 	for _, claim := range c.Claims {
 		if err := resolveDocumentReference(claim.SourceDocument, documentsByID); err != nil {
 			return fmt.Errorf("claim %s source document: %w", claim.Metadata.ResourceID, err)
+		}
+		if claim.BindingState == ClaimBindingSourceBacked {
+			for _, endpoint := range []protocol.ResourceID{claim.SubjectResourceID, claim.ObjectResourceID} {
+				resource, ok := resourcesByID[endpoint]
+				if !ok || resource.Type != protocol.ResourceEntity {
+					return fmt.Errorf("claim %s: %w", claim.Metadata.ResourceID, ErrInvalidClaimRecord)
+				}
+			}
 		}
 		if err := resolveProvenanceReferences(claim.Metadata, claim.Provenance, resourcesByID, documentsByID, claimDocumentsByID); err != nil {
 			return fmt.Errorf("claim %s provenance: %w", claim.Metadata.ResourceID, err)
@@ -906,13 +1058,12 @@ func resolveDocumentReference(
 }
 
 func validateResourceType(resourceType protocol.ResourceType) error {
-	switch resourceType {
-	case protocol.ResourceDocument, protocol.ResourceChunk, protocol.ResourceEntity,
-		protocol.ResourceClaim, protocol.ResourceDerivedArtifact:
-		return nil
-	default:
-		return fmt.Errorf("unsupported resource type %q", resourceType)
+	for _, allowed := range protocol.SupportedGraphResourceKinds() {
+		if string(resourceType) == string(allowed) {
+			return nil
+		}
 	}
+	return fmt.Errorf("unsupported resource type")
 }
 
 func validateToken(name, value string) error {

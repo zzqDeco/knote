@@ -129,6 +129,7 @@ func TestPermissionedAcceptanceProvenanceModesAndIntermediateRevocation(t *testi
 	claim := Claim{
 		Metadata: testMetadata(t, scope, protocol.ResourceClaim, "claims/protected", "protected-claim",
 			snapshot.Ref().Version, "content-claim-v1", "projection-acceptance-v1", "", "document:protected"),
+		BindingState:   ClaimBindingUnbound,
 		SourceDocument: document.VersionRef(),
 		Text:           "protected claim",
 		Provenance: Provenance{DerivationMode: protocol.DerivationAnySupport, Supports: []Support{

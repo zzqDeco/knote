@@ -182,11 +182,16 @@ func TestServiceBuildArtifactsAreStableAndEntityIsPerDocument(t *testing.T) {
 	if first.BundleManifest.GraphBindingContractVersion != protocol.GraphBindingContractVersion {
 		t.Fatalf("graph binding contract version = %d", first.BundleManifest.GraphBindingContractVersion)
 	}
-	if got, want := len(repo.artifacts.GraphBindings), repo.artifacts.ProjectionResourceCount; got != want {
+	if got, want := len(repo.artifacts.GraphBindings), repo.artifacts.ProjectionResourceCount-len(repo.artifacts.Claims); got != want {
 		t.Fatalf("graph binding count = %d, want %d", got, want)
 	}
 	if err := protocol.ValidateGraphResourceBindings(repo.artifacts.GraphBindings); err != nil {
 		t.Fatalf("graph bindings: %v", err)
+	}
+	for _, binding := range repo.artifacts.GraphBindings {
+		if binding.Resource.Type == protocol.ResourceClaim {
+			t.Fatalf("unbound synthetic claim became a graph resource: %+v", binding)
+		}
 	}
 	if len(repo.artifacts.ClaimBindings) != 0 {
 		t.Fatalf("synthetic Phase 1 claims gained fabricated graph triples: %+v", repo.artifacts.ClaimBindings)
@@ -1095,7 +1100,7 @@ func TestServiceProjectionReplayUsesOneKAGBuildKeyAfterPersistedIndexReceipt(t *
 	}
 }
 
-func TestServiceRetryRecoversArtifactPointerAfterCatalogCAS(t *testing.T) {
+func TestServiceArtifactPointerFailureRollsBackCatalogAndRetryCommitsTogether(t *testing.T) {
 	ctx := context.Background()
 	repo := newMemoryRepo()
 	repo.config.KAG.Namespace = "RecoveryTest"
@@ -1115,6 +1120,26 @@ func TestServiceRetryRecoversArtifactPointerAfterCatalogCAS(t *testing.T) {
 	if repo.artifacts.BundleManifest.ProjectionVersion != first.BundleManifest.ProjectionVersion {
 		t.Fatal("failed public pointer publication changed selected artifacts")
 	}
+	store, err := catalog.NewProjectionStore(projectionJournalRoot(
+		repo.projectionRoot,
+		first.BundleManifest.ProjectionVersion,
+		failed.BundleManifest.ProjectionVersion,
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	servingAfterFailure, err := store.ServingProjection()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if servingAfterFailure.Version != first.BundleManifest.ProjectionVersion {
+		t.Fatalf("artifact failure left Catalog at %s while artifacts served %s",
+			servingAfterFailure.Version, repo.artifacts.BundleManifest.ProjectionVersion)
+	}
+	rolledBackCandidate := filepath.Join(store.Root(), "projections", failed.BundleManifest.ProjectionVersion+".json")
+	if _, err := os.Stat(rolledBackCandidate); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("rolled back Catalog candidate still exists: %v", err)
+	}
 	callsAfterCAS := backend.buildCalls
 	workAfterCAS := backend.wholeNamespaceBuilds
 	repo.publishErr = nil
@@ -1131,6 +1156,16 @@ func TestServiceRetryRecoversArtifactPointerAfterCatalogCAS(t *testing.T) {
 	if backend.buildCalls != callsAfterCAS+1 || backend.wholeNamespaceBuilds != workAfterCAS {
 		t.Fatalf("artifact pointer recovery did not idempotently replay KAG: calls=%d->%d work=%d->%d",
 			callsAfterCAS, backend.buildCalls, workAfterCAS, backend.wholeNamespaceBuilds)
+	}
+	servingAfterRetry, err := store.ServingProjection()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if servingAfterRetry.Version != repo.artifacts.BundleManifest.ProjectionVersion ||
+		servingAfterRetry.Version != recovered.BundleManifest.ProjectionVersion {
+		t.Fatalf("retry diverged Catalog and artifact pointers: catalog=%s artifact=%s result=%s",
+			servingAfterRetry.Version, repo.artifacts.BundleManifest.ProjectionVersion,
+			recovered.BundleManifest.ProjectionVersion)
 	}
 }
 
