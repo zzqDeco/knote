@@ -3,7 +3,7 @@
 - Status: accepted
 - Date: 2026-07-14
 - Parent: GitHub issue #55
-- Implements: GitHub issue #56
+- Implements: GitHub issues #56 and #58
 - Inspected package: OpenSPG/KAG `0.8.0`
 
 ## Decision
@@ -59,7 +59,7 @@ derivation mode
 sorted provenance document/chunk kg IDs
 ```
 
-The predicate key is a `pred_...` digest, not a relation label. The Claim remains independently authorizable; its provenance must resolve to the declared source document or chunks whose authorization boundary is that document. Synthetic Phase 1 text claims do not satisfy this contract, so issue #56 emits an explicit empty `claim_bindings.jsonl`. Issue #58 must populate it only from source-backed semantic extraction.
+The predicate key is a `pred_...` digest, not a relation label. The Claim remains independently authorizable; its provenance must resolve to the declared source document or chunks whose authorization boundary is that document. Catalog Claim records explicitly distinguish `unbound` Phase 1 text claims from `source_backed` semantic claims. Unbound claims remain in `claims.jsonl` for compatibility but produce neither graph Claim resources nor `ClaimTripleBinding` records.
 
 ## Generic Graph Schema
 
@@ -80,6 +80,7 @@ Tenant, knowledge base, projection, labels, and property names are not query par
 6. Projection cutover replaces the complete graph namespace; graph IDs change because projection version is part of their identity.
 7. Replay with the same source snapshot, ACL/build configuration, and projection version produces byte-identical bindings.
 8. Reconciliation is full: omitted resources and claims disappear with the old immutable bundle. No incremental OpenSPG state is authoritative.
+9. If artifact pointer publication fails before commit, the exact candidate-owned Catalog pointer is rolled back to its base and the unselected Catalog candidate is removed before retry.
 
 ## Consequences
 

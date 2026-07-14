@@ -285,6 +285,7 @@ func validateReplayPlan(plan ProjectionPlan, current Projection) error {
 		expectedSupersede.Versions.Source = plan.Run.SourceSnapshot.Version
 		expectedSupersede.Versions.Projection = plan.Run.ProjectionVersion
 		expectedSupersede.ServingState = StateSuperseded
+		expectedSupersede.ClaimRecord = nil
 		if hasSupersede && !resourceMetadataEqual(group.byKind[OperationSupersede].Resource, expectedSupersede) {
 			return fmt.Errorf("supersede operation for resource %s does not match the current resource", resourceID)
 		}
@@ -302,6 +303,7 @@ func validateReplayPlan(plan ProjectionPlan, current Projection) error {
 
 func sameTerminalDefinition(previous, terminal ResourceMetadata) bool {
 	previous.Versions.Source = terminal.Versions.Source
+	previous.ClaimRecord = nil
 	return sameResourceDefinition(previous, terminal)
 }
 

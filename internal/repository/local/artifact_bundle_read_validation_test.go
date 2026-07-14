@@ -2,10 +2,17 @@ package local
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/zzqDeco/knote/internal/protocol"
+	"github.com/zzqDeco/knote/internal/repository"
 )
 
 func TestReadCurrentArtifactManifestValidatesExactRegularBundleContents(t *testing.T) {
@@ -108,5 +115,67 @@ func TestReadCurrentArtifactManifestValidatesExactRegularBundleContents(t *testi
 				t.Fatalf("read error = %v, want substring %q", err, test.wantErr)
 			}
 		})
+	}
+}
+
+func TestReadCurrentArtifactManifestRejectsDigestValidGraphProjectionMismatch(t *testing.T) {
+	workspace := t.TempDir()
+	store := New(workspace)
+	set := testBundleArtifactSet(t, "prj_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "first")
+	if err := store.WriteArtifacts(context.Background(), set); err != nil {
+		t.Fatal(err)
+	}
+	bundleDir := filepath.Join(workspace, "artifacts", "bundles", set.BundleManifest.ProjectionID)
+	graphPath := filepath.Join(bundleDir, protocol.GraphBindingsArtifactPath)
+	if err := os.WriteFile(graphPath, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	manifestPath := filepath.Join(bundleDir, bundleManifestName)
+	manifestData, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest protocol.ArtifactBundleManifest
+	if err := json.Unmarshal(manifestData, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	emptySum := sha256.Sum256(nil)
+	for index := range manifest.Files {
+		if manifest.Files[index].Path == protocol.GraphBindingsArtifactPath {
+			manifest.Files[index].SHA256 = hex.EncodeToString(emptySum[:])
+			manifest.Files[index].Count = 0
+			manifest.Files[index].SizeBytes = 0
+		}
+	}
+	manifestData, err = marshalIndentedJSON(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manifestPath, manifestData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pointerPath := filepath.Join(workspace, "artifacts", "current.json")
+	pointerData, err := os.ReadFile(pointerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pointer protocol.ArtifactCurrentPointer
+	if err := json.Unmarshal(pointerData, &pointer); err != nil {
+		t.Fatal(err)
+	}
+	manifestSum := sha256.Sum256(manifestData)
+	pointer.ManifestSHA256 = hex.EncodeToString(manifestSum[:])
+	pointerData, err = marshalIndentedJSON(pointer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(pointerPath, pointerData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = store.ReadCurrentArtifactManifest(context.Background())
+	if !errors.Is(err, repository.ErrArtifactProjectionMismatch) ||
+		err.Error() != repository.ErrArtifactProjectionMismatch.Error() {
+		t.Fatalf("digest-valid graph mismatch error = %v, want generic projection mismatch", err)
 	}
 }

@@ -7,12 +7,18 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"reflect"
 	"sort"
 
+	"github.com/zzqDeco/knote/internal/catalog"
 	"github.com/zzqDeco/knote/internal/protocol"
 )
 
-var ErrArtifactCurrentNotFound = errors.New("artifact current pointer not found")
+var (
+	ErrArtifactCurrentNotFound    = errors.New("artifact current pointer not found")
+	ErrArtifactProjectionMismatch = errors.New("artifact projection mismatch")
+)
 
 type ArtifactFilePayload struct {
 	Descriptor protocol.ArtifactBundleFile
@@ -53,8 +59,11 @@ func CanonicalArtifactFiles(set ArtifactSet) ([]ArtifactFilePayload, error) {
 				set.BundleManifest.GraphBindingContractVersion,
 			)
 		}
+		if len(graphBindings) == 0 {
+			return nil, ErrArtifactProjectionMismatch
+		}
 		if err := protocol.ValidateGraphResourceBindings(graphBindings); err != nil {
-			return nil, err
+			return nil, ErrArtifactProjectionMismatch
 		}
 		versions := graphBindings[0].Resource.Versions
 		if versions.Source != set.BundleManifest.SourceSnapshot.Version {
@@ -67,7 +76,17 @@ func CanonicalArtifactFiles(set ArtifactSet) ([]ArtifactFilePayload, error) {
 			return nil, fmt.Errorf("graph binding projection version does not match bundle manifest")
 		}
 		if err := protocol.ValidateClaimTripleBindings(graphBindings, claimBindings); err != nil {
-			return nil, err
+			return nil, ErrArtifactProjectionMismatch
+		}
+		if err := validateGraphArtifactProjection(
+			set.BundleManifest,
+			set.ProjectionJSON,
+			set.ProjectionResourceCount,
+			claims,
+			graphBindings,
+			claimBindings,
+		); err != nil {
+			return nil, ErrArtifactProjectionMismatch
 		}
 	}
 
@@ -112,6 +131,282 @@ func CanonicalArtifactFiles(set ArtifactSet) ([]ArtifactFilePayload, error) {
 	}
 	sort.Slice(payloads, func(i, j int) bool { return payloads[i].Descriptor.Path < payloads[j].Descriptor.Path })
 	return payloads, nil
+}
+
+// ValidateGraphArtifactPayloads cross-validates the body-free graph files
+// against projection.json after ordinary manifest digest validation succeeds.
+// It intentionally returns one generic error class for all content failures.
+func ValidateGraphArtifactPayloads(
+	manifest protocol.ArtifactBundleManifest,
+	files map[string][]byte,
+) error {
+	if manifest.GraphBindingContractVersion == 0 {
+		return nil
+	}
+	if !protocol.IsSupportedGraphBindingContractVersion(manifest.GraphBindingContractVersion) {
+		return ErrArtifactProjectionMismatch
+	}
+	claims, err := decodeJSONL[protocol.Claim](files["claims.jsonl"])
+	if err != nil {
+		return ErrArtifactProjectionMismatch
+	}
+	graphBindings, err := decodeJSONL[protocol.GraphResourceBinding](files[protocol.GraphBindingsArtifactPath])
+	if err != nil {
+		return ErrArtifactProjectionMismatch
+	}
+	if len(graphBindings) == 0 {
+		return ErrArtifactProjectionMismatch
+	}
+	claimBindings, err := decodeJSONL[protocol.ClaimTripleBinding](files[protocol.ClaimBindingsArtifactPath])
+	if err != nil {
+		return ErrArtifactProjectionMismatch
+	}
+	graphBindingCount := len(graphBindings)
+	claimBindingCount := len(claimBindings)
+	if manifest.GraphBindingContractVersion == protocol.GraphBindingContractVersionV1 {
+		graphBindings, claimBindings, err = protocol.UpgradeGraphBindingContract(graphBindings, claimBindings)
+		if err != nil {
+			return ErrArtifactProjectionMismatch
+		}
+	}
+	projection, projectionErr := decodeProjection(files["projection.json"])
+	projectionResourceCount := len(projection.Resources)
+	if projectionErr != nil {
+		projectionResourceCount = len(graphBindings)
+		if err := validateLegacyGraphArtifactProjection(
+			manifest, files["projection.json"], claims, graphBindings, claimBindings,
+		); err != nil {
+			return ErrArtifactProjectionMismatch
+		}
+	}
+	counts := map[string]int{
+		"projection.json":                  projectionResourceCount,
+		"claims.jsonl":                     len(claims),
+		protocol.GraphBindingsArtifactPath: graphBindingCount,
+		protocol.ClaimBindingsArtifactPath: claimBindingCount,
+	}
+	for _, descriptor := range manifest.Files {
+		if count, ok := counts[descriptor.Path]; ok && descriptor.Count != count {
+			return ErrArtifactProjectionMismatch
+		}
+	}
+	if projectionErr == nil {
+		if err := validateDecodedGraphArtifactProjection(manifest, projection, claims, graphBindings, claimBindings); err != nil {
+			return ErrArtifactProjectionMismatch
+		}
+	}
+	return nil
+}
+
+func validateGraphArtifactProjection(
+	manifest protocol.ArtifactBundleManifest,
+	projectionData []byte,
+	projectionResourceCount int,
+	claims []protocol.Claim,
+	graphBindings []protocol.GraphResourceBinding,
+	claimBindings []protocol.ClaimTripleBinding,
+) error {
+	projection, err := decodeProjection(projectionData)
+	if err != nil {
+		if legacyErr := validateLegacyGraphArtifactProjection(
+			manifest, projectionData, claims, graphBindings, claimBindings,
+		); legacyErr != nil {
+			return fmt.Errorf("decode projection: %w", err)
+		}
+		if len(graphBindings) != projectionResourceCount {
+			return fmt.Errorf("legacy projection resource count differs")
+		}
+		return nil
+	}
+	if len(projection.Resources) != projectionResourceCount {
+		return fmt.Errorf("projection resource count differs")
+	}
+	return validateDecodedGraphArtifactProjection(manifest, projection, claims, graphBindings, claimBindings)
+}
+
+func validateLegacyGraphArtifactProjection(
+	manifest protocol.ArtifactBundleManifest,
+	projectionData []byte,
+	claims []protocol.Claim,
+	graphBindings []protocol.GraphResourceBinding,
+	claimBindings []protocol.ClaimTripleBinding,
+) error {
+	var envelope map[string]json.RawMessage
+	decoder := json.NewDecoder(bytes.NewReader(projectionData))
+	if err := decoder.Decode(&envelope); err != nil || len(envelope) != 1 {
+		return ErrArtifactProjectionMismatch
+	}
+	if err := requireJSONEOF(decoder); err != nil {
+		return ErrArtifactProjectionMismatch
+	}
+	var version string
+	if data, ok := envelope["version"]; !ok || json.Unmarshal(data, &version) != nil ||
+		version != manifest.ProjectionVersion {
+		return ErrArtifactProjectionMismatch
+	}
+	if manifest.GraphBindingContractVersion != protocol.GraphBindingContractVersionV1 {
+		return ErrArtifactProjectionMismatch
+	}
+	if len(graphBindings) == 0 || len(claimBindings) != 0 ||
+		protocol.ValidateGraphResourceBindings(graphBindings) != nil {
+		return ErrArtifactProjectionMismatch
+	}
+	versions := graphBindings[0].Resource.Versions
+	if versions.Source != manifest.SourceSnapshot.Version || versions.ACL != manifest.AuthorizationVersion ||
+		versions.Projection != manifest.ProjectionVersion {
+		return ErrArtifactProjectionMismatch
+	}
+	graphClaimIDs := make([]string, 0)
+	for _, binding := range graphBindings {
+		if binding.Resource.Type == protocol.ResourceClaim {
+			graphClaimIDs = append(graphClaimIDs, string(binding.Resource.ResourceID))
+		}
+	}
+	sort.Strings(graphClaimIDs)
+	claimIDs := make([]string, len(claims))
+	for index, claim := range claims {
+		claimIDs[index] = claim.ClaimID
+	}
+	if !reflect.DeepEqual(claimIDs, graphClaimIDs) || manifest.Compatibility.ClaimCount != len(claims) {
+		return ErrArtifactProjectionMismatch
+	}
+	return nil
+}
+
+func validateDecodedGraphArtifactProjection(
+	manifest protocol.ArtifactBundleManifest,
+	projection catalog.Projection,
+	claims []protocol.Claim,
+	graphBindings []protocol.GraphResourceBinding,
+	claimBindings []protocol.ClaimTripleBinding,
+) error {
+	if projection.Version != manifest.ProjectionVersion ||
+		projection.SourceSnapshot.Version != manifest.SourceSnapshot.Version ||
+		projection.SourceSnapshot.Digest != protocol.ContentDigest("sha256:"+manifest.SourceSnapshot.Digest) ||
+		graphBindings[0].Resource.Versions.ACL != manifest.AuthorizationVersion ||
+		projection.SourceSnapshot.DocumentCount != manifest.SourceSnapshot.DocumentCount {
+		return fmt.Errorf("projection identity differs from manifest")
+	}
+	var err error
+	if manifest.GraphBindingContractVersion == protocol.GraphBindingContractVersionV1 {
+		err = validateUpgradedV1ProjectionGraphBindings(projection, graphBindings, claimBindings)
+	} else {
+		err = catalog.ValidateProjectionGraphBindings(projection, graphBindings, claimBindings)
+	}
+	if err != nil {
+		return fmt.Errorf("graph bindings: %w", err)
+	}
+	expectedClaimIDs := make([]string, 0)
+	for _, resource := range projection.Resources {
+		if resource.IsServing() && resource.Type == protocol.ResourceClaim {
+			expectedClaimIDs = append(expectedClaimIDs, string(resource.ResourceID))
+		}
+	}
+	sort.Strings(expectedClaimIDs)
+	actualClaimIDs := make([]string, len(claims))
+	for index, claim := range claims {
+		actualClaimIDs[index] = claim.ClaimID
+		if index > 0 && actualClaimIDs[index-1] >= actualClaimIDs[index] {
+			return fmt.Errorf("claim artifacts are not sorted")
+		}
+	}
+	if !reflect.DeepEqual(actualClaimIDs, expectedClaimIDs) ||
+		manifest.Compatibility.ClaimCount != len(claims) {
+		return fmt.Errorf("claim artifacts differ from projection")
+	}
+	return nil
+}
+
+func validateUpgradedV1ProjectionGraphBindings(
+	projection catalog.Projection,
+	graphBindings []protocol.GraphResourceBinding,
+	claimBindings []protocol.ClaimTripleBinding,
+) error {
+	expectedGraph, err := legacyV1ProjectionGraphBindings(projection)
+	if err != nil || !reflect.DeepEqual(expectedGraph, graphBindings) {
+		return ErrArtifactProjectionMismatch
+	}
+	_, expectedClaims, err := catalog.ProjectionGraphBindings(projection)
+	if err != nil {
+		return ErrArtifactProjectionMismatch
+	}
+	if len(expectedClaims) != len(claimBindings) {
+		return ErrArtifactProjectionMismatch
+	}
+	for index := range expectedClaims {
+		expected := expectedClaims[index]
+		actual := claimBindings[index]
+		expected.Supports = nil
+		actual.Supports = nil
+		if !reflect.DeepEqual(expected, actual) {
+			return ErrArtifactProjectionMismatch
+		}
+	}
+	return nil
+}
+
+func legacyV1ProjectionGraphBindings(projection catalog.Projection) ([]protocol.GraphResourceBinding, error) {
+	bindings := make([]protocol.GraphResourceBinding, 0, len(projection.Resources))
+	for _, resource := range projection.Resources {
+		if !resource.IsServing() {
+			continue
+		}
+		handle, err := resource.ServingHandle()
+		if err != nil {
+			return nil, err
+		}
+		binding, err := protocol.NewGraphResourceBinding(handle)
+		if err != nil {
+			return nil, err
+		}
+		bindings = append(bindings, binding)
+	}
+	protocol.SortGraphResourceBindings(bindings)
+	if err := protocol.ValidateGraphResourceBindings(bindings); err != nil {
+		return nil, err
+	}
+	return bindings, nil
+}
+
+func decodeProjection(data []byte) (catalog.Projection, error) {
+	var projection catalog.Projection
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&projection); err != nil {
+		return catalog.Projection{}, err
+	}
+	if err := requireJSONEOF(decoder); err != nil {
+		return catalog.Projection{}, err
+	}
+	if err := projection.Validate(); err != nil {
+		return catalog.Projection{}, err
+	}
+	return projection, nil
+}
+
+func decodeJSONL[T any](data []byte) ([]T, error) {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	items := make([]T, 0)
+	for {
+		var item T
+		if err := decoder.Decode(&item); errors.Is(err, io.EOF) {
+			return items, nil
+		} else if err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+}
+
+func requireJSONEOF(decoder *json.Decoder) error {
+	var trailing any
+	if err := decoder.Decode(&trailing); errors.Is(err, io.EOF) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	return fmt.Errorf("unexpected trailing JSON value")
 }
 
 func ArtifactFileDescriptors(payloads []ArtifactFilePayload) []protocol.ArtifactBundleFile {
@@ -220,7 +515,7 @@ artifacts:
   claim_bindings: claim_bindings.jsonl
   summaries: summaries.jsonl
 graph_binding_contract:
-  version: 1
+  version: 2
   graph_object_type: KnoteResource
   claim_edge_type: KnoteClaimEdge
 `

@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/zzqDeco/knote/internal/catalog"
 	"github.com/zzqDeco/knote/internal/protocol"
 	"github.com/zzqDeco/knote/internal/repository"
 	localrepo "github.com/zzqDeco/knote/internal/repository/local"
@@ -1009,11 +1010,41 @@ func writePrimitiveGraphContract(t *testing.T, workspace string) protocol.Resour
 	t.Helper()
 	projectionID := "prj_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	generatedAt := time.Unix(0, 0).UTC()
-	resource := testPrimitiveResource(testResourceA)
-	resource.Versions.Index = "index_" + projectionID
-	resource.Versions.Graph = "graph_" + projectionID
-	resource.Versions.Projection = projectionID
+	scope := catalog.Scope{TenantID: "local", KnowledgeBaseID: "default"}
+	resourceID, err := protocol.NewStableResourceID(scope.TenantID, scope.KnowledgeBaseID, protocol.ResourceDocument, "sources/primitive.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	versions := protocol.ResourceVersions{
+		Source: "source-v1", Content: "content-v1", ACL: "acl-v1",
+		Index: "index_" + projectionID, Graph: "graph_" + projectionID, Projection: projectionID,
+	}
+	metadata, err := catalog.NewResourceMetadata(
+		scope, protocol.ResourceDocument, "sources/primitive.md", "document:"+string(resourceID), resourceID,
+		protocol.NewContentDigest("allowed body"), versions, catalog.SensitivityInternal, "local",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata.ServingState = catalog.StatePublished
+	metadata.ProjectionStatus = catalog.SucceededProjectionStatus()
+	resource, err := metadata.ServingHandle()
+	if err != nil {
+		t.Fatal(err)
+	}
 	binding, err := protocol.NewGraphResourceBinding(resource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := catalog.SourceSnapshotRef{
+		Scope: scope, SourceID: "workspace", Version: versions.Source, SecurityDomain: "local",
+		Digest: protocol.ContentDigest("sha256:" + strings.Repeat("a", 64)), DocumentCount: 1,
+	}
+	projection, err := catalog.NewProjection(scope, projectionID, snapshot, catalog.StatePublished, []catalog.ResourceMetadata{metadata})
+	if err != nil {
+		t.Fatal(err)
+	}
+	projectionJSON, err := json.Marshal(projection)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1024,7 +1055,7 @@ func writePrimitiveGraphContract(t *testing.T, workspace string) protocol.Resour
 		Manifest: manifest, GraphBindings: []protocol.GraphResourceBinding{binding},
 		ClaimBindings:  []protocol.ClaimTripleBinding{},
 		BuildReport:    "# graph contract\n",
-		ProjectionJSON: []byte("{\"version\":\"" + projectionID + "\"}\n"), ProjectionResourceCount: 1,
+		ProjectionJSON: projectionJSON, ProjectionResourceCount: 1,
 		BundleManifest: protocol.ArtifactBundleManifest{
 			Version: protocol.ArtifactBundleManifestVersion, ProjectionID: projectionID, ProjectionVersion: projectionID,
 			Namespace: "KnoteKB__" + projectionID, AuthorizationObject: "knowledge-base:default",

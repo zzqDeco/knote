@@ -597,7 +597,7 @@ artifacts:
   claim_bindings: claim_bindings.jsonl
   summaries: summaries.jsonl
 graph_binding_contract:
-  version: 1
+  version: 2
   graph_object_type: KnoteResource
   claim_edge_type: KnoteClaimEdge
 `

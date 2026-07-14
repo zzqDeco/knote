@@ -192,6 +192,49 @@ func (s *ProjectionStore) ServingProjection() (Projection, error) {
 	return projection, err
 }
 
+// RollbackServing restores the exact base projection only while the supplied
+// plan still owns the serving pointer. It is used when the public artifact
+// pointer did not commit after the private Catalog CAS advanced.
+func (s *ProjectionStore) RollbackServing(plan ProjectionPlan, base Projection) error {
+	if err := plan.Validate(); err != nil {
+		return err
+	}
+	if err := base.Validate(); err != nil {
+		return err
+	}
+	return s.withLock(func() error {
+		pointer, err := s.readServingPointerLocked()
+		if err != nil {
+			return err
+		}
+		if pointer.Scope != plan.Run.Scope || pointer.ProjectionVersion != plan.Run.ProjectionVersion ||
+			pointer.RunID != plan.Run.RunID || pointer.PlanID != plan.PlanID {
+			return ErrStaleServingPointer
+		}
+		if err := s.verifyBaseProjectionLocked(base, plan); err != nil {
+			return err
+		}
+		restored := ServingPointer{
+			Scope: base.Scope, ProjectionVersion: base.Version,
+			SourceSnapshotVersion: base.SourceSnapshot.Version,
+		}
+		if err := restored.Validate(); err != nil {
+			return err
+		}
+		if err := s.writeJSON(s.pointerPath(), restored); err != nil {
+			return err
+		}
+		candidatePath := s.projectionPath(plan.Run.ProjectionVersion)
+		if err := os.Remove(candidatePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove rolled back Catalog projection: %w", err)
+		}
+		if err := s.syncDirectory(s.projectionsDir()); err != nil {
+			return fmt.Errorf("sync rolled back Catalog projection directory: %w", err)
+		}
+		return nil
+	})
+}
+
 // Run returns one durable sync-run record so callers can select a new retry
 // identity after a terminal failure without deleting the audit journal.
 func (s *ProjectionStore) Run(runID string) (SyncRun, error) {

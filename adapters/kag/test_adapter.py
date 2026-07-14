@@ -192,13 +192,14 @@ def write_permissioned_provider_module(workspace: Path, source: str) -> dict[str
 def graph_contract_binding(
     projection_id: str,
     resource: dict[str, object] | None = None,
+    contract_version: int = adapter.GRAPH_BINDING_CONTRACT_VERSION,
     **overrides: object,
 ) -> dict[str, object]:
     resource = resource or graph_contract_resource(projection_id)
     value: dict[str, object] = {
-        "version": adapter.GRAPH_BINDING_CONTRACT_VERSION,
+        "version": contract_version,
         "graph_object_id": adapter.expected_graph_object_id(
-            projection_id, str(resource["resource_id"])
+            projection_id, str(resource["resource_id"]), contract_version
         ),
         "resource": resource,
     }
@@ -206,15 +207,104 @@ def graph_contract_binding(
     return value
 
 
+def source_backed_claim_contract(
+    projection_id: str,
+    contract_version: int = adapter.GRAPH_BINDING_CONTRACT_VERSION,
+    derivation: str = "any_support",
+) -> tuple[list[dict[str, object]], dict[str, object]]:
+    resource_ids = {
+        "source": "res_11111111111111111111111111111111",
+        "subject": "res_22222222222222222222222222222222",
+        "object": "res_33333333333333333333333333333333",
+        "claim": "res_44444444444444444444444444444444",
+        "evidence_a": "res_55555555555555555555555555555555",
+        "evidence_b": "res_66666666666666666666666666666666",
+    }
+
+    def resource(name: str, resource_type: str) -> dict[str, object]:
+        resource_id = resource_ids[name]
+        value = graph_contract_resource(projection_id, resource_id)
+        value["type"] = resource_type
+        value["authz_object"] = f"{resource_type}:{resource_id}"
+        if resource_type == "chunk":
+            value["authorization_resource_id"] = resource_ids["source"]
+            value["authz_object"] = f"document:{resource_ids['source']}"
+        return value
+
+    resources = {
+        "source": resource("source", "document"),
+        "subject": resource("subject", "entity"),
+        "object": resource("object", "entity"),
+        "claim": resource("claim", "claim"),
+        "evidence_a": resource("evidence_a", "chunk"),
+        "evidence_b": resource("evidence_b", "chunk"),
+    }
+    graph_rows = sorted(
+        [
+            graph_contract_binding(projection_id, value, contract_version)
+            for value in resources.values()
+        ],
+        key=lambda row: str(row["graph_object_id"]),
+    )
+    graph_ids = {
+        name: adapter.expected_graph_object_id(
+            projection_id, resource_ids[name], contract_version
+        )
+        for name in resource_ids
+    }
+
+    def support(support_id: str, names: list[str]) -> dict[str, object]:
+        return {
+            "support_key": "sup_"
+            + hashlib.sha256(support_id.encode("utf-8")).hexdigest()[:32],
+            "provenance": sorted(graph_ids[name] for name in names),
+            "provenance_resource_ids": sorted(resource_ids[name] for name in names),
+        }
+
+    supports = sorted(
+        [
+            support("support_alpha", ["evidence_a", "evidence_b"]),
+            support("support_beta", ["source"]),
+        ],
+        key=lambda item: str(item["support_key"]),
+    )
+    all_evidence = ["source", "evidence_a", "evidence_b"]
+    claim_row: dict[str, object] = {
+        "version": contract_version,
+        "claim": graph_ids["claim"],
+        "subject": graph_ids["subject"],
+        "predicate_key": "pred_a3b0b7f1948c58d586d3af99fee4704e",
+        "object": graph_ids["object"],
+        "source_document": graph_ids["source"],
+        "derivation": derivation,
+        "provenance": sorted(graph_ids[name] for name in all_evidence),
+    }
+    if contract_version == adapter.GRAPH_BINDING_CONTRACT_VERSION:
+        claim_row.update(
+            {
+                "subject_resource_id": resource_ids["subject"],
+                "object_resource_id": resource_ids["object"],
+                "source_document_resource_id": resource_ids["source"],
+                "source_version": "source_graph_v1",
+                "provenance_resource_ids": sorted(
+                    resource_ids[name] for name in all_evidence
+                ),
+            }
+        )
+        claim_row["supports"] = supports
+    return graph_rows, claim_row
+
+
 def write_graph_contract_bundle(
     workspace: Path,
     *,
     graph_rows: list[dict[str, object]] | None = None,
     claim_rows: list[dict[str, object]] | None = None,
+    contract_version: int = adapter.GRAPH_BINDING_CONTRACT_VERSION,
 ) -> str:
     projection_id = "prj_" + "a" * 32
     if graph_rows is None:
-        graph_rows = [graph_contract_binding(projection_id)]
+        graph_rows = [graph_contract_binding(projection_id, contract_version=contract_version)]
     if claim_rows is None:
         claim_rows = []
 
@@ -261,7 +351,7 @@ def write_graph_contract_bundle(
         "namespace": "KnoteKB__" + projection_id,
         "authz_object": "knowledge-base:kb_test",
         "authz_version": "acl_graph_v1",
-        "graph_binding_contract_version": adapter.GRAPH_BINDING_CONTRACT_VERSION,
+        "graph_binding_contract_version": contract_version,
         "source_snapshot": {
             "version": "source_graph_v1",
             "digest": "b" * 64,
@@ -994,6 +1084,196 @@ class AdapterTest(unittest.TestCase):
             )
             self.assertEqual(lines[-1]["code"], "invalid_graph_binding")
 
+    def test_real_primitive_accepts_non_empty_source_backed_claim_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            projection_id = "prj_" + "a" * 32
+            graph_rows, claim_row = source_backed_claim_contract(projection_id)
+            write_graph_contract_bundle(
+                workspace, graph_rows=graph_rows, claim_rows=[claim_row]
+            )
+
+            _, lines = call_adapter(
+                {
+                    "id": "source-backed",
+                    "method": "kag.retrieve",
+                    "params": {
+                        "workspace": str(workspace),
+                        "authorization": real_graph_authorization(),
+                        "query": "knote",
+                        "limit": 10,
+                    },
+                },
+                fake=False,
+            )
+
+            self.assertEqual(lines[-1]["type"], "error")
+            self.assertEqual(lines[-1]["code"], "primitive_unavailable")
+
+    def test_v1_claim_contract_upgrade_preserves_derivation_semantics(self) -> None:
+        for derivation, want_support_count, want_group_size in (
+            ("all_required", 1, 3),
+            ("any_support", 3, 1),
+        ):
+            with self.subTest(derivation=derivation), tempfile.TemporaryDirectory() as directory:
+                workspace = Path(directory)
+                projection_id = "prj_" + "a" * 32
+                graph_rows, claim_row = source_backed_claim_contract(
+                    projection_id,
+                    adapter.GRAPH_BINDING_CONTRACT_VERSION_V1,
+                    derivation,
+                )
+                self.assertNotIn("supports", claim_row)
+                write_graph_contract_bundle(
+                    workspace,
+                    graph_rows=graph_rows,
+                    claim_rows=[claim_row],
+                    contract_version=adapter.GRAPH_BINDING_CONTRACT_VERSION_V1,
+                )
+
+                _, upgraded = adapter.load_current_graph_contract(
+                    {"workspace": str(workspace)}, real_graph_authorization()
+                )
+                _, repeated = adapter.load_current_graph_contract(
+                    {"workspace": str(workspace)}, real_graph_authorization()
+                )
+
+                self.assertEqual(upgraded, repeated)
+                self.assertEqual(
+                    upgraded[0]["version"], adapter.GRAPH_BINDING_CONTRACT_VERSION
+                )
+                self.assertEqual(len(upgraded[0]["supports"]), want_support_count)
+                for support in upgraded[0]["supports"]:
+                    self.assertEqual(len(support["provenance"]), want_group_size)
+                    self.assertEqual(
+                        len(support["provenance_resource_ids"]), want_group_size
+                    )
+
+    def test_v1_claim_contract_upgrade_drops_undeclared_predicate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            projection_id = "prj_" + "a" * 32
+            graph_rows, claim_row = source_backed_claim_contract(
+                projection_id, adapter.GRAPH_BINDING_CONTRACT_VERSION_V1
+            )
+            claim_row["predicate_key"] = "pred_" + "f" * 32
+            write_graph_contract_bundle(
+                workspace,
+                graph_rows=graph_rows,
+                claim_rows=[claim_row],
+                contract_version=adapter.GRAPH_BINDING_CONTRACT_VERSION_V1,
+            )
+
+            resources, upgraded = adapter.load_current_graph_contract(
+                {"workspace": str(workspace)}, real_graph_authorization()
+            )
+
+            self.assertEqual(len(resources), len(graph_rows))
+            self.assertEqual(upgraded, [])
+
+    def test_real_primitive_rejects_invalid_source_backed_claim_contracts(self) -> None:
+        projection_id = "prj_" + "a" * 32
+        graph_rows, valid_claim = source_backed_claim_contract(projection_id)
+
+        def cloned_claim() -> dict[str, object]:
+            return json.loads(json.dumps(valid_claim))
+
+        legacy = cloned_claim()
+        for field in (
+            "subject_resource_id",
+            "object_resource_id",
+            "source_document_resource_id",
+            "source_version",
+            "provenance_resource_ids",
+            "supports",
+        ):
+            legacy.pop(field)
+
+        mismatched_subject = cloned_claim()
+        mismatched_subject["subject_resource_id"] = valid_claim["object_resource_id"]
+
+        stale_source = cloned_claim()
+        stale_source["source_version"] = "source_stale"
+
+        mismatched_support = cloned_claim()
+        mismatched_support["supports"][0]["provenance_resource_ids"] = [
+            "res_55555555555555555555555555555555"
+        ]
+        mismatched_support["supports"][1]["provenance_resource_ids"] = [
+            "res_11111111111111111111111111111111",
+            "res_66666666666666666666666666666666",
+        ]
+
+        unsorted_supports = cloned_claim()
+        unsorted_supports["supports"].reverse()
+
+        raw_support_label = cloned_claim()
+        raw_support_label["supports"][0]["support_key"] = "support_alpha"
+
+        cases = {
+            "legacy non-empty binding": legacy,
+            "mismatched stable subject": mismatched_subject,
+            "stale source version": stale_source,
+            "mismatched support mapping": mismatched_support,
+            "unsorted supports": unsorted_supports,
+            "raw support label": raw_support_label,
+        }
+        for name, claim_row in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                workspace = Path(directory)
+                write_graph_contract_bundle(
+                    workspace, graph_rows=graph_rows, claim_rows=[claim_row]
+                )
+                _, lines = call_adapter(
+                    {
+                        "id": "invalid-source-backed",
+                        "method": "kag.retrieve",
+                        "params": {
+                            "workspace": str(workspace),
+                            "authorization": real_graph_authorization(),
+                            "query": "knote",
+                            "limit": 10,
+                        },
+                    },
+                    fake=False,
+                )
+
+                self.assertEqual(lines[-1]["type"], "error")
+                self.assertEqual(lines[-1]["code"], "invalid_graph_binding")
+
+    def test_real_primitive_rejects_undeclared_opaque_predicate_without_echo(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            projection_id = "prj_" + "a" * 32
+            graph_rows, claim_row = source_backed_claim_contract(projection_id)
+            undeclared = "pred_" + "f" * 32
+            claim_row["predicate_key"] = undeclared
+            write_graph_contract_bundle(
+                workspace, graph_rows=graph_rows, claim_rows=[claim_row]
+            )
+
+            proc, lines = call_adapter(
+                {
+                    "id": "undeclared-predicate",
+                    "method": "kag.retrieve",
+                    "params": {
+                        "workspace": str(workspace),
+                        "authorization": real_graph_authorization(),
+                        "query": "knote",
+                        "limit": 10,
+                    },
+                },
+                fake=False,
+            )
+
+            self.assertEqual(lines[-1]["type"], "error")
+            self.assertEqual(lines[-1]["code"], "invalid_graph_binding")
+            self.assertEqual(
+                lines[-1]["error"], "selected graph binding contract is invalid"
+            )
+            self.assertNotIn(undeclared, proc.stdout)
+            self.assertNotIn(undeclared, proc.stderr)
+
     def test_real_primitive_rejects_graph_file_tampering_against_manifest_digest(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
@@ -1021,7 +1301,9 @@ class AdapterTest(unittest.TestCase):
             )
             self.assertEqual(lines[-1]["type"], "error")
             self.assertEqual(lines[-1]["code"], "invalid_graph_binding")
-            self.assertIn("digest", lines[-1]["error"])
+            self.assertEqual(
+                lines[-1]["error"], "selected graph binding contract is invalid"
+            )
 
     def test_real_primitive_ignores_flat_compatibility_graph_binding(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1195,7 +1477,7 @@ def create(context):
                 str(row["resource"]["resource_id"]): str(row["graph_object_id"])
                 for row in graph_rows
             }
-            predicate_key = "pred_" + "5" * 32
+            predicate_key = "pred_a3b0b7f1948c58d586d3af99fee4704e"
             claim_rows = [
                 {
                     "version": adapter.GRAPH_BINDING_CONTRACT_VERSION,
@@ -1206,6 +1488,18 @@ def create(context):
                     "source_document": by_resource[str(source["resource_id"])],
                     "derivation": "all_required",
                     "provenance": [by_resource[str(source["resource_id"])]],
+                    "subject_resource_id": subject["resource_id"],
+                    "object_resource_id": target["resource_id"],
+                    "source_document_resource_id": source["resource_id"],
+                    "source_version": source["versions"]["source"],
+                    "provenance_resource_ids": [source["resource_id"]],
+                    "supports": [
+                        {
+                            "support_key": "sup_" + "6" * 32,
+                            "provenance": [by_resource[str(source["resource_id"])]],
+                            "provenance_resource_ids": [source["resource_id"]],
+                        }
+                    ],
                 }
             ]
             write_graph_contract_bundle(

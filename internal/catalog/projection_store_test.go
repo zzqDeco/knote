@@ -500,6 +500,30 @@ func TestProjectionStoreSerializesConcurrentCASContenders(t *testing.T) {
 	}
 }
 
+func TestProjectionStoreRollbackServingRestoresExactBaseAndRemovesCandidate(t *testing.T) {
+	store, current, plan := testProjectionStorePlan(t, t.TempDir(), "projection-v2")
+	execution, err := store.Execute(context.Background(), plan, current, successfulCountingExecutor(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !execution.PointerAdvanced || execution.Projection.Version != plan.Run.ProjectionVersion {
+		t.Fatalf("candidate was not selected before rollback: %+v", execution)
+	}
+	if err := store.RollbackServing(plan, current); err != nil {
+		t.Fatal(err)
+	}
+	assertServingVersion(t, store, current.Version)
+	if _, err := os.Stat(store.projectionPath(plan.Run.ProjectionVersion)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("rolled back candidate projection still exists: %v", err)
+	}
+	if run, err := store.Run(plan.Run.RunID); err != nil || run.State != RunSucceeded {
+		t.Fatalf("rollback changed immutable run audit state: run=%+v err=%v", run, err)
+	}
+	if err := store.RollbackServing(plan, current); !errors.Is(err, ErrStaleServingPointer) {
+		t.Fatalf("repeated rollback error = %v, want stale pointer", err)
+	}
+}
+
 func TestProjectionStoreResultConflictsAreRejected(t *testing.T) {
 	store, _, plan := testProjectionStorePlan(t, t.TempDir(), "projection-v2")
 	if err := store.Stage(plan); err != nil {

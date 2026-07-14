@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -124,7 +125,7 @@ func TestServiceBuildWithoutBackendFailsClosed(t *testing.T) {
 	}
 }
 
-func TestServiceBuildArtifactsAreStableAndEntityIsPerDocument(t *testing.T) {
+func TestServiceBuildArtifactsAreStableAndClaimsAreSourceBacked(t *testing.T) {
 	ctx := context.Background()
 	repo := newMemoryRepo()
 	repo.sourceModTimes["sources/long.md"] = time.Unix(42, 0).UTC()
@@ -173,14 +174,27 @@ func TestServiceBuildArtifactsAreStableAndEntityIsPerDocument(t *testing.T) {
 	if len(repo.artifacts.Chunks) < 2 {
 		t.Fatalf("test source did not split into multiple chunks: %+v", repo.artifacts.Chunks)
 	}
-	if len(repo.artifacts.Entities) != 1 {
-		t.Fatalf("expected one document entity, got %d: %+v", len(repo.artifacts.Entities), repo.artifacts.Entities)
+	if got, want := len(repo.artifacts.Entities), len(repo.artifacts.Chunks)+1; got != want {
+		t.Fatalf("entity count = %d, want one source-backed statement per chunk plus one document entity (%d): %+v", got, want, repo.artifacts.Entities)
 	}
-	if got, want := len(repo.artifacts.Entities[0].EvidenceChunkIDs), len(repo.artifacts.Chunks); got != want {
+	var documentEntity protocol.Entity
+	for _, entity := range repo.artifacts.Entities {
+		if entity.Type == "Document" {
+			documentEntity = entity
+			break
+		}
+	}
+	if documentEntity.EntityID == "" {
+		t.Fatalf("document entity was not emitted: %+v", repo.artifacts.Entities)
+	}
+	if got, want := len(documentEntity.EvidenceChunkIDs), len(repo.artifacts.Chunks); got != want {
 		t.Fatalf("document entity evidence chunk count = %d, want %d", got, want)
 	}
 	if first.BundleManifest.GraphBindingContractVersion != protocol.GraphBindingContractVersion {
 		t.Fatalf("graph binding contract version = %d", first.BundleManifest.GraphBindingContractVersion)
+	}
+	if want := fmt.Sprintf("graph_binding_contract:\n  version: %d\n", protocol.GraphBindingContractVersion); !strings.Contains(repo.artifacts.SchemaYAML, want) {
+		t.Fatalf("build schema graph binding contract = %q, want %q", repo.artifacts.SchemaYAML, want)
 	}
 	if got, want := len(repo.artifacts.GraphBindings), repo.artifacts.ProjectionResourceCount; got != want {
 		t.Fatalf("graph binding count = %d, want %d", got, want)
@@ -188,8 +202,17 @@ func TestServiceBuildArtifactsAreStableAndEntityIsPerDocument(t *testing.T) {
 	if err := protocol.ValidateGraphResourceBindings(repo.artifacts.GraphBindings); err != nil {
 		t.Fatalf("graph bindings: %v", err)
 	}
-	if len(repo.artifacts.ClaimBindings) != 0 {
-		t.Fatalf("synthetic Phase 1 claims gained fabricated graph triples: %+v", repo.artifacts.ClaimBindings)
+	if got, want := len(repo.artifacts.ClaimBindings), len(repo.artifacts.Claims); got != want {
+		t.Fatalf("source-backed Claim binding count = %d, want %d: %+v", got, want, repo.artifacts.ClaimBindings)
+	}
+	if err := protocol.ValidateClaimTripleBindings(repo.artifacts.GraphBindings, repo.artifacts.ClaimBindings); err != nil {
+		t.Fatalf("Claim bindings: %v", err)
+	}
+	for _, binding := range repo.artifacts.ClaimBindings {
+		if binding.PredicateKey == "" || binding.SourceVersion == "" || len(binding.Supports) != 1 ||
+			len(binding.Supports[0].ProvenanceResourceIDs) != 1 {
+			t.Fatalf("source-backed Claim binding lost its semantic or support contract: %+v", binding)
+		}
 	}
 	filePaths := make(map[string]bool, len(first.BundleManifest.Files))
 	for _, file := range first.BundleManifest.Files {
@@ -1095,7 +1118,7 @@ func TestServiceProjectionReplayUsesOneKAGBuildKeyAfterPersistedIndexReceipt(t *
 	}
 }
 
-func TestServiceRetryRecoversArtifactPointerAfterCatalogCAS(t *testing.T) {
+func TestServiceArtifactPointerFailureRollsBackCatalogAndRetryCommitsTogether(t *testing.T) {
 	ctx := context.Background()
 	repo := newMemoryRepo()
 	repo.config.KAG.Namespace = "RecoveryTest"
@@ -1115,6 +1138,26 @@ func TestServiceRetryRecoversArtifactPointerAfterCatalogCAS(t *testing.T) {
 	if repo.artifacts.BundleManifest.ProjectionVersion != first.BundleManifest.ProjectionVersion {
 		t.Fatal("failed public pointer publication changed selected artifacts")
 	}
+	store, err := catalog.NewProjectionStore(projectionJournalRoot(
+		repo.projectionRoot,
+		first.BundleManifest.ProjectionVersion,
+		failed.BundleManifest.ProjectionVersion,
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	servingAfterFailure, err := store.ServingProjection()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if servingAfterFailure.Version != first.BundleManifest.ProjectionVersion {
+		t.Fatalf("artifact failure left Catalog at %s while artifacts served %s",
+			servingAfterFailure.Version, repo.artifacts.BundleManifest.ProjectionVersion)
+	}
+	rolledBackCandidate := filepath.Join(store.Root(), "projections", failed.BundleManifest.ProjectionVersion+".json")
+	if _, err := os.Stat(rolledBackCandidate); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("rolled back Catalog candidate still exists: %v", err)
+	}
 	callsAfterCAS := backend.buildCalls
 	workAfterCAS := backend.wholeNamespaceBuilds
 	repo.publishErr = nil
@@ -1131,6 +1174,16 @@ func TestServiceRetryRecoversArtifactPointerAfterCatalogCAS(t *testing.T) {
 	if backend.buildCalls != callsAfterCAS+1 || backend.wholeNamespaceBuilds != workAfterCAS {
 		t.Fatalf("artifact pointer recovery did not idempotently replay KAG: calls=%d->%d work=%d->%d",
 			callsAfterCAS, backend.buildCalls, workAfterCAS, backend.wholeNamespaceBuilds)
+	}
+	servingAfterRetry, err := store.ServingProjection()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if servingAfterRetry.Version != repo.artifacts.BundleManifest.ProjectionVersion ||
+		servingAfterRetry.Version != recovered.BundleManifest.ProjectionVersion {
+		t.Fatalf("retry diverged Catalog and artifact pointers: catalog=%s artifact=%s result=%s",
+			servingAfterRetry.Version, repo.artifacts.BundleManifest.ProjectionVersion,
+			recovered.BundleManifest.ProjectionVersion)
 	}
 }
 

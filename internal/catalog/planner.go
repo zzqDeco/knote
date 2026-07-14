@@ -253,6 +253,13 @@ func (p Projection) Validate() error {
 		)
 	}
 	for _, resource := range p.Resources {
+		if resource.Type == protocol.ResourceClaim && resource.ClaimRecord != nil {
+			if err := validateProjectionClaimRecord(resource, *resource.ClaimRecord, resourcesByID); err != nil {
+				return err
+			}
+		}
+	}
+	for _, resource := range p.Resources {
 		if resource.IsServing() && resource.Type != protocol.ResourceDocument &&
 			resource.Type != protocol.ResourceChunk && len(resource.Dependencies) == 0 {
 			return fmt.Errorf("serving resource %s has no canonical dependencies", resource.ResourceID)
@@ -287,6 +294,53 @@ func (p Projection) Validate() error {
 		if i > 0 && p.AppliedOperations[i-1].OperationID > receipt.OperationID {
 			return fmt.Errorf("operation receipts are not in canonical order")
 		}
+	}
+	return nil
+}
+
+func validateProjectionClaimRecord(
+	claim ResourceMetadata,
+	record ClaimProjectionRecord,
+	resources map[protocol.ResourceID]ResourceMetadata,
+) error {
+	source, ok := resources[record.SourceDocument.ResourceID]
+	if !ok || source.Type != protocol.ResourceDocument ||
+		source.Versions.Source != record.SourceDocument.SourceVersion ||
+		source.Versions.Content != record.SourceDocument.ContentVersion ||
+		source.Versions.ACL != record.SourceDocument.ACLVersion ||
+		source.Versions.Projection != record.SourceDocument.ProjectionVersion {
+		return fmt.Errorf("claim %s: %w", claim.ResourceID, ErrInvalidClaimRecord)
+	}
+	dependencies := []protocol.ResourceID{record.SourceDocument.ResourceID}
+	for _, support := range record.Provenance.Supports {
+		for _, evidence := range support.Evidence {
+			resource, exists := resources[evidence.ResourceID]
+			if !exists || resource.Type != evidence.Type || resource.Versions != evidence.Versions {
+				return fmt.Errorf("claim %s: %w", claim.ResourceID, ErrInvalidClaimRecord)
+			}
+			if evidence.Document != record.SourceDocument {
+				return fmt.Errorf("claim %s: %w", claim.ResourceID, ErrInvalidClaimRecord)
+			}
+			if resource.Type == protocol.ResourceDocument && resource.ResourceID != source.ResourceID {
+				return fmt.Errorf("claim %s: %w", claim.ResourceID, ErrInvalidClaimRecord)
+			}
+			if resource.Type == protocol.ResourceChunk && resource.AuthorizationResourceID != source.ResourceID {
+				return fmt.Errorf("claim %s: %w", claim.ResourceID, ErrInvalidClaimRecord)
+			}
+			dependencies = append(dependencies, evidence.ResourceID)
+		}
+	}
+	if record.IsSourceBacked() {
+		for _, endpoint := range []protocol.ResourceID{record.SubjectResourceID, record.ObjectResourceID} {
+			resource, exists := resources[endpoint]
+			if !exists || resource.Type != protocol.ResourceEntity {
+				return fmt.Errorf("claim %s: %w", claim.ResourceID, ErrInvalidClaimRecord)
+			}
+			dependencies = append(dependencies, endpoint)
+		}
+	}
+	if !resourceIDsEqual(claim.Dependencies, canonicalResourceIDs(dependencies)) {
+		return fmt.Errorf("claim %s: %w", claim.ResourceID, ErrInvalidClaimRecord)
 	}
 	return nil
 }
@@ -433,6 +487,7 @@ func PlanRevocations(
 			continue
 		}
 		resource.Versions.Projection = run.ProjectionVersion
+		rebindClaimRecordProjection(&resource, run)
 		desired = append(desired, resource)
 	}
 	return planResources(run, current, desired, OperationRevoke)
@@ -509,6 +564,7 @@ func planResources(
 			superseded.Versions.Source = run.SourceSnapshot.Version
 			superseded.Versions.Projection = run.ProjectionVersion
 			superseded.ServingState = StateSuperseded
+			superseded.ClaimRecord = nil
 			operations = append(operations, newProjectionOperation(run, OperationSupersede, superseded))
 		}
 		for _, kind := range []OperationKind{
@@ -525,6 +581,7 @@ func planResources(
 		terminal := resource
 		terminal.Versions.Source = run.SourceSnapshot.Version
 		terminal.Versions.Projection = run.ProjectionVersion
+		terminal.ClaimRecord = nil
 		if staleKind == OperationRevoke {
 			terminal.ServingState = StateRevoked
 		} else {
@@ -563,6 +620,7 @@ func validateDesiredReplacement(
 		}
 		resource.Versions.Source = run.SourceSnapshot.Version
 		resource.Versions.Projection = run.ProjectionVersion
+		resource.ClaimRecord = nil
 		if staleKind == OperationRevoke {
 			resource.ServingState = StateRevoked
 		} else {
@@ -579,6 +637,26 @@ func validateDesiredReplacement(
 		return fmt.Errorf("desired replacement projection: %w", err)
 	}
 	return nil
+}
+
+func rebindClaimRecordProjection(resource *ResourceMetadata, run SyncRun) {
+	if resource == nil || resource.Type != protocol.ResourceClaim || resource.ClaimRecord == nil {
+		return
+	}
+	record := *resource.ClaimRecord
+	record.SourceDocument.SourceVersion = run.SourceSnapshot.Version
+	record.SourceDocument.ProjectionVersion = run.ProjectionVersion
+	record.Provenance = record.Provenance.normalized()
+	for supportIndex := range record.Provenance.Supports {
+		for evidenceIndex := range record.Provenance.Supports[supportIndex].Evidence {
+			evidence := &record.Provenance.Supports[supportIndex].Evidence[evidenceIndex]
+			evidence.Versions.Source = run.SourceSnapshot.Version
+			evidence.Versions.Projection = run.ProjectionVersion
+			evidence.Document.SourceVersion = run.SourceSnapshot.Version
+			evidence.Document.ProjectionVersion = run.ProjectionVersion
+		}
+	}
+	resource.ClaimRecord = &record
 }
 
 func validateChunkBoundaries(resources []ResourceMetadata) error {
