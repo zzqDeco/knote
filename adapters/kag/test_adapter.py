@@ -1797,6 +1797,44 @@ def create(context):
                 check=True,
             )
 
+    @unittest.skipIf(os.name == "nt", "POSIX provider process cleanup")
+    def test_provider_timeout_stops_runner_before_descendant_snapshot(self) -> None:
+        events: list[tuple[object, ...]] = []
+        process = types.SimpleNamespace(
+            pid=4242,
+            wait=lambda: events.append(("wait",)),
+        )
+
+        with (
+            patch.object(
+                adapter.os,
+                "kill",
+                side_effect=lambda pid, sig: events.append(("kill", pid, sig)),
+            ),
+            patch.object(
+                adapter,
+                "terminate_posix_descendants",
+                side_effect=lambda pid: events.append(("snapshot", pid)) or {4343},
+            ),
+            patch.object(
+                adapter.os,
+                "killpg",
+                side_effect=lambda pid, sig: events.append(("killpg", pid, sig)),
+            ),
+            patch.object(
+                adapter,
+                "kill_posix_pids",
+                side_effect=lambda pids: events.append(("kill_pids", pids)),
+            ),
+        ):
+            adapter.terminate_provider_process_domain(process)
+
+        self.assertEqual(events[0], ("kill", 4242, adapter.signal.SIGSTOP))
+        self.assertEqual(events[1], ("snapshot", 4242))
+        self.assertEqual(events[2], ("killpg", 4242, adapter.signal.SIGKILL))
+        self.assertEqual(events[3], ("kill_pids", {4343}))
+        self.assertEqual(events[4], ("wait",))
+
     def test_prepare_corpus_is_sorted_and_stable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)

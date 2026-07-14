@@ -2336,11 +2336,11 @@ def terminate_provider_process_domain(process: subprocess.Popen[str]) -> None:
             except OSError:
                 pass
     else:
-        tracked: set[int] = set()
         try:
-            tracked.update(posix_descendant_pids(process.pid))
-        except OSError:
+            os.kill(process.pid, signal.SIGSTOP)
+        except ProcessLookupError:
             pass
+        tracked = terminate_posix_descendants(process.pid)
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
