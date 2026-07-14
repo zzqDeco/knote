@@ -15,6 +15,7 @@ import json
 import math
 import os
 import re
+import select
 import signal
 import subprocess
 import sys
@@ -2123,7 +2124,7 @@ def create_windows_provider_job() -> int | None:
     return int(job)
 
 
-def permissioned_provider_guardian(parent_pid: int, runner_pid: int) -> int:
+def permissioned_provider_guardian(parent_pid: int, runner_pid: int, liveness_fd: int) -> int:
     """Terminate the provider process domain if its adapter parent disappears."""
     if parent_pid <= 1 or runner_pid <= 1:
         return 1
@@ -2141,7 +2142,14 @@ def permissioned_provider_guardian(parent_pid: int, runner_pid: int) -> int:
         except OSError:
             pass
         tracked.discard(os.getpid())
-        if not posix_process_exists(parent_pid):
+        parent_disappeared = not posix_process_exists(parent_pid)
+        if liveness_fd >= 0:
+            readable, _, _ = select.select([liveness_fd], [], [], 0.02)
+            if readable and os.read(liveness_fd, 1) == b"":
+                parent_disappeared = True
+        elif not parent_disappeared:
+            time.sleep(0.02)
+        if parent_disappeared:
             try:
                 os.kill(runner_pid, signal.SIGKILL)
             except ProcessLookupError:
@@ -2152,12 +2160,14 @@ def permissioned_provider_guardian(parent_pid: int, runner_pid: int) -> int:
                 exclude={os.getpid()},
             )
             return 0
-        time.sleep(0.02)
     kill_posix_pids(tracked, exclude={os.getpid()})
     return 0
 
 
-def start_provider_guardian() -> subprocess.Popen[str]:
+def start_provider_guardian(liveness_fd: int) -> subprocess.Popen[str]:
+    options: dict[str, Any] = {}
+    if os.name != "nt" and liveness_fd >= 0:
+        options["pass_fds"] = (liveness_fd,)
     guardian = subprocess.Popen(
         [
             sys.executable,
@@ -2165,12 +2175,14 @@ def start_provider_guardian() -> subprocess.Popen[str]:
             PERMISSIONED_PROVIDER_GUARDIAN_ARG,
             str(os.getppid()),
             str(os.getpid()),
+            str(liveness_fd),
         ],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         text=True,
         close_fds=True,
+        **options,
     )
     try:
         ready = guardian.stdout.readline() if guardian.stdout is not None else ""
@@ -2187,7 +2199,7 @@ def start_provider_guardian() -> subprocess.Popen[str]:
     return guardian
 
 
-def permissioned_provider_runner(response_path: str) -> int:
+def permissioned_provider_runner(response_path: str, liveness_fd: int) -> int:
     """Run provider code without inheriting the adapter's output descriptors."""
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_NOFOLLOW"):
@@ -2199,10 +2211,14 @@ def permissioned_provider_runner(response_path: str) -> int:
 
     try:
         _provider_job = create_windows_provider_job()
-        _guardian = start_provider_guardian()
+        _guardian = start_provider_guardian(liveness_fd)
     except BaseException:
+        if liveness_fd >= 0:
+            os.close(liveness_fd)
         os.close(response_fd)
         return 1
+    if liveness_fd >= 0:
+        os.close(liveness_fd)
 
     envelope: dict[str, Any] = {"version": 1, "status": "unavailable"}
     try:
@@ -2340,13 +2356,20 @@ def call_permissioned_provider(
     with tempfile.TemporaryDirectory(prefix="knote-kag-provider-") as directory:
         response_path = Path(directory) / "response.json"
         process: subprocess.Popen[str] | None = None
+        liveness_read = -1
+        liveness_write = -1
         try:
+            options: dict[str, Any] = {}
+            if os.name != "nt":
+                liveness_read, liveness_write = os.pipe()
+                options["pass_fds"] = (liveness_read,)
             process = subprocess.Popen(
                 [
                     sys.executable,
                     str(Path(__file__).resolve()),
                     PERMISSIONED_PROVIDER_RUNNER_ARG,
                     str(response_path),
+                    str(liveness_read),
                 ],
                 stdin=subprocess.PIPE,
                 text=True,
@@ -2355,7 +2378,11 @@ def call_permissioned_provider(
                 stderr=subprocess.DEVNULL,
                 close_fds=True,
                 start_new_session=os.name != "nt",
+                **options,
             )
+            if liveness_read >= 0:
+                os.close(liveness_read)
+                liveness_read = -1
             process.communicate(payload, timeout=PROVIDER_RUNNER_TIMEOUT_SECONDS)
         except (OSError, subprocess.TimeoutExpired) as exc:
             if process is not None:
@@ -2365,6 +2392,10 @@ def call_permissioned_provider(
                 PRIMITIVE_UNAVAILABLE_CODE,
             ) from exc
         finally:
+            if liveness_read >= 0:
+                os.close(liveness_read)
+            if liveness_write >= 0:
+                os.close(liveness_write)
             if process is not None and process.poll() is not None:
                 terminate_provider_process_domain(process)
         if process.returncode != 0 or not response_path.is_file():
@@ -3165,8 +3196,14 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 3 and sys.argv[1] == PERMISSIONED_PROVIDER_RUNNER_ARG:
-        raise SystemExit(permissioned_provider_runner(sys.argv[2]))
-    if len(sys.argv) == 4 and sys.argv[1] == PERMISSIONED_PROVIDER_GUARDIAN_ARG:
-        raise SystemExit(permissioned_provider_guardian(int(sys.argv[2]), int(sys.argv[3])))
+    if len(sys.argv) == 4 and sys.argv[1] == PERMISSIONED_PROVIDER_RUNNER_ARG:
+        raise SystemExit(permissioned_provider_runner(sys.argv[2], int(sys.argv[3])))
+    if len(sys.argv) == 5 and sys.argv[1] == PERMISSIONED_PROVIDER_GUARDIAN_ARG:
+        raise SystemExit(
+            permissioned_provider_guardian(
+                int(sys.argv[2]),
+                int(sys.argv[3]),
+                int(sys.argv[4]),
+            )
+        )
     raise SystemExit(main())
