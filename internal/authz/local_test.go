@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 const localTestModelID = "01GAHCE4YVKPQEKZQHT2R89MQV"
@@ -189,6 +190,39 @@ func TestLocalAuthorizerModelMismatchAndCancellationDeny(t *testing.T) {
 	}
 }
 
+func TestLocalBatchCheckCancellationDuringEvaluationDenies(t *testing.T) {
+	tests := []struct {
+		name    string
+		failure error
+		wantErr error
+	}{
+		{name: "canceled", failure: context.Canceled, wantErr: ErrUnavailable},
+		{name: "deadline", failure: context.DeadlineExceeded, wantErr: ErrTimeout},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			authorizer := newLocalTestAuthorizer(t)
+			ctx := newFailOnNthErrContext(test.failure, 3)
+			decisions, err := authorizer.BatchCheck(ctx, BatchCheckRequest{
+				AuthorizationModelID: localTestModelID,
+				Checks: []BatchCheckItem{{
+					CorrelationID: "would-allow", User: "user:alice",
+					Relation: RelationCanView, Object: "document:welcome",
+				}},
+			})
+			if !errors.Is(err, test.wantErr) {
+				t.Fatalf("error = %v, want %v", err, test.wantErr)
+			}
+			if len(decisions) != 1 || decisions[0].Allowed {
+				t.Fatalf("decisions = %#v, want one fail-closed deny", decisions)
+			}
+			if !errors.Is(ctx.Err(), test.failure) {
+				t.Fatalf("context error = %v, want %v", ctx.Err(), test.failure)
+			}
+		})
+	}
+}
+
 func TestLocalAuthorizerTuplesAreSorted(t *testing.T) {
 	authorizer := newLocalTestAuthorizer(t)
 	tuples := authorizer.Tuples()
@@ -257,4 +291,40 @@ func assertLocalDecision(t *testing.T, authorizer *LocalAuthorizer, user, relati
 	if decision.Allowed != allowed {
 		t.Fatalf("check %s %s %s allowed=%t, want %t", user, relation, object, decision.Allowed, allowed)
 	}
+}
+
+type failOnNthErrContext struct {
+	failure error
+	failAt  int
+	calls   int
+	done    chan struct{}
+}
+
+func newFailOnNthErrContext(failure error, failAt int) *failOnNthErrContext {
+	return &failOnNthErrContext{failure: failure, failAt: failAt, done: make(chan struct{})}
+}
+
+func (c *failOnNthErrContext) Deadline() (time.Time, bool) {
+	return time.Time{}, false
+}
+
+func (c *failOnNthErrContext) Done() <-chan struct{} {
+	return c.done
+}
+
+func (c *failOnNthErrContext) Err() error {
+	c.calls++
+	if c.calls < c.failAt {
+		return nil
+	}
+	select {
+	case <-c.done:
+	default:
+		close(c.done)
+	}
+	return c.failure
+}
+
+func (c *failOnNthErrContext) Value(any) any {
+	return nil
 }

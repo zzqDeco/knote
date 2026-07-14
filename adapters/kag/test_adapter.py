@@ -63,6 +63,39 @@ def fake_resource_handle(resource_id: str) -> dict[str, object]:
     return adapter.copy_fake_candidate(resource_id)["resource"]
 
 
+def sorted_resource_handles(
+    resources: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    return sorted(
+        (json.loads(json.dumps(resource)) for resource in resources),
+        key=lambda resource: str(resource["resource_id"]),
+    )
+
+
+def fake_retrieve_allowed_resources() -> list[dict[str, object]]:
+    return sorted_resource_handles(
+        [fake_resource_handle(resource_id) for resource_id in adapter.FAKE_RETRIEVE_IDS]
+    )
+
+
+def generate_path(
+    resources: list[dict[str, object]],
+    predicate_key: str = adapter.FAKE_PREDICATE_KEY,
+) -> dict[str, object]:
+    return {
+        "resources": [json.loads(json.dumps(resource)) for resource in resources],
+        "claim_bindings": [
+            {
+                "parent_resource_id": resources[index * 2]["resource_id"],
+                "claim_resource_id": resources[index * 2 + 1]["resource_id"],
+                "object_resource_id": resources[index * 2 + 2]["resource_id"],
+                "predicate_key": predicate_key,
+            }
+            for index in range((len(resources) - 1) // 2)
+        ],
+    }
+
+
 def authorization_context(**overrides: object) -> dict[str, object]:
     authorization: dict[str, object] = {
         "version": "v1",
@@ -81,7 +114,74 @@ def authorization_context(**overrides: object) -> dict[str, object]:
 
 
 def authorized_params(**params: object) -> dict[str, object]:
+    if "query" in params:
+        params.setdefault("allowed_resources", fake_retrieve_allowed_resources())
+        params.setdefault("limit", 10)
+    frontier = params.get("frontier")
+    if "operation" not in params and isinstance(frontier, list) and frontier:
+        first = frontier[0]
+        if isinstance(first, dict) and isinstance(first.get("resource"), dict):
+            resource = first["resource"]
+            params["operation"] = graph_operation(
+                str(resource["versions"]["projection"]),
+                [str(resource["resource_id"])],
+            )
+            params.setdefault(
+                "phase",
+                "claim_to_object"
+                if resource.get("type") == "claim"
+                else "entity_to_claim",
+            )
+    if isinstance(frontier, list) and frontier:
+        params.setdefault("limit", adapter.MAX_PRIMITIVE_ITEMS)
     return {"authorization": authorization_context(), **params}
+
+
+def graph_operation(
+    projection_version: str,
+    start_resource_ids: list[str],
+    *,
+    predicate_keys: list[str] | None = None,
+    resource_kinds: list[str] | None = None,
+    direction: str = "outbound",
+    filters: list[dict[str, object]] | None = None,
+    order: list[dict[str, object]] | None = None,
+    max_frontier_width: int = 100,
+    max_candidates_per_hop: int = 100,
+) -> dict[str, object]:
+    return {
+        "version": 1,
+        "template": "claim_traversal_v1",
+        "parameters": {
+            "version": 1,
+            "predicate_allowlist_version": 1,
+            "resource_kind_allowlist_version": 1,
+            "projection_version": projection_version,
+            "identity_version": adapter.GRAPH_BINDING_CONTRACT_VERSION,
+            "start_resource_ids": sorted(set(start_resource_ids)),
+            "predicate_keys": sorted(
+                set(predicate_keys or [adapter.FAKE_PREDICATE_KEY])
+            ),
+            "resource_kinds": sorted(set(resource_kinds or ["entity"])),
+            "direction": direction,
+            "fields": sorted(adapter.REQUIRED_GRAPH_FIELDS),
+            "filters": filters or [],
+            "order": order
+            or [
+                {"key": "predicate_key", "direction": "ascending", "priority": 0},
+                {"key": "object_id", "direction": "ascending", "priority": 1},
+                {"key": "claim_id", "direction": "ascending", "priority": 2},
+            ],
+            "limits": {
+                "max_depth": 2,
+                "max_frontier_width": max_frontier_width,
+                "max_candidates_per_hop": max_candidates_per_hop,
+                "max_total_resources": 128,
+                "max_batch_checks": 16,
+                "max_wall_clock_millis": 5_000,
+            },
+        },
+    }
 
 
 def initialize_checkout_projection(
@@ -388,6 +488,22 @@ def real_graph_authorization() -> dict[str, object]:
     return authorization_context(tenant_id="local", knowledge_base_id="kb_test")
 
 
+def real_retrieve_params(
+    workspace: Path | str,
+    resources: list[dict[str, object]],
+    **overrides: object,
+) -> dict[str, object]:
+    params: dict[str, object] = {
+        "workspace": str(workspace),
+        "authorization": real_graph_authorization(),
+        "query": "knote",
+        "allowed_resources": sorted_resource_handles(resources),
+        "limit": 10,
+    }
+    params.update(overrides)
+    return params
+
+
 class AdapterTest(unittest.TestCase):
     def test_read_artifact_file_rejects_oversized_input_with_a_bounded_read(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -413,6 +529,80 @@ class AdapterTest(unittest.TestCase):
         lines = [json.loads(line) for line in proc.stdout.splitlines()]
         self.assertEqual(lines[-1]["type"], "result")
         self.assertEqual(lines[-1]["data"]["mode"], "fake")
+
+    def test_fake_discover_contract_is_complete_sorted_and_body_free(self) -> None:
+        request = {
+            "id": "discover",
+            "method": "kag.discover",
+            "params": {
+                "authorization": authorization_context(),
+                "resource_types": sorted(adapter.RESOURCE_TYPES),
+                "limit": adapter.MAX_PRIMITIVE_ITEMS,
+            },
+        }
+
+        _, first_lines = call_adapter(request)
+        _, second_lines = call_adapter(request)
+
+        first = first_lines[-1]
+        self.assertEqual(first, second_lines[-1])
+        self.assertEqual(first["type"], "result")
+        data = first["data"]
+        self.assertEqual(set(data), {"mode", "resources", "complete"})
+        self.assertEqual(data["mode"], "fake")
+        self.assertTrue(data["complete"])
+        self.assertEqual(
+            [resource["resource_id"] for resource in data["resources"]],
+            sorted(adapter.FAKE_CANDIDATES_BY_ID),
+        )
+        for resource in data["resources"]:
+            self.assertEqual(set(resource), adapter.RESOURCE_FIELDS)
+            self.assertEqual(
+                set(resource["versions"]), adapter.RESOURCE_VERSION_FIELDS
+            )
+            for protected_field in ("body", "content", "text", "title", "path"):
+                self.assertNotIn(protected_field, resource)
+
+    def test_discover_overflow_is_explicitly_incomplete_and_limit_is_fixed(self) -> None:
+        authorization = adapter.validate_authorization(real_graph_authorization())
+        resources = {
+            f"kg_{index:032x}": graph_contract_resource(
+                "prj_" + "a" * 32, f"res_{index:032x}"
+            )
+            for index in range(adapter.MAX_PRIMITIVE_ITEMS + 1)
+        }
+        params = {
+            "authorization": real_graph_authorization(),
+            "resource_types": ["document"],
+            "limit": adapter.MAX_PRIMITIVE_ITEMS,
+        }
+
+        discovered = adapter.discover_resources(
+            params, authorization, resources, "real"
+        )
+
+        self.assertFalse(discovered["complete"])
+        self.assertEqual(
+            len(discovered["resources"]), adapter.MAX_PRIMITIVE_ITEMS
+        )
+        self.assertEqual(
+            [resource["resource_id"] for resource in discovered["resources"]],
+            [f"res_{index:032x}" for index in range(adapter.MAX_PRIMITIVE_ITEMS)],
+        )
+        _, lines = call_adapter(
+            {
+                "id": "partial-discover",
+                "method": "kag.discover",
+                "params": {
+                    "authorization": authorization_context(),
+                    "resource_types": ["document"],
+                    "limit": adapter.MAX_PRIMITIVE_ITEMS - 1,
+                },
+            }
+        )
+        self.assertEqual(lines[-1]["type"], "error")
+        self.assertEqual(lines[-1]["code"], "invalid_request")
+        self.assertIn("full discovery scan limit", lines[-1]["error"])
 
     def test_fake_retrieve_contract_is_deterministic_and_body_free(self) -> None:
         request = {
@@ -465,7 +655,9 @@ class AdapterTest(unittest.TestCase):
             {
                 "id": "expand",
                 "method": "kag.expand",
-                "params": authorized_params(frontier=[intro], limit=2),
+                "params": authorized_params(
+                    frontier=[intro], limit=adapter.MAX_PRIMITIVE_ITEMS
+                ),
             }
         )
 
@@ -482,8 +674,19 @@ class AdapterTest(unittest.TestCase):
             self.assertEqual(set(candidate["resource"]), adapter.RESOURCE_FIELDS)
             self.assertEqual(set(candidate["resource"]["versions"]), adapter.RESOURCE_VERSION_FIELDS)
         for expansion in data["expansions"]:
-            self.assertEqual(set(expansion), {"from_resource_id", "to_resource_id", "hop"})
+            self.assertEqual(
+                set(expansion),
+                {
+                    "from_resource_id",
+                    "to_resource_id",
+                    "claim_resource_id",
+                    "predicate_key",
+                    "hop",
+                },
+            )
             self.assertEqual(expansion["from_resource_id"], adapter.FAKE_INTRO_ID)
+            self.assertEqual(expansion["claim_resource_id"], expansion["to_resource_id"])
+            self.assertEqual(expansion["predicate_key"], adapter.FAKE_PREDICATE_KEY)
             self.assertEqual(expansion["hop"], 1)
         self.assertNotIn("body", json.dumps(data))
         self.assertNotIn("relation", json.dumps(data))
@@ -535,6 +738,171 @@ class AdapterTest(unittest.TestCase):
         self.assertIn("knote is local-first.", data["answer"])
         self.assertIn("Its runtime can authorize graph stages before generation.", data["answer"])
 
+    def test_fake_generate_validates_complete_path_and_spies_only_resource_ids(self) -> None:
+        intro = fake_resource_handle(adapter.FAKE_INTRO_ID)
+        claim = fake_resource_handle(adapter.FAKE_LOCAL_FIRST_ID)
+        runtime = fake_resource_handle(adapter.FAKE_RUNTIME_ID)
+        evidence = {
+            "resource": runtime,
+            "content": adapter.FAKE_CONTENT_BY_ID[adapter.FAKE_RUNTIME_ID],
+            "citation_handle": "cite-runtime",
+        }
+        path = generate_path([intro, claim, runtime])
+
+        _, lines = call_adapter(
+            {
+                "id": "generate-path",
+                "method": "kag.generate",
+                "params": authorized_params(
+                    question="What is the runtime?", evidence=[evidence], paths=[path]
+                ),
+            },
+            stage_spy=True,
+        )
+
+        response = lines[-1]
+        self.assertEqual(response["type"], "result")
+        path_stage = response["data"]["debug"]["stages"][1]
+        self.assertEqual(
+            path_stage,
+            {
+                "stage": "generate.path_input",
+                "resource_ids": [
+                    adapter.FAKE_INTRO_ID,
+                    adapter.FAKE_LOCAL_FIRST_ID,
+                    adapter.FAKE_RUNTIME_ID,
+                ],
+                "count": 3,
+            },
+        )
+        self.assertTrue(
+            {"body", "label", "relation"}.isdisjoint(path_stage)
+        )
+
+    def test_fake_generate_rejects_malformed_incomplete_and_mismatched_paths(self) -> None:
+        intro = fake_resource_handle(adapter.FAKE_INTRO_ID)
+        claim = fake_resource_handle(adapter.FAKE_LOCAL_FIRST_ID)
+        runtime = fake_resource_handle(adapter.FAKE_RUNTIME_ID)
+        evidence = {
+            "resource": runtime,
+            "content": adapter.FAKE_CONTENT_BY_ID[adapter.FAKE_RUNTIME_ID],
+            "citation_handle": "cite-runtime",
+        }
+        base = authorized_params(
+            question="What is the runtime?",
+            evidence=[evidence],
+            paths=[generate_path([intro, claim, runtime])],
+        )
+
+        cases: list[tuple[str, object, str]] = [
+            (
+                "path count",
+                lambda params: params.update(paths=[]),
+                "exactly one complete path",
+            ),
+            (
+                "incomplete segment",
+                lambda params: params["paths"][0]["resources"].pop(),
+                "complete entity/Claim/entity",
+            ),
+            (
+                "binding sequence",
+                lambda params: params["paths"][0]["claim_bindings"][0].update(
+                    object_resource_id=adapter.FAKE_DENIED_NEXT_HOP_ID
+                ),
+                "does not match the resource sequence",
+            ),
+            (
+                "terminal evidence",
+                lambda params: params["paths"][0]["resources"][-1].update(
+                    content_digest=intro["content_digest"]
+                ),
+                "exact fake serving resource handle",
+            ),
+            (
+                "protected path field",
+                lambda params: params["paths"][0].update(
+                    body="PROTECTED PATH BODY"
+                ),
+                "unexpected body",
+            ),
+        ]
+        for name, mutate, expected_error in cases:
+            with self.subTest(name=name):
+                params = json.loads(json.dumps(base))
+                mutate(params)
+                proc, lines = call_adapter(
+                    {"id": "bad-path", "method": "kag.generate", "params": params}
+                )
+                response = lines[-1]
+                self.assertEqual(response["type"], "error")
+                self.assertIn(expected_error, response["error"])
+                self.assertNotIn("PROTECTED PATH BODY", proc.stderr)
+
+    def test_distinct_complete_paths_to_same_terminal_remain_distinguishable(self) -> None:
+        authorization = adapter.validate_authorization(authorization_context())
+        terminal = fake_resource_handle(adapter.FAKE_RUNTIME_ID)
+        evidence = [
+            adapter.validate_evidence(
+                {
+                    "resource": terminal,
+                    "content": adapter.FAKE_CONTENT_BY_ID[adapter.FAKE_RUNTIME_ID],
+                    "citation_handle": "cite-runtime",
+                },
+                "evidence[0]",
+            )
+        ]
+        intro = fake_resource_handle(adapter.FAKE_INTRO_ID)
+        first_claim = fake_resource_handle(adapter.FAKE_LOCAL_FIRST_ID)
+        alternate_parent = fake_resource_handle(adapter.FAKE_DENIED_CANARY_ID)
+        alternate_claim = fake_resource_handle(adapter.FAKE_DENIED_CANARY_DETAIL_ID)
+        selected_resources = {
+            resource["resource_id"]: resource
+            for resource in (
+                intro,
+                first_claim,
+                alternate_parent,
+                alternate_claim,
+                terminal,
+            )
+        }
+
+        def require_resource(resource: dict[str, object], field: str) -> None:
+            self.assertEqual(resource, selected_resources[resource["resource_id"]], field)
+
+        first = adapter.validate_generate_paths(
+            [generate_path([intro, first_claim, terminal])],
+            evidence,
+            authorization,
+            require_resource=require_resource,
+            claims=[
+                {
+                    "subject_resource_id": adapter.FAKE_INTRO_ID,
+                    "claim_resource_id": adapter.FAKE_LOCAL_FIRST_ID,
+                    "object_resource_id": adapter.FAKE_RUNTIME_ID,
+                    "predicate_key": adapter.FAKE_PREDICATE_KEY,
+                }
+            ],
+        )
+        second = adapter.validate_generate_paths(
+            [generate_path([alternate_parent, alternate_claim, terminal])],
+            evidence,
+            authorization,
+            require_resource=require_resource,
+            claims=[
+                {
+                    "subject_resource_id": adapter.FAKE_DENIED_CANARY_ID,
+                    "claim_resource_id": adapter.FAKE_DENIED_CANARY_DETAIL_ID,
+                    "object_resource_id": adapter.FAKE_RUNTIME_ID,
+                    "predicate_key": adapter.FAKE_PREDICATE_KEY,
+                }
+            ],
+        )
+        self.assertNotEqual(
+            json.dumps({"paths": first}, sort_keys=True),
+            json.dumps({"paths": second}, sort_keys=True),
+        )
+
     def test_validate_evidence_preserves_whitespace_for_digest(self) -> None:
         content = "  authorized body with boundary whitespace  \n"
         resource = fake_resource_handle(adapter.FAKE_INTRO_ID)
@@ -547,13 +915,56 @@ class AdapterTest(unittest.TestCase):
 
         self.assertEqual(validated["content"], content)
 
+    def test_graph_resource_identity_and_version_tokens_reject_whitespace(self) -> None:
+        resource = fake_resource_handle(adapter.FAKE_INTRO_ID)
+        cases: list[tuple[str, object]] = [
+            (
+                "resource_id",
+                lambda value: value.update(
+                    resource_id=" " + str(value["resource_id"])
+                ),
+            ),
+            (
+                "authz_object",
+                lambda value: value.update(
+                    authz_object=str(value["authz_object"]) + " "
+                ),
+            ),
+            (
+                "projection version",
+                lambda value: value["versions"].update(
+                    projection=" " + str(value["versions"]["projection"])
+                ),
+            ),
+            (
+                "source version",
+                lambda value: value["versions"].update(
+                    source=str(value["versions"]["source"]) + " "
+                ),
+            ),
+        ]
+        for name, mutate in cases:
+            with self.subTest(name=name):
+                malformed = json.loads(json.dumps(resource))
+                mutate(malformed)
+                with self.assertRaisesRegex(
+                    adapter.AdapterRequestError,
+                    "leading or trailing whitespace",
+                ):
+                    adapter.validate_resource(malformed, "resource")
+
     def test_authorization_context_is_exact_and_fail_closed(self) -> None:
         accepted = authorization_context(agent_id="agent_fake", task_id="task_fake")
         _, accepted_lines = call_adapter(
             {
                 "id": "accepted",
                 "method": "kag.retrieve",
-                "params": {"authorization": accepted, "query": "q", "limit": 1},
+                "params": {
+                    "authorization": accepted,
+                    "query": "q",
+                    "allowed_resources": fake_retrieve_allowed_resources(),
+                    "limit": 1,
+                },
             }
         )
         self.assertEqual(accepted_lines[-1]["type"], "result")
@@ -586,7 +997,12 @@ class AdapterTest(unittest.TestCase):
                     {
                         "id": "invalid-auth",
                         "method": "kag.retrieve",
-                        "params": {"authorization": authorization, "query": "q"},
+                        "params": {
+                            "authorization": authorization,
+                            "query": "q",
+                            "allowed_resources": fake_retrieve_allowed_resources(),
+                            "limit": 10,
+                        },
                     }
                 )
                 response = lines[-1]
@@ -618,6 +1034,8 @@ class AdapterTest(unittest.TestCase):
                     "params": {
                         "authorization": authorization_context(tenant_id="tenant_other"),
                         "query": "q",
+                        "allowed_resources": fake_retrieve_allowed_resources(),
+                        "limit": 10,
                     },
                 },
                 "outside authorization tenant_id",
@@ -682,7 +1100,9 @@ class AdapterTest(unittest.TestCase):
             {
                 "id": "x1",
                 "method": "kag.expand",
-                "params": authorized_params(frontier=[intro], limit=10),
+                "params": authorized_params(
+                    frontier=[intro], limit=adapter.MAX_PRIMITIVE_ITEMS
+                ),
             },
             stage_spy=True,
         )
@@ -702,7 +1122,10 @@ class AdapterTest(unittest.TestCase):
             {
                 "id": "x2",
                 "method": "kag.expand",
-                "params": authorized_params(frontier=authorized_frontier, limit=10),
+                "params": authorized_params(
+                    frontier=authorized_frontier,
+                    limit=adapter.MAX_PRIMITIVE_ITEMS,
+                ),
             },
             stage_spy=True,
         )
@@ -768,6 +1191,14 @@ class AdapterTest(unittest.TestCase):
         valid_candidate = adapter.copy_fake_candidate(adapter.FAKE_INTRO_ID)
         valid_resource = fake_resource_handle(adapter.FAKE_INTRO_ID)
         auth = authorization_context()
+        expand_base = {
+            "authorization": auth,
+            "operation": graph_operation(
+                adapter.FAKE_PROJECTION_VERSION, [adapter.FAKE_INTRO_ID]
+            ),
+            "phase": "entity_to_claim",
+            "limit": adapter.MAX_PRIMITIVE_ITEMS,
+        }
         cases = [
             (
                 {"id": "bad", "method": "kag.retrieve", "params": {"limit": 1}},
@@ -777,7 +1208,20 @@ class AdapterTest(unittest.TestCase):
                 {
                     "id": "bad",
                     "method": "kag.retrieve",
-                    "params": {"authorization": auth, "limit": 1},
+                    "params": {"authorization": auth, "query": "q", "limit": 1},
+                },
+                "missing allowed_resources",
+            ),
+            (
+                {
+                    "id": "bad",
+                    "method": "kag.retrieve",
+                    "params": {
+                        "authorization": auth,
+                        "query": "",
+                        "allowed_resources": fake_retrieve_allowed_resources(),
+                        "limit": 1,
+                    },
                 },
                 "query must be a non-empty string",
             ),
@@ -785,32 +1229,64 @@ class AdapterTest(unittest.TestCase):
                 {
                     "id": "bad",
                     "method": "kag.retrieve",
-                    "params": {"authorization": auth, "query": "q", "limit": 0},
+                    "params": {
+                        "authorization": auth,
+                        "query": "q",
+                        "allowed_resources": fake_retrieve_allowed_resources(),
+                        "limit": 0,
+                    },
                 },
                 "limit must be between 1 and 100",
             ),
             (
                 {
                     "id": "bad",
-                    "method": "kag.expand",
-                    "params": {"authorization": auth, "frontier": valid_candidate},
+                    "method": "kag.retrieve",
+                    "params": {
+                        "authorization": auth,
+                        "query": "q",
+                        "allowed_resources": list(
+                            reversed(fake_retrieve_allowed_resources())
+                        ),
+                        "limit": 10,
+                    },
                 },
-                "frontier must be a list",
+                "strictly sorted and unique",
             ),
             (
                 {
                     "id": "bad",
                     "method": "kag.expand",
-                    "params": {"authorization": auth, "frontier": []},
+                    "params": {**expand_base, "frontier": valid_candidate},
                 },
-                "frontier must be a list",
+                "frontier must contain between 1 and 100",
+            ),
+            (
+                {
+                    "id": "bad",
+                    "method": "kag.expand",
+                    "params": {**expand_base, "frontier": []},
+                },
+                "frontier must contain between 1 and 100",
             ),
             (
                 {
                     "id": "bad",
                     "method": "kag.expand",
                     "params": {
-                        "authorization": auth,
+                        **expand_base,
+                        "frontier": [valid_candidate],
+                        "limit": adapter.MAX_PRIMITIVE_ITEMS - 1,
+                    },
+                },
+                "full expansion scan limit",
+            ),
+            (
+                {
+                    "id": "bad",
+                    "method": "kag.expand",
+                    "params": {
+                        **expand_base,
                         "frontier": [{**valid_candidate, "content": "protected"}],
                     },
                 },
@@ -821,7 +1297,7 @@ class AdapterTest(unittest.TestCase):
                     "id": "bad",
                     "method": "kag.expand",
                     "params": {
-                        "authorization": auth,
+                        **expand_base,
                         "frontier": [{**valid_candidate, "score": float("nan")}],
                     },
                 },
@@ -832,7 +1308,7 @@ class AdapterTest(unittest.TestCase):
                     "id": "bad",
                     "method": "kag.expand",
                     "params": {
-                        "authorization": auth,
+                        **expand_base,
                         "frontier": [
                             {
                                 **valid_candidate,
@@ -848,7 +1324,7 @@ class AdapterTest(unittest.TestCase):
                     "id": "bad",
                     "method": "kag.expand",
                     "params": {
-                        "authorization": auth,
+                        **expand_base,
                         "frontier": [
                             {
                                 **valid_candidate,
@@ -871,7 +1347,7 @@ class AdapterTest(unittest.TestCase):
                     "method": "kag.generate",
                     "params": {"authorization": auth, "question": "q"},
                 },
-                "evidence must be a non-empty list",
+                "missing evidence",
             ),
             (
                 {
@@ -939,6 +1415,300 @@ class AdapterTest(unittest.TestCase):
                 self.assertEqual(response["code"], "invalid_request")
                 self.assertIn(expected_error, response["error"])
 
+    def test_expand_plan_boundary_rejects_unsupported_or_unstructured_input(self) -> None:
+        candidate = adapter.copy_fake_candidate(adapter.FAKE_INTRO_ID)
+        canary = "MATCH (secret:ProtectedLabel) RETURN secret.body"
+        cases: list[tuple[str, dict[str, object], str]] = []
+
+        def add_operation_case(
+            name: str, mutate: object, expected_error: str
+        ) -> None:
+            operation = graph_operation(
+                adapter.FAKE_PROJECTION_VERSION, [adapter.FAKE_INTRO_ID]
+            )
+            mutate(operation)
+            cases.append(
+                (
+                    name,
+                    authorized_params(
+                        operation=operation,
+                        phase="entity_to_claim",
+                        frontier=[candidate],
+                        limit=adapter.MAX_PRIMITIVE_ITEMS,
+                    ),
+                    expected_error,
+                )
+            )
+
+        add_operation_case(
+            "inbound",
+            lambda operation: operation["parameters"].update(direction="inbound"),
+            "direction is unsupported",
+        )
+        add_operation_case(
+            "both",
+            lambda operation: operation["parameters"].update(direction="both"),
+            "direction is unsupported",
+        )
+        add_operation_case(
+            "frontier provider maximum",
+            lambda operation: operation["parameters"]["limits"].update(
+                max_frontier_width=101
+            ),
+            "max_frontier_width exceeds provider limit",
+        )
+        add_operation_case(
+            "candidate provider maximum",
+            lambda operation: operation["parameters"]["limits"].update(
+                max_candidates_per_hop=101
+            ),
+            "max_candidates_per_hop exceeds provider limit",
+        )
+        add_operation_case(
+            "unsupported resource kind",
+            lambda operation: operation["parameters"].update(
+                resource_kinds=["document"]
+            ),
+            "resource_kinds is unsupported by the provider",
+        )
+        add_operation_case(
+            "unknown predicate",
+            lambda operation: operation["parameters"].update(
+                predicate_keys=["pred_" + "f" * 32]
+            ),
+            "not declared by the active allowlist",
+        )
+        add_operation_case(
+            "stale projection",
+            lambda operation: operation["parameters"].update(
+                projection_version="prj_" + "e" * 32
+            ),
+            "does not match the selected projection",
+        )
+        add_operation_case(
+            "raw nested query",
+            lambda operation: operation.update(cypher=canary),
+            "unexpected cypher",
+        )
+        cases.extend(
+            [
+                (
+                    "unknown phase",
+                    authorized_params(
+                        operation=graph_operation(
+                            adapter.FAKE_PROJECTION_VERSION,
+                            [adapter.FAKE_INTRO_ID],
+                        ),
+                        phase="entity_to_relation",
+                        frontier=[candidate],
+                    ),
+                    "phase is unsupported",
+                ),
+                (
+                    "wrong frontier kind",
+                    authorized_params(
+                        operation=graph_operation(
+                            adapter.FAKE_PROJECTION_VERSION,
+                            [adapter.FAKE_INTRO_ID],
+                        ),
+                        phase="claim_to_object",
+                        frontier=[candidate],
+                    ),
+                    "type is unsupported for phase",
+                ),
+                (
+                    "raw top-level query",
+                    {
+                        **authorized_params(
+                            operation=graph_operation(
+                                adapter.FAKE_PROJECTION_VERSION,
+                                [adapter.FAKE_INTRO_ID],
+                            ),
+                            phase="entity_to_claim",
+                            frontier=[candidate],
+                        ),
+                        "gql": canary,
+                    },
+                    "unexpected gql",
+                ),
+            ]
+        )
+
+        for name, params, expected_error in cases:
+            with self.subTest(name=name):
+                proc, lines = call_adapter(
+                    {"id": "bad-plan", "method": "kag.expand", "params": params}
+                )
+                response = lines[-1]
+                self.assertEqual(response["type"], "error")
+                self.assertEqual(response["code"], "invalid_request")
+                self.assertIn(expected_error, response["error"])
+                self.assertNotIn(canary, proc.stdout)
+                self.assertNotIn(canary, proc.stderr)
+
+    def test_phase_expansion_rejects_unique_target_overflow(self) -> None:
+        projection = "prj_" + "1" * 32
+        frontier_id = "res_" + "1" * 32
+        frontier_resource = graph_contract_resource(projection, frontier_id)
+        frontier_resource["type"] = "entity"
+        frontier_resource["authz_object"] = f"entity:{frontier_id}"
+        handles = [{"resource": frontier_resource, "score": 1.0}]
+        resources_by_id: dict[str, dict[str, object]] = {}
+        claims: list[dict[str, str]] = []
+        for index in range(101):
+            claim_id = f"res_{index + 2:032x}"
+            object_id = f"res_{index + 200:032x}"
+            claim_resource = graph_contract_resource(projection, claim_id)
+            claim_resource["type"] = "claim"
+            claim_resource["authz_object"] = f"claim:{claim_id}"
+            object_resource = graph_contract_resource(projection, object_id)
+            object_resource["type"] = "entity"
+            object_resource["authz_object"] = f"entity:{object_id}"
+            resources_by_id[claim_id] = claim_resource
+            resources_by_id[object_id] = object_resource
+            claims.append(
+                {
+                    "claim_resource_id": claim_id,
+                    "subject_resource_id": frontier_id,
+                    "predicate_key": adapter.FAKE_PREDICATE_KEY,
+                    "object_resource_id": object_id,
+                    "source_document_resource_id": "res_" + "f" * 32,
+                    "derivation": "any_support",
+                }
+            )
+
+        with self.assertRaisesRegex(
+            adapter.AdapterRequestError, "expansion candidate limit exceeded"
+        ):
+            adapter.phase_expansion(
+                handles,
+                100,
+                graph_operation(projection, [frontier_id]),
+                "entity_to_claim",
+                resources_by_id,
+                claims,
+            )
+        with self.assertRaisesRegex(
+            adapter.AdapterRequestError, "full expansion scan limit"
+        ):
+            adapter.phase_expansion(
+                handles,
+                1,
+                graph_operation(projection, [frontier_id]),
+                "entity_to_claim",
+                resources_by_id,
+                claims[:2],
+            )
+
+    def test_fake_expand_applies_structured_filters_order_and_phases(self) -> None:
+        intro = adapter.copy_fake_candidate(adapter.FAKE_INTRO_ID)
+        filtered_operation = graph_operation(
+            adapter.FAKE_PROJECTION_VERSION,
+            [adapter.FAKE_INTRO_ID],
+            filters=[
+                {
+                    "kind": "claim_id_in",
+                    "resource_ids": [adapter.FAKE_LOCAL_FIRST_ID],
+                }
+            ],
+        )
+        _, filtered_lines = call_adapter(
+            {
+                "id": "filtered",
+                "method": "kag.expand",
+                "params": authorized_params(
+                    operation=filtered_operation,
+                    phase="entity_to_claim",
+                    frontier=[intro],
+                    limit=adapter.MAX_PRIMITIVE_ITEMS,
+                ),
+            }
+        )
+        filtered = filtered_lines[-1]["data"]
+        self.assertEqual(
+            [candidate_resource_id(item) for item in filtered["candidates"]],
+            [adapter.FAKE_LOCAL_FIRST_ID],
+        )
+
+        ordered_operation = graph_operation(
+            adapter.FAKE_PROJECTION_VERSION,
+            [adapter.FAKE_INTRO_ID],
+            order=[
+                {"key": "claim_id", "direction": "descending", "priority": 0}
+            ],
+        )
+        _, ordered_lines = call_adapter(
+            {
+                "id": "ordered",
+                "method": "kag.expand",
+                "params": authorized_params(
+                    operation=ordered_operation,
+                    phase="entity_to_claim",
+                    frontier=[intro],
+                    limit=adapter.MAX_PRIMITIVE_ITEMS,
+                ),
+            }
+        )
+        self.assertEqual(
+            [
+                candidate_resource_id(item)
+                for item in ordered_lines[-1]["data"]["candidates"]
+            ],
+            [adapter.FAKE_LOCAL_FIRST_ID, adapter.FAKE_DENIED_FRONTIER_ID],
+        )
+
+        post_authorization_limit_operation = graph_operation(
+            adapter.FAKE_PROJECTION_VERSION,
+            [adapter.FAKE_INTRO_ID],
+            max_candidates_per_hop=1,
+        )
+        _, scan_lines = call_adapter(
+            {
+                "id": "post-authorization-limit",
+                "method": "kag.expand",
+                "params": authorized_params(
+                    operation=post_authorization_limit_operation,
+                    phase="entity_to_claim",
+                    frontier=[intro],
+                    limit=adapter.MAX_PRIMITIVE_ITEMS,
+                ),
+            }
+        )
+        self.assertEqual(
+            [
+                candidate_resource_id(item)
+                for item in scan_lines[-1]["data"]["candidates"]
+            ],
+            [adapter.FAKE_LOCAL_FIRST_ID, adapter.FAKE_DENIED_FRONTIER_ID],
+        )
+
+        claim = filtered["candidates"][0]
+        _, object_lines = call_adapter(
+            {
+                "id": "object",
+                "method": "kag.expand",
+                "params": authorized_params(
+                    operation=filtered_operation,
+                    phase="claim_to_object",
+                    frontier=[claim],
+                    limit=adapter.MAX_PRIMITIVE_ITEMS,
+                ),
+            }
+        )
+        object_data = object_lines[-1]["data"]
+        self.assertEqual(
+            [candidate_resource_id(item) for item in object_data["candidates"]],
+            [adapter.FAKE_RUNTIME_ID],
+        )
+        self.assertEqual(
+            object_data["expansions"][0]["claim_resource_id"],
+            adapter.FAKE_LOCAL_FIRST_ID,
+        )
+        self.assertEqual(
+            object_data["expansions"][0]["predicate_key"],
+            adapter.FAKE_PREDICATE_KEY,
+        )
+
     def test_non_object_request_is_a_typed_error(self) -> None:
         _, lines = call_adapter([])
 
@@ -947,11 +1717,199 @@ class AdapterTest(unittest.TestCase):
             {"id": "", "type": "error", "error": "request must be a JSON object", "code": "invalid_request"},
         )
 
+    def test_real_discover_reads_complete_sorted_handles_without_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            projection_id = "prj_" + "a" * 32
+            resources = [
+                graph_contract_typed_resource(
+                    projection_id,
+                    "res_33333333333333333333333333333333",
+                    "entity",
+                    "third body",
+                ),
+                graph_contract_typed_resource(
+                    projection_id,
+                    "res_11111111111111111111111111111111",
+                    "document",
+                    "first body",
+                ),
+                graph_contract_typed_resource(
+                    projection_id,
+                    "res_22222222222222222222222222222222",
+                    "entity",
+                    "second body",
+                ),
+            ]
+            graph_rows = sorted(
+                [graph_contract_binding(projection_id, resource) for resource in resources],
+                key=lambda row: str(row["graph_object_id"]),
+            )
+            write_graph_contract_bundle(workspace, graph_rows=graph_rows)
+            stdout = StringIO()
+            with (
+                patch.object(adapter, "call_permissioned_provider") as provider,
+                redirect_stdout(stdout),
+            ):
+                adapter.real_response(
+                    {
+                        "id": "discover-real",
+                        "method": "kag.discover",
+                        "params": {
+                            "workspace": str(workspace),
+                            "authorization": real_graph_authorization(),
+                            "resource_types": ["document", "entity"],
+                            "limit": adapter.MAX_PRIMITIVE_ITEMS,
+                        },
+                    }
+                )
+
+            provider.assert_not_called()
+            response = json.loads(stdout.getvalue())
+            self.assertEqual(response["type"], "result")
+            self.assertTrue(response["data"]["complete"])
+            self.assertEqual(
+                response["data"]["resources"], sorted_resource_handles(resources)
+            )
+            self.assertNotIn("body", json.dumps(response["data"]))
+
+    def test_real_retrieve_passes_only_exact_allowlist_to_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            projection_id = "prj_" + "a" * 32
+            resources = [
+                graph_contract_resource(
+                    projection_id, f"res_{index:032x}"
+                )
+                for index in (1, 2, 3)
+            ]
+            graph_rows = sorted(
+                [graph_contract_binding(projection_id, resource) for resource in resources],
+                key=lambda row: str(row["graph_object_id"]),
+            )
+            write_graph_contract_bundle(workspace, graph_rows=graph_rows)
+            allowed = [resources[0], resources[2]]
+            expected_graph_ids = sorted(
+                adapter.expected_graph_object_id(
+                    projection_id, str(resource["resource_id"])
+                )
+                for resource in allowed
+            )
+            denied_graph_id = adapter.expected_graph_object_id(
+                projection_id, str(resources[1]["resource_id"])
+            )
+            resource_by_graph_id = {
+                adapter.expected_graph_object_id(
+                    projection_id, str(resource["resource_id"])
+                ): resource
+                for resource in resources
+            }
+            observed: list[tuple[dict[str, object], str, dict[str, object]]] = []
+
+            def provider_call(
+                context: dict[str, object], method: str, request: dict[str, object]
+            ) -> dict[str, object]:
+                observed.append((context, method, request))
+                return {
+                    "candidates": [
+                        {"graph_object_id": expected_graph_ids[0], "score": 0.9}
+                    ]
+                }
+
+            stdout = StringIO()
+            with (
+                patch.object(
+                    adapter, "call_permissioned_provider", side_effect=provider_call
+                ),
+                redirect_stdout(stdout),
+            ):
+                adapter.real_response(
+                    {
+                        "id": "retrieve-allowlist",
+                        "method": "kag.retrieve",
+                        "params": real_retrieve_params(
+                            workspace, allowed, query="authorized query", limit=7
+                        ),
+                    }
+                )
+
+            self.assertEqual(len(observed), 1)
+            context, method, request = observed[0]
+            self.assertEqual(method, "retrieve")
+            self.assertEqual(context["allowed_graph_object_ids"], expected_graph_ids)
+            self.assertEqual(request["allowed_graph_object_ids"], expected_graph_ids)
+            self.assertNotIn(denied_graph_id, json.dumps(context))
+            self.assertNotIn(denied_graph_id, json.dumps(request))
+            response = json.loads(stdout.getvalue())
+            self.assertEqual(
+                response["data"]["candidates"],
+                [{"resource": resource_by_graph_id[expected_graph_ids[0]], "score": 0.9}],
+            )
+
+    def test_real_retrieve_rejects_provider_candidate_outside_allowlist(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            projection_id = "prj_" + "a" * 32
+            allowed = graph_contract_resource(
+                projection_id, "res_11111111111111111111111111111111"
+            )
+            denied = graph_contract_resource(
+                projection_id, "res_22222222222222222222222222222222"
+            )
+            graph_rows = sorted(
+                [
+                    graph_contract_binding(projection_id, allowed),
+                    graph_contract_binding(projection_id, denied),
+                ],
+                key=lambda row: str(row["graph_object_id"]),
+            )
+            write_graph_contract_bundle(workspace, graph_rows=graph_rows)
+            denied_graph_id = adapter.expected_graph_object_id(
+                projection_id, str(denied["resource_id"])
+            )
+
+            with (
+                patch.object(
+                    adapter,
+                    "call_permissioned_provider",
+                    return_value={
+                        "candidates": [
+                            {"graph_object_id": denied_graph_id, "score": 1.0}
+                        ]
+                    },
+                ),
+                self.assertRaises(adapter.AdapterRequestError) as caught,
+            ):
+                adapter.real_response(
+                    {
+                        "id": "outside-allowlist",
+                        "method": "kag.retrieve",
+                        "params": real_retrieve_params(workspace, [allowed]),
+                    }
+                )
+
+            self.assertEqual(
+                caught.exception.code, adapter.INVALID_PRIMITIVE_RESPONSE_CODE
+            )
+            self.assertEqual(
+                str(caught.exception),
+                "permissioned retrieve provider returned an invalid candidate",
+            )
+
     def test_real_primitives_never_initialize_stock_kag_solver_components(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
-            projection_id = write_graph_contract_bundle(workspace)
-            resource = graph_contract_resource(projection_id)
+            projection_id = "prj_" + "a" * 32
+            resource = graph_contract_typed_resource(
+                projection_id,
+                "res_11111111111111111111111111111111",
+                "entity",
+                "permissioned body",
+            )
+            write_graph_contract_bundle(
+                workspace,
+                graph_rows=[graph_contract_binding(projection_id, resource)],
+            )
             graph_object_id = adapter.expected_graph_object_id(
                 projection_id, str(resource["resource_id"])
             )
@@ -966,10 +1924,18 @@ class AdapterTest(unittest.TestCase):
                 raise AssertionError(f"unexpected provider method: {method}")
 
             requests = {
-                "kag.retrieve": {"query": "knote", "limit": 10},
-                "kag.expand": {
-                    "frontier": [{"resource": resource, "score": 0.9}],
+                "kag.retrieve": {
+                    "query": "knote",
+                    "allowed_resources": sorted_resource_handles([resource]),
                     "limit": 10,
+                },
+                "kag.expand": {
+                    "operation": graph_operation(
+                        projection_id, [str(resource["resource_id"])]
+                    ),
+                    "phase": "entity_to_claim",
+                    "frontier": [{"resource": resource, "score": 0.9}],
+                    "limit": adapter.MAX_PRIMITIVE_ITEMS,
                 },
                 "kag.generate": {
                     "question": "knote",
@@ -1055,12 +2021,9 @@ class AdapterTest(unittest.TestCase):
                     {
                         "id": "binding",
                         "method": "kag.retrieve",
-                        "params": {
-                            "workspace": str(workspace),
-                            "authorization": real_graph_authorization(),
-                            "query": "knote",
-                            "limit": 10,
-                        },
+                        "params": real_retrieve_params(
+                            workspace, [graph_contract_resource(projection_id)]
+                        ),
                     },
                     fake=False,
                 )
@@ -1073,12 +2036,11 @@ class AdapterTest(unittest.TestCase):
                 {
                     "id": "missing",
                     "method": "kag.retrieve",
-                    "params": {
-                        "workspace": directory,
-                        "authorization": real_graph_authorization(),
-                        "query": "knote",
-                        "limit": 10,
-                    },
+                    "params": real_retrieve_params(
+                        directory,
+                        [graph_contract_resource(projection_id)],
+                        limit=adapter.MAX_PRIMITIVE_ITEMS,
+                    ),
                 },
                 fake=False,
             )
@@ -1097,12 +2059,11 @@ class AdapterTest(unittest.TestCase):
                 {
                     "id": "source-backed",
                     "method": "kag.retrieve",
-                    "params": {
-                        "workspace": str(workspace),
-                        "authorization": real_graph_authorization(),
-                        "query": "knote",
-                        "limit": 10,
-                    },
+                    "params": real_retrieve_params(
+                        workspace,
+                        [graph_rows[0]["resource"]],
+                        limit=adapter.MAX_PRIMITIVE_ITEMS,
+                    ),
                 },
                 fake=False,
             )
@@ -1131,10 +2092,10 @@ class AdapterTest(unittest.TestCase):
                     contract_version=adapter.GRAPH_BINDING_CONTRACT_VERSION_V1,
                 )
 
-                _, upgraded = adapter.load_current_graph_contract(
+                _, upgraded, _ = adapter.load_current_graph_contract(
                     {"workspace": str(workspace)}, real_graph_authorization()
                 )
-                _, repeated = adapter.load_current_graph_contract(
+                _, repeated, _ = adapter.load_current_graph_contract(
                     {"workspace": str(workspace)}, real_graph_authorization()
                 )
 
@@ -1164,7 +2125,7 @@ class AdapterTest(unittest.TestCase):
                 contract_version=adapter.GRAPH_BINDING_CONTRACT_VERSION_V1,
             )
 
-            resources, upgraded = adapter.load_current_graph_contract(
+            resources, upgraded, _ = adapter.load_current_graph_contract(
                 {"workspace": str(workspace)}, real_graph_authorization()
             )
 
@@ -1228,12 +2189,9 @@ class AdapterTest(unittest.TestCase):
                     {
                         "id": "invalid-source-backed",
                         "method": "kag.retrieve",
-                        "params": {
-                            "workspace": str(workspace),
-                            "authorization": real_graph_authorization(),
-                            "query": "knote",
-                            "limit": 10,
-                        },
+                        "params": real_retrieve_params(
+                            workspace, [graph_rows[0]["resource"]]
+                        ),
                     },
                     fake=False,
                 )
@@ -1256,12 +2214,11 @@ class AdapterTest(unittest.TestCase):
                 {
                     "id": "undeclared-predicate",
                     "method": "kag.retrieve",
-                    "params": {
-                        "workspace": str(workspace),
-                        "authorization": real_graph_authorization(),
-                        "query": "knote",
-                        "limit": 10,
-                    },
+                    "params": real_retrieve_params(
+                        workspace,
+                        [graph_rows[0]["resource"]],
+                        limit=adapter.MAX_PRIMITIVE_ITEMS,
+                    ),
                 },
                 fake=False,
             )
@@ -1290,12 +2247,11 @@ class AdapterTest(unittest.TestCase):
                 {
                     "id": "tampered",
                     "method": "kag.retrieve",
-                    "params": {
-                        "workspace": str(workspace),
-                        "authorization": real_graph_authorization(),
-                        "query": "knote",
-                        "limit": 10,
-                    },
+                    "params": real_retrieve_params(
+                        workspace,
+                        [graph_contract_resource(projection_id)],
+                        limit=adapter.MAX_PRIMITIVE_ITEMS,
+                    ),
                 },
                 fake=False,
             )
@@ -1308,7 +2264,8 @@ class AdapterTest(unittest.TestCase):
     def test_real_primitive_ignores_flat_compatibility_graph_binding(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
-            write_graph_contract_bundle(workspace)
+            projection_id = write_graph_contract_bundle(workspace)
+            resource = graph_contract_resource(projection_id)
             (workspace / "artifacts" / adapter.GRAPH_BINDINGS_ARTIFACT).write_text(
                 '{"title":"forged compatibility metadata"}\n', encoding="utf-8"
             )
@@ -1316,12 +2273,7 @@ class AdapterTest(unittest.TestCase):
                 {
                     "id": "compatibility",
                     "method": "kag.retrieve",
-                    "params": {
-                        "workspace": str(workspace),
-                        "authorization": real_graph_authorization(),
-                        "query": "knote",
-                        "limit": 10,
-                    },
+                    "params": real_retrieve_params(workspace, [resource]),
                 },
                 fake=False,
             )
@@ -1383,12 +2335,7 @@ def create(context):
                 {
                     "id": "retrieve-real",
                     "method": "kag.retrieve",
-                    "params": {
-                        "workspace": str(workspace),
-                        "authorization": real_graph_authorization(),
-                        "query": "knote",
-                        "limit": 10,
-                    },
+                    "params": real_retrieve_params(workspace, [resource]),
                 },
                 fake=False,
                 stage_spy=True,
@@ -1505,6 +2452,9 @@ def create(context):
             write_graph_contract_bundle(
                 workspace, graph_rows=graph_rows, claim_rows=claim_rows
             )
+            operation = graph_operation(
+                projection_id, [str(subject["resource_id"])]
+            )
 
             first_proc, first_lines = call_adapter(
                 {
@@ -1513,8 +2463,10 @@ def create(context):
                     "params": {
                         "workspace": str(workspace),
                         "authorization": real_graph_authorization(),
+                        "operation": operation,
+                        "phase": "entity_to_claim",
                         "frontier": [{"resource": subject, "score": 0.8}],
-                        "limit": 10,
+                        "limit": adapter.MAX_PRIMITIVE_ITEMS,
                     },
                 },
                 fake=False,
@@ -1532,6 +2484,8 @@ def create(context):
                     {
                         "from_resource_id": subject["resource_id"],
                         "to_resource_id": claim["resource_id"],
+                        "claim_resource_id": claim["resource_id"],
+                        "predicate_key": predicate_key,
                         "hop": 1,
                     }
                 ],
@@ -1544,8 +2498,10 @@ def create(context):
                     "params": {
                         "workspace": str(workspace),
                         "authorization": real_graph_authorization(),
+                        "operation": operation,
+                        "phase": "claim_to_object",
                         "frontier": first["data"]["candidates"],
-                        "limit": 10,
+                        "limit": adapter.MAX_PRIMITIVE_ITEMS,
                     },
                 },
                 fake=False,
@@ -1555,9 +2511,141 @@ def create(context):
                 [candidate_resource_id(value) for value in second["data"]["candidates"]],
                 [target["resource_id"]],
             )
+            self.assertEqual(
+                second["data"]["expansions"],
+                [
+                    {
+                        "from_resource_id": claim["resource_id"],
+                        "to_resource_id": target["resource_id"],
+                        "claim_resource_id": claim["resource_id"],
+                        "predicate_key": predicate_key,
+                        "hop": 1,
+                    }
+                ],
+            )
             serialized = first_proc.stdout + first_proc.stderr + second_proc.stdout + second_proc.stderr
             self.assertNotIn("PROTECTED CLAIM BODY", serialized)
-            self.assertNotIn(predicate_key, serialized)
+            self.assertIn(predicate_key, serialized)
+            self.assertNotIn("located_in", serialized)
+            self.assertNotIn("relation_label", serialized)
+
+    def test_real_generate_forwards_only_validated_selected_path_metadata(self) -> None:
+        provider_source = r'''
+import os
+
+class Provider:
+    def generate(self, request):
+        path = request["paths"][0]
+        assert [item["resource_id"] for item in path["resources"]] == os.environ["KNOTE_PATH_IDS"].split(",")
+        assert set(path) == {"resources", "claim_bindings"}
+        assert set(path["claim_bindings"][0]) == {
+            "parent_resource_id", "claim_resource_id", "object_resource_id", "predicate_key"
+        }
+        for resource in path["resources"]:
+            assert {"body", "content", "label", "relation"}.isdisjoint(resource)
+        with open(os.environ["KNOTE_PROVIDER_STAGE_FILE"], "a", encoding="utf-8") as stream:
+            stream.write("generate\n")
+        return {"answer": "authorized path answer"}
+
+def create(context):
+    return Provider()
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            projection_id = "prj_" + "a" * 32
+            graph_rows, claim_row = source_backed_claim_contract(projection_id)
+            write_graph_contract_bundle(
+                workspace, graph_rows=graph_rows, claim_rows=[claim_row]
+            )
+            resources = {
+                row["resource"]["resource_id"]: row["resource"] for row in graph_rows
+            }
+            subject = resources[claim_row["subject_resource_id"]]
+            claim = resources[
+                next(
+                    row["resource"]["resource_id"]
+                    for row in graph_rows
+                    if row["graph_object_id"] == claim_row["claim"]
+                )
+            ]
+            target = resources[claim_row["object_resource_id"]]
+            path = generate_path(
+                [subject, claim, target], str(claim_row["predicate_key"])
+            )
+            evidence = {
+                "resource": target,
+                "content": "permissioned body",
+                "citation_handle": "cite-target",
+            }
+            stage_file = workspace / "path-provider-stages.txt"
+            env = write_permissioned_provider_module(workspace, provider_source)
+            env.update(
+                {
+                    "KNOTE_PATH_IDS": ",".join(
+                        str(resource["resource_id"])
+                        for resource in (subject, claim, target)
+                    ),
+                    "KNOTE_PROVIDER_STAGE_FILE": str(stage_file),
+                }
+            )
+
+            _, lines = call_adapter(
+                {
+                    "id": "generate-selected-path",
+                    "method": "kag.generate",
+                    "params": {
+                        "workspace": str(workspace),
+                        "authorization": real_graph_authorization(),
+                        "question": "What is the target?",
+                        "evidence": [evidence],
+                        "paths": [path],
+                    },
+                },
+                fake=False,
+                stage_spy=True,
+                extra_env=env,
+            )
+            response = lines[-1]
+            self.assertEqual(response["type"], "result")
+            self.assertEqual(response["data"]["answer"], "authorized path answer")
+            self.assertEqual(
+                response["data"]["debug"]["stages"][1],
+                {
+                    "stage": "generate.path_input",
+                    "resource_ids": [
+                        subject["resource_id"],
+                        claim["resource_id"],
+                        target["resource_id"],
+                    ],
+                    "count": 3,
+                },
+            )
+            self.assertEqual(stage_file.read_text(encoding="utf-8"), "generate\n")
+
+            mismatched = json.loads(json.dumps(path))
+            mismatched["claim_bindings"][0]["predicate_key"] = next(
+                key
+                for key in sorted(adapter.SUPPORTED_CLAIM_PREDICATE_KEYS)
+                if key != claim_row["predicate_key"]
+            )
+            _, rejected_lines = call_adapter(
+                {
+                    "id": "reject-mismatched-path",
+                    "method": "kag.generate",
+                    "params": {
+                        "workspace": str(workspace),
+                        "authorization": real_graph_authorization(),
+                        "question": "What is the target?",
+                        "evidence": [evidence],
+                        "paths": [mismatched],
+                    },
+                },
+                fake=False,
+                extra_env=env,
+            )
+            self.assertEqual(rejected_lines[-1]["type"], "error")
+            self.assertEqual(rejected_lines[-1]["code"], "invalid_graph_binding")
+            self.assertEqual(stage_file.read_text(encoding="utf-8"), "generate\n")
 
     def test_real_provider_is_not_loaded_before_exact_evidence_validation(self) -> None:
         provider_source = r'''
@@ -1629,12 +2717,7 @@ def create(context):
                 {
                     "id": "leak",
                     "method": "kag.retrieve",
-                    "params": {
-                        "workspace": str(workspace),
-                        "authorization": real_graph_authorization(),
-                        "query": "knote",
-                        "limit": 10,
-                    },
+                    "params": real_retrieve_params(workspace, [resource]),
                 },
                 fake=False,
                 extra_env=env,
@@ -1656,19 +2739,15 @@ def create(context):
 '''
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
-            write_graph_contract_bundle(workspace)
+            projection_id = write_graph_contract_bundle(workspace)
+            resource = graph_contract_resource(projection_id)
             env = write_permissioned_provider_module(workspace, provider_source)
             env["KNOTE_PROVIDER_CANARY"] = canary
             proc, lines = call_adapter(
                 {
                     "id": "top-level-provider-field",
                     "method": "kag.retrieve",
-                    "params": {
-                        "workspace": str(workspace),
-                        "authorization": real_graph_authorization(),
-                        "query": "knote",
-                        "limit": 10,
-                    },
+                    "params": real_retrieve_params(workspace, [resource]),
                 },
                 fake=False,
                 extra_env=env,
@@ -1693,19 +2772,15 @@ def create(context):
 '''
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
-            write_graph_contract_bundle(workspace)
+            projection_id = write_graph_contract_bundle(workspace)
+            resource = graph_contract_resource(projection_id)
             env = write_permissioned_provider_module(workspace, provider_source)
             env["KNOTE_PROVIDER_CANARY"] = canary
             proc, lines = call_adapter(
                 {
                     "id": "lazy-provider-capability",
                     "method": "kag.retrieve",
-                    "params": {
-                        "workspace": str(workspace),
-                        "authorization": real_graph_authorization(),
-                        "query": "knote",
-                        "limit": 10,
-                    },
+                    "params": real_retrieve_params(workspace, [resource]),
                 },
                 fake=False,
                 extra_env=env,
@@ -1747,12 +2822,7 @@ def create(context):
                 {
                     "id": "provider-failure",
                     "method": "kag.retrieve",
-                    "params": {
-                        "workspace": str(workspace),
-                        "authorization": real_graph_authorization(),
-                        "query": "knote",
-                        "limit": 10,
-                    },
+                    "params": real_retrieve_params(workspace, [resource]),
                 },
                 fake=False,
                 extra_env=env,
@@ -1796,12 +2866,7 @@ def create(context):
                 {
                     "id": "native-stdio-provider",
                     "method": "kag.retrieve",
-                    "params": {
-                        "workspace": str(workspace),
-                        "authorization": real_graph_authorization(),
-                        "query": "knote",
-                        "limit": 10,
-                    },
+                    "params": real_retrieve_params(workspace, [resource]),
                 },
                 fake=False,
                 extra_env=env,
@@ -1846,12 +2911,7 @@ def create(context):
                 {
                     "id": "enumerated-fd-provider",
                     "method": "kag.retrieve",
-                    "params": {
-                        "workspace": str(workspace),
-                        "authorization": real_graph_authorization(),
-                        "query": "knote",
-                        "limit": 10,
-                    },
+                    "params": real_retrieve_params(workspace, [resource]),
                 },
                 fake=False,
                 extra_env=env,
@@ -1904,12 +2964,7 @@ def create(context):
                 {
                     "id": "procfs-parent-fd-provider",
                     "method": "kag.retrieve",
-                    "params": {
-                        "workspace": str(workspace),
-                        "authorization": real_graph_authorization(),
-                        "query": "knote",
-                        "limit": 10,
-                    },
+                    "params": real_retrieve_params(workspace, [resource]),
                 },
                 fake=False,
                 extra_env=env,
@@ -1936,19 +2991,15 @@ def create(context):
 '''
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
-            write_graph_contract_bundle(workspace)
+            projection_id = write_graph_contract_bundle(workspace)
+            resource = graph_contract_resource(projection_id)
             env = write_permissioned_provider_module(workspace, provider_source)
             env["KNOTE_PROVIDER_CANARY"] = canary
             proc, lines = call_adapter(
                 {
                     "id": "dict-subclass-provider",
                     "method": "kag.retrieve",
-                    "params": {
-                        "workspace": str(workspace),
-                        "authorization": real_graph_authorization(),
-                        "query": "knote",
-                        "limit": 10,
-                    },
+                    "params": real_retrieve_params(workspace, [resource]),
                 },
                 fake=False,
                 extra_env=env,

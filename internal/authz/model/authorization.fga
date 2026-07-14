@@ -33,3 +33,43 @@ type document
     define unscoped_editor: editor or inherited_editor
     define can_view: member from organization and unscoped_reader
     define can_edit: member from organization and unscoped_editor
+
+type entity
+  relations
+    define organization: [organization]
+    define source_document: [document]
+    define viewer: [user, group#member]
+    define editor: [user, group#member]
+    define restricted: [user:*]
+    define inherited_reader: can_view from source_document but not restricted
+    define inherited_editor: can_edit from source_document but not restricted
+    define unscoped_reader: viewer or editor or inherited_reader
+    define unscoped_editor: editor or inherited_editor
+    define can_view: member from organization and unscoped_reader
+    define can_edit: member from organization and unscoped_editor
+
+type claim
+  relations
+    define organization: [organization]
+    define source_document: [document]
+    define subject: [entity]
+    define object: [entity]
+    define viewer: [user, group#member]
+    define editor: [user, group#member]
+    define restricted: [user:*]
+    define source_reader: can_view from source_document
+    define source_editor: can_edit from source_document
+    define subject_reader: can_view from subject
+    define subject_editor: can_edit from subject
+    define object_reader: can_view from object
+    define object_editor: can_edit from object
+    define entities_reader: subject_reader and object_reader
+    define entities_editor: subject_editor and object_editor
+    define inheritable_reader: source_reader and entities_reader
+    define inheritable_editor: source_editor and entities_editor
+    define inherited_reader: inheritable_reader but not restricted
+    define inherited_editor: inheritable_editor but not restricted
+    define unscoped_reader: viewer or editor or inherited_reader
+    define unscoped_editor: editor or inherited_editor
+    define can_view: member from organization and unscoped_reader
+    define can_edit: member from organization and unscoped_editor

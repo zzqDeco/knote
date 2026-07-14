@@ -83,7 +83,62 @@ func TestOpenFGABatchPreservesInputOrderAndOrdinaryDeny(t *testing.T) {
 	}
 }
 
-func TestOpenFGABatchRejectsOversizedWithoutCallingService(t *testing.T) {
+func TestOpenFGABatchAtPhysicalLimitUsesOneRequest(t *testing.T) {
+	var calls atomic.Int32
+	authorizer := newTestOpenFGA(t, http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		calls.Add(1)
+		if request.URL.Path != "/stores/"+openFGATestStoreID+"/batch-check" {
+			t.Errorf("path = %q", request.URL.Path)
+		}
+		var body struct {
+			Checks []struct {
+				CorrelationID string `json:"correlation_id"`
+			} `json:"checks"`
+		}
+		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		if len(body.Checks) != MaxBatchChecks {
+			t.Errorf("physical batch size = %d, want %d", len(body.Checks), MaxBatchChecks)
+		}
+		results := make(map[string]map[string]bool, len(body.Checks))
+		for _, check := range body.Checks {
+			results[check.CorrelationID] = map[string]bool{"allowed": true}
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(writer).Encode(map[string]any{"result": results}); err != nil {
+			t.Errorf("encode response: %v", err)
+		}
+	}))
+
+	request := BatchCheckRequest{
+		AuthorizationModelID: openFGATestModelID,
+		Checks:               make([]BatchCheckItem, MaxBatchChecks),
+	}
+	for index := range request.Checks {
+		request.Checks[index] = BatchCheckItem{
+			CorrelationID: fmt.Sprintf("check-%d", index), User: "user:alice",
+			Relation: RelationCanView, Object: "document:welcome",
+		}
+	}
+	decisions, err := authorizer.BatchCheck(context.Background(), request)
+	if err != nil {
+		t.Fatalf("batch check: %v", err)
+	}
+	if len(decisions) != MaxBatchChecks {
+		t.Fatalf("decision count = %d, want %d", len(decisions), MaxBatchChecks)
+	}
+	for _, decision := range decisions {
+		if !decision.Allowed {
+			t.Fatalf("physical-limit batch returned deny: %#v", decision)
+		}
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("physical RPCs = %d, want 1", calls.Load())
+	}
+}
+
+func TestOpenFGABatchRejectsFiftyOneChecksWithoutCallingService(t *testing.T) {
 	var calls atomic.Int32
 	authorizer := newTestOpenFGA(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		calls.Add(1)
@@ -94,6 +149,9 @@ func TestOpenFGABatchRejectsOversizedWithoutCallingService(t *testing.T) {
 			CorrelationID: fmt.Sprintf("check-%d", index), User: "user:alice",
 			Relation: RelationCanView, Object: "document:welcome",
 		}
+	}
+	if len(checks) != 51 {
+		t.Fatalf("regression requires 51 checks, got %d", len(checks))
 	}
 	decisions, err := authorizer.BatchCheck(context.Background(), BatchCheckRequest{
 		AuthorizationModelID: openFGATestModelID,

@@ -2,6 +2,7 @@ package model_test
 
 import (
 	"context"
+	"errors"
 	"os"
 	"sort"
 	"testing"
@@ -56,11 +57,15 @@ func TestAuthorizationModelTruthTable(t *testing.T) {
 		"restricted-child-blocks-only-inheritance": false,
 		"direct-share":                             false,
 		"direct-share-revoke":                      false,
+		"entity-claim-policy-oracle":               false,
 	}
 	for _, testCase := range suite.Tests {
 		testCase := testCase
 		t.Run(testCase.Name, func(t *testing.T) {
 			required[testCase.Name] = true
+			if err := authz.ValidateTuples(testCase.Tuples); err != nil {
+				t.Fatalf("OpenFGA tuple snapshot preflight: %v", err)
+			}
 			authorizer, err := authz.NewLocalAuthorizer(testModelID, testCase.Tuples)
 			if err != nil {
 				t.Fatalf("create local authorizer: %v", err)
@@ -93,5 +98,31 @@ func TestAuthorizationModelTruthTable(t *testing.T) {
 		if !covered {
 			t.Errorf("required model scenario %q is missing", name)
 		}
+	}
+}
+
+func TestOpenFGATupleSnapshotPreflightRejectsDuplicateClaimBindings(t *testing.T) {
+	tests := []struct {
+		name      string
+		relation  string
+		duplicate string
+	}{
+		{name: "source", relation: authz.RelationSourceDocument, duplicate: "document:stale"},
+		{name: "subject", relation: authz.RelationSubject, duplicate: "entity:stale-subject"},
+		{name: "object", relation: authz.RelationObject, duplicate: "entity:stale-object"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			tuples := []authz.Tuple{
+				{User: "organization:acme", Relation: authz.RelationOrganization, Object: "claim:edge"},
+				{User: "document:current", Relation: authz.RelationSourceDocument, Object: "claim:edge"},
+				{User: "entity:subject", Relation: authz.RelationSubject, Object: "claim:edge"},
+				{User: "entity:object", Relation: authz.RelationObject, Object: "claim:edge"},
+				{User: test.duplicate, Relation: test.relation, Object: "claim:edge"},
+			}
+			if err := authz.ValidateTuples(tuples); !errors.Is(err, authz.ErrInvalidRequest) {
+				t.Fatalf("preflight error = %v, want %v", err, authz.ErrInvalidRequest)
+			}
+		})
 	}
 }

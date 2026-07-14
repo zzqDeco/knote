@@ -15,7 +15,10 @@ import (
 	"github.com/zzqDeco/knote/internal/protocol"
 )
 
-var errNoEvidence = errors.New("authorized query found no evidence")
+var (
+	errNoEvidence                   = errors.New("authorized query found no evidence")
+	errIncompleteCandidateDiscovery = errors.New("authorized candidate discovery exceeded its hard limit")
+)
 
 const (
 	defaultRetrieveLimit = 20
@@ -32,6 +35,7 @@ type Options struct {
 	Authorizer       authz.BatchChecker
 	Loader           EvidenceLoader
 	Cache            *QueryCache
+	Traversal        TraversalConfig
 	RetrieverVersion string
 	PromptVersion    string
 	RetrieveLimit    int
@@ -49,13 +53,15 @@ type Service struct {
 	promptVersion    string
 	retrieveLimit    int
 	evidenceLimit    int
-	expandLimit      int
+	traversal        traversalConfig
+	traversalDigest  traversalPlanDigest
 	now              func() time.Time
 }
 
 type QueryResult struct {
 	Generation kag.GenerateResult
 	Evidence   protocol.EvidencePackage
+	Traversal  *TraversalReport
 }
 
 func New(options Options) (*Service, error) {
@@ -91,7 +97,11 @@ func New(options Options) (*Service, error) {
 	if err := validateLimit("evidence_limit", options.EvidenceLimit, false); err != nil {
 		return nil, err
 	}
-	if err := validateLimit("expand_limit", options.ExpandLimit, true); err != nil {
+	if options.ExpandLimit != 0 {
+		return nil, fmt.Errorf("legacy untyped expand_limit is not supported; configure a typed traversal plan")
+	}
+	traversal, traversalDigest, err := normalizeTraversalConfig(options.Traversal)
+	if err != nil {
 		return nil, err
 	}
 	if options.Now == nil {
@@ -101,25 +111,42 @@ func New(options Options) (*Service, error) {
 		kag: options.KAG, authorizer: options.Authorizer, loader: options.Loader, cache: options.Cache,
 		retrieverVersion: options.RetrieverVersion, promptVersion: options.PromptVersion,
 		retrieveLimit: options.RetrieveLimit, evidenceLimit: options.EvidenceLimit,
-		expandLimit: options.ExpandLimit, now: options.Now,
+		traversal: traversal, traversalDigest: traversalDigest,
+		now: options.Now,
 	}, nil
 }
 
-func (s *Service) Query(ctx context.Context, request protocol.QueryRequest) (QueryResult, error) {
+func (s *Service) Query(ctx context.Context, request protocol.QueryRequest) (result QueryResult, err error) {
 	if ctx == nil {
 		return QueryResult{}, fmt.Errorf("authorized query requires a context")
 	}
 	if err := request.Validate(); err != nil {
 		return QueryResult{}, fmt.Errorf("authorized query: %w", err)
 	}
+	queryContext := ctx
+	var budget *traversalBudget
+	if s.traversal.enabled {
+		var cancel context.CancelFunc
+		budget, queryContext, cancel = newTraversalBudget(ctx, s.traversal.limits, s.now)
+		defer cancel()
+		defer func() {
+			report := budget.report()
+			result.Traversal = &report
+		}()
+		if err := budget.check(); err != nil {
+			return QueryResult{}, err
+		}
+	}
+	useCache := s.cache != nil
 	var cacheKey queryCacheKey
-	if s.cache != nil {
+	if useCache && !s.traversal.enabled {
 		cacheKey = newQueryCacheKey(
 			request, s.retrieverVersion, s.promptVersion,
-			s.retrieveLimit, s.evidenceLimit, s.expandLimit,
+			s.retrieveLimit, s.evidenceLimit,
+			traversalPlanDigest{}, traversalPlanDigest{},
 		)
 		if snapshot, ok := s.cache.get(cacheKey); ok {
-			cached, err := s.revalidateCached(ctx, request, snapshot.result)
+			cached, err := s.revalidateCached(queryContext, request, snapshot.result, nil)
 			if err == nil && s.cache.containsRevision(cacheKey, snapshot.revision) {
 				return cached, nil
 			}
@@ -127,51 +154,56 @@ func (s *Service) Query(ctx context.Context, request protocol.QueryRequest) (Que
 		}
 	}
 	authorization := request.Authorization
-	retrieveRequest := kag.RetrieveRequest{
-		Authorization: authorization,
-		Query:         request.Question,
-		Limit:         s.retrieveLimit,
-	}
-	retrieved, err := s.kag.Retrieve(ctx, retrieveRequest)
+	allowedResources, err := s.discoverAuthorizedResources(queryContext, authorization, budget)
 	if err != nil {
+		return QueryResult{}, err
+	}
+	retrieveRequest := kag.RetrieveRequest{
+		Authorization:    authorization,
+		Query:            request.Question,
+		AllowedResources: allowedResources,
+		Limit:            s.retrieveLimit,
+	}
+	retrieved, err := s.kag.Retrieve(queryContext, retrieveRequest)
+	if err != nil {
+		if budget != nil {
+			return QueryResult{}, traversalExternalCallError(budget, err)
+		}
 		return QueryResult{}, fmt.Errorf("authorized query retrieve: %w", err)
 	}
+	if budget != nil {
+		if err := budget.check(); err != nil {
+			return QueryResult{}, err
+		}
+	}
 	if err := retrieved.ValidateFor(retrieveRequest); err != nil {
+		if budget != nil {
+			return QueryResult{}, errInvalidTraversalResponse
+		}
 		return QueryResult{}, fmt.Errorf("authorized query retrieve result: %w", err)
 	}
 	if len(retrieved.Candidates) == 0 {
 		return QueryResult{}, errNoEvidence
 	}
 
-	approved, err := s.filterAuthorizedCandidates(ctx, authorization, "r", retrieved.Candidates)
-	if err != nil {
-		return QueryResult{}, fmt.Errorf("authorized query retrieve authorization: %w", err)
-	}
-	selected := appendCandidates(nil, approved, s.evidenceLimit)
-
-	if s.expandLimit > 0 && len(approved) > 0 && len(selected) < s.evidenceLimit {
-		expandRequest := kag.ExpandRequest{
-			Authorization: authorization,
-			Frontier:      approved,
-			Limit:         s.expandLimit,
-		}
-		expanded, err := s.kag.Expand(ctx, expandRequest)
+	var selected []kag.CandidateHandle
+	var traversalPaths []traversalPath
+	var traversalGroups []traversalTerminalGroup
+	var traversalPlan traversalPlanDigest
+	if s.traversal.enabled {
+		execution, err := s.executeTraversal(queryContext, authorization, retrieved.Candidates, budget)
 		if err != nil {
-			return QueryResult{}, fmt.Errorf("authorized query expand: %w", err)
+			return QueryResult{}, err
 		}
-		if err := expanded.ValidateFor(expandRequest); err != nil {
-			return QueryResult{}, fmt.Errorf("authorized query expand result: %w", err)
-		}
-		for index, expansion := range expanded.Expansions {
-			if expansion.Hop != 1 {
-				return QueryResult{}, fmt.Errorf("authorized query expansion %d is not one hop", index)
-			}
-		}
-		approvedExpansion, err := s.filterAuthorizedCandidates(ctx, authorization, "e", expanded.Candidates)
-		if err != nil {
-			return QueryResult{}, fmt.Errorf("authorized query expansion authorization: %w", err)
-		}
-		selected = appendCandidates(selected, approvedExpansion, s.evidenceLimit)
+		traversalPlan = execution.planDigest
+		traversalGroups = execution.terminalGroups()
+		selected = traversalGroupCandidates(traversalGroups)
+	} else {
+		// Discovery authorized every exact resource before the provider ranked
+		// it, and RetrieveResult.ValidateFor proved the provider stayed inside
+		// that scope. The final evidence check below remains the live revocation
+		// gate immediately before generation.
+		selected = appendCandidates(nil, retrieved.Candidates, s.evidenceLimit)
 	}
 	if len(selected) == 0 {
 		return QueryResult{}, errNoEvidence
@@ -181,16 +213,62 @@ func (s *Service) Query(ctx context.Context, request protocol.QueryRequest) (Que
 	for index, candidate := range selected {
 		handles[index] = candidate.Resource
 	}
-	items, err := s.loadExact(ctx, authorization, handles)
+	if budget != nil {
+		if err := budget.check(); err != nil {
+			return QueryResult{}, err
+		}
+	}
+	items, err := s.loadExact(queryContext, authorization, handles)
 	if err != nil {
+		if budget != nil {
+			return QueryResult{}, traversalExternalCallError(budget, err)
+		}
 		return QueryResult{}, fmt.Errorf("authorized query load evidence: %w", err)
 	}
-	checked, err := s.checkEvidence(ctx, authorization, "f", items)
+	if budget != nil {
+		if err := budget.check(); err != nil {
+			return QueryResult{}, err
+		}
+	}
+	var checked checkedEvidence
+	if s.traversal.enabled {
+		items, traversalPaths, checked, err = s.finalizeTraversalEvidence(
+			queryContext, authorization, items, traversalGroups, s.evidenceLimit, budget,
+		)
+		if err == nil {
+			budget.setCompletePaths(len(items))
+		}
+	} else {
+		checked, err = s.checkEvidence(queryContext, authorization, "f", items)
+	}
 	if err != nil {
 		if errors.Is(err, errNoEvidence) {
 			return QueryResult{}, errNoEvidence
 		}
 		return QueryResult{}, fmt.Errorf("authorized query final evidence check: %w", err)
+	}
+	if useCache && s.traversal.enabled {
+		pathDigest, err := digestTraversalPaths(traversalPaths)
+		if err != nil {
+			return QueryResult{}, errInvalidTraversalResponse
+		}
+		cacheKey = newQueryCacheKey(
+			request, s.retrieverVersion, s.promptVersion,
+			s.retrieveLimit, s.evidenceLimit,
+			traversalPlan, pathDigest,
+		)
+		if snapshot, ok := s.cache.get(cacheKey); ok {
+			cached, err := s.revalidateCached(queryContext, request, snapshot.result, budget)
+			if err != nil {
+				s.cache.deleteIfRevision(cacheKey, snapshot.revision)
+				return QueryResult{}, err
+			}
+			if !s.cache.containsRevision(cacheKey, snapshot.revision) {
+				return QueryResult{}, ErrProtectedContentUnavailable
+			}
+			budget.setCompletePaths(len(cached.Evidence.Items))
+			return cached, nil
+		}
 	}
 	// This is the final evidence authorization check. No content-bearing or graph
 	// operation is allowed between this check and generation.
@@ -202,23 +280,137 @@ func (s *Service) Query(ctx context.Context, request protocol.QueryRequest) (Que
 	if err != nil {
 		return QueryResult{}, fmt.Errorf("authorized query evidence package: %w", err)
 	}
-	if s.cache != nil && s.cache.containsInvalidatedResource(evidenceResourceIDs(checked.handles, checked.boundaries)) {
+	if useCache && s.cache.containsInvalidatedResource(evidenceResourceIDs(checked.handles, checked.boundaries)) {
 		return QueryResult{}, ErrProtectedContentUnavailable
 	}
 
 	generateRequest := newGenerateRequest(authorization, request.Question, items)
-	generation, err := s.kag.Generate(ctx, generateRequest)
+	if s.traversal.enabled {
+		paths, err := generateTraversalPaths(traversalPaths)
+		if err != nil || len(paths) != len(items) {
+			return QueryResult{}, errInvalidTraversalResponse
+		}
+		generateRequest.Paths = paths
+	}
+	if budget != nil {
+		if err := budget.check(); err != nil {
+			return QueryResult{}, err
+		}
+	}
+	generation, err := s.kag.Generate(queryContext, generateRequest)
 	if err != nil {
+		if budget != nil {
+			return QueryResult{}, traversalExternalCallError(budget, err)
+		}
 		return QueryResult{}, fmt.Errorf("authorized query generate: %w", err)
+	}
+	if budget != nil {
+		if err := budget.check(); err != nil {
+			return QueryResult{}, err
+		}
 	}
 	if err := generation.ValidateFor(generateRequest); err != nil {
 		return QueryResult{}, fmt.Errorf("authorized query generate result: %w", err)
 	}
-	result := QueryResult{Generation: generation, Evidence: evidencePackage}
-	if s.cache != nil && !s.cache.put(cacheKey, result) {
+	result = QueryResult{Generation: generation, Evidence: evidencePackage}
+	if useCache && !s.cache.put(cacheKey, result) {
 		return QueryResult{}, ErrProtectedContentUnavailable
 	}
 	return result, nil
+}
+
+func (s *Service) discoverAuthorizedResources(
+	ctx context.Context,
+	authorization protocol.AuthorizationContext,
+	budget *traversalBudget,
+) ([]protocol.ResourceHandle, error) {
+	resourceTypes := []protocol.ResourceType{
+		protocol.ResourceChunk,
+		protocol.ResourceClaim,
+		protocol.ResourceDerivedArtifact,
+		protocol.ResourceDocument,
+		protocol.ResourceEntity,
+	}
+	if s.traversal.enabled {
+		resourceTypes = []protocol.ResourceType{protocol.ResourceEntity}
+	}
+	request := kag.DiscoverRequest{
+		Authorization: authorization,
+		ResourceTypes: resourceTypes,
+		Limit:         maxPrimitiveLimit,
+	}
+	if budget != nil {
+		if err := budget.check(); err != nil {
+			return nil, err
+		}
+	}
+	discovered, err := s.kag.Discover(ctx, request)
+	if err != nil {
+		if budget != nil {
+			return nil, traversalExternalCallError(budget, err)
+		}
+		return nil, fmt.Errorf("authorized query discover: %w", err)
+	}
+	if budget != nil {
+		if err := budget.check(); err != nil {
+			return nil, err
+		}
+	}
+	if err := discovered.ValidateFor(request); err != nil {
+		if budget != nil {
+			return nil, errInvalidTraversalResponse
+		}
+		return nil, fmt.Errorf("authorized query discover result: %w", err)
+	}
+	if !discovered.Complete {
+		if budget != nil {
+			return nil, errTraversalBudgetExceeded
+		}
+		return nil, errIncompleteCandidateDiscovery
+	}
+	if len(discovered.Resources) == 0 {
+		return nil, errNoEvidence
+	}
+
+	if budget != nil {
+		if err := budget.addResources(discovered.Resources); err != nil {
+			return nil, err
+		}
+		checks, err := s.checkTraversalResources(
+			ctx, authorization, "tr-discover", discovered.Resources, budget,
+		)
+		if err != nil {
+			return nil, err
+		}
+		budget.recordHop(0, TraversalPhaseDiscovery, discovered.Resources, checks)
+		allowed := make([]protocol.ResourceHandle, 0, len(discovered.Resources))
+		for _, resource := range discovered.Resources {
+			if checks[resource.AuthorizationID].allowed {
+				allowed = append(allowed, resource)
+			}
+		}
+		if len(allowed) == 0 {
+			return nil, errNoEvidence
+		}
+		return allowed, nil
+	}
+
+	candidates := make([]kag.CandidateHandle, len(discovered.Resources))
+	for index, resource := range discovered.Resources {
+		candidates[index] = kag.CandidateHandle{Resource: resource}
+	}
+	allowed, err := s.filterAuthorizedCandidates(ctx, authorization, "pre-rank", candidates)
+	if err != nil {
+		return nil, fmt.Errorf("authorized query discovery authorization: %w", err)
+	}
+	if len(allowed) == 0 {
+		return nil, errNoEvidence
+	}
+	resources := make([]protocol.ResourceHandle, len(allowed))
+	for index, candidate := range allowed {
+		resources[index] = candidate.Resource
+	}
+	return resources, nil
 }
 
 type checkedEvidence struct {
@@ -232,6 +424,7 @@ func (s *Service) revalidateCached(
 	ctx context.Context,
 	request protocol.QueryRequest,
 	cached QueryResult,
+	budget *traversalBudget,
 ) (QueryResult, error) {
 	original := authorizationFromPackage(cached.Evidence)
 	if err := cached.Evidence.ValidateFor(original); err != nil {
@@ -248,8 +441,22 @@ func (s *Service) revalidateCached(
 	if err := cached.Generation.ValidateFor(originalGenerate); err != nil {
 		return QueryResult{}, ErrProtectedContentUnavailable
 	}
-
-	if _, err := s.checkLiveEvidence(ctx, request.Authorization, "cache", cached.Evidence.Items); err != nil {
+	bindings, err := cachedDecisionBindings(request.Authorization, cached.Evidence)
+	if err != nil {
+		return QueryResult{}, ErrProtectedContentUnavailable
+	}
+	if budget != nil {
+		budgetResources := append([]protocol.ResourceHandle(nil), bindings.handles...)
+		for _, resource := range bindings.handles {
+			budgetResources = append(budgetResources, bindings.boundaries[resource.ResourceID])
+		}
+		if err := budget.addResources(budgetResources); err != nil {
+			return QueryResult{}, err
+		}
+	}
+	if _, err := s.checkCachedDecisionBindings(
+		ctx, request.Authorization, "cache", bindings, budget,
+	); err != nil {
 		return QueryResult{}, ErrProtectedContentUnavailable
 	}
 	handles := make([]protocol.ResourceHandle, len(cached.Evidence.Items))
@@ -260,7 +467,9 @@ func (s *Service) revalidateCached(
 	if err != nil || !reflect.DeepEqual(loaded, cached.Evidence.Items) {
 		return QueryResult{}, ErrProtectedContentUnavailable
 	}
-	checked, err := s.checkLiveEvidence(ctx, request.Authorization, "cache-final", loaded)
+	checked, err := s.checkCachedDecisionBindings(
+		ctx, request.Authorization, "cache-final", bindings, budget,
+	)
 	if err != nil {
 		return QueryResult{}, ErrProtectedContentUnavailable
 	}
@@ -280,6 +489,82 @@ func (s *Service) revalidateCached(
 		Generation: cloneGeneration(cached.Generation),
 		Evidence:   evidencePackage,
 	}, nil
+}
+
+func cachedDecisionBindings(
+	authorization protocol.AuthorizationContext,
+	evidence protocol.EvidencePackage,
+) (checkedEvidence, error) {
+	if err := authorization.Validate(); err != nil || len(evidence.Decisions) == 0 {
+		return checkedEvidence{}, ErrProtectedContentUnavailable
+	}
+	bindings := checkedEvidence{
+		handles:    make([]protocol.ResourceHandle, 0, len(evidence.Decisions)),
+		boundaries: make(map[protocol.ResourceID]protocol.ResourceHandle, len(evidence.Decisions)),
+		projection: evidence.ProjectionVersion,
+	}
+	seen := make(map[protocol.ResourceID]protocol.ResourceHandle, len(evidence.Decisions))
+	for _, decision := range evidence.Decisions {
+		resource := decision.Resource
+		boundary := decision.AuthorizationResource
+		if err := resource.ValidateFor(authorization); err != nil ||
+			boundary.ValidateFor(authorization) != nil ||
+			resource.Versions.Projection != bindings.projection ||
+			boundary.Versions.Projection != bindings.projection ||
+			validateBoundary(resource, boundary) != nil {
+			return checkedEvidence{}, ErrProtectedContentUnavailable
+		}
+		if existing, duplicate := seen[resource.ResourceID]; duplicate {
+			if existing != resource || bindings.boundaries[resource.ResourceID] != boundary {
+				return checkedEvidence{}, ErrProtectedContentUnavailable
+			}
+			continue
+		}
+		seen[resource.ResourceID] = resource
+		bindings.handles = append(bindings.handles, resource)
+		bindings.boundaries[resource.ResourceID] = boundary
+	}
+	return bindings, nil
+}
+
+func (s *Service) checkCachedDecisionBindings(
+	ctx context.Context,
+	authorization protocol.AuthorizationContext,
+	stage string,
+	bindings checkedEvidence,
+	budget *traversalBudget,
+) (checkedEvidence, error) {
+	boundaries := make([]protocol.ResourceHandle, len(bindings.handles))
+	for index, resource := range bindings.handles {
+		boundary, ok := bindings.boundaries[resource.ResourceID]
+		if !ok {
+			return checkedEvidence{}, ErrProtectedContentUnavailable
+		}
+		boundaries[index] = boundary
+	}
+	var (
+		checked map[string]objectCheck
+		err     error
+	)
+	if budget == nil {
+		checked, err = s.checkLiveObjects(ctx, authorization, stage, boundaries)
+	} else {
+		authorization.Consistency = protocol.ConsistencyHigherConsistency
+		checked, err = s.checkTraversalResources(ctx, authorization, stage, boundaries, budget)
+	}
+	if err != nil {
+		return checkedEvidence{}, err
+	}
+	objects := make(map[string]objectCheck, len(bindings.handles))
+	for index, resource := range bindings.handles {
+		result, ok := checked[boundaries[index].AuthorizationID]
+		if !ok || !result.allowed {
+			return checkedEvidence{}, ErrProtectedContentUnavailable
+		}
+		objects[resource.AuthorizationID] = result
+	}
+	bindings.objects = objects
+	return bindings, nil
 }
 
 func (s *Service) checkEvidence(
@@ -418,21 +703,16 @@ func (s *Service) OpenCitation(
 	if cited == nil {
 		return protocol.EvidenceItem{}, ErrCitationUnavailable
 	}
-	liveHandles, boundaries, _, err := collectEvidenceHandles(current, []protocol.EvidenceItem{*cited})
+	bindings, err := cachedDecisionBindings(current, evidencePackage)
 	if err != nil {
 		return protocol.EvidenceItem{}, ErrCitationUnavailable
 	}
-	if s.cache != nil && s.cache.containsInvalidatedResource(evidenceResourceIDs(liveHandles, boundaries)) {
+	resourceIDs := evidenceResourceIDs(bindings.handles, bindings.boundaries)
+	if s.cache != nil && s.cache.containsInvalidatedResource(resourceIDs) {
 		return protocol.EvidenceItem{}, ErrCitationUnavailable
 	}
-	checked, err := s.checkLiveObjects(ctx, current, "c", liveHandles)
-	if err != nil {
+	if _, err := s.checkCachedDecisionBindings(ctx, current, "c", bindings, nil); err != nil {
 		return protocol.EvidenceItem{}, ErrCitationUnavailable
-	}
-	for _, resource := range liveHandles {
-		if !checked[resource.AuthorizationID].allowed {
-			return protocol.EvidenceItem{}, ErrCitationUnavailable
-		}
 	}
 	loaded, err := s.loadExact(ctx, current, []protocol.ResourceHandle{cited.Resource})
 	if err != nil {
@@ -441,16 +721,10 @@ func (s *Service) OpenCitation(
 	if !reflect.DeepEqual(loaded[0], *cited) {
 		return protocol.EvidenceItem{}, ErrCitationUnavailable
 	}
-	checked, err = s.checkLiveObjects(ctx, current, "c-final", liveHandles)
-	if err != nil {
+	if _, err := s.checkCachedDecisionBindings(ctx, current, "c-final", bindings, nil); err != nil {
 		return protocol.EvidenceItem{}, ErrCitationUnavailable
 	}
-	for _, resource := range liveHandles {
-		if !checked[resource.AuthorizationID].allowed {
-			return protocol.EvidenceItem{}, ErrCitationUnavailable
-		}
-	}
-	if s.cache != nil && s.cache.containsInvalidatedResource(evidenceResourceIDs(liveHandles, boundaries)) {
+	if s.cache != nil && s.cache.containsInvalidatedResource(resourceIDs) {
 		return protocol.EvidenceItem{}, ErrCitationUnavailable
 	}
 	return loaded[0], nil

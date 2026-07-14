@@ -13,8 +13,10 @@ import (
 )
 
 const (
-	APITokenEnv    = "KNOTE_OPENFGA_API_TOKEN"
-	MaxBatchChecks = 100
+	APITokenEnv = "KNOTE_OPENFGA_API_TOKEN"
+	// MaxBatchChecks matches the pinned OpenFGA SDK's physical server batch size
+	// so one accepted logical batch cannot be split into multiple HTTP RPCs.
+	MaxBatchChecks = 50
 )
 
 const (
@@ -23,17 +25,22 @@ const (
 	TypeOrganization  = "organization"
 	TypeKnowledgeBase = "knowledge_base"
 	TypeDocument      = "document"
+	TypeEntity        = "entity"
+	TypeClaim         = "claim"
 )
 
 const (
-	RelationMember       = "member"
-	RelationOrganization = "organization"
-	RelationParent       = "parent"
-	RelationViewer       = "viewer"
-	RelationEditor       = "editor"
-	RelationRestricted   = "restricted"
-	RelationCanView      = protocol.EvidenceReadRelation
-	RelationCanEdit      = "can_edit"
+	RelationMember         = "member"
+	RelationOrganization   = "organization"
+	RelationParent         = "parent"
+	RelationSourceDocument = "source_document"
+	RelationSubject        = "subject"
+	RelationObject         = "object"
+	RelationViewer         = "viewer"
+	RelationEditor         = "editor"
+	RelationRestricted     = "restricted"
+	RelationCanView        = protocol.EvidenceReadRelation
+	RelationCanEdit        = "can_edit"
 )
 
 var (

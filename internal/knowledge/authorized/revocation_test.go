@@ -100,6 +100,145 @@ func TestAuthorizeProtectedContentUsesCurrentModelAndHigherConsistency(t *testin
 	}
 }
 
+func TestAuthorizeProtectedContentReauthorizesIntermediateClaimWithoutLoadingIt(t *testing.T) {
+	document := queryTestDocument(queryTestModelID, "content", "projection-v1")
+	claim := revocationTestClaim(t, "authorization-only-claim")
+	authorization := queryTestAuthorization("alice", "request-claim-replay")
+	binding, _ := revocationTestBindingWithIntermediateClaim(
+		t, authorization, queryTestItem(document), claim,
+	)
+	authorizer := &queryTestAuthorizer{}
+	loader := &queryTestLoader{load: func(handles []protocol.ResourceHandle) ([]protocol.EvidenceItem, error) {
+		if len(handles) != 1 || handles[0] != document {
+			return nil, fmt.Errorf("loader received authorization-only path resources: %#v", handles)
+		}
+		return []protocol.EvidenceItem{queryTestItem(document)}, nil
+	}}
+	service, err := New(Options{
+		KAG: &queryTestKAG{}, Authorizer: authorizer, Loader: loader,
+		RetrieveLimit: 10, EvidenceLimit: 2, Now: time.Now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := service.AuthorizeProtectedContent(context.Background(), authorization, binding)
+	if err != nil || !report.Allowed() || report.ResourceCount != 2 {
+		t.Fatalf("intermediate Claim replay authorization = %#v, %v", report, err)
+	}
+	if len(loader.calls) != 1 || len(loader.calls[0]) != 1 || loader.calls[0][0] != document {
+		t.Fatalf("intermediate Claim reached the evidence loader: %#v", loader.calls)
+	}
+	if len(authorizer.calls) != 2 {
+		t.Fatalf("live authorization calls = %d, want pre-load and post-load checks", len(authorizer.calls))
+	}
+	for _, call := range authorizer.calls {
+		if call.Consistency != authz.ConsistencyHigherConsistency || len(call.Checks) != 2 ||
+			!revocationTestChecksObject(call, document.AuthorizationID) ||
+			!revocationTestChecksObject(call, claim.AuthorizationID) {
+			t.Fatalf("live authorization did not cover every protected binding resource: %#v", call)
+		}
+	}
+}
+
+func TestIntermediateClaimRevocationFailsClosedAndTombstonesCache(t *testing.T) {
+	document := queryTestDocument(queryTestModelID, "content", "projection-v1")
+	claim := revocationTestClaim(t, "revoked-intermediate-claim")
+	authorization := queryTestAuthorization("alice", "request-revoked-claim")
+	binding, evidence := revocationTestBindingWithIntermediateClaim(
+		t, authorization, queryTestItem(document), claim,
+	)
+
+	t.Run("live deny", func(t *testing.T) {
+		authorizer := &queryTestAuthorizer{decide: func(_ int, request authz.BatchCheckRequest) ([]authz.Decision, error) {
+			return queryTestDecisions(request, func(check authz.BatchCheckItem) bool {
+				return check.Object != claim.AuthorizationID
+			}), nil
+		}}
+		loader := &queryTestLoader{load: func([]protocol.ResourceHandle) ([]protocol.EvidenceItem, error) {
+			return nil, errors.New("authorization-only Claim denial should precede loading")
+		}}
+		service, err := New(Options{
+			KAG: &queryTestKAG{}, Authorizer: authorizer, Loader: loader,
+			RetrieveLimit: 10, EvidenceLimit: 2, Now: time.Now,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		report, err := service.AuthorizeProtectedContent(context.Background(), authorization, binding)
+		if !errors.Is(err, ErrProtectedContentUnavailable) || err.Error() != ErrProtectedContentUnavailable.Error() ||
+			report.ResourceCount != 2 || report.AllowedCount != 1 || report.DeniedCount != 1 {
+			t.Fatalf("denied intermediate Claim replay = %#v, %v", report, err)
+		}
+		if len(loader.calls) != 0 {
+			t.Fatalf("denied intermediate Claim reached loader: %#v", loader.calls)
+		}
+	})
+
+	t.Run("tombstone", func(t *testing.T) {
+		cacheNow := time.Date(2026, 7, 14, 9, 0, 0, 0, time.UTC)
+		cache, err := newQueryCache(4, func() time.Time { return cacheNow })
+		if err != nil {
+			t.Fatal(err)
+		}
+		authorizer := &queryTestAuthorizer{}
+		loader := &queryTestLoader{load: func(handles []protocol.ResourceHandle) ([]protocol.EvidenceItem, error) {
+			if len(handles) != 1 || handles[0] != document {
+				return nil, fmt.Errorf("loader received authorization-only path resources: %#v", handles)
+			}
+			return []protocol.EvidenceItem{queryTestItem(document)}, nil
+		}}
+		service, err := New(Options{
+			KAG: &queryTestKAG{}, Authorizer: authorizer, Loader: loader, Cache: cache,
+			RetrieverVersion: "retriever-v1", PromptVersion: "prompt-v1",
+			RetrieveLimit: 10, EvidenceLimit: 2, Now: time.Now,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		coordinator, err := NewRevocationCoordinator(service)
+		if err != nil {
+			t.Fatal(err)
+		}
+		key := cacheTestKey(
+			protocol.QueryRequest{Question: "claim cache", Authorization: authorization},
+			"retriever-v1", "prompt-v1",
+		)
+		cached := QueryResult{Evidence: evidence}
+		if !cache.put(key, cached) {
+			t.Fatal("cache entry with an intermediate Claim was rejected before revocation")
+		}
+
+		report, err := coordinator.Apply(context.Background(), RevocationRequest{
+			Authorization: authorization,
+			Binding:       binding,
+			ResourceIDs:   []protocol.ResourceID{claim.ResourceID},
+			RevokedAt:     cacheNow.Add(-time.Second),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if report.InvalidatedResourceCount != 1 || report.RemovedEntryCount != 1 ||
+			report.ProtectedResourceCount != 2 || report.AllowedCount != 2 {
+			t.Fatalf("intermediate Claim revocation report = %#v", report)
+		}
+		if _, ok := cache.get(key); ok {
+			t.Fatal("intermediate Claim tombstone did not evict the bound cache entry")
+		}
+		if cache.put(key, cached) {
+			t.Fatal("intermediate Claim tombstone allowed an in-flight cache put")
+		}
+		if _, err := service.AuthorizeProtectedContent(context.Background(), authorization, binding); !errors.Is(err, ErrProtectedContentUnavailable) ||
+			err.Error() != ErrProtectedContentUnavailable.Error() {
+			t.Fatalf("tombstoned intermediate Claim replay error = %v", err)
+		}
+		if len(loader.calls) != 0 {
+			t.Fatalf("tombstoned intermediate Claim reached loader: %#v", loader.calls)
+		}
+	})
+}
+
 func TestRevocationCoordinatorInvalidatesAndReportsMetadataOnly(t *testing.T) {
 	cacheNow := time.Date(2026, 7, 13, 9, 0, 5, 0, time.UTC)
 	cache, err := newQueryCache(4, func() time.Time { return cacheNow })
@@ -598,6 +737,12 @@ type blockingGenerateKAG struct {
 	release  chan struct{}
 }
 
+func (b *blockingGenerateKAG) Discover(context.Context, kag.DiscoverRequest) (kag.DiscoverResult, error) {
+	return kag.DiscoverResult{
+		Mode: "fake", Resources: []protocol.ResourceHandle{b.document}, Complete: true,
+	}, nil
+}
+
 func (b *blockingGenerateKAG) Retrieve(context.Context, kag.RetrieveRequest) (kag.RetrieveResult, error) {
 	return queryTestRetrieve(b.document), nil
 }
@@ -666,6 +811,72 @@ func revocationTestBindingForItem(
 		t.Fatal(err)
 	}
 	return binding
+}
+
+func revocationTestBindingWithIntermediateClaim(
+	t *testing.T,
+	authorization protocol.AuthorizationContext,
+	item protocol.EvidenceItem,
+	claim protocol.ResourceHandle,
+) (protocol.ProtectedContentBinding, protocol.EvidencePackage) {
+	t.Helper()
+	handles, boundaries, projection, err := collectEvidenceHandles(
+		authorization, []protocol.EvidenceItem{item},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := claim.ValidateFor(authorization); err != nil {
+		t.Fatal(err)
+	}
+	if claim.Type != protocol.ResourceClaim || claim.Versions.Projection != projection {
+		t.Fatal("intermediate Claim must match the evidence projection")
+	}
+	handles = append(handles, claim)
+	boundaries[claim.ResourceID] = claim
+	objects := make(map[string]objectCheck, len(handles))
+	for index, handle := range handles {
+		objects[handle.AuthorizationID] = objectCheck{
+			correlationID: fmt.Sprintf("binding-resource-%d", index), allowed: true,
+		}
+	}
+	evidence, err := buildEvidencePackage(
+		authorization,
+		[]protocol.EvidenceItem{item},
+		checkedEvidence{handles: handles, boundaries: boundaries, projection: projection, objects: objects},
+		time.Unix(1, 0).UTC(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding, err := protocol.NewProtectedContentBinding(authorization, evidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return binding, evidence
+}
+
+func revocationTestClaim(t *testing.T, sourceKey string) protocol.ResourceHandle {
+	t.Helper()
+	resourceID, err := protocol.NewStableResourceID(
+		"tenant-1", "kb-1", protocol.ResourceClaim, sourceKey,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := queryTestDocument(resourceID, "claim", "projection-v1")
+	claim.Type = protocol.ResourceClaim
+	claim.AuthorizationID = "claim:" + string(resourceID)
+	return claim
+}
+
+func revocationTestChecksObject(request authz.BatchCheckRequest, object string) bool {
+	for _, check := range request.Checks {
+		if check.Object == object {
+			return true
+		}
+	}
+	return false
 }
 
 func revocationTestServiceWithLoader(t *testing.T, loader EvidenceLoader) *Service {

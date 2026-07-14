@@ -32,6 +32,7 @@ var (
 // PrimitiveBackend is the controlled KAG boundary used by authorized retrieval.
 // It deliberately excludes the opaque solver-backed Query and Explain methods.
 type PrimitiveBackend interface {
+	Discover(context.Context, DiscoverRequest) (DiscoverResult, error)
 	Retrieve(context.Context, RetrieveRequest) (RetrieveResult, error)
 	Expand(context.Context, ExpandRequest) (ExpandResult, error)
 	Generate(context.Context, GenerateRequest) (GenerateResult, error)
@@ -55,10 +56,82 @@ func (h CandidateHandle) Validate() error {
 	return nil
 }
 
-type RetrieveRequest struct {
+// DiscoverRequest asks the trusted adapter for a complete, body-free catalog
+// of graph handles before any relevance provider is invoked.
+type DiscoverRequest struct {
 	Authorization protocol.AuthorizationContext `json:"authorization"`
-	Query         string                        `json:"query"`
+	ResourceTypes []protocol.ResourceType       `json:"resource_types"`
 	Limit         int                           `json:"limit"`
+}
+
+func (r DiscoverRequest) Validate() error {
+	if err := r.Authorization.Validate(); err != nil {
+		return fmt.Errorf("authorization: %w", err)
+	}
+	if r.Limit != maxPrimitiveItems {
+		return fmt.Errorf("limit must equal the full discovery scan limit of %d", maxPrimitiveItems)
+	}
+	if len(r.ResourceTypes) == 0 || len(r.ResourceTypes) > 5 {
+		return fmt.Errorf("resource_types must contain between 1 and 5 values")
+	}
+	for index, resourceType := range r.ResourceTypes {
+		switch resourceType {
+		case protocol.ResourceDocument, protocol.ResourceChunk, protocol.ResourceEntity,
+			protocol.ResourceClaim, protocol.ResourceDerivedArtifact:
+		default:
+			return fmt.Errorf("resource_types[%d] is unsupported", index)
+		}
+		if index > 0 && resourceType <= r.ResourceTypes[index-1] {
+			return fmt.Errorf("resource_types must be strictly sorted and unique")
+		}
+	}
+	return nil
+}
+
+type DiscoverResult struct {
+	Mode      string                    `json:"mode"`
+	Resources []protocol.ResourceHandle `json:"resources"`
+	Complete  bool                      `json:"complete"`
+}
+
+func (r DiscoverResult) ValidateFor(req DiscoverRequest) error {
+	if err := req.Validate(); err != nil {
+		return fmt.Errorf("discover request: %w", err)
+	}
+	if err := validatePrimitiveMode(r.Mode); err != nil {
+		return fmt.Errorf("discover mode: %w", err)
+	}
+	if len(r.Resources) > req.Limit {
+		return fmt.Errorf("discovered resource count exceeds requested limit")
+	}
+	if !r.Complete && len(r.Resources) != req.Limit {
+		return fmt.Errorf("incomplete discovery must fill the requested limit")
+	}
+	projection := ""
+	for index, resource := range r.Resources {
+		if err := validateResourceForAuthorization(resource, req.Authorization); err != nil {
+			return fmt.Errorf("resource %d: %w", index, err)
+		}
+		if !containsResourceType(req.ResourceTypes, resource.Type) {
+			return fmt.Errorf("resource %d has a type outside the discovery request", index)
+		}
+		if projection == "" {
+			projection = resource.Versions.Projection
+		} else if resource.Versions.Projection != projection {
+			return fmt.Errorf("resource %d projection does not match the discovered resource set", index)
+		}
+		if index > 0 && resource.ResourceID <= r.Resources[index-1].ResourceID {
+			return fmt.Errorf("discovered resources must be strictly sorted and unique")
+		}
+	}
+	return nil
+}
+
+type RetrieveRequest struct {
+	Authorization    protocol.AuthorizationContext `json:"authorization"`
+	Query            string                        `json:"query"`
+	AllowedResources []protocol.ResourceHandle     `json:"allowed_resources"`
+	Limit            int                           `json:"limit"`
 }
 
 func (r RetrieveRequest) Validate() error {
@@ -71,7 +144,27 @@ func (r RetrieveRequest) Validate() error {
 	if len(r.Query) > maxPrimitiveTextBytes {
 		return fmt.Errorf("query exceeds the primitive text limit")
 	}
-	return validatePrimitiveLimit(r.Limit)
+	if err := validatePrimitiveLimit(r.Limit); err != nil {
+		return err
+	}
+	if len(r.AllowedResources) == 0 || len(r.AllowedResources) > maxPrimitiveItems {
+		return fmt.Errorf("allowed_resources must contain between 1 and %d handles", maxPrimitiveItems)
+	}
+	projection := ""
+	for index, resource := range r.AllowedResources {
+		if err := validateResourceForAuthorization(resource, r.Authorization); err != nil {
+			return fmt.Errorf("allowed resource %d: %w", index, err)
+		}
+		if projection == "" {
+			projection = resource.Versions.Projection
+		} else if resource.Versions.Projection != projection {
+			return fmt.Errorf("allowed resource %d projection does not match the allowed resource set", index)
+		}
+		if index > 0 && resource.ResourceID <= r.AllowedResources[index-1].ResourceID {
+			return fmt.Errorf("allowed_resources must be strictly sorted and unique")
+		}
+	}
+	return nil
 }
 
 type RetrieveResult struct {
@@ -86,35 +179,110 @@ func (r RetrieveResult) ValidateFor(req RetrieveRequest) error {
 	if err := validatePrimitiveMode(r.Mode); err != nil {
 		return fmt.Errorf("retrieve mode: %w", err)
 	}
-	return validateCandidatesForAuthorization(r.Candidates, req.Limit, req.Authorization)
+	if err := validateCandidatesForAuthorization(r.Candidates, req.Limit, req.Authorization); err != nil {
+		return err
+	}
+	allowed := make(map[protocol.ResourceID]protocol.ResourceHandle, len(req.AllowedResources))
+	for _, resource := range req.AllowedResources {
+		allowed[resource.ResourceID] = resource
+	}
+	for index, candidate := range r.Candidates {
+		resource, ok := allowed[candidate.Resource.ResourceID]
+		if !ok || resource != candidate.Resource {
+			return fmt.Errorf("candidate %d is outside the exact authorized retrieval scope", index)
+		}
+	}
+	return nil
+}
+
+type ExpandPhase string
+
+const (
+	ExpandPhaseEntityToClaim ExpandPhase = "entity_to_claim"
+	ExpandPhaseClaimToObject ExpandPhase = "claim_to_object"
+)
+
+func (p ExpandPhase) Validate() error {
+	switch p {
+	case ExpandPhaseEntityToClaim, ExpandPhaseClaimToObject:
+		return nil
+	default:
+		return fmt.Errorf("unsupported expand phase")
+	}
 }
 
 type ExpandRequest struct {
-	Authorization protocol.AuthorizationContext `json:"authorization"`
-	Frontier      []CandidateHandle             `json:"frontier"`
-	Limit         int                           `json:"limit"`
+	Authorization protocol.AuthorizationContext     `json:"authorization"`
+	Operation     protocol.GraphOperationDescriptor `json:"operation"`
+	Phase         ExpandPhase                       `json:"phase"`
+	Frontier      []CandidateHandle                 `json:"frontier"`
+	Limit         int                               `json:"limit"`
 }
 
 func (r ExpandRequest) Validate() error {
 	if err := r.Authorization.Validate(); err != nil {
 		return fmt.Errorf("authorization: %w", err)
 	}
+	if err := r.Operation.Validate(); err != nil {
+		return fmt.Errorf("operation: %w", err)
+	}
+	if err := r.Phase.Validate(); err != nil {
+		return err
+	}
+	plan := r.Operation.Parameters
+	if plan.Direction != protocol.TraversalOutbound {
+		return fmt.Errorf("expand operation direction is unsupported")
+	}
+	if plan.IdentityVersion != protocol.GraphBindingContractVersion {
+		return fmt.Errorf("expand operation identity version is unsupported")
+	}
+	if plan.Limits.MaxDepth < 1 {
+		return fmt.Errorf("expand operation max depth must be positive")
+	}
+	if plan.Limits.MaxFrontierWidth > maxPrimitiveItems {
+		return fmt.Errorf("expand operation max frontier width exceeds provider limit")
+	}
+	if plan.Limits.MaxCandidatesPerHop > maxPrimitiveItems {
+		return fmt.Errorf("expand operation max candidates per hop exceeds provider limit")
+	}
+	for _, kind := range plan.ResourceKinds {
+		if kind != protocol.GraphResourceEntity && kind != protocol.GraphResourceClaim {
+			return fmt.Errorf("expand operation resource kind is unsupported")
+		}
+	}
 	if len(r.Frontier) == 0 {
 		return fmt.Errorf("authorized frontier is required")
 	}
-	if len(r.Frontier) > maxPrimitiveItems {
-		return fmt.Errorf("authorized frontier exceeds the primitive item limit")
+	if len(r.Frontier) > plan.Limits.MaxFrontierWidth {
+		return fmt.Errorf("authorized frontier exceeds the operation max frontier width")
 	}
-	if err := validatePrimitiveLimit(r.Limit); err != nil {
+	if r.Limit != maxPrimitiveItems {
+		return fmt.Errorf("expand limit must equal the full provider scan limit of %d", maxPrimitiveItems)
+	}
+	if err := validateCandidatesForAuthorization(r.Frontier, len(r.Frontier), r.Authorization); err != nil {
 		return err
 	}
-	return validateCandidatesForAuthorization(r.Frontier, len(r.Frontier), r.Authorization)
+	for index, candidate := range r.Frontier {
+		if candidate.Resource.Versions.Projection != plan.ProjectionVersion {
+			return fmt.Errorf("frontier candidate %d does not match the operation projection", index)
+		}
+		expectedType := protocol.ResourceEntity
+		if r.Phase == ExpandPhaseClaimToObject {
+			expectedType = protocol.ResourceClaim
+		}
+		if candidate.Resource.Type != expectedType {
+			return fmt.Errorf("frontier candidate %d has an unsupported resource kind for phase", index)
+		}
+	}
+	return nil
 }
 
 type ExpansionHandle struct {
-	FromResourceID protocol.ResourceID `json:"from_resource_id"`
-	ToResourceID   protocol.ResourceID `json:"to_resource_id"`
-	Hop            int                 `json:"hop"`
+	FromResourceID  protocol.ResourceID        `json:"from_resource_id"`
+	ToResourceID    protocol.ResourceID        `json:"to_resource_id"`
+	ClaimResourceID protocol.ResourceID        `json:"claim_resource_id"`
+	PredicateKey    protocol.ClaimPredicateKey `json:"predicate_key"`
+	Hop             int                        `json:"hop"`
 }
 
 func (h ExpansionHandle) Validate() error {
@@ -123,6 +291,15 @@ func (h ExpansionHandle) Validate() error {
 	}
 	if err := h.ToResourceID.Validate(); err != nil {
 		return fmt.Errorf("expansion target: %w", err)
+	}
+	if err := h.ClaimResourceID.Validate(); err != nil {
+		return fmt.Errorf("expansion claim: %w", err)
+	}
+	if err := h.PredicateKey.Validate(); err != nil {
+		return fmt.Errorf("expansion predicate: %w", err)
+	}
+	if h.FromResourceID == h.ToResourceID {
+		return fmt.Errorf("expansion source and target must differ")
 	}
 	if h.Hop < 1 {
 		return fmt.Errorf("expansion hop must be positive")
@@ -146,6 +323,21 @@ func (r ExpandResult) ValidateFor(req ExpandRequest) error {
 	if err := validateCandidatesForAuthorization(r.Candidates, req.Limit, req.Authorization); err != nil {
 		return err
 	}
+	for index, candidate := range r.Candidates {
+		if candidate.Resource.Versions.Projection != req.Operation.Parameters.ProjectionVersion {
+			return fmt.Errorf("candidate %d does not match the operation projection", index)
+		}
+		if req.Phase == ExpandPhaseEntityToClaim {
+			if candidate.Resource.Type != protocol.ResourceClaim {
+				return fmt.Errorf("candidate %d is not a Claim for entity_to_claim", index)
+			}
+		} else {
+			if candidate.Resource.Type != protocol.ResourceEntity ||
+				!containsGraphResourceKind(req.Operation.Parameters.ResourceKinds, protocol.GraphResourceEntity) {
+				return fmt.Errorf("candidate %d has an unsupported object resource kind", index)
+			}
+		}
+	}
 	frontier := make(map[protocol.ResourceID]protocol.ResourceHandle, len(req.Frontier))
 	for _, candidate := range req.Frontier {
 		frontier[candidate.Resource.ResourceID] = candidate.Resource
@@ -155,6 +347,7 @@ func (r ExpandResult) ValidateFor(req ExpandRequest) error {
 		targets[candidate.Resource.ResourceID] = candidate.Resource
 	}
 	seenEdges := make(map[string]struct{}, len(r.Expansions))
+	seenClaims := make(map[protocol.ResourceID]ExpansionHandle, len(r.Expansions))
 	referencedTargets := make(map[protocol.ResourceID]struct{}, len(r.Expansions))
 	for index, expansion := range r.Expansions {
 		if err := expansion.Validate(); err != nil {
@@ -165,6 +358,12 @@ func (r ExpandResult) ValidateFor(req ExpandRequest) error {
 		}
 		if _, ok := targets[expansion.ToResourceID]; !ok {
 			return fmt.Errorf("expansion target %s has no candidate handle", expansion.ToResourceID)
+		}
+		if expansion.Hop != 1 {
+			return fmt.Errorf("expansion %d is not one primitive hop", index)
+		}
+		if !containsClaimPredicateKey(req.Operation.Parameters.PredicateKeys, expansion.PredicateKey) {
+			return fmt.Errorf("expansion %d predicate is outside the operation allowlist", index)
 		}
 		source := frontier[expansion.FromResourceID]
 		target := targets[expansion.ToResourceID]
@@ -177,11 +376,36 @@ func (r ExpandResult) ValidateFor(req ExpandRequest) error {
 				source.Versions.Projection,
 			)
 		}
-		key := fmt.Sprintf("%s\x00%d\x00%s", expansion.FromResourceID, expansion.Hop, expansion.ToResourceID)
+		if req.Phase == ExpandPhaseEntityToClaim {
+			if source.Type != protocol.ResourceEntity || target.Type != protocol.ResourceClaim ||
+				expansion.ClaimResourceID != expansion.ToResourceID {
+				return fmt.Errorf("expansion %d has an unsupported entity_to_claim edge shape", index)
+			}
+		} else if source.Type != protocol.ResourceClaim || target.Type != protocol.ResourceEntity ||
+			expansion.ClaimResourceID != expansion.FromResourceID {
+			return fmt.Errorf("expansion %d has an unsupported claim_to_object edge shape", index)
+		}
+		key := fmt.Sprintf(
+			"%s\x00%d\x00%s\x00%s\x00%s",
+			expansion.FromResourceID,
+			expansion.Hop,
+			expansion.ToResourceID,
+			expansion.ClaimResourceID,
+			expansion.PredicateKey,
+		)
 		if _, duplicate := seenEdges[key]; duplicate {
 			return fmt.Errorf("duplicate expansion %s", key)
 		}
 		seenEdges[key] = struct{}{}
+		if previous, duplicate := seenClaims[expansion.ClaimResourceID]; duplicate {
+			return fmt.Errorf(
+				"claim %s is bound to multiple expansion edges (%s and %s)",
+				expansion.ClaimResourceID,
+				previous.ToResourceID,
+				expansion.ToResourceID,
+			)
+		}
+		seenClaims[expansion.ClaimResourceID] = expansion
 		referencedTargets[expansion.ToResourceID] = struct{}{}
 		if index > 0 && expansionLess(expansion, r.Expansions[index-1]) {
 			return fmt.Errorf("expansions are not deterministically sorted")
@@ -220,10 +444,129 @@ func (e AuthorizedEvidence) Validate() error {
 	return nil
 }
 
+// GeneratePathClaimBinding binds one entity -> Claim -> entity segment in a
+// body-free generator path.
+type GeneratePathClaimBinding struct {
+	ParentResourceID protocol.ResourceID        `json:"parent_resource_id"`
+	ClaimResourceID  protocol.ResourceID        `json:"claim_resource_id"`
+	ObjectResourceID protocol.ResourceID        `json:"object_resource_id"`
+	PredicateKey     protocol.ClaimPredicateKey `json:"predicate_key"`
+}
+
+func (b GeneratePathClaimBinding) Validate() error {
+	if err := b.ParentResourceID.Validate(); err != nil {
+		return fmt.Errorf("parent_resource_id: %w", err)
+	}
+	if err := b.ClaimResourceID.Validate(); err != nil {
+		return fmt.Errorf("claim_resource_id: %w", err)
+	}
+	if err := b.ObjectResourceID.Validate(); err != nil {
+		return fmt.Errorf("object_resource_id: %w", err)
+	}
+	if err := b.PredicateKey.Validate(); err != nil {
+		return fmt.Errorf("predicate_key: %w", err)
+	}
+	if b.ParentResourceID == b.ClaimResourceID ||
+		b.ParentResourceID == b.ObjectResourceID ||
+		b.ClaimResourceID == b.ObjectResourceID {
+		return fmt.Errorf("path Claim binding resources must be distinct")
+	}
+	return nil
+}
+
+// GeneratePath is the complete, body-free authorized traversal path paired
+// with one terminal evidence item.
+type GeneratePath struct {
+	Resources     []protocol.ResourceHandle  `json:"resources"`
+	ClaimBindings []GeneratePathClaimBinding `json:"claim_bindings"`
+}
+
+func (p GeneratePath) Validate() error {
+	if p.Resources == nil || len(p.Resources) == 0 {
+		return fmt.Errorf("resources must be a non-empty list")
+	}
+	if len(p.Resources) > maxPrimitiveItems {
+		return fmt.Errorf("resources exceed the primitive item limit")
+	}
+	if p.ClaimBindings == nil {
+		return fmt.Errorf("claim_bindings must be a list")
+	}
+	if len(p.ClaimBindings) > maxPrimitiveItems {
+		return fmt.Errorf("claim_bindings exceed the primitive item limit")
+	}
+	if len(p.Resources) != 2*len(p.ClaimBindings)+1 {
+		return fmt.Errorf("path must contain complete entity/Claim/entity segments")
+	}
+
+	projection := ""
+	seenResources := make(map[protocol.ResourceID]struct{}, len(p.Resources))
+	for index, resource := range p.Resources {
+		if err := resource.Validate(); err != nil {
+			return fmt.Errorf("resource %d: %w", index, err)
+		}
+		expectedType := protocol.ResourceEntity
+		if index%2 == 1 {
+			expectedType = protocol.ResourceClaim
+		}
+		if resource.Type != expectedType {
+			return fmt.Errorf("resource %d does not match the entity/Claim/entity path shape", index)
+		}
+		if projection == "" {
+			projection = resource.Versions.Projection
+		} else if resource.Versions.Projection != projection {
+			return fmt.Errorf("resource %d projection does not match the path projection", index)
+		}
+		if _, duplicate := seenResources[resource.ResourceID]; duplicate {
+			return fmt.Errorf("path contains duplicate resource %s", resource.ResourceID)
+		}
+		seenResources[resource.ResourceID] = struct{}{}
+	}
+
+	seenBindings := make(map[string]struct{}, len(p.ClaimBindings))
+	for index, binding := range p.ClaimBindings {
+		if err := binding.Validate(); err != nil {
+			return fmt.Errorf("claim_binding %d: %w", index, err)
+		}
+		parent := p.Resources[index*2]
+		claim := p.Resources[index*2+1]
+		object := p.Resources[index*2+2]
+		if binding.ParentResourceID != parent.ResourceID ||
+			binding.ClaimResourceID != claim.ResourceID ||
+			binding.ObjectResourceID != object.ResourceID {
+			return fmt.Errorf("claim_binding %d does not match the resource sequence", index)
+		}
+		key := strings.Join([]string{
+			string(binding.ParentResourceID),
+			string(binding.ClaimResourceID),
+			string(binding.ObjectResourceID),
+			string(binding.PredicateKey),
+		}, "\x00")
+		if _, duplicate := seenBindings[key]; duplicate {
+			return fmt.Errorf("path contains duplicate Claim binding")
+		}
+		seenBindings[key] = struct{}{}
+	}
+	return nil
+}
+
+func (p GeneratePath) Clone() GeneratePath {
+	clone := p
+	if p.Resources != nil {
+		clone.Resources = make([]protocol.ResourceHandle, len(p.Resources))
+		copy(clone.Resources, p.Resources)
+	}
+	if p.ClaimBindings != nil {
+		clone.ClaimBindings = make([]GeneratePathClaimBinding, len(p.ClaimBindings))
+		copy(clone.ClaimBindings, p.ClaimBindings)
+	}
+	return clone
+}
+
 type GenerateRequest struct {
 	Authorization protocol.AuthorizationContext `json:"authorization"`
 	Question      string                        `json:"question"`
 	Evidence      []AuthorizedEvidence          `json:"evidence"`
+	Paths         []GeneratePath                `json:"paths,omitempty"`
 }
 
 func (r GenerateRequest) Validate() error {
@@ -266,7 +609,76 @@ func (r GenerateRequest) Validate() error {
 		}
 		seenCitations[evidence.CitationHandle] = struct{}{}
 	}
+	if r.Paths == nil {
+		return nil
+	}
+	if len(r.Paths) != len(r.Evidence) {
+		return fmt.Errorf("paths must contain exactly one complete path per evidence item")
+	}
+	seenPaths := make(map[string]struct{}, len(r.Paths))
+	for index, path := range r.Paths {
+		if err := path.validateFor(r.Authorization, r.Evidence[index]); err != nil {
+			return fmt.Errorf("path %d: %w", index, err)
+		}
+		key := generatePathKey(path)
+		if _, duplicate := seenPaths[key]; duplicate {
+			return fmt.Errorf("duplicate path %d", index)
+		}
+		seenPaths[key] = struct{}{}
+	}
 	return nil
+}
+
+func (r GenerateRequest) Clone() GenerateRequest {
+	clone := r
+	if r.Evidence != nil {
+		clone.Evidence = append([]AuthorizedEvidence(nil), r.Evidence...)
+	}
+	if r.Paths != nil {
+		clone.Paths = make([]GeneratePath, len(r.Paths))
+		for index, path := range r.Paths {
+			clone.Paths[index] = path.Clone()
+		}
+	}
+	return clone
+}
+
+func (p GeneratePath) validateFor(
+	authorization protocol.AuthorizationContext,
+	evidence AuthorizedEvidence,
+) error {
+	if err := p.Validate(); err != nil {
+		return err
+	}
+	projection := evidence.Resource.Versions.Projection
+	for index, resource := range p.Resources {
+		if err := validateResourceForAuthorization(resource, authorization); err != nil {
+			return fmt.Errorf("resource %d: %w", index, err)
+		}
+		if resource.Versions.Projection != projection {
+			return fmt.Errorf("resource %d does not match the evidence projection", index)
+		}
+	}
+	if p.Resources[len(p.Resources)-1] != evidence.Resource {
+		return fmt.Errorf("terminal resource does not exactly match the paired evidence")
+	}
+	return nil
+}
+
+func generatePathKey(path GeneratePath) string {
+	parts := make([]string, 0, len(path.Resources)+len(path.ClaimBindings))
+	for _, resource := range path.Resources {
+		parts = append(parts, string(resource.ResourceID))
+	}
+	for _, binding := range path.ClaimBindings {
+		parts = append(parts, strings.Join([]string{
+			string(binding.ParentResourceID),
+			string(binding.ClaimResourceID),
+			string(binding.ObjectResourceID),
+			string(binding.PredicateKey),
+		}, "\x01"))
+	}
+	return strings.Join(parts, "\x00")
 }
 
 type CitationHandle struct {
@@ -333,6 +745,25 @@ func (r GenerateResult) ValidateFor(req GenerateRequest) error {
 		return fmt.Errorf("generation evidence, citations, and trace must reference the same authorized resources")
 	}
 	return nil
+}
+
+func (c Client) Discover(ctx context.Context, req DiscoverRequest) (DiscoverResult, error) {
+	if err := req.Validate(); err != nil {
+		return DiscoverResult{}, err
+	}
+	params, err := structParams(req)
+	if err != nil {
+		return DiscoverResult{}, err
+	}
+	response, err := c.call(ctx, "kag.discover", c.params(params))
+	if err != nil {
+		return DiscoverResult{}, err
+	}
+	result, err := decodePrimitive[DiscoverResult](response)
+	if err != nil {
+		return DiscoverResult{}, err
+	}
+	return result, result.ValidateFor(req)
 }
 
 func (c Client) Retrieve(ctx context.Context, req RetrieveRequest) (RetrieveResult, error) {
@@ -543,7 +974,40 @@ func expansionLess(left, right ExpansionHandle) bool {
 	if left.FromResourceID != right.FromResourceID {
 		return left.FromResourceID < right.FromResourceID
 	}
-	return left.ToResourceID < right.ToResourceID
+	if left.ToResourceID != right.ToResourceID {
+		return left.ToResourceID < right.ToResourceID
+	}
+	if left.ClaimResourceID != right.ClaimResourceID {
+		return left.ClaimResourceID < right.ClaimResourceID
+	}
+	return left.PredicateKey < right.PredicateKey
+}
+
+func containsGraphResourceKind(kinds []protocol.GraphResourceKind, target protocol.GraphResourceKind) bool {
+	for _, kind := range kinds {
+		if kind == target {
+			return true
+		}
+	}
+	return false
+}
+
+func containsClaimPredicateKey(keys []protocol.ClaimPredicateKey, target protocol.ClaimPredicateKey) bool {
+	for _, key := range keys {
+		if key == target {
+			return true
+		}
+	}
+	return false
+}
+
+func containsResourceType(types []protocol.ResourceType, target protocol.ResourceType) bool {
+	for _, resourceType := range types {
+		if resourceType == target {
+			return true
+		}
+	}
+	return false
 }
 
 func validatedResourceIDSet(

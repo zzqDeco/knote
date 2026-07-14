@@ -177,6 +177,8 @@ func (a *OpenFGAAuthorizer) BatchCheck(ctx context.Context, request BatchCheckRe
 			AuthorizationModelId: &a.config.AuthorizationModelID,
 			StoreId:              &a.config.StoreID,
 			Consistency:          consistency,
+			MaxParallelRequests:  openfga.PtrInt32(1),
+			MaxBatchSize:         openfga.PtrInt32(int32(MaxBatchChecks)),
 		}).
 		Execute()
 	if err != nil {

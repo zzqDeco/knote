@@ -11,7 +11,7 @@ The credential-free gate is the same command run by `.github/workflows/ci.yml`:
 
 ```sh
 KNOTE_KAG_FAKE=1 go test ./...
-python -m unittest discover -s adapters/kag -p '*test*.py'
+/usr/bin/python3 -m unittest discover -s adapters/kag -p '*test*.py'
 GOTOOLCHAIN=go1.25.12 go run github.com/openfga/cli/cmd/fga@v0.7.17 model test --tests internal/authz/model/authorization.fga.yaml
 ```
 
@@ -39,12 +39,14 @@ the three deterministic resources in
 | Bob | 1 | 2 | no |
 | Unknown principal | 0 | 3 | yes |
 
-Candidate and result order is significant. A test must compare exact ordered
-resource handles, exact projection and authorization versions, and the full
-set of generator, citation, trace, cache, and session references. A body-free
-candidate with the wrong tenant, knowledge base, authorization boundary,
-content digest, projection, ACL version, or serving state is a contract failure,
-not an ordinary retrieval miss.
+Discovery and result order is significant. The trusted adapter must return a
+complete, deterministic, body-free resource catalog. Authorization filters that
+catalog before a relevance provider runs, and `Retrieve` accepts only the exact
+sorted authorized handles. A test must compare those handles, exact projection
+and authorization versions, and the full set of generator, citation, trace,
+cache, and session references. A body-free candidate with the wrong tenant,
+knowledge base, authorization boundary, content digest, projection, ACL version,
+or serving state is a contract failure, not an ordinary retrieval miss.
 
 ## Hard invariants
 
@@ -53,6 +55,7 @@ The following are release blockers and are not percentile metrics:
 | Invariant | Required result |
 |---|---:|
 | Policy-oracle false allows | 0 |
+| Unauthorized resources presented to the relevance provider | 0 |
 | Unauthorized evidence items or citations | 0 |
 | Unauthorized generator or solver inputs | 0 |
 | Unauthorized trace/debug resource participation | 0 |
@@ -79,11 +82,11 @@ every sample.
 |---|---|---:|
 | Authorized Recall@3 | returned authorized relevant / oracle authorized relevant | 1.00 for Alice and Bob |
 | Authorized Precision@3 | returned authorized relevant / all returned evidence | 1.00 for every non-empty result |
-| Post-filter drop rate | denied candidates / valid candidates returned by retrieve or expand | exactly 1/3 for Alice and 2/3 for Bob; aggregate exactly 0.50 |
+| Authorization drop rate | denied handles / valid handles returned by trusted discovery or graph expansion | exactly 1/3 for Alice and 2/3 for Bob; aggregate exactly 0.50 |
 | Authorized empty-result rate | positive queries with no authorized evidence / positive queries | 0/2; the unknown-principal negative control is exactly 1/1 |
 | Authorized Path Completeness | complete authorized oracle paths returned / complete authorized oracle paths | 1.00 for controlled provenance fixtures |
-| BatchCheck size | checks in one `BatchCheckRequest` | 1 to `authz.MaxBatchChecks` (100) |
-| BatchCheck RPC count | sum of authorization batches for one query | exactly 2 for the no-expansion Alice/Bob fixture; at most 3 for a one-hop fixture when each stage has at most 100 unique objects |
+| BatchCheck size | checks in one `BatchCheckRequest` | 1 to `authz.MaxBatchChecks` (50) |
+| BatchCheck RPC count | sum of authorization batches for one query | exactly 2 for the no-expansion Alice/Bob fixture; exactly 5 for a complete one-hop fixture when each stage has at most 50 unique objects |
 | BatchCheck latency | elapsed time for one deterministic local batch | every sample <= 1 s; report P99 |
 | Retrieval latency | fake `Retrieve` call elapsed time | every sample <= 1 s; report P99 |
 | Total authorized query latency | `Service.Query` entry through validated generation result, including authorization and exact load | every sample <= 1 s; report P99 |
@@ -94,13 +97,16 @@ every sample.
 The BatchCheck count formula for larger fixtures is:
 
 ```text
-ceil(unique_retrieve_objects / 100)
-+ ceil(unique_expand_objects / 100)       # zero when expansion is disabled
-+ ceil(unique_final_evidence_objects / 100)
+ceil(unique_discovered_objects / 50)      # pre-ranking authorization
++ ceil(unique_start_objects / 50)         # zero when traversal is disabled
++ ceil(unique_claim_objects / 50)         # zero when traversal is disabled
++ ceil(unique_object_objects / 50)        # zero when traversal is disabled
++ ceil(unique_final_path_and_evidence_objects / 50)
 ```
 
-Cache-hit revalidation, citation open, and protected-session replay each permit
-at most two live authorization passes for up to 100 unique objects. Revocation
+Cache-hit revalidation permits two live authorization passes; each pass uses as
+many 50-item physical batches as its exact resource set requires. Citation open
+and protected-session replay use the same physical batch ceiling. Revocation
 application permits one live pass after synchronous tombstoning. Count every
 attempt, including a timeout or malformed response; retries are not hidden from
 the metric.
@@ -121,7 +127,7 @@ scenario gates:
 
 | Issue #41 scenario | Current deterministic anchors |
 |---|---|
-| Alice and Bob receive different evidence; quality and drop/empty budgets | `internal/knowledge/authorized/permissioned_acceptance_test.go: TestPermissionedAcceptancePolicyOracleAndRetrievalMetrics` |
+| Alice and Bob receive different evidence; pre-ranking authorization, quality, and drop/empty budgets | `internal/knowledge/authorized/service_test.go: TestQueryScopesEvidencePerPrincipal`; `internal/runtime/permissioned_acceptance_test.go: TestPermissionedAcceptanceSideChannelSurfacesHideCanaries`; `internal/knowledge/authorized/permissioned_acceptance_test.go: TestPermissionedAcceptancePolicyOracleAndRetrievalMetrics` |
 | Entity support and Claim visibility remain independent | `internal/knowledge/authorized/permissioned_acceptance_test.go: TestPermissionedAcceptanceVisibleEntityHiddenClaim`; `internal/authz/permissioned_acceptance_test.go: TestPermissionedAcceptanceEntityVisibleProtectedClaimHidden` |
 | A denied intermediate blocks later participation; `any_support` and `all_required` stay closed | `internal/knowledge/authorized/permissioned_acceptance_test.go: TestPermissionedAcceptanceProvenancePathSemantics`; `internal/authz/permissioned_acceptance_test.go: TestPermissionedAcceptanceDeniedIntermediateClaimBlocksPathParticipation`; `internal/catalog/permissioned_acceptance_test.go: TestPermissionedAcceptanceProvenanceModesAndIntermediateRevocation` |
 | Revocation denies cache, in-flight result, citation, and replay within SLO | `internal/knowledge/authorized/permissioned_acceptance_test.go: TestPermissionedAcceptanceRevocationSLO`; `internal/runtime/permissioned_acceptance_test.go: TestPermissionedAcceptanceRevocationDeniesCacheCitationAndSessionReplay`, `TestPermissionedAcceptanceRevocationPropagationPercentiles` |

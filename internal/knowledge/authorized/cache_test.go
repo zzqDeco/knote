@@ -143,11 +143,10 @@ func TestQueryCacheSeparatesQueryPlanLimits(t *testing.T) {
 	request := protocol.QueryRequest{
 		Question: "same plan question", Authorization: queryTestAuthorization("alice", "request-plan"),
 	}
-	base := newQueryCacheKey(request, "retriever-v1", "prompt-v1", 10, 1, 0)
+	base := newQueryCacheKey(request, "retriever-v1", "prompt-v1", 10, 1, traversalPlanDigest{}, traversalPlanDigest{})
 	for name, changed := range map[string]queryCacheKey{
-		"retrieve": newQueryCacheKey(request, "retriever-v1", "prompt-v1", 11, 1, 0),
-		"evidence": newQueryCacheKey(request, "retriever-v1", "prompt-v1", 10, 2, 0),
-		"expand":   newQueryCacheKey(request, "retriever-v1", "prompt-v1", 10, 1, 1),
+		"retrieve": newQueryCacheKey(request, "retriever-v1", "prompt-v1", 11, 1, traversalPlanDigest{}, traversalPlanDigest{}),
+		"evidence": newQueryCacheKey(request, "retriever-v1", "prompt-v1", 10, 2, traversalPlanDigest{}, traversalPlanDigest{}),
 	} {
 		if base == changed {
 			t.Fatalf("%s limit did not change cache key", name)
@@ -164,10 +163,10 @@ func TestQueryCacheSeparatesQueryPlanLimits(t *testing.T) {
 	}}
 	cache := mustQueryCache(t, 4)
 	small := cacheTestServiceWithLimits(
-		t, backend, authorizer, loader, cache, "retriever-v1", "prompt-v1", 10, 1, 0,
+		t, backend, authorizer, loader, cache, "retriever-v1", "prompt-v1", 10, 1,
 	)
 	large := cacheTestServiceWithLimits(
-		t, backend, authorizer, loader, cache, "retriever-v1", "prompt-v1", 10, 2, 0,
+		t, backend, authorizer, loader, cache, "retriever-v1", "prompt-v1", 10, 2,
 	)
 	first, err := small.Query(context.Background(), request)
 	if err != nil {
@@ -186,6 +185,65 @@ func TestQueryCacheSeparatesQueryPlanLimits(t *testing.T) {
 	}
 	if len(second.Evidence.Items) != 2 {
 		t.Fatalf("large plan evidence count = %d, want 2", len(second.Evidence.Items))
+	}
+}
+
+func TestQueryCacheKeySeparatesTraversalPlanDigests(t *testing.T) {
+	request := protocol.QueryRequest{
+		Question: "same traversal question", Authorization: queryTestAuthorization("alice", "request-traversal-plan"),
+	}
+	baseDigest := cacheTestTraversalPlanDigest(
+		t, 1, protocol.ClaimPredicateLocatedIn, protocol.ClaimPredicateSupports,
+	)
+	base := newQueryCacheKey(request, "retriever-v1", "prompt-v1", 10, 4, baseDigest, traversalPlanDigest{})
+	variations := []struct {
+		name   string
+		digest traversalPlanDigest
+	}{
+		{
+			name: "limit",
+			digest: cacheTestTraversalPlanDigest(
+				t, 2, protocol.ClaimPredicateLocatedIn, protocol.ClaimPredicateSupports,
+			),
+		},
+		{
+			name:   "predicate allowlist",
+			digest: cacheTestTraversalPlanDigest(t, 1, protocol.ClaimPredicateLocatedIn),
+		},
+	}
+	for _, variation := range variations {
+		t.Run(variation.name, func(t *testing.T) {
+			if variation.digest == baseDigest {
+				t.Fatal("different canonical traversal plans produced the same digest")
+			}
+			changed := newQueryCacheKey(
+				request, "retriever-v1", "prompt-v1", 10, 4, variation.digest, traversalPlanDigest{},
+			)
+			if changed == base {
+				t.Fatal("different traversal plan digests shared a cache key")
+			}
+		})
+	}
+}
+
+func TestQueryCacheKeyReusesEqualCanonicalTraversalPlanDigest(t *testing.T) {
+	firstDigest := cacheTestTraversalPlanDigest(
+		t, 1, protocol.ClaimPredicateSupports, protocol.ClaimPredicateLocatedIn,
+	)
+	secondDigest := cacheTestTraversalPlanDigest(
+		t, 1, protocol.ClaimPredicateLocatedIn, protocol.ClaimPredicateSupports,
+	)
+	if firstDigest != secondDigest {
+		t.Fatal("equivalent traversal plans produced different canonical digests")
+	}
+	request := protocol.QueryRequest{
+		Question:      "canonical traversal question",
+		Authorization: queryTestAuthorization("alice", "request-canonical-traversal-plan"),
+	}
+	first := newQueryCacheKey(request, "retriever-v1", "prompt-v1", 10, 4, firstDigest, traversalPlanDigest{})
+	second := newQueryCacheKey(request, "retriever-v1", "prompt-v1", 10, 4, secondDigest, traversalPlanDigest{})
+	if first != second {
+		t.Fatal("equal canonical traversal plan digests did not share a cache key")
 	}
 }
 
@@ -393,8 +451,11 @@ func TestQueryCacheReauthorizesLocalTupleRevocations(t *testing.T) {
 			if !errors.Is(err, errNoEvidence) {
 				t.Fatalf("revoked tuple returned error %v", err)
 			}
-			if backend.retrieveCalls != 2 || backend.generateCalls != 1 {
-				t.Fatalf("revoked tuple returned a cached answer")
+			if backend.retrieveCalls != 1 || backend.generateCalls != 1 {
+				t.Fatalf(
+					"revoked tuple reached retrieval or generation: retrieve=%d generate=%d",
+					backend.retrieveCalls, backend.generateCalls,
+				)
 			}
 			if strings.Contains(err.Error(), test.principal) ||
 				strings.Contains(err.Error(), string(document.ResourceID)) {
@@ -579,7 +640,7 @@ func cacheTestService(
 	promptVersion string,
 ) *Service {
 	return cacheTestServiceWithLimits(
-		t, backend, authorizer, loader, cache, retrieverVersion, promptVersion, 10, 4, 0,
+		t, backend, authorizer, loader, cache, retrieverVersion, promptVersion, 10, 4,
 	)
 }
 
@@ -593,13 +654,12 @@ func cacheTestServiceWithLimits(
 	promptVersion string,
 	retrieveLimit int,
 	evidenceLimit int,
-	expandLimit int,
 ) *Service {
 	t.Helper()
 	service, err := New(Options{
 		KAG: backend, Authorizer: authorizer, Loader: loader, Cache: cache,
 		RetrieverVersion: retrieverVersion, PromptVersion: promptVersion,
-		RetrieveLimit: retrieveLimit, EvidenceLimit: evidenceLimit, ExpandLimit: expandLimit,
+		RetrieveLimit: retrieveLimit, EvidenceLimit: evidenceLimit,
 		Now: func() time.Time { return time.Date(2026, 7, 13, 6, 0, 0, 0, time.UTC) },
 	})
 	if err != nil {
@@ -621,5 +681,33 @@ func TestQueryCacheQuestionDigestIsExact(t *testing.T) {
 }
 
 func cacheTestKey(request protocol.QueryRequest, retrieverVersion, promptVersion string) queryCacheKey {
-	return newQueryCacheKey(request, retrieverVersion, promptVersion, 10, 4, 0)
+	return newQueryCacheKey(
+		request, retrieverVersion, promptVersion, 10, 4,
+		traversalPlanDigest{}, traversalPlanDigest{},
+	)
+}
+
+func cacheTestTraversalPlanDigest(
+	t *testing.T,
+	maxDepth int,
+	predicateSources ...protocol.ClaimPredicateSourceKey,
+) traversalPlanDigest {
+	t.Helper()
+	_, digest, err := normalizeTraversalConfig(TraversalConfig{
+		Enabled:          true,
+		PredicateSources: predicateSources,
+		ResourceKinds:    []protocol.GraphResourceKind{protocol.GraphResourceEntity},
+		Direction:        protocol.TraversalOutbound,
+		Limits: protocol.TraversalLimits{
+			MaxDepth: maxDepth, MaxFrontierWidth: 64, MaxCandidatesPerHop: 64,
+			MaxTotalResources: 128, MaxBatchChecks: 16, MaxWallClockMillis: 5_000,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if digest == (traversalPlanDigest{}) {
+		t.Fatal("canonical traversal plan digest is empty")
+	}
+	return digest
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -23,23 +24,63 @@ const (
 )
 
 type queryTestKAG struct {
+	discoverResult *kag.DiscoverResult
+	discoverErr    error
 	retrieveResult kag.RetrieveResult
 	retrieveErr    error
 	expandResult   kag.ExpandResult
 	expandErr      error
 	generateErr    error
+	discoverCalls  int
 	retrieveCalls  int
 	expandCalls    int
 	generateCalls  int
+	lastDiscover   kag.DiscoverRequest
+	lastRetrieve   kag.RetrieveRequest
 	lastExpand     kag.ExpandRequest
 	lastGenerate   kag.GenerateRequest
 	events         *[]string
 }
 
-func (f *queryTestKAG) Retrieve(context.Context, kag.RetrieveRequest) (kag.RetrieveResult, error) {
+func (f *queryTestKAG) Discover(_ context.Context, request kag.DiscoverRequest) (kag.DiscoverResult, error) {
+	f.discoverCalls++
+	f.lastDiscover = request
+	f.event("discover")
+	if f.discoverResult != nil {
+		return *f.discoverResult, f.discoverErr
+	}
+	resources := make([]protocol.ResourceHandle, 0, len(f.retrieveResult.Candidates))
+	seen := make(map[protocol.ResourceID]struct{}, len(f.retrieveResult.Candidates))
+	for _, candidate := range f.retrieveResult.Candidates {
+		if !containsTestResourceType(request.ResourceTypes, candidate.Resource.Type) {
+			continue
+		}
+		if _, duplicate := seen[candidate.Resource.ResourceID]; duplicate {
+			continue
+		}
+		seen[candidate.Resource.ResourceID] = struct{}{}
+		resources = append(resources, candidate.Resource)
+	}
+	sort.Slice(resources, func(i, j int) bool { return resources[i].ResourceID < resources[j].ResourceID })
+	return kag.DiscoverResult{Mode: "fake", Resources: resources, Complete: true}, f.discoverErr
+}
+
+func (f *queryTestKAG) Retrieve(_ context.Context, request kag.RetrieveRequest) (kag.RetrieveResult, error) {
 	f.retrieveCalls++
+	f.lastRetrieve = request
 	f.event("retrieve")
-	return f.retrieveResult, f.retrieveErr
+	allowed := make(map[protocol.ResourceID]protocol.ResourceHandle, len(request.AllowedResources))
+	for _, resource := range request.AllowedResources {
+		allowed[resource.ResourceID] = resource
+	}
+	result := f.retrieveResult
+	result.Candidates = nil
+	for _, candidate := range f.retrieveResult.Candidates {
+		if resource, ok := allowed[candidate.Resource.ResourceID]; ok && resource == candidate.Resource {
+			result.Candidates = append(result.Candidates, candidate)
+		}
+	}
+	return result, f.retrieveErr
 }
 
 func (f *queryTestKAG) Expand(_ context.Context, request kag.ExpandRequest) (kag.ExpandResult, error) {
@@ -51,7 +92,7 @@ func (f *queryTestKAG) Expand(_ context.Context, request kag.ExpandRequest) (kag
 
 func (f *queryTestKAG) Generate(_ context.Context, request kag.GenerateRequest) (kag.GenerateResult, error) {
 	f.generateCalls++
-	f.lastGenerate = request
+	f.lastGenerate = request.Clone()
 	f.event("generate")
 	if f.generateErr != nil {
 		return kag.GenerateResult{}, f.generateErr
@@ -72,6 +113,15 @@ func (f *queryTestKAG) event(value string) {
 	if f.events != nil {
 		*f.events = append(*f.events, value)
 	}
+}
+
+func containsTestResourceType(types []protocol.ResourceType, target protocol.ResourceType) bool {
+	for _, resourceType := range types {
+		if resourceType == target {
+			return true
+		}
+	}
+	return false
 }
 
 type queryTestAuthorizer struct {
@@ -164,10 +214,13 @@ func TestQueryScopesEvidencePerPrincipal(t *testing.T) {
 			if len(loader.calls) != 1 || len(loader.calls[0]) != 1 || loader.calls[0][0] != test.allowed {
 				t.Fatalf("loader received %#v", loader.calls)
 			}
+			if got := backend.lastRetrieve.AllowedResources; !reflect.DeepEqual(got, []protocol.ResourceHandle{test.allowed}) {
+				t.Fatalf("retrieval authorization scope = %#v, want only %#v", got, test.allowed)
+			}
 			if strings.Contains(result.Generation.Answer, string(test.denied.ResourceID)) {
 				t.Fatal("denied resource reached generation")
 			}
-			if got, want := events, []string{"retrieve", "authz", "load", "authz", "generate"}; !reflect.DeepEqual(got, want) {
+			if got, want := events, []string{"discover", "authz", "retrieve", "load", "authz", "generate"}; !reflect.DeepEqual(got, want) {
 				t.Fatalf("events = %v, want %v", got, want)
 			}
 			for _, call := range authorizer.calls {
@@ -178,6 +231,36 @@ func TestQueryScopesEvidencePerPrincipal(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestQueryFailsClosedBeforeRankingWhenDiscoveryIsIncomplete(t *testing.T) {
+	resources := make([]protocol.ResourceHandle, maxPrimitiveLimit)
+	for index := range resources {
+		resources[index] = queryTestDocument(
+			protocol.ResourceID(fmt.Sprintf("res_%032x", index+1)),
+			"content",
+			"projection-v1",
+		)
+	}
+	backend := &queryTestKAG{discoverResult: &kag.DiscoverResult{
+		Mode: "fake", Resources: resources, Complete: false,
+	}}
+	authorizer := &queryTestAuthorizer{}
+	loader := &queryTestLoader{}
+	service := queryTestService(t, backend, authorizer, loader, 0, 4)
+
+	_, err := service.Query(context.Background(), protocol.QueryRequest{
+		Question: "q", Authorization: queryTestAuthorization("alice", "request-incomplete-discovery"),
+	})
+	if !errors.Is(err, errIncompleteCandidateDiscovery) {
+		t.Fatalf("incomplete discovery error = %v", err)
+	}
+	if len(authorizer.calls) != 0 || backend.retrieveCalls != 0 || len(loader.calls) != 0 || backend.generateCalls != 0 {
+		t.Fatalf(
+			"incomplete discovery crossed a protected boundary: authz=%d retrieve=%d load=%d generate=%d",
+			len(authorizer.calls), backend.retrieveCalls, len(loader.calls), backend.generateCalls,
+		)
 	}
 }
 
@@ -406,55 +489,17 @@ func TestQueryRejectsInvalidRetrievalBeforeAuthorization(t *testing.T) {
 	}
 }
 
-func TestQueryAuthorizesExpansionPerHop(t *testing.T) {
-	documentA := queryTestDocument(queryTestModelID, "a", "projection-v1")
-	documentB := queryTestDocument(queryTestOtherID, "b", "projection-v1")
-	documentC := queryTestDocument(queryTestThirdID, "c", "projection-v1")
-	documentD := queryTestDocument(queryTestFourthID, "d", "projection-v1")
-	backend := &queryTestKAG{
-		retrieveResult: queryTestRetrieve(documentA, documentB),
-		expandResult: kag.ExpandResult{
-			Mode:       "fake",
-			Candidates: []kag.CandidateHandle{{Resource: documentC, Score: 0.7}, {Resource: documentD, Score: 0.6}},
-			Expansions: []kag.ExpansionHandle{
-				{FromResourceID: documentA.ResourceID, ToResourceID: documentC.ResourceID, Hop: 1},
-				{FromResourceID: documentA.ResourceID, ToResourceID: documentD.ResourceID, Hop: 1},
-			},
-		},
-	}
-	authorizer := &queryTestAuthorizer{}
-	authorizer.decide = func(call int, request authz.BatchCheckRequest) ([]authz.Decision, error) {
-		allowed := map[int]map[string]bool{
-			0: {documentA.AuthorizationID: true},
-			1: {documentC.AuthorizationID: true},
-			2: {documentA.AuthorizationID: true, documentC.AuthorizationID: true},
-		}
-		return queryTestDecisions(request, func(check authz.BatchCheckItem) bool { return allowed[call][check.Object] }), nil
-	}
-	loader := &queryTestLoader{items: map[protocol.ResourceID]protocol.EvidenceItem{
-		documentA.ResourceID: queryTestItem(documentA), documentC.ResourceID: queryTestItem(documentC),
-	}}
-	service := queryTestService(t, backend, authorizer, loader, 4, 3)
-	result, err := service.Query(context.Background(), protocol.QueryRequest{
-		Question: "q", Authorization: queryTestAuthorization("alice", "request-expand"),
+func TestNewRejectsLegacyUntypedExpandLimit(t *testing.T) {
+	_, err := New(Options{
+		KAG:           &queryTestKAG{},
+		Authorizer:    &queryTestAuthorizer{},
+		Loader:        &queryTestLoader{},
+		RetrieveLimit: 10,
+		EvidenceLimit: 3,
+		ExpandLimit:   4,
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(backend.lastExpand.Frontier) != 1 || backend.lastExpand.Frontier[0].Resource != documentA {
-		t.Fatalf("expand frontier = %#v", backend.lastExpand.Frontier)
-	}
-	if got, want := result.Generation.EvidenceResourceIDs, []protocol.ResourceID{documentA.ResourceID, documentC.ResourceID}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("generation evidence = %v, want %v", got, want)
-	}
-	for _, denied := range []protocol.ResourceID{documentB.ResourceID, documentD.ResourceID} {
-		for _, call := range loader.calls {
-			for _, handle := range call {
-				if handle.ResourceID == denied {
-					t.Fatalf("denied resource %s reached loader", denied)
-				}
-			}
-		}
+	if err == nil || !strings.Contains(err.Error(), "legacy untyped expand_limit") {
+		t.Fatalf("New error = %v, want legacy untyped expand limit rejection", err)
 	}
 }
 
@@ -499,7 +544,7 @@ func TestQueryRejectsLoaderMutationAndFinalRevocation(t *testing.T) {
 		if backend.generateCalls != 0 {
 			t.Fatal("final revocation reached generation")
 		}
-		if got, want := events, []string{"retrieve", "authz", "load", "authz"}; !reflect.DeepEqual(got, want) {
+		if got, want := events, []string{"discover", "authz", "retrieve", "load", "authz"}; !reflect.DeepEqual(got, want) {
 			t.Fatalf("events = %v, want %v", got, want)
 		}
 	})
