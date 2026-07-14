@@ -17,10 +17,11 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from copy import deepcopy
 from ipaddress import ip_address
-from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from typing import Any
@@ -70,6 +71,7 @@ INVALID_GRAPH_BINDING_CODE = "invalid_graph_binding"
 PRIMITIVE_UNAVAILABLE_CODE = "primitive_unavailable"
 INVALID_PRIMITIVE_RESPONSE_CODE = "invalid_primitive_response"
 PERMISSIONED_PROVIDER_ENV = "KNOTE_KAG_PERMISSIONED_PROVIDER"
+PERMISSIONED_PROVIDER_RUNNER_ARG = "--permissioned-provider-runner"
 TEST_STAGE_SPY_ENV = "KNOTE_KAG_TEST_STAGE_SPY"
 TEST_DELAY_MS_ENV = "KNOTE_KAG_TEST_DELAY_MS"
 
@@ -159,6 +161,8 @@ MAX_GRAPH_BINDING_LINE_BYTES = 1 << 20
 MAX_ARTIFACT_CURRENT_POINTER_BYTES = 64 << 10
 MAX_ARTIFACT_BUNDLE_MANIFEST_BYTES = 4 << 20
 MAX_PRIMITIVE_TEXT_BYTES = 1 << 20
+MAX_PROVIDER_RESPONSE_BYTES = 2 << 20
+PROVIDER_RUNNER_TIMEOUT_SECONDS = 30
 
 FAKE_INTRO_ID = "res_00000000000000000000000000000001"
 FAKE_DENIED_CANARY_ID = "res_00000000000000000000000000000002"
@@ -1868,68 +1872,192 @@ def permissioned_provider_context(
     }
 
 
-@contextmanager
-def suppress_provider_output() -> Any:
-    """Discard Python and file-descriptor output across untrusted provider calls."""
-    saved_stdout = os.dup(1)
-    saved_stderr = os.dup(2)
-    null_fd = os.open(os.devnull, os.O_WRONLY)
-    captured_stdout = StringIO()
-    captured_stderr = StringIO()
+def write_all(fd: int, payload: bytes) -> None:
+    view = memoryview(payload)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:
+            raise OSError("provider runner response write failed")
+        view = view[written:]
+
+
+def permissioned_provider_runner(response_path: str) -> int:
+    """Run provider code without inheriting the adapter's output descriptors."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
     try:
-        sys.stdout.flush()
-        sys.stderr.flush()
-        os.dup2(null_fd, 1)
-        os.dup2(null_fd, 2)
-        with redirect_stdout(captured_stdout), redirect_stderr(captured_stderr):
-            yield
+        response_fd = os.open(response_path, flags, 0o600)
+    except OSError:
+        return 1
+
+    envelope: dict[str, Any] = {"version": 1, "status": "unavailable"}
+    try:
+        payload = json.loads(sys.stdin.buffer.read())
+        if not isinstance(payload, dict) or set(payload) != {
+            "version",
+            "provider",
+            "context",
+            "method",
+            "request",
+        }:
+            raise ValueError("invalid provider runner request")
+        spec = payload.get("provider")
+        context = payload.get("context")
+        method = payload.get("method")
+        request = payload.get("request")
+        if (
+            payload.get("version") != 1
+            or not isinstance(spec, str)
+            or not PROVIDER_SPEC_RE.fullmatch(spec)
+            or not isinstance(context, dict)
+            or method not in {"retrieve", "generate"}
+            or not isinstance(request, dict)
+        ):
+            raise ValueError("invalid provider runner request")
+        module_name, factory_name = spec.split(":", 1)
+        module = importlib.import_module(module_name)
+        factory = getattr(module, factory_name)
+        provider = factory(dict(context))
+        operation = getattr(provider, method, None)
+        if not callable(operation):
+            raise ValueError("provider capability unavailable")
+        provider_response = operation(deepcopy(request))
+    except BaseException:
+        pass
+    else:
+        try:
+            if not isinstance(provider_response, dict):
+                raise TypeError("provider response must be an object")
+            normalized_payload = json.dumps(
+                provider_response,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            if len(normalized_payload) > MAX_PROVIDER_RESPONSE_BYTES:
+                raise ValueError("provider response exceeds limit")
+            normalized_response = json.loads(normalized_payload)
+            if type(normalized_response) is not dict:
+                raise TypeError("provider response must be a plain object")
+        except BaseException:
+            envelope = {"version": 1, "status": "invalid_response"}
+        else:
+            envelope = {
+                "version": 1,
+                "status": "ok",
+                "response": normalized_response,
+            }
+
+    try:
+        encoded = json.dumps(
+            envelope,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        os.ftruncate(response_fd, 0)
+        os.lseek(response_fd, 0, os.SEEK_SET)
+        write_all(response_fd, encoded)
+        os.fsync(response_fd)
+    except BaseException:
+        return 1
     finally:
-        os.dup2(saved_stdout, 1)
-        os.dup2(saved_stderr, 2)
-        os.close(null_fd)
-        os.close(saved_stdout)
-        os.close(saved_stderr)
+        try:
+            os.close(response_fd)
+        except OSError:
+            pass
+    return 0
 
 
-def load_permissioned_provider(context: dict[str, Any]) -> Any:
+def call_permissioned_provider(
+    context: dict[str, Any], method: str, request: dict[str, Any]
+) -> dict[str, Any]:
     spec = os.environ.get(PERMISSIONED_PROVIDER_ENV, "").strip()
     if not PROVIDER_SPEC_RE.fullmatch(spec):
         raise AdapterRequestError(
             "permissioned primitive provider is unavailable",
             PRIMITIVE_UNAVAILABLE_CODE,
         )
-    module_name, factory_name = spec.split(":", 1)
-    try:
-        with suppress_provider_output():
-            module = importlib.import_module(module_name)
-            factory = getattr(module, factory_name)
-            provider = factory(dict(context))
-    except BaseException as exc:
+    payload = json.dumps(
+        {
+            "version": 1,
+            "provider": spec,
+            "context": context,
+            "method": method,
+            "request": request,
+        },
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    )
+    with tempfile.TemporaryDirectory(prefix="knote-kag-provider-") as directory:
+        response_path = Path(directory) / "response.json"
+        try:
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(__file__).resolve()),
+                    PERMISSIONED_PROVIDER_RUNNER_ARG,
+                    str(response_path),
+                ],
+                input=payload,
+                text=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=PROVIDER_RUNNER_TIMEOUT_SECONDS,
+                check=False,
+                close_fds=True,
+                start_new_session=True,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise AdapterRequestError(
+                "permissioned primitive provider call failed",
+                PRIMITIVE_UNAVAILABLE_CODE,
+            ) from exc
+        if completed.returncode != 0 or not response_path.is_file():
+            raise AdapterRequestError(
+                "permissioned primitive provider call failed",
+                PRIMITIVE_UNAVAILABLE_CODE,
+            )
+        try:
+            read_flags = os.O_RDONLY
+            if hasattr(os, "O_NOFOLLOW"):
+                read_flags |= os.O_NOFOLLOW
+            response_fd = os.open(response_path, read_flags)
+            with os.fdopen(response_fd, "rb") as stream:
+                encoded = stream.read(MAX_PROVIDER_RESPONSE_BYTES + 1025)
+            if len(encoded) > MAX_PROVIDER_RESPONSE_BYTES + 1024:
+                raise ValueError("provider runner response exceeds limit")
+            envelope = json.loads(encoded)
+        except (OSError, ValueError, UnicodeError) as exc:
+            raise AdapterRequestError(
+                "permissioned primitive provider returned an invalid response",
+                INVALID_PRIMITIVE_RESPONSE_CODE,
+            ) from exc
+
+    if not isinstance(envelope, dict) or envelope.get("version") != 1:
         raise AdapterRequestError(
-            "permissioned primitive provider is unavailable",
-            PRIMITIVE_UNAVAILABLE_CODE,
-        ) from exc
-    return provider
-
-
-def call_permissioned_provider(
-    provider: Any, method: str, request: dict[str, Any]
-) -> dict[str, Any]:
-    try:
-        with suppress_provider_output():
-            operation = getattr(provider, method, None)
-            if not callable(operation):
-                raise AdapterRequestError(
-                    "permissioned primitive provider capability is unavailable",
-                    PRIMITIVE_UNAVAILABLE_CODE,
-                )
-            response = operation(deepcopy(request))
-    except BaseException as exc:
+            "permissioned primitive provider returned an invalid response",
+            INVALID_PRIMITIVE_RESPONSE_CODE,
+        )
+    status = envelope.get("status")
+    if status == "unavailable" and set(envelope) == {"version", "status"}:
         raise AdapterRequestError(
             "permissioned primitive provider call failed",
             PRIMITIVE_UNAVAILABLE_CODE,
-        ) from exc
-    if not isinstance(response, dict):
+        )
+    if status == "invalid_response" and set(envelope) == {"version", "status"}:
+        raise AdapterRequestError(
+            "permissioned primitive provider returned an invalid response",
+            INVALID_PRIMITIVE_RESPONSE_CODE,
+        )
+    response = envelope.get("response")
+    if (
+        status != "ok"
+        or set(envelope) != {"version", "status", "response"}
+        or type(response) is not dict
+    ):
         raise AdapterRequestError(
             "permissioned primitive provider returned an invalid response",
             INVALID_PRIMITIVE_RESPONSE_CODE,
@@ -1954,11 +2082,8 @@ def real_retrieve(
 ) -> dict[str, Any]:
     query, limit = validate_real_retrieve_request(params, authorization)
     projection_version = next(iter(resources.values()))["versions"]["projection"]
-    provider = load_permissioned_provider(
-        permissioned_provider_context(params, authorization, projection_version)
-    )
     response = call_permissioned_provider(
-        provider,
+        permissioned_provider_context(params, authorization, projection_version),
         "retrieve",
         {
             "version": 1,
@@ -2139,11 +2264,8 @@ def real_generate(
 ) -> dict[str, Any]:
     question, items = validate_real_generate_request(params, authorization, resources)
     projection_version = items[0]["resource"]["versions"]["projection"]
-    provider = load_permissioned_provider(
-        permissioned_provider_context(params, authorization, projection_version)
-    )
     response = call_permissioned_provider(
-        provider,
+        permissioned_provider_context(params, authorization, projection_version),
         "generate",
         {
             "version": 1,
@@ -2691,4 +2813,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] == PERMISSIONED_PROVIDER_RUNNER_ARG:
+        raise SystemExit(permissioned_provider_runner(sys.argv[2]))
     raise SystemExit(main())

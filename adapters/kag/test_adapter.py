@@ -866,12 +866,14 @@ class AdapterTest(unittest.TestCase):
                 projection_id, str(resource["resource_id"])
             )
 
-            class Provider:
-                def retrieve(self, _request: dict[str, object]) -> dict[str, object]:
+            def provider_call(
+                _context: dict[str, object], method: str, _request: dict[str, object]
+            ) -> dict[str, object]:
+                if method == "retrieve":
                     return {"candidates": [{"graph_object_id": graph_object_id, "score": 0.9}]}
-
-                def generate(self, _request: dict[str, object]) -> dict[str, object]:
+                if method == "generate":
                     return {"answer": "authorized answer"}
+                raise AssertionError(f"unexpected provider method: {method}")
 
             requests = {
                 "kag.retrieve": {"query": "knote", "limit": 10},
@@ -894,7 +896,9 @@ class AdapterTest(unittest.TestCase):
                 with self.subTest(method=method):
                     stdout = StringIO()
                     with (
-                        patch.object(adapter, "load_permissioned_provider", return_value=Provider()),
+                        patch.object(
+                            adapter, "call_permissioned_provider", side_effect=provider_call
+                        ),
                         patch.object(adapter, "runtime_dir") as runtime_dir_mock,
                         patch.object(adapter, "select_config") as select_config_mock,
                         patch.object(adapter, "check_real_health") as health_mock,
@@ -1461,6 +1465,144 @@ def create(context):
             )
             self.assertEqual(lines[-1]["type"], "error")
             self.assertEqual(lines[-1]["code"], "primitive_unavailable")
+            self.assertNotIn(canary, proc.stdout)
+            self.assertNotIn(canary, proc.stderr)
+
+    def test_real_provider_native_stdio_buffer_cannot_reach_adapter_output(self) -> None:
+        canary = "PROTECTED NATIVE STDIO CANARY"
+        provider_source = r'''
+import ctypes
+import os
+class Provider:
+    def retrieve(self, request):
+        libc = ctypes.CDLL(None)
+        payload = os.environ["KNOTE_PROVIDER_CANARY"].encode()
+        libc.printf(b"%s", ctypes.c_char_p(payload))
+        return {"candidates": [{
+            "graph_object_id": os.environ["KNOTE_PROVIDER_GRAPH_ID"],
+            "score": 0.9,
+        }]}
+def create(context):
+    return Provider()
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            projection_id = write_graph_contract_bundle(workspace)
+            resource = graph_contract_resource(projection_id)
+            env = write_permissioned_provider_module(workspace, provider_source)
+            env.update(
+                {
+                    "KNOTE_PROVIDER_GRAPH_ID": adapter.expected_graph_object_id(
+                        projection_id, str(resource["resource_id"])
+                    ),
+                    "KNOTE_PROVIDER_CANARY": canary,
+                }
+            )
+            proc, lines = call_adapter(
+                {
+                    "id": "native-stdio-provider",
+                    "method": "kag.retrieve",
+                    "params": {
+                        "workspace": str(workspace),
+                        "authorization": real_graph_authorization(),
+                        "query": "knote",
+                        "limit": 10,
+                    },
+                },
+                fake=False,
+                extra_env=env,
+            )
+            self.assertEqual(lines[-1]["type"], "result")
+            self.assertNotIn(canary, proc.stdout)
+            self.assertNotIn(canary, proc.stderr)
+
+    def test_real_provider_cannot_write_to_saved_adapter_output_descriptors(self) -> None:
+        canary = "PROTECTED ENUMERATED FD CANARY"
+        provider_source = r'''
+import os
+class Provider:
+    def retrieve(self, request):
+        payload = (os.environ["KNOTE_PROVIDER_CANARY"] + "\n").encode()
+        for fd in range(3, 64):
+            try:
+                os.write(fd, payload)
+            except OSError:
+                pass
+        return {"candidates": [{
+            "graph_object_id": os.environ["KNOTE_PROVIDER_GRAPH_ID"],
+            "score": 0.9,
+        }]}
+def create(context):
+    return Provider()
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            projection_id = write_graph_contract_bundle(workspace)
+            resource = graph_contract_resource(projection_id)
+            env = write_permissioned_provider_module(workspace, provider_source)
+            env.update(
+                {
+                    "KNOTE_PROVIDER_GRAPH_ID": adapter.expected_graph_object_id(
+                        projection_id, str(resource["resource_id"])
+                    ),
+                    "KNOTE_PROVIDER_CANARY": canary,
+                }
+            )
+            proc, lines = call_adapter(
+                {
+                    "id": "enumerated-fd-provider",
+                    "method": "kag.retrieve",
+                    "params": {
+                        "workspace": str(workspace),
+                        "authorization": real_graph_authorization(),
+                        "query": "knote",
+                        "limit": 10,
+                    },
+                },
+                fake=False,
+                extra_env=env,
+            )
+            self.assertEqual(lines[-1]["type"], "result")
+            self.assertNotIn(canary, proc.stdout)
+            self.assertNotIn(canary, proc.stderr)
+
+    def test_real_provider_dict_subclass_is_normalized_inside_runner(self) -> None:
+        canary = "PROTECTED DICT SUBCLASS CANARY"
+        provider_source = r'''
+import os
+class ProviderResponse(dict):
+    def items(self):
+        payload = (os.environ["KNOTE_PROVIDER_CANARY"] + "\n").encode()
+        os.write(1, payload)
+        os.write(2, payload)
+        raise RuntimeError(os.environ["KNOTE_PROVIDER_CANARY"])
+class Provider:
+    def retrieve(self, request):
+        return ProviderResponse({"candidates": []})
+def create(context):
+    return Provider()
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            write_graph_contract_bundle(workspace)
+            env = write_permissioned_provider_module(workspace, provider_source)
+            env["KNOTE_PROVIDER_CANARY"] = canary
+            proc, lines = call_adapter(
+                {
+                    "id": "dict-subclass-provider",
+                    "method": "kag.retrieve",
+                    "params": {
+                        "workspace": str(workspace),
+                        "authorization": real_graph_authorization(),
+                        "query": "knote",
+                        "limit": 10,
+                    },
+                },
+                fake=False,
+                extra_env=env,
+            )
+            self.assertEqual(lines[-1]["type"], "error")
+            self.assertEqual(lines[-1]["code"], "invalid_primitive_response")
             self.assertNotIn(canary, proc.stdout)
             self.assertNotIn(canary, proc.stderr)
 
