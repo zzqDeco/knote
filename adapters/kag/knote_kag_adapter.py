@@ -18,8 +18,9 @@ import re
 import subprocess
 import sys
 import time
+from copy import deepcopy
 from ipaddress import ip_address
-from contextlib import contextmanager, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from typing import Any
@@ -66,6 +67,9 @@ PRIMITIVE_METHODS = frozenset({"kag.retrieve", "kag.expand", "kag.generate"})
 UNSUPPORTED_PRIMITIVE_CODE = "unsupported_primitive"
 INVALID_REQUEST_CODE = "invalid_request"
 INVALID_GRAPH_BINDING_CODE = "invalid_graph_binding"
+PRIMITIVE_UNAVAILABLE_CODE = "primitive_unavailable"
+INVALID_PRIMITIVE_RESPONSE_CODE = "invalid_primitive_response"
+PERMISSIONED_PROVIDER_ENV = "KNOTE_KAG_PERMISSIONED_PROVIDER"
 TEST_STAGE_SPY_ENV = "KNOTE_KAG_TEST_STAGE_SPY"
 TEST_DELAY_MS_ENV = "KNOTE_KAG_TEST_DELAY_MS"
 
@@ -147,10 +151,14 @@ GRAPH_OBJECT_ID_RE = re.compile(r"kg_[0-9a-f]{32}\Z")
 CLAIM_PREDICATE_KEY_RE = re.compile(r"pred_[0-9a-f]{32}\Z")
 PROJECTION_ID_RE = re.compile(r"prj_[0-9a-f]{32}\Z")
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
+PROVIDER_SPEC_RE = re.compile(
+    r"[A-Za-z_][A-Za-z0-9_.]*:[A-Za-z_][A-Za-z0-9_]*\Z"
+)
 MAX_GRAPH_BINDING_FILE_BYTES = 64 << 20
 MAX_GRAPH_BINDING_LINE_BYTES = 1 << 20
 MAX_ARTIFACT_CURRENT_POINTER_BYTES = 64 << 10
 MAX_ARTIFACT_BUNDLE_MANIFEST_BYTES = 4 << 20
+MAX_PRIMITIVE_TEXT_BYTES = 1 << 20
 
 FAKE_INTRO_ID = "res_00000000000000000000000000000001"
 FAKE_DENIED_CANARY_ID = "res_00000000000000000000000000000002"
@@ -1806,6 +1814,347 @@ def _load_current_graph_contract(
     return resources, claims
 
 
+def bounded_primitive_text(value: Any, field: str) -> str:
+    text = required_content(value, field)
+    if len(text.encode("utf-8")) > MAX_PRIMITIVE_TEXT_BYTES:
+        raise AdapterRequestError(f"{field} exceeds the primitive text limit")
+    return text
+
+
+def selected_resource_maps(
+    resources: dict[str, dict[str, Any]],
+) -> tuple[dict[str, str], dict[str, dict[str, Any]]]:
+    graph_by_resource_id: dict[str, str] = {}
+    resource_by_id: dict[str, dict[str, Any]] = {}
+    for graph_object_id, resource in resources.items():
+        resource_id = resource["resource_id"]
+        graph_by_resource_id[resource_id] = graph_object_id
+        resource_by_id[resource_id] = resource
+    return graph_by_resource_id, resource_by_id
+
+
+def require_selected_resource(
+    resource: dict[str, Any],
+    resources: dict[str, dict[str, Any]],
+    field: str,
+) -> str:
+    graph_by_resource_id, resource_by_id = selected_resource_maps(resources)
+    resource_id = resource["resource_id"]
+    selected = resource_by_id.get(resource_id)
+    if selected is None or selected != resource:
+        raise AdapterRequestError(
+            f"{field} does not match the exact selected graph resource binding",
+            INVALID_GRAPH_BINDING_CODE,
+        )
+    return graph_by_resource_id[resource_id]
+
+
+def permissioned_provider_context(
+    params: dict[str, Any],
+    authorization: dict[str, Any],
+    projection_version: str,
+) -> dict[str, Any]:
+    return {
+        "version": 1,
+        "workspace": str(workspace_path(params).resolve()),
+        "tenant_id": authorization["tenant_id"],
+        "knowledge_base_id": authorization["knowledge_base_id"],
+        "projection_version": projection_version,
+        "host": str(params.get("host") or "").strip(),
+        "config_path": str(params.get("config_path") or "").strip(),
+        "project_id": str(params.get("project_id") or "").strip(),
+        "namespace": str(params.get("namespace") or "").strip(),
+        "language": str(params.get("language") or "").strip(),
+    }
+
+
+def load_permissioned_provider(context: dict[str, Any]) -> Any:
+    spec = os.environ.get(PERMISSIONED_PROVIDER_ENV, "").strip()
+    if not PROVIDER_SPEC_RE.fullmatch(spec):
+        raise AdapterRequestError(
+            "permissioned primitive provider is unavailable",
+            PRIMITIVE_UNAVAILABLE_CODE,
+        )
+    module_name, factory_name = spec.split(":", 1)
+    captured_stdout = StringIO()
+    captured_stderr = StringIO()
+    try:
+        with redirect_stdout(captured_stdout), redirect_stderr(captured_stderr):
+            module = importlib.import_module(module_name)
+            factory = getattr(module, factory_name)
+            provider = factory(dict(context))
+    except Exception as exc:
+        raise AdapterRequestError(
+            "permissioned primitive provider is unavailable",
+            PRIMITIVE_UNAVAILABLE_CODE,
+        ) from exc
+    return provider
+
+
+def call_permissioned_provider(
+    provider: Any, method: str, request: dict[str, Any]
+) -> dict[str, Any]:
+    operation = getattr(provider, method, None)
+    if not callable(operation):
+        raise AdapterRequestError(
+            "permissioned primitive provider capability is unavailable",
+            PRIMITIVE_UNAVAILABLE_CODE,
+        )
+    captured_stdout = StringIO()
+    captured_stderr = StringIO()
+    try:
+        with redirect_stdout(captured_stdout), redirect_stderr(captured_stderr):
+            response = operation(deepcopy(request))
+    except Exception as exc:
+        raise AdapterRequestError(
+            "permissioned primitive provider call failed",
+            PRIMITIVE_UNAVAILABLE_CODE,
+        ) from exc
+    if not isinstance(response, dict):
+        raise AdapterRequestError(
+            "permissioned primitive provider returned an invalid response",
+            INVALID_PRIMITIVE_RESPONSE_CODE,
+        )
+    return response
+
+
+def validate_real_retrieve_request(
+    params: dict[str, Any], authorization: dict[str, Any]
+) -> tuple[str, int]:
+    query = bounded_primitive_text(params.get("query"), "query").strip()
+    limit = primitive_limit(params, 10)
+    if not query:
+        raise AdapterRequestError("query must be a non-empty string")
+    return query, limit
+
+
+def real_retrieve(
+    params: dict[str, Any],
+    authorization: dict[str, Any],
+    resources: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    query, limit = validate_real_retrieve_request(params, authorization)
+    projection_version = next(iter(resources.values()))["versions"]["projection"]
+    provider = load_permissioned_provider(
+        permissioned_provider_context(params, authorization, projection_version)
+    )
+    response = call_permissioned_provider(
+        provider,
+        "retrieve",
+        {
+            "version": 1,
+            "query": query,
+            "limit": limit,
+            "projection_version": projection_version,
+        },
+    )
+    validate_exact_fields(response, frozenset({"candidates"}), "provider retrieve response")
+    values = response.get("candidates")
+    if not isinstance(values, list) or len(values) > limit:
+        raise AdapterRequestError(
+            "permissioned retrieve provider returned an invalid candidate set",
+            INVALID_PRIMITIVE_RESPONSE_CODE,
+        )
+    candidates: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, value in enumerate(values):
+        field = f"provider retrieve response.candidates[{index}]"
+        if not isinstance(value, dict):
+            raise AdapterRequestError(
+                "permissioned retrieve provider returned an invalid candidate",
+                INVALID_PRIMITIVE_RESPONSE_CODE,
+            )
+        try:
+            validate_exact_fields(value, frozenset({"graph_object_id", "score"}), field)
+            graph_object_id = required_authorization_token(
+                value.get("graph_object_id"), f"{field}.graph_object_id"
+            )
+        except AdapterRequestError as exc:
+            raise AdapterRequestError(
+                "permissioned retrieve provider returned an invalid candidate",
+                INVALID_PRIMITIVE_RESPONSE_CODE,
+            ) from exc
+        score = value.get("score")
+        if (
+            graph_object_id not in resources
+            or graph_object_id in seen
+            or isinstance(score, bool)
+            or not isinstance(score, (int, float))
+            or not math.isfinite(score)
+            or score < 0
+            or score > 1
+        ):
+            raise AdapterRequestError(
+                "permissioned retrieve provider returned an invalid candidate",
+                INVALID_PRIMITIVE_RESPONSE_CODE,
+            )
+        seen.add(graph_object_id)
+        candidates.append({"resource": resources[graph_object_id], "score": float(score)})
+    candidates.sort(key=lambda candidate: (-candidate["score"], candidate["resource"]["resource_id"]))
+    resource_ids = [candidate["resource"]["resource_id"] for candidate in candidates]
+    return add_test_stage_spy(
+        {"mode": "real", "candidates": candidates},
+        [("retrieve.output", resource_ids)],
+    )
+
+
+def validate_real_expand_request(
+    params: dict[str, Any],
+    authorization: dict[str, Any],
+    resources: dict[str, dict[str, Any]],
+) -> tuple[list[tuple[dict[str, Any], str]], int]:
+    frontier = params.get("frontier")
+    if not isinstance(frontier, list) or not frontier or len(frontier) > 100:
+        raise AdapterRequestError("frontier must contain between 1 and 100 candidate handles")
+    handles: list[tuple[dict[str, Any], str]] = []
+    seen: set[str] = set()
+    for index, value in enumerate(frontier):
+        handle = validate_candidate(value, f"frontier[{index}]")
+        require_authorization_scope(handle["resource"], authorization, f"frontier[{index}].resource")
+        graph_object_id = require_selected_resource(
+            handle["resource"], resources, f"frontier[{index}].resource"
+        )
+        resource_id = handle["resource"]["resource_id"]
+        if resource_id in seen:
+            raise AdapterRequestError("frontier contains duplicate resource_id values")
+        seen.add(resource_id)
+        handles.append((handle, graph_object_id))
+    return handles, primitive_limit(params, 10)
+
+
+def real_expand(
+    params: dict[str, Any],
+    authorization: dict[str, Any],
+    resources: dict[str, dict[str, Any]],
+    claims: list[dict[str, Any]],
+) -> dict[str, Any]:
+    handles, limit = validate_real_expand_request(params, authorization, resources)
+    frontier_scores = {graph_object_id: handle["score"] for handle, graph_object_id in handles}
+    candidate_scores: dict[str, float] = {}
+    graph_edges: set[tuple[str, str]] = set()
+    for claim in claims:
+        if claim["subject"] in frontier_scores:
+            score = float(frontier_scores[claim["subject"]])
+            candidate_scores[claim["claim"]] = max(candidate_scores.get(claim["claim"], 0.0), score)
+            graph_edges.add((claim["subject"], claim["claim"]))
+        if claim["claim"] in frontier_scores:
+            score = float(frontier_scores[claim["claim"]])
+            candidate_scores[claim["object"]] = max(candidate_scores.get(claim["object"], 0.0), score)
+            graph_edges.add((claim["claim"], claim["object"]))
+    ranked = sorted(
+        candidate_scores,
+        key=lambda graph_object_id: (
+            -candidate_scores[graph_object_id],
+            resources[graph_object_id]["resource_id"],
+        ),
+    )[:limit]
+    included = set(ranked)
+    candidates = [
+        {"resource": resources[graph_object_id], "score": candidate_scores[graph_object_id]}
+        for graph_object_id in ranked
+    ]
+    expansions = sorted(
+        (
+            {
+                "from_resource_id": resources[source]["resource_id"],
+                "to_resource_id": resources[target]["resource_id"],
+                "hop": 1,
+            }
+            for source, target in graph_edges
+            if target in included
+        ),
+        key=lambda edge: (edge["hop"], edge["from_resource_id"], edge["to_resource_id"]),
+    )
+    frontier_ids = sorted(handle["resource"]["resource_id"] for handle, _ in handles)
+    output_ids = [candidate["resource"]["resource_id"] for candidate in candidates]
+    return add_test_stage_spy(
+        {"mode": "real", "candidates": candidates, "expansions": expansions},
+        [("expand.frontier_input", frontier_ids), ("expand.candidate_output", output_ids)],
+    )
+
+
+def validate_real_generate_request(
+    params: dict[str, Any],
+    authorization: dict[str, Any],
+    resources: dict[str, dict[str, Any]],
+) -> tuple[str, list[dict[str, Any]]]:
+    question = bounded_primitive_text(params.get("question"), "question").strip()
+    evidence = params.get("evidence")
+    if not isinstance(evidence, list) or not evidence or len(evidence) > 100:
+        raise AdapterRequestError("evidence must contain between 1 and 100 authorized evidence objects")
+    items: list[dict[str, Any]] = []
+    resource_ids: set[str] = set()
+    citation_handles: set[str] = set()
+    projection_version = ""
+    for index, value in enumerate(evidence):
+        item = validate_evidence(value, f"evidence[{index}]")
+        if len(item["content"].encode("utf-8")) > MAX_PRIMITIVE_TEXT_BYTES:
+            raise AdapterRequestError(f"evidence[{index}].content exceeds the primitive text limit")
+        require_authorization_scope(item["resource"], authorization, f"evidence[{index}].resource")
+        require_selected_resource(item["resource"], resources, f"evidence[{index}].resource")
+        resource_id = item["resource"]["resource_id"]
+        citation_handle = item["citation_handle"]
+        if resource_id in resource_ids:
+            raise AdapterRequestError("evidence contains duplicate resource_id values")
+        if citation_handle in citation_handles:
+            raise AdapterRequestError("evidence contains duplicate citation_handle values")
+        item_projection = item["resource"]["versions"]["projection"]
+        if projection_version and projection_version != item_projection:
+            raise AdapterRequestError("evidence crosses selected projection versions")
+        projection_version = item_projection
+        resource_ids.add(resource_id)
+        citation_handles.add(citation_handle)
+        items.append(item)
+    if not question:
+        raise AdapterRequestError("question must be a non-empty string")
+    return question, items
+
+
+def real_generate(
+    params: dict[str, Any],
+    authorization: dict[str, Any],
+    resources: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    question, items = validate_real_generate_request(params, authorization, resources)
+    projection_version = items[0]["resource"]["versions"]["projection"]
+    provider = load_permissioned_provider(
+        permissioned_provider_context(params, authorization, projection_version)
+    )
+    response = call_permissioned_provider(
+        provider,
+        "generate",
+        {
+            "version": 1,
+            "question": question,
+            "projection_version": projection_version,
+            "evidence": items,
+        },
+    )
+    try:
+        validate_exact_fields(response, frozenset({"answer"}), "provider generate response")
+        answer = bounded_primitive_text(response.get("answer"), "provider generate response.answer")
+    except AdapterRequestError as exc:
+        raise AdapterRequestError(
+            "permissioned generate provider returned an invalid response",
+            INVALID_PRIMITIVE_RESPONSE_CODE,
+        ) from exc
+    resource_ids = [item["resource"]["resource_id"] for item in items]
+    citations = [
+        {"handle": item["citation_handle"], "resource_id": item["resource"]["resource_id"]}
+        for item in items
+    ]
+    return add_test_stage_spy(
+        {
+            "mode": "real",
+            "answer": answer,
+            "citations": citations,
+            "evidence_resource_ids": resource_ids,
+            "trace": {"resource_ids": resource_ids, "count": len(resource_ids)},
+        },
+        [("generate.evidence_input", resource_ids), ("generate.citation_output", resource_ids)],
+    )
+
+
 def validate_candidate(value: Any, field: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise AdapterRequestError(f"{field} must be an object")
@@ -2228,15 +2577,13 @@ def real_response(req: dict[str, Any]) -> None:
     if method in PRIMITIVE_METHODS:
         params = primitive_params(req)
         authorization = validate_authorization(params.get("authorization"))
-        # The selected immutable bundle is the only identity authority. Real
-        # primitives remain disabled until #57, but no future result can be
-        # emitted without first passing this body-free binding validation.
-        load_current_graph_contract(params, authorization)
-        error(
-            req_id,
-            f"{method} is not supported by the real OpenSPG/KAG adapter",
-            UNSUPPORTED_PRIMITIVE_CODE,
-        )
+        resources, claims = load_current_graph_contract(params, authorization)
+        handlers = {
+            "kag.retrieve": lambda: real_retrieve(params, authorization, resources),
+            "kag.expand": lambda: real_expand(params, authorization, resources, claims),
+            "kag.generate": lambda: real_generate(params, authorization, resources),
+        }
+        result(req_id, handlers[method]())
         return
     if method == "kag.health":
         real_health(req)

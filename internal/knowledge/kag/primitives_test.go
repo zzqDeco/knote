@@ -78,39 +78,121 @@ func TestPrimitiveClientActualFakeAdapterRoundTrip(t *testing.T) {
 	}
 }
 
-func TestPrimitiveClientActualRealAdapterReturnsUnsupportedBeforeKAGSetup(t *testing.T) {
+func TestPrimitiveClientActualRealAdapterPermissionedRoundTrip(t *testing.T) {
 	repoRoot := primitiveTestRepoRoot(t)
 	workspace := t.TempDir()
 	resource := writePrimitiveGraphContract(t, workspace)
+	graphObjectID, err := protocol.NewGraphObjectID(resource.Versions.Projection, resource.ResourceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := writePrimitiveProvider(t, workspace, `
+import os
+
+class Provider:
+    def retrieve(self, request):
+        return {"candidates": [{"graph_object_id": os.environ["KNOTE_TEST_GRAPH_ID"], "score": 0.9}]}
+
+    def generate(self, request):
+        if [item["content"] for item in request["evidence"]] != ["allowed body"]:
+            raise RuntimeError("unexpected evidence")
+        return {"answer": "authorized real answer"}
+
+def create(context):
+    return Provider()
+`)
 	client := Client{
-		AdapterPath: filepath.Join(repoRoot, "adapters", "kag", "knote_kag_adapter.py"),
-		Workspace:   workspace,
-		Fake:        false,
+		AdapterPath:          filepath.Join(repoRoot, "adapters", "kag", "knote_kag_adapter.py"),
+		Workspace:            workspace,
+		Fake:                 false,
+		PermissionedProvider: provider,
 	}
 	t.Setenv("KNOTE_PYTHON", pythonForTest())
 	t.Setenv("KNOTE_KAG_FAKE", "")
+	t.Setenv("KNOTE_KAG_PERMISSIONED_PROVIDER", "invalid_provider:create")
+	t.Setenv("KNOTE_TEST_GRAPH_ID", string(graphObjectID))
 	candidate := CandidateHandle{Resource: resource, Score: 0.9}
 	evidence := AuthorizedEvidence{
 		Resource: candidate.Resource, Content: "allowed body", CitationHandle: "citation-1",
 	}
 
-	_, retrieveErr := client.Retrieve(context.Background(), RetrieveRequest{
+	retrieved, err := client.Retrieve(context.Background(), RetrieveRequest{
 		Authorization: testAuthorizationContext(), Query: "knote", Limit: 10,
 	})
-	_, expandErr := client.Expand(context.Background(), ExpandRequest{
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retrieved.Mode != "real" || len(retrieved.Candidates) != 1 || retrieved.Candidates[0].Resource != resource {
+		t.Fatalf("unexpected real retrieve result: %+v", retrieved)
+	}
+
+	expanded, err := client.Expand(context.Background(), ExpandRequest{
 		Authorization: testAuthorizationContext(), Frontier: []CandidateHandle{candidate}, Limit: 10,
 	})
-	_, generateErr := client.Generate(context.Background(), GenerateRequest{
+	if err != nil {
+		t.Fatal(err)
+	}
+	if expanded.Mode != "real" || len(expanded.Candidates) != 0 || len(expanded.Expansions) != 0 {
+		t.Fatalf("unexpected empty real expansion result: %+v", expanded)
+	}
+
+	generated, err := client.Generate(context.Background(), GenerateRequest{
 		Authorization: testAuthorizationContext(), Question: "knote", Evidence: []AuthorizedEvidence{evidence},
 	})
-	for method, err := range map[string]error{
-		"kag.retrieve": retrieveErr,
-		"kag.expand":   expandErr,
-		"kag.generate": generateErr,
-	} {
-		if !errors.Is(err, ErrUnsupportedPrimitive) {
-			t.Fatalf("%s should return typed unsupported before KAG setup, got %T: %v", method, err, err)
-		}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if generated.Mode != "real" || generated.Answer != "authorized real answer" || len(generated.Citations) != 1 {
+		t.Fatalf("unexpected real generation result: %+v", generated)
+	}
+}
+
+func TestPrimitiveClientActualRealAdapterReturnsTypedProviderUnavailable(t *testing.T) {
+	repoRoot := primitiveTestRepoRoot(t)
+	workspace := t.TempDir()
+	writePrimitiveGraphContract(t, workspace)
+	client := Client{
+		AdapterPath: filepath.Join(repoRoot, "adapters", "kag", "knote_kag_adapter.py"),
+		Workspace:   workspace,
+	}
+	t.Setenv("KNOTE_PYTHON", pythonForTest())
+	t.Setenv("KNOTE_KAG_FAKE", "")
+	t.Setenv("KNOTE_KAG_PERMISSIONED_PROVIDER", "")
+	_, err := client.Retrieve(context.Background(), RetrieveRequest{
+		Authorization: testAuthorizationContext(), Query: "knote", Limit: 10,
+	})
+	if !errors.Is(err, ErrPrimitiveUnavailable) || !IsPrimitiveUnavailable(err) {
+		t.Fatalf("provider-unavailable error = %T %v", err, err)
+	}
+}
+
+func TestPrimitiveClientActualRealProviderHonorsContextDeadline(t *testing.T) {
+	repoRoot := primitiveTestRepoRoot(t)
+	workspace := t.TempDir()
+	writePrimitiveGraphContract(t, workspace)
+	provider := writePrimitiveProvider(t, workspace, `
+import time
+class Provider:
+    def retrieve(self, request):
+        time.sleep(5)
+        return {"candidates": []}
+def create(context):
+    return Provider()
+`)
+	client := Client{
+		AdapterPath:          filepath.Join(repoRoot, "adapters", "kag", "knote_kag_adapter.py"),
+		Workspace:            workspace,
+		PermissionedProvider: provider,
+	}
+	t.Setenv("KNOTE_PYTHON", pythonForTest())
+	t.Setenv("KNOTE_KAG_FAKE", "")
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel()
+	_, err := client.Retrieve(ctx, RetrieveRequest{
+		Authorization: testAuthorizationContext(), Query: "knote", Limit: 10,
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("actual provider deadline error = %T %v", err, err)
 	}
 }
 
@@ -494,6 +576,33 @@ print(json.dumps({"id": req["id"], "type": "error", "code": "unsupported_primiti
 	}
 }
 
+func TestPrimitiveClientReturnsTypedInvalidPrimitiveResponseError(t *testing.T) {
+	workspace := t.TempDir()
+	adapter := writePrimitiveAdapter(t, workspace, `
+import json, sys
+req = json.loads(sys.stdin.readline())
+print(json.dumps({"id": req["id"], "type": "error", "code": "invalid_primitive_response", "error": "permissioned primitive provider returned an invalid response"}))
+`)
+	t.Setenv("KNOTE_PYTHON", pythonForTest())
+	client := Client{AdapterPath: adapter, Workspace: workspace}
+
+	_, err := client.Retrieve(context.Background(), RetrieveRequest{
+		Authorization: testAuthorizationContext(), Query: "knote", Limit: 10,
+	})
+	if !errors.Is(err, ErrInvalidPrimitiveResponse) || !IsInvalidPrimitiveResponse(err) {
+		t.Fatalf("expected typed invalid primitive response error, got %T: %v", err, err)
+	}
+}
+
+func TestPrimitiveResultsRequireMode(t *testing.T) {
+	result := RetrieveResult{}
+	if err := result.ValidateFor(RetrieveRequest{
+		Authorization: testAuthorizationContext(), Query: "knote", Limit: 10,
+	}); err == nil || !strings.Contains(err.Error(), "mode") {
+		t.Fatalf("missing primitive mode should fail, got %v", err)
+	}
+}
+
 func TestPrimitiveClientCancellationReturnsContextError(t *testing.T) {
 	workspace := t.TempDir()
 	adapter := writePrimitiveAdapter(t, workspace, "import time\ntime.sleep(5)\n")
@@ -693,4 +802,19 @@ func writePrimitiveAdapter(t *testing.T, workspace, script string) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+func writePrimitiveProvider(t *testing.T, workspace, script string) string {
+	t.Helper()
+	const module = "knote_permissioned_provider_fixture"
+	path := filepath.Join(workspace, module+".py")
+	if err := os.WriteFile(path, []byte(script), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pythonPath := workspace
+	if existing := os.Getenv("PYTHONPATH"); existing != "" {
+		pythonPath += string(os.PathListSeparator) + existing
+	}
+	t.Setenv("PYTHONPATH", pythonPath)
+	return module + ":create"
 }

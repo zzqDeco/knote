@@ -18,15 +18,16 @@ import (
 const maxNDJSONLineBytes = 16 * 1024 * 1024
 
 type Client struct {
-	AdapterPath string
-	Workspace   string
-	Host        string
-	Fake        bool
-	ConfigPath  string
-	ProjectID   string
-	Namespace   string
-	Language    string
-	RuntimeDir  string
+	AdapterPath          string
+	Workspace            string
+	Host                 string
+	Fake                 bool
+	ConfigPath           string
+	ProjectID            string
+	Namespace            string
+	Language             string
+	RuntimeDir           string
+	PermissionedProvider string
 }
 
 type Request struct {
@@ -87,6 +88,10 @@ func (e *AdapterError) Is(target error) bool {
 		return e.Code == ErrorCodeUnsupportedPrimitive
 	case ErrInvalidGraphBinding:
 		return e.Code == ErrorCodeInvalidGraphBinding
+	case ErrPrimitiveUnavailable:
+		return e.Code == ErrorCodePrimitiveUnavailable
+	case ErrInvalidPrimitiveResponse:
+		return e.Code == ErrorCodeInvalidPrimitiveResponse
 	default:
 		return false
 	}
@@ -98,6 +103,14 @@ func IsUnsupportedPrimitive(err error) bool {
 
 func IsInvalidGraphBinding(err error) bool {
 	return errors.Is(err, ErrInvalidGraphBinding)
+}
+
+func IsPrimitiveUnavailable(err error) bool {
+	return errors.Is(err, ErrPrimitiveUnavailable)
+}
+
+func IsInvalidPrimitiveResponse(err error) bool {
+	return errors.Is(err, ErrInvalidPrimitiveResponse)
 }
 
 type Backend interface {
@@ -195,7 +208,10 @@ func (c Client) call(ctx context.Context, method string, params map[string]any) 
 	cmd.Dir = c.Workspace
 	cmd.Env = os.Environ()
 	if c.Fake {
-		cmd.Env = append(cmd.Env, "KNOTE_KAG_FAKE=1")
+		cmd.Env = replaceProcessEnv(cmd.Env, "KNOTE_KAG_FAKE", "1")
+	}
+	if provider := strings.TrimSpace(c.PermissionedProvider); provider != "" {
+		cmd.Env = replaceProcessEnv(cmd.Env, "KNOTE_KAG_PERMISSIONED_PROVIDER", provider)
 	}
 	cmd.Stdin = bytes.NewReader(append(payload, '\n'))
 	out, err := cmd.StdoutPipe()
@@ -311,4 +327,15 @@ func findInParents(dir, rel string) (string, bool) {
 func fileExists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
+}
+
+func replaceProcessEnv(env []string, key, value string) []string {
+	prefix := key + "="
+	updated := make([]string, 0, len(env)+1)
+	for _, entry := range env {
+		if !strings.HasPrefix(entry, prefix) {
+			updated = append(updated, entry)
+		}
+	}
+	return append(updated, prefix+value)
 }

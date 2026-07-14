@@ -14,13 +14,19 @@ import (
 )
 
 const (
-	ErrorCodeUnsupportedPrimitive = "unsupported_primitive"
-	ErrorCodeInvalidGraphBinding  = "invalid_graph_binding"
+	ErrorCodeUnsupportedPrimitive     = "unsupported_primitive"
+	ErrorCodeInvalidGraphBinding      = "invalid_graph_binding"
+	ErrorCodePrimitiveUnavailable     = "primitive_unavailable"
+	ErrorCodeInvalidPrimitiveResponse = "invalid_primitive_response"
+	maxPrimitiveItems                 = 100
+	maxPrimitiveTextBytes             = 1 << 20
 )
 
 var (
-	ErrUnsupportedPrimitive = errors.New("KAG primitive is unsupported")
-	ErrInvalidGraphBinding  = errors.New("KAG graph binding is invalid")
+	ErrUnsupportedPrimitive     = errors.New("KAG primitive is unsupported")
+	ErrInvalidGraphBinding      = errors.New("KAG graph binding is invalid")
+	ErrPrimitiveUnavailable     = errors.New("KAG permissioned primitive provider is unavailable")
+	ErrInvalidPrimitiveResponse = errors.New("KAG permissioned primitive response is invalid")
 )
 
 // PrimitiveBackend is the controlled KAG boundary used by authorized retrieval.
@@ -62,6 +68,9 @@ func (r RetrieveRequest) Validate() error {
 	if strings.TrimSpace(r.Query) == "" {
 		return fmt.Errorf("query is required")
 	}
+	if len(r.Query) > maxPrimitiveTextBytes {
+		return fmt.Errorf("query exceeds the primitive text limit")
+	}
 	return validatePrimitiveLimit(r.Limit)
 }
 
@@ -74,8 +83,8 @@ func (r RetrieveResult) ValidateFor(req RetrieveRequest) error {
 	if err := req.Validate(); err != nil {
 		return fmt.Errorf("retrieve request: %w", err)
 	}
-	if strings.TrimSpace(r.Mode) == "" {
-		return fmt.Errorf("retrieve mode is required")
+	if err := validatePrimitiveMode(r.Mode); err != nil {
+		return fmt.Errorf("retrieve mode: %w", err)
 	}
 	return validateCandidatesForAuthorization(r.Candidates, req.Limit, req.Authorization)
 }
@@ -92,6 +101,9 @@ func (r ExpandRequest) Validate() error {
 	}
 	if len(r.Frontier) == 0 {
 		return fmt.Errorf("authorized frontier is required")
+	}
+	if len(r.Frontier) > maxPrimitiveItems {
+		return fmt.Errorf("authorized frontier exceeds the primitive item limit")
 	}
 	if err := validatePrimitiveLimit(r.Limit); err != nil {
 		return err
@@ -128,8 +140,8 @@ func (r ExpandResult) ValidateFor(req ExpandRequest) error {
 	if err := req.Validate(); err != nil {
 		return fmt.Errorf("expand request: %w", err)
 	}
-	if strings.TrimSpace(r.Mode) == "" {
-		return fmt.Errorf("expand mode is required")
+	if err := validatePrimitiveMode(r.Mode); err != nil {
+		return fmt.Errorf("expand mode: %w", err)
 	}
 	if err := validateCandidatesForAuthorization(r.Candidates, req.Limit, req.Authorization); err != nil {
 		return err
@@ -196,6 +208,9 @@ func (e AuthorizedEvidence) Validate() error {
 	if strings.TrimSpace(e.Content) == "" {
 		return fmt.Errorf("authorized evidence content is required")
 	}
+	if len(e.Content) > maxPrimitiveTextBytes {
+		return fmt.Errorf("authorized evidence content exceeds the primitive text limit")
+	}
 	if protocol.NewContentDigest(e.Content) != e.Resource.ContentDigest {
 		return fmt.Errorf("authorized evidence content does not match the resource handle")
 	}
@@ -218,8 +233,14 @@ func (r GenerateRequest) Validate() error {
 	if strings.TrimSpace(r.Question) == "" {
 		return fmt.Errorf("question is required")
 	}
+	if len(r.Question) > maxPrimitiveTextBytes {
+		return fmt.Errorf("question exceeds the primitive text limit")
+	}
 	if len(r.Evidence) == 0 {
 		return fmt.Errorf("authorized evidence is required")
+	}
+	if len(r.Evidence) > maxPrimitiveItems {
+		return fmt.Errorf("authorized evidence exceeds the primitive item limit")
 	}
 	seen := make(map[protocol.ResourceID]struct{}, len(r.Evidence))
 	seenCitations := make(map[string]struct{}, len(r.Evidence))
@@ -270,11 +291,14 @@ func (r GenerateResult) ValidateFor(req GenerateRequest) error {
 	if err := req.Validate(); err != nil {
 		return fmt.Errorf("generate request: %w", err)
 	}
-	if strings.TrimSpace(r.Mode) == "" {
-		return fmt.Errorf("generate mode is required")
+	if err := validatePrimitiveMode(r.Mode); err != nil {
+		return fmt.Errorf("generate mode: %w", err)
 	}
 	if strings.TrimSpace(r.Answer) == "" {
 		return fmt.Errorf("generated answer is required")
+	}
+	if len(r.Answer) > maxPrimitiveTextBytes {
+		return fmt.Errorf("generated answer exceeds the primitive text limit")
 	}
 	allowed := make(map[protocol.ResourceID]AuthorizedEvidence, len(req.Evidence))
 	for _, evidence := range req.Evidence {
@@ -558,6 +582,13 @@ func sameResourceIDSet(left, right map[protocol.ResourceID]struct{}) bool {
 func validatePrimitiveLimit(limit int) error {
 	if limit < 1 || limit > 100 {
 		return fmt.Errorf("limit must be between 1 and 100")
+	}
+	return nil
+}
+
+func validatePrimitiveMode(mode string) error {
+	if strings.TrimSpace(mode) == "" {
+		return fmt.Errorf("is required")
 	}
 	return nil
 }

@@ -163,6 +163,32 @@ def graph_contract_resource(
     }
 
 
+def graph_contract_typed_resource(
+    projection_id: str,
+    resource_id: str,
+    resource_type: str,
+    content: str,
+) -> dict[str, object]:
+    resource = graph_contract_resource(projection_id, resource_id)
+    resource["type"] = resource_type
+    resource["authz_object"] = f"{resource_type}:{resource_id}"
+    resource["content_digest"] = "sha256:" + hashlib.sha256(content.encode("utf-8")).hexdigest()
+    return resource
+
+
+def write_permissioned_provider_module(workspace: Path, source: str) -> dict[str, str]:
+    module_name = "knote_permissioned_provider_fixture"
+    (workspace / f"{module_name}.py").write_text(source, encoding="utf-8")
+    python_path = str(workspace)
+    existing = os.environ.get("PYTHONPATH", "")
+    if existing:
+        python_path += os.pathsep + existing
+    return {
+        adapter.PERMISSIONED_PROVIDER_ENV: f"{module_name}:create",
+        "PYTHONPATH": python_path,
+    }
+
+
 def graph_contract_binding(
     projection_id: str,
     resource: dict[str, object] | None = None,
@@ -831,14 +857,44 @@ class AdapterTest(unittest.TestCase):
             {"id": "", "type": "error", "error": "request must be a JSON object", "code": "invalid_request"},
         )
 
-    def test_real_primitives_fail_before_any_kag_setup(self) -> None:
+    def test_real_primitives_never_initialize_stock_kag_solver_components(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
-            write_graph_contract_bundle(workspace)
-            for method in sorted(adapter.PRIMITIVE_METHODS):
+            projection_id = write_graph_contract_bundle(workspace)
+            resource = graph_contract_resource(projection_id)
+            graph_object_id = adapter.expected_graph_object_id(
+                projection_id, str(resource["resource_id"])
+            )
+
+            class Provider:
+                def retrieve(self, _request: dict[str, object]) -> dict[str, object]:
+                    return {"candidates": [{"graph_object_id": graph_object_id, "score": 0.9}]}
+
+                def generate(self, _request: dict[str, object]) -> dict[str, object]:
+                    return {"answer": "authorized answer"}
+
+            requests = {
+                "kag.retrieve": {"query": "knote", "limit": 10},
+                "kag.expand": {
+                    "frontier": [{"resource": resource, "score": 0.9}],
+                    "limit": 10,
+                },
+                "kag.generate": {
+                    "question": "knote",
+                    "evidence": [
+                        {
+                            "resource": resource,
+                            "content": "permissioned body",
+                            "citation_handle": "cite-1",
+                        }
+                    ],
+                },
+            }
+            for method, method_params in requests.items():
                 with self.subTest(method=method):
                     stdout = StringIO()
                     with (
+                        patch.object(adapter, "load_permissioned_provider", return_value=Provider()),
                         patch.object(adapter, "runtime_dir") as runtime_dir_mock,
                         patch.object(adapter, "select_config") as select_config_mock,
                         patch.object(adapter, "check_real_health") as health_mock,
@@ -852,15 +908,15 @@ class AdapterTest(unittest.TestCase):
                                 "params": {
                                     "workspace": str(workspace),
                                     "authorization": real_graph_authorization(),
+                                    **method_params,
                                 },
                             }
                         )
 
                     response = json.loads(stdout.getvalue())
                     self.assertEqual(response["id"], "real")
-                    self.assertEqual(response["type"], "error")
-                    self.assertEqual(response["code"], "unsupported_primitive")
-                    self.assertIn(method, response["error"])
+                    self.assertEqual(response["type"], "result")
+                    self.assertEqual(response["data"]["mode"], "real")
                     runtime_dir_mock.assert_not_called()
                     select_config_mock.assert_not_called()
                     health_mock.assert_not_called()
@@ -984,7 +1040,433 @@ class AdapterTest(unittest.TestCase):
                 fake=False,
             )
             self.assertEqual(lines[-1]["type"], "error")
-            self.assertEqual(lines[-1]["code"], "unsupported_primitive")
+            self.assertEqual(lines[-1]["code"], "primitive_unavailable")
+
+    def test_real_retrieve_and_generate_use_only_the_permissioned_provider_contract(self) -> None:
+        provider_source = r'''
+import json
+import os
+import sys
+
+def log(stage):
+    with open(os.environ["KNOTE_PROVIDER_STAGE_FILE"], "a", encoding="utf-8") as stream:
+        stream.write(stage + "\n")
+
+class Provider:
+    def retrieve(self, request):
+        log("retrieve")
+        print(os.environ["KNOTE_PROVIDER_CANARY"])
+        print(os.environ["KNOTE_PROVIDER_CANARY"], file=sys.stderr)
+        return {"candidates": [{"graph_object_id": os.environ["KNOTE_PROVIDER_GRAPH_ID"], "score": 0.91}]}
+
+    def generate(self, request):
+        log("generate")
+        assert [item["content"] for item in request["evidence"]] == ["permissioned body"]
+        print(os.environ["KNOTE_PROVIDER_CANARY"])
+        print(os.environ["KNOTE_PROVIDER_CANARY"], file=sys.stderr)
+        return {"answer": "authorized provider answer"}
+
+def create(context):
+    assert context["projection_version"].startswith("prj_")
+    log("factory")
+    return Provider()
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            projection_id = write_graph_contract_bundle(workspace)
+            resource = graph_contract_resource(projection_id)
+            graph_object_id = adapter.expected_graph_object_id(
+                projection_id, str(resource["resource_id"])
+            )
+            stage_file = workspace / "provider-stages.txt"
+            canary = "PROTECTED PROVIDER OUTPUT MUST BE DISCARDED"
+            env = write_permissioned_provider_module(workspace, provider_source)
+            env.update(
+                {
+                    "KNOTE_PROVIDER_STAGE_FILE": str(stage_file),
+                    "KNOTE_PROVIDER_GRAPH_ID": graph_object_id,
+                    "KNOTE_PROVIDER_CANARY": canary,
+                }
+            )
+
+            retrieve_proc, retrieve_lines = call_adapter(
+                {
+                    "id": "retrieve-real",
+                    "method": "kag.retrieve",
+                    "params": {
+                        "workspace": str(workspace),
+                        "authorization": real_graph_authorization(),
+                        "query": "knote",
+                        "limit": 10,
+                    },
+                },
+                fake=False,
+                stage_spy=True,
+                extra_env=env,
+            )
+            retrieve = retrieve_lines[-1]
+            self.assertEqual(retrieve["type"], "result")
+            self.assertEqual(retrieve["data"]["mode"], "real")
+            self.assertEqual(
+                retrieve["data"]["candidates"],
+                [{"resource": resource, "score": 0.91}],
+            )
+            self.assertTrue({"body", "title", "path", "description"}.isdisjoint(
+                retrieve["data"]["candidates"][0]
+            ))
+            self.assertNotIn(canary, retrieve_proc.stdout)
+            self.assertNotIn(canary, retrieve_proc.stderr)
+
+            generate_proc, generate_lines = call_adapter(
+                {
+                    "id": "generate-real",
+                    "method": "kag.generate",
+                    "params": {
+                        "workspace": str(workspace),
+                        "authorization": real_graph_authorization(),
+                        "question": "What is knote?",
+                        "evidence": [
+                            {
+                                "resource": resource,
+                                "content": "permissioned body",
+                                "citation_handle": "cite-1",
+                            }
+                        ],
+                    },
+                },
+                fake=False,
+                stage_spy=True,
+                extra_env=env,
+            )
+            generated = generate_lines[-1]
+            resource_id = resource["resource_id"]
+            self.assertEqual(generated["type"], "result")
+            self.assertEqual(generated["data"]["mode"], "real")
+            self.assertEqual(generated["data"]["answer"], "authorized provider answer")
+            self.assertEqual(
+                generated["data"]["citations"],
+                [{"handle": "cite-1", "resource_id": resource_id}],
+            )
+            self.assertEqual(generated["data"]["evidence_resource_ids"], [resource_id])
+            self.assertEqual(
+                generated["data"]["trace"],
+                {"resource_ids": [resource_id], "count": 1},
+            )
+            self.assertNotIn(canary, generate_proc.stdout)
+            self.assertNotIn(canary, generate_proc.stderr)
+            self.assertEqual(
+                stage_file.read_text(encoding="utf-8").splitlines(),
+                ["factory", "retrieve", "factory", "generate"],
+            )
+
+    def test_real_expand_reads_only_verified_source_backed_claim_bindings(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            projection_id = "prj_" + "a" * 32
+            source = graph_contract_typed_resource(
+                projection_id, "res_11111111111111111111111111111111", "document", "source body"
+            )
+            subject = graph_contract_typed_resource(
+                projection_id, "res_22222222222222222222222222222222", "entity", "subject body"
+            )
+            target = graph_contract_typed_resource(
+                projection_id, "res_33333333333333333333333333333333", "entity", "target body"
+            )
+            claim = graph_contract_typed_resource(
+                projection_id,
+                "res_44444444444444444444444444444444",
+                "claim",
+                "PROTECTED CLAIM BODY MUST NOT BE MATERIALIZED",
+            )
+            graph_rows = [
+                graph_contract_binding(projection_id, resource)
+                for resource in (source, subject, target, claim)
+            ]
+            graph_rows.sort(key=lambda row: str(row["graph_object_id"]))
+            by_resource = {
+                str(row["resource"]["resource_id"]): str(row["graph_object_id"])
+                for row in graph_rows
+            }
+            predicate_key = "pred_" + "5" * 32
+            claim_rows = [
+                {
+                    "version": adapter.GRAPH_BINDING_CONTRACT_VERSION,
+                    "claim": by_resource[str(claim["resource_id"])],
+                    "subject": by_resource[str(subject["resource_id"])],
+                    "predicate_key": predicate_key,
+                    "object": by_resource[str(target["resource_id"])],
+                    "source_document": by_resource[str(source["resource_id"])],
+                    "derivation": "all_required",
+                    "provenance": [by_resource[str(source["resource_id"])]],
+                }
+            ]
+            write_graph_contract_bundle(
+                workspace, graph_rows=graph_rows, claim_rows=claim_rows
+            )
+
+            first_proc, first_lines = call_adapter(
+                {
+                    "id": "expand-subject",
+                    "method": "kag.expand",
+                    "params": {
+                        "workspace": str(workspace),
+                        "authorization": real_graph_authorization(),
+                        "frontier": [{"resource": subject, "score": 0.8}],
+                        "limit": 10,
+                    },
+                },
+                fake=False,
+            )
+            first = first_lines[-1]
+            self.assertEqual(first["type"], "result")
+            self.assertEqual(first["data"]["mode"], "real")
+            self.assertEqual(
+                [candidate_resource_id(value) for value in first["data"]["candidates"]],
+                [claim["resource_id"]],
+            )
+            self.assertEqual(
+                first["data"]["expansions"],
+                [
+                    {
+                        "from_resource_id": subject["resource_id"],
+                        "to_resource_id": claim["resource_id"],
+                        "hop": 1,
+                    }
+                ],
+            )
+
+            second_proc, second_lines = call_adapter(
+                {
+                    "id": "expand-claim",
+                    "method": "kag.expand",
+                    "params": {
+                        "workspace": str(workspace),
+                        "authorization": real_graph_authorization(),
+                        "frontier": first["data"]["candidates"],
+                        "limit": 10,
+                    },
+                },
+                fake=False,
+            )
+            second = second_lines[-1]
+            self.assertEqual(
+                [candidate_resource_id(value) for value in second["data"]["candidates"]],
+                [target["resource_id"]],
+            )
+            serialized = first_proc.stdout + first_proc.stderr + second_proc.stdout + second_proc.stderr
+            self.assertNotIn("PROTECTED CLAIM BODY", serialized)
+            self.assertNotIn(predicate_key, serialized)
+
+    def test_real_provider_is_not_loaded_before_exact_evidence_validation(self) -> None:
+        provider_source = r'''
+import os
+def create(context):
+    with open(os.environ["KNOTE_PROVIDER_STAGE_FILE"], "w", encoding="utf-8") as stream:
+        stream.write("loaded")
+    raise RuntimeError("PROTECTED PROVIDER INITIALIZATION CANARY")
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            projection_id = write_graph_contract_bundle(workspace)
+            resource = graph_contract_resource(projection_id)
+            stage_file = workspace / "provider-loaded.txt"
+            env = write_permissioned_provider_module(workspace, provider_source)
+            env["KNOTE_PROVIDER_STAGE_FILE"] = str(stage_file)
+            _, lines = call_adapter(
+                {
+                    "id": "invalid-evidence",
+                    "method": "kag.generate",
+                    "params": {
+                        "workspace": str(workspace),
+                        "authorization": real_graph_authorization(),
+                        "question": "knote",
+                        "evidence": [
+                            {
+                                "resource": resource,
+                                "content": "wrong body",
+                                "citation_handle": "cite-1",
+                            }
+                        ],
+                    },
+                },
+                fake=False,
+                extra_env=env,
+            )
+            self.assertEqual(lines[-1]["type"], "error")
+            self.assertEqual(lines[-1]["code"], "invalid_request")
+            self.assertFalse(stage_file.exists())
+
+    def test_real_provider_response_leak_fields_fail_closed_without_echo(self) -> None:
+        canary = "PROTECTED PROVIDER RESPONSE CANARY"
+        provider_source = r'''
+import os
+class Provider:
+    def retrieve(self, request):
+        return {"candidates": [{
+            "graph_object_id": os.environ["KNOTE_PROVIDER_GRAPH_ID"],
+            "score": 0.9,
+            "body": os.environ["KNOTE_PROVIDER_CANARY"],
+        }]}
+def create(context):
+    return Provider()
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            projection_id = write_graph_contract_bundle(workspace)
+            resource = graph_contract_resource(projection_id)
+            env = write_permissioned_provider_module(workspace, provider_source)
+            env.update(
+                {
+                    "KNOTE_PROVIDER_GRAPH_ID": adapter.expected_graph_object_id(
+                        projection_id, str(resource["resource_id"])
+                    ),
+                    "KNOTE_PROVIDER_CANARY": canary,
+                }
+            )
+            proc, lines = call_adapter(
+                {
+                    "id": "leak",
+                    "method": "kag.retrieve",
+                    "params": {
+                        "workspace": str(workspace),
+                        "authorization": real_graph_authorization(),
+                        "query": "knote",
+                        "limit": 10,
+                    },
+                },
+                fake=False,
+                extra_env=env,
+            )
+            self.assertEqual(lines[-1]["type"], "error")
+            self.assertEqual(lines[-1]["code"], "invalid_primitive_response")
+            self.assertNotIn(canary, proc.stdout)
+            self.assertNotIn(canary, proc.stderr)
+
+    def test_real_provider_failure_is_typed_and_does_not_echo_protected_output(self) -> None:
+        canary = "PROTECTED PROVIDER FAILURE CANARY"
+        provider_source = r'''
+import os
+import sys
+class Provider:
+    def retrieve(self, request):
+        print(os.environ["KNOTE_PROVIDER_CANARY"])
+        print(os.environ["KNOTE_PROVIDER_CANARY"], file=sys.stderr)
+        raise RuntimeError(os.environ["KNOTE_PROVIDER_CANARY"])
+def create(context):
+    return Provider()
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            projection_id = write_graph_contract_bundle(workspace)
+            resource = graph_contract_resource(projection_id)
+            env = write_permissioned_provider_module(workspace, provider_source)
+            env.update(
+                {
+                    "KNOTE_PROVIDER_GRAPH_ID": adapter.expected_graph_object_id(
+                        projection_id, str(resource["resource_id"])
+                    ),
+                    "KNOTE_PROVIDER_CANARY": canary,
+                }
+            )
+            proc, lines = call_adapter(
+                {
+                    "id": "provider-failure",
+                    "method": "kag.retrieve",
+                    "params": {
+                        "workspace": str(workspace),
+                        "authorization": real_graph_authorization(),
+                        "query": "knote",
+                        "limit": 10,
+                    },
+                },
+                fake=False,
+                extra_env=env,
+            )
+            self.assertEqual(lines[-1]["type"], "error")
+            self.assertEqual(lines[-1]["code"], "primitive_unavailable")
+            self.assertNotIn(canary, proc.stdout)
+            self.assertNotIn(canary, proc.stderr)
+
+    def test_real_provider_oversized_generation_response_fails_closed(self) -> None:
+        provider_source = r'''
+class Provider:
+    def generate(self, request):
+        return {"answer": "x" * ((1 << 20) + 1)}
+def create(context):
+    return Provider()
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            projection_id = write_graph_contract_bundle(workspace)
+            resource = graph_contract_resource(projection_id)
+            env = write_permissioned_provider_module(workspace, provider_source)
+            _, lines = call_adapter(
+                {
+                    "id": "oversized",
+                    "method": "kag.generate",
+                    "params": {
+                        "workspace": str(workspace),
+                        "authorization": real_graph_authorization(),
+                        "question": "knote",
+                        "evidence": [
+                            {
+                                "resource": resource,
+                                "content": "permissioned body",
+                                "citation_handle": "cite-1",
+                            }
+                        ],
+                    },
+                },
+                fake=False,
+                extra_env=env,
+            )
+            self.assertEqual(lines[-1]["type"], "error")
+            self.assertEqual(lines[-1]["code"], "invalid_primitive_response")
+
+    def test_real_provider_cannot_mutate_validated_evidence_references(self) -> None:
+        provider_source = r'''
+class Provider:
+    def generate(self, request):
+        request["evidence"][0]["resource"]["resource_id"] = "res_ffffffffffffffffffffffffffffffff"
+        request["evidence"][0]["citation_handle"] = "forged-citation"
+        return {"answer": "authorized answer"}
+def create(context):
+    return Provider()
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            projection_id = write_graph_contract_bundle(workspace)
+            resource = graph_contract_resource(projection_id)
+            env = write_permissioned_provider_module(workspace, provider_source)
+            _, lines = call_adapter(
+                {
+                    "id": "mutating-provider",
+                    "method": "kag.generate",
+                    "params": {
+                        "workspace": str(workspace),
+                        "authorization": real_graph_authorization(),
+                        "question": "knote",
+                        "evidence": [
+                            {
+                                "resource": resource,
+                                "content": "permissioned body",
+                                "citation_handle": "cite-1",
+                            }
+                        ],
+                    },
+                },
+                fake=False,
+                extra_env=env,
+            )
+            response = lines[-1]
+            self.assertEqual(response["type"], "result")
+            self.assertEqual(
+                response["data"]["citations"],
+                [{"handle": "cite-1", "resource_id": resource["resource_id"]}],
+            )
+            self.assertEqual(
+                response["data"]["evidence_resource_ids"], [resource["resource_id"]]
+            )
 
     def test_error_json_remains_compatible_when_code_is_absent(self) -> None:
         stdout = StringIO()
