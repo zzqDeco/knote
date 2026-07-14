@@ -15,9 +15,13 @@ import json
 import math
 import os
 import re
+import select
+import signal
 import subprocess
 import sys
+import tempfile
 import time
+from copy import deepcopy
 from ipaddress import ip_address
 from contextlib import contextmanager, redirect_stdout
 from io import StringIO
@@ -66,6 +70,11 @@ PRIMITIVE_METHODS = frozenset({"kag.retrieve", "kag.expand", "kag.generate"})
 UNSUPPORTED_PRIMITIVE_CODE = "unsupported_primitive"
 INVALID_REQUEST_CODE = "invalid_request"
 INVALID_GRAPH_BINDING_CODE = "invalid_graph_binding"
+PRIMITIVE_UNAVAILABLE_CODE = "primitive_unavailable"
+INVALID_PRIMITIVE_RESPONSE_CODE = "invalid_primitive_response"
+PERMISSIONED_PROVIDER_ENV = "KNOTE_KAG_PERMISSIONED_PROVIDER"
+PERMISSIONED_PROVIDER_RUNNER_ARG = "--permissioned-provider-runner"
+PERMISSIONED_PROVIDER_GUARDIAN_ARG = "--permissioned-provider-guardian"
 TEST_STAGE_SPY_ENV = "KNOTE_KAG_TEST_STAGE_SPY"
 TEST_DELAY_MS_ENV = "KNOTE_KAG_TEST_DELAY_MS"
 
@@ -147,10 +156,16 @@ GRAPH_OBJECT_ID_RE = re.compile(r"kg_[0-9a-f]{32}\Z")
 CLAIM_PREDICATE_KEY_RE = re.compile(r"pred_[0-9a-f]{32}\Z")
 PROJECTION_ID_RE = re.compile(r"prj_[0-9a-f]{32}\Z")
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
+PROVIDER_SPEC_RE = re.compile(
+    r"[A-Za-z_][A-Za-z0-9_.]*:[A-Za-z_][A-Za-z0-9_]*\Z"
+)
 MAX_GRAPH_BINDING_FILE_BYTES = 64 << 20
 MAX_GRAPH_BINDING_LINE_BYTES = 1 << 20
 MAX_ARTIFACT_CURRENT_POINTER_BYTES = 64 << 10
 MAX_ARTIFACT_BUNDLE_MANIFEST_BYTES = 4 << 20
+MAX_PRIMITIVE_TEXT_BYTES = 1 << 20
+MAX_PROVIDER_RESPONSE_BYTES = 2 << 20
+PROVIDER_RUNNER_TIMEOUT_SECONDS = 30
 
 FAKE_INTRO_ID = "res_00000000000000000000000000000001"
 FAKE_DENIED_CANARY_ID = "res_00000000000000000000000000000002"
@@ -1806,6 +1821,892 @@ def _load_current_graph_contract(
     return resources, claims
 
 
+def bounded_primitive_text(value: Any, field: str) -> str:
+    text = required_content(value, field)
+    if len(text.encode("utf-8")) > MAX_PRIMITIVE_TEXT_BYTES:
+        raise AdapterRequestError(f"{field} exceeds the primitive text limit")
+    return text
+
+
+def selected_resource_maps(
+    resources: dict[str, dict[str, Any]],
+) -> tuple[dict[str, str], dict[str, dict[str, Any]]]:
+    graph_by_resource_id: dict[str, str] = {}
+    resource_by_id: dict[str, dict[str, Any]] = {}
+    for graph_object_id, resource in resources.items():
+        resource_id = resource["resource_id"]
+        graph_by_resource_id[resource_id] = graph_object_id
+        resource_by_id[resource_id] = resource
+    return graph_by_resource_id, resource_by_id
+
+
+def require_selected_resource(
+    resource: dict[str, Any],
+    resources: dict[str, dict[str, Any]],
+    field: str,
+) -> str:
+    graph_by_resource_id, resource_by_id = selected_resource_maps(resources)
+    resource_id = resource["resource_id"]
+    selected = resource_by_id.get(resource_id)
+    if selected is None or selected != resource:
+        raise AdapterRequestError(
+            f"{field} does not match the exact selected graph resource binding",
+            INVALID_GRAPH_BINDING_CODE,
+        )
+    return graph_by_resource_id[resource_id]
+
+
+def permissioned_provider_context(
+    params: dict[str, Any],
+    authorization: dict[str, Any],
+    projection_version: str,
+) -> dict[str, Any]:
+    return {
+        "version": 1,
+        "workspace": str(workspace_path(params).resolve()),
+        "tenant_id": authorization["tenant_id"],
+        "knowledge_base_id": authorization["knowledge_base_id"],
+        "projection_version": projection_version,
+        "host": str(params.get("host") or "").strip(),
+        "config_path": str(params.get("config_path") or "").strip(),
+        "project_id": str(params.get("project_id") or "").strip(),
+        "namespace": str(params.get("namespace") or "").strip(),
+        "language": str(params.get("language") or "").strip(),
+    }
+
+
+def write_all(fd: int, payload: bytes) -> None:
+    view = memoryview(payload)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:
+            raise OSError("provider runner response write failed")
+        view = view[written:]
+
+
+def deny_provider_parent_fd_access() -> None:
+    """Prevent Linux provider children from reopening adapter descriptors via procfs."""
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        prctl = libc.prctl
+        prctl.restype = ctypes.c_int
+        if prctl(4, 0, 0, 0, 0) != 0:  # PR_SET_DUMPABLE
+            raise OSError(ctypes.get_errno(), "prctl(PR_SET_DUMPABLE) failed")
+        if prctl(3, 0, 0, 0, 0) != 0:  # PR_GET_DUMPABLE
+            raise OSError("adapter process remained dumpable")
+    except BaseException as exc:
+        raise AdapterRequestError(
+            "permissioned primitive provider isolation failed",
+            PRIMITIVE_UNAVAILABLE_CODE,
+        ) from exc
+
+
+def enable_linux_provider_subreaper() -> None:
+    """Keep daemonized provider descendants attached to the runner."""
+    if not sys.platform.startswith("linux"):
+        return
+
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    prctl = libc.prctl
+    prctl.restype = ctypes.c_int
+    if prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
+        raise OSError(ctypes.get_errno(), "prctl(PR_SET_CHILD_SUBREAPER) failed")
+    enabled = ctypes.c_int()
+    if prctl(37, ctypes.byref(enabled), 0, 0, 0) != 0:  # PR_GET_CHILD_SUBREAPER
+        raise OSError(ctypes.get_errno(), "prctl(PR_GET_CHILD_SUBREAPER) failed")
+    if enabled.value != 1:
+        raise OSError("provider runner did not become a child subreaper")
+
+
+def posix_process_exists(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return False
+    return True
+
+
+def posix_process_parents() -> dict[int, int]:
+    """Return a best-effort snapshot of the POSIX process parent graph."""
+    parents: dict[int, int] = {}
+    if sys.platform.startswith("linux"):
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                stat = (entry / "stat").read_text(encoding="ascii")
+                fields = stat[stat.rfind(")") + 2 :].split()
+                parents[int(entry.name)] = int(fields[1])
+            except (IndexError, OSError, ValueError):
+                continue
+        return parents
+
+    completed = subprocess.run(
+        ["/bin/ps", "-axo", "pid=,ppid="],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        encoding="ascii",
+        errors="strict",
+        timeout=1,
+        check=False,
+        close_fds=True,
+    )
+    if completed.returncode != 0:
+        raise OSError("provider process tree inspection failed")
+    for line in completed.stdout.splitlines():
+        fields = line.split()
+        if len(fields) != 2:
+            continue
+        try:
+            parents[int(fields[0])] = int(fields[1])
+        except ValueError:
+            continue
+    return parents
+
+
+def posix_descendant_pids(root_pid: int) -> set[int]:
+    parents = posix_process_parents()
+    descendants: set[int] = set()
+    changed = True
+    while changed:
+        changed = False
+        for pid, parent_pid in parents.items():
+            if pid in descendants or pid == root_pid:
+                continue
+            if parent_pid == root_pid or parent_pid in descendants:
+                descendants.add(pid)
+                changed = True
+    return descendants
+
+
+def kill_posix_pids(pids: set[int], exclude: set[int] | None = None) -> None:
+    excluded = exclude or set()
+    for pid in sorted(pids - excluded, reverse=True):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (PermissionError, ProcessLookupError):
+            pass
+
+
+def terminate_posix_descendants(
+    root_pid: int,
+    tracked: set[int] | None = None,
+    exclude: set[int] | None = None,
+) -> set[int]:
+    """Kill detached and ordinary descendants while the root still anchors them."""
+    observed = set(tracked or ())
+    excluded = exclude or set()
+    for _ in range(3):
+        try:
+            observed.update(posix_descendant_pids(root_pid))
+        except OSError:
+            pass
+        observed.difference_update(excluded)
+        kill_posix_pids(observed, excluded)
+        time.sleep(0.01)
+    return observed
+
+
+def windows_provider_guardian(parent_pid: int, runner_pid: int) -> int:
+    import ctypes
+
+    synchronize = 0x00100000
+    process_terminate = 0x0001
+    wait_object_0 = 0
+    wait_timeout = 258
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_bool, ctypes.c_uint32]
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+    kernel32.TerminateProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    kernel32.TerminateProcess.restype = ctypes.c_bool
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_bool
+
+    parent = kernel32.OpenProcess(synchronize, False, parent_pid)
+    runner = kernel32.OpenProcess(synchronize | process_terminate, False, runner_pid)
+    if not parent or not runner:
+        if parent:
+            kernel32.CloseHandle(parent)
+        if runner:
+            kernel32.CloseHandle(runner)
+        return 1
+    try:
+        sys.stdout.write("ready\n")
+        sys.stdout.flush()
+        sys.stdout.close()
+        while True:
+            parent_status = kernel32.WaitForSingleObject(parent, 20)
+            if parent_status == wait_object_0:
+                kernel32.TerminateProcess(runner, 1)
+                return 0
+            if parent_status != wait_timeout:
+                return 1
+            runner_status = kernel32.WaitForSingleObject(runner, 0)
+            if runner_status == wait_object_0:
+                return 0
+            if runner_status != wait_timeout:
+                return 1
+    finally:
+        kernel32.CloseHandle(parent)
+        kernel32.CloseHandle(runner)
+
+
+def create_windows_provider_job() -> int | None:
+    """Bind the runner and descendants to a kill-on-runner-exit Windows job."""
+    if os.name != "nt":
+        return None
+
+    import ctypes
+    from ctypes import wintypes
+
+    class JobObjectBasicLimitInformation(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_longlong),
+            ("PerJobUserTimeLimit", ctypes.c_longlong),
+            ("LimitFlags", wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD),
+        ]
+
+    class IOCounters(ctypes.Structure):
+        _fields_ = [
+            ("ReadOperationCount", ctypes.c_ulonglong),
+            ("WriteOperationCount", ctypes.c_ulonglong),
+            ("OtherOperationCount", ctypes.c_ulonglong),
+            ("ReadTransferCount", ctypes.c_ulonglong),
+            ("WriteTransferCount", ctypes.c_ulonglong),
+            ("OtherTransferCount", ctypes.c_ulonglong),
+        ]
+
+    class JobObjectExtendedLimitInformation(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", JobObjectBasicLimitInformation),
+            ("IoInfo", IOCounters),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    job_object_extended_limit_information = 9
+    job_object_limit_kill_on_job_close = 0x00002000
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+    kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    kernel32.SetInformationJobObject.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    ]
+    kernel32.SetInformationJobObject.restype = wintypes.BOOL
+    kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    job = kernel32.CreateJobObjectW(None, None)
+    if not job:
+        raise OSError(ctypes.get_last_error(), "CreateJobObjectW failed")
+    limits = JobObjectExtendedLimitInformation()
+    limits.BasicLimitInformation.LimitFlags = job_object_limit_kill_on_job_close
+    if not kernel32.SetInformationJobObject(
+        job,
+        job_object_extended_limit_information,
+        ctypes.byref(limits),
+        ctypes.sizeof(limits),
+    ):
+        error_code = ctypes.get_last_error()
+        kernel32.CloseHandle(job)
+        raise OSError(error_code, "SetInformationJobObject failed")
+    if not kernel32.AssignProcessToJobObject(job, kernel32.GetCurrentProcess()):
+        error_code = ctypes.get_last_error()
+        kernel32.CloseHandle(job)
+        raise OSError(error_code, "AssignProcessToJobObject failed")
+    return int(job)
+
+
+def permissioned_provider_guardian(parent_pid: int, runner_pid: int, liveness_fd: int) -> int:
+    """Terminate the provider process domain if its adapter parent disappears."""
+    if parent_pid <= 1 or runner_pid <= 1:
+        return 1
+    if os.name == "nt":
+        return windows_provider_guardian(parent_pid, runner_pid)
+    if not posix_process_exists(parent_pid) or not posix_process_exists(runner_pid):
+        return 1
+    sys.stdout.write("ready\n")
+    sys.stdout.flush()
+    sys.stdout.close()
+    tracked: set[int] = set()
+    while posix_process_exists(runner_pid):
+        try:
+            tracked.update(posix_descendant_pids(runner_pid))
+        except OSError:
+            pass
+        tracked.discard(os.getpid())
+        parent_disappeared = not posix_process_exists(parent_pid)
+        if liveness_fd >= 0:
+            readable, _, _ = select.select([liveness_fd], [], [], 0.02)
+            if readable and os.read(liveness_fd, 1) == b"":
+                parent_disappeared = True
+        elif not parent_disappeared:
+            time.sleep(0.02)
+        if parent_disappeared:
+            try:
+                os.kill(runner_pid, signal.SIGSTOP)
+            except ProcessLookupError:
+                pass
+            tracked = terminate_posix_descendants(
+                runner_pid,
+                tracked,
+                exclude={os.getpid()},
+            )
+            try:
+                os.kill(runner_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            kill_posix_pids(tracked, exclude={os.getpid()})
+            return 0
+    kill_posix_pids(tracked, exclude={os.getpid()})
+    return 0
+
+
+def start_provider_guardian(liveness_fd: int) -> subprocess.Popen[str]:
+    options: dict[str, Any] = {}
+    if os.name != "nt" and liveness_fd >= 0:
+        options["pass_fds"] = (liveness_fd,)
+    guardian = subprocess.Popen(
+        [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            PERMISSIONED_PROVIDER_GUARDIAN_ARG,
+            str(os.getppid()),
+            str(os.getpid()),
+            str(liveness_fd),
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        close_fds=True,
+        **options,
+    )
+    try:
+        ready = guardian.stdout.readline() if guardian.stdout is not None else ""
+    finally:
+        if guardian.stdout is not None:
+            guardian.stdout.close()
+    if ready != "ready\n" or guardian.poll() is not None:
+        try:
+            guardian.kill()
+        except OSError:
+            pass
+        guardian.wait()
+        raise OSError("provider guardian failed to start")
+    return guardian
+
+
+def permissioned_provider_runner(response_path: str, liveness_fd: int) -> int:
+    """Run provider code without inheriting the adapter's output descriptors."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        response_fd = os.open(response_path, flags, 0o600)
+    except OSError:
+        return 1
+
+    try:
+        enable_linux_provider_subreaper()
+        _provider_job = create_windows_provider_job()
+        _guardian = start_provider_guardian(liveness_fd)
+    except BaseException:
+        if liveness_fd >= 0:
+            os.close(liveness_fd)
+        os.close(response_fd)
+        return 1
+    if liveness_fd >= 0:
+        os.close(liveness_fd)
+
+    envelope: dict[str, Any] = {"version": 1, "status": "unavailable"}
+    try:
+        payload = json.loads(sys.stdin.buffer.read())
+        if not isinstance(payload, dict) or set(payload) != {
+            "version",
+            "provider",
+            "context",
+            "method",
+            "request",
+        }:
+            raise ValueError("invalid provider runner request")
+        spec = payload.get("provider")
+        context = payload.get("context")
+        method = payload.get("method")
+        request = payload.get("request")
+        if (
+            payload.get("version") != 1
+            or not isinstance(spec, str)
+            or not PROVIDER_SPEC_RE.fullmatch(spec)
+            or not isinstance(context, dict)
+            or method not in {"retrieve", "generate"}
+            or not isinstance(request, dict)
+        ):
+            raise ValueError("invalid provider runner request")
+        module_name, factory_name = spec.split(":", 1)
+        module = importlib.import_module(module_name)
+        factory = getattr(module, factory_name)
+        provider = factory(dict(context))
+        operation = getattr(provider, method, None)
+        if not callable(operation):
+            raise ValueError("provider capability unavailable")
+        provider_response = operation(deepcopy(request))
+    except BaseException:
+        pass
+    else:
+        try:
+            if not isinstance(provider_response, dict):
+                raise TypeError("provider response must be an object")
+            normalized_payload = json.dumps(
+                provider_response,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            if len(normalized_payload) > MAX_PROVIDER_RESPONSE_BYTES:
+                raise ValueError("provider response exceeds limit")
+            normalized_response = json.loads(normalized_payload)
+            if type(normalized_response) is not dict:
+                raise TypeError("provider response must be a plain object")
+        except BaseException:
+            envelope = {"version": 1, "status": "invalid_response"}
+        else:
+            envelope = {
+                "version": 1,
+                "status": "ok",
+                "response": normalized_response,
+            }
+
+    if os.name != "nt":
+        terminate_posix_descendants(os.getpid(), exclude={_guardian.pid})
+
+    try:
+        encoded = json.dumps(
+            envelope,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        os.ftruncate(response_fd, 0)
+        os.lseek(response_fd, 0, os.SEEK_SET)
+        write_all(response_fd, encoded)
+        os.fsync(response_fd)
+    except BaseException:
+        return 1
+    finally:
+        try:
+            os.close(response_fd)
+        except OSError:
+            pass
+    return 0
+
+
+def terminate_provider_process_domain(process: subprocess.Popen[str]) -> None:
+    """Kill and reap the runner plus every descendant in its execution domain."""
+    if os.name == "nt":
+        if process.poll() is None:
+            try:
+                process.kill()
+            except OSError:
+                pass
+    else:
+        try:
+            os.kill(process.pid, signal.SIGSTOP)
+        except ProcessLookupError:
+            pass
+        tracked = terminate_posix_descendants(process.pid)
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            if process.poll() is None:
+                try:
+                    process.kill()
+                except OSError:
+                    pass
+        kill_posix_pids(tracked)
+    try:
+        process.wait()
+    except OSError:
+        pass
+
+
+def call_permissioned_provider(
+    context: dict[str, Any], method: str, request: dict[str, Any]
+) -> dict[str, Any]:
+    spec = os.environ.get(PERMISSIONED_PROVIDER_ENV, "").strip()
+    if not PROVIDER_SPEC_RE.fullmatch(spec):
+        raise AdapterRequestError(
+            "permissioned primitive provider is unavailable",
+            PRIMITIVE_UNAVAILABLE_CODE,
+        )
+    payload = json.dumps(
+        {
+            "version": 1,
+            "provider": spec,
+            "context": context,
+            "method": method,
+            "request": request,
+        },
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    )
+    deny_provider_parent_fd_access()
+    with tempfile.TemporaryDirectory(prefix="knote-kag-provider-") as directory:
+        response_path = Path(directory) / "response.json"
+        process: subprocess.Popen[str] | None = None
+        liveness_read = -1
+        liveness_write = -1
+        try:
+            options: dict[str, Any] = {}
+            if os.name != "nt":
+                liveness_read, liveness_write = os.pipe()
+                options["pass_fds"] = (liveness_read,)
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(Path(__file__).resolve()),
+                    PERMISSIONED_PROVIDER_RUNNER_ARG,
+                    str(response_path),
+                    str(liveness_read),
+                ],
+                stdin=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+                start_new_session=os.name != "nt",
+                **options,
+            )
+            if liveness_read >= 0:
+                os.close(liveness_read)
+                liveness_read = -1
+            process.communicate(payload, timeout=PROVIDER_RUNNER_TIMEOUT_SECONDS)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            if process is not None:
+                terminate_provider_process_domain(process)
+            raise AdapterRequestError(
+                "permissioned primitive provider call failed",
+                PRIMITIVE_UNAVAILABLE_CODE,
+            ) from exc
+        finally:
+            if liveness_read >= 0:
+                os.close(liveness_read)
+            if liveness_write >= 0:
+                os.close(liveness_write)
+            if process is not None and process.poll() is not None:
+                terminate_provider_process_domain(process)
+        if process.returncode != 0 or not response_path.is_file():
+            raise AdapterRequestError(
+                "permissioned primitive provider call failed",
+                PRIMITIVE_UNAVAILABLE_CODE,
+            )
+        try:
+            read_flags = os.O_RDONLY
+            if hasattr(os, "O_NOFOLLOW"):
+                read_flags |= os.O_NOFOLLOW
+            response_fd = os.open(response_path, read_flags)
+            with os.fdopen(response_fd, "rb") as stream:
+                encoded = stream.read(MAX_PROVIDER_RESPONSE_BYTES + 1025)
+            if len(encoded) > MAX_PROVIDER_RESPONSE_BYTES + 1024:
+                raise ValueError("provider runner response exceeds limit")
+            envelope = json.loads(encoded)
+        except (OSError, ValueError, UnicodeError) as exc:
+            raise AdapterRequestError(
+                "permissioned primitive provider returned an invalid response",
+                INVALID_PRIMITIVE_RESPONSE_CODE,
+            ) from exc
+
+    if not isinstance(envelope, dict) or envelope.get("version") != 1:
+        raise AdapterRequestError(
+            "permissioned primitive provider returned an invalid response",
+            INVALID_PRIMITIVE_RESPONSE_CODE,
+        )
+    status = envelope.get("status")
+    if status == "unavailable" and set(envelope) == {"version", "status"}:
+        raise AdapterRequestError(
+            "permissioned primitive provider call failed",
+            PRIMITIVE_UNAVAILABLE_CODE,
+        )
+    if status == "invalid_response" and set(envelope) == {"version", "status"}:
+        raise AdapterRequestError(
+            "permissioned primitive provider returned an invalid response",
+            INVALID_PRIMITIVE_RESPONSE_CODE,
+        )
+    response = envelope.get("response")
+    if (
+        status != "ok"
+        or set(envelope) != {"version", "status", "response"}
+        or type(response) is not dict
+    ):
+        raise AdapterRequestError(
+            "permissioned primitive provider returned an invalid response",
+            INVALID_PRIMITIVE_RESPONSE_CODE,
+        )
+    return response
+
+
+def validate_real_retrieve_request(
+    params: dict[str, Any], authorization: dict[str, Any]
+) -> tuple[str, int]:
+    query = bounded_primitive_text(params.get("query"), "query").strip()
+    limit = primitive_limit(params, 10)
+    if not query:
+        raise AdapterRequestError("query must be a non-empty string")
+    return query, limit
+
+
+def real_retrieve(
+    params: dict[str, Any],
+    authorization: dict[str, Any],
+    resources: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    query, limit = validate_real_retrieve_request(params, authorization)
+    projection_version = next(iter(resources.values()))["versions"]["projection"]
+    response = call_permissioned_provider(
+        permissioned_provider_context(params, authorization, projection_version),
+        "retrieve",
+        {
+            "version": 1,
+            "query": query,
+            "limit": limit,
+            "projection_version": projection_version,
+        },
+    )
+    try:
+        validate_exact_fields(response, frozenset({"candidates"}), "provider retrieve response")
+        values = response.get("candidates")
+        if not isinstance(values, list) or len(values) > limit:
+            raise AdapterRequestError("invalid provider retrieve candidate set")
+    except AdapterRequestError as exc:
+        raise AdapterRequestError(
+            "permissioned retrieve provider returned an invalid candidate set",
+            INVALID_PRIMITIVE_RESPONSE_CODE,
+        ) from exc
+    candidates: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, value in enumerate(values):
+        field = f"provider retrieve response.candidates[{index}]"
+        if not isinstance(value, dict):
+            raise AdapterRequestError(
+                "permissioned retrieve provider returned an invalid candidate",
+                INVALID_PRIMITIVE_RESPONSE_CODE,
+            )
+        try:
+            validate_exact_fields(value, frozenset({"graph_object_id", "score"}), field)
+            graph_object_id = required_authorization_token(
+                value.get("graph_object_id"), f"{field}.graph_object_id"
+            )
+        except AdapterRequestError as exc:
+            raise AdapterRequestError(
+                "permissioned retrieve provider returned an invalid candidate",
+                INVALID_PRIMITIVE_RESPONSE_CODE,
+            ) from exc
+        score = value.get("score")
+        if (
+            graph_object_id not in resources
+            or graph_object_id in seen
+            or isinstance(score, bool)
+            or not isinstance(score, (int, float))
+            or score < 0
+            or score > 1
+            or not math.isfinite(score)
+        ):
+            raise AdapterRequestError(
+                "permissioned retrieve provider returned an invalid candidate",
+                INVALID_PRIMITIVE_RESPONSE_CODE,
+            )
+        seen.add(graph_object_id)
+        candidates.append({"resource": resources[graph_object_id], "score": float(score)})
+    candidates.sort(key=lambda candidate: (-candidate["score"], candidate["resource"]["resource_id"]))
+    resource_ids = [candidate["resource"]["resource_id"] for candidate in candidates]
+    return add_test_stage_spy(
+        {"mode": "real", "candidates": candidates},
+        [("retrieve.output", resource_ids)],
+    )
+
+
+def validate_real_expand_request(
+    params: dict[str, Any],
+    authorization: dict[str, Any],
+    resources: dict[str, dict[str, Any]],
+) -> tuple[list[tuple[dict[str, Any], str]], int]:
+    frontier = params.get("frontier")
+    if not isinstance(frontier, list) or not frontier or len(frontier) > 100:
+        raise AdapterRequestError("frontier must contain between 1 and 100 candidate handles")
+    handles: list[tuple[dict[str, Any], str]] = []
+    seen: set[str] = set()
+    for index, value in enumerate(frontier):
+        handle = validate_candidate(value, f"frontier[{index}]")
+        require_authorization_scope(handle["resource"], authorization, f"frontier[{index}].resource")
+        graph_object_id = require_selected_resource(
+            handle["resource"], resources, f"frontier[{index}].resource"
+        )
+        resource_id = handle["resource"]["resource_id"]
+        if resource_id in seen:
+            raise AdapterRequestError("frontier contains duplicate resource_id values")
+        seen.add(resource_id)
+        handles.append((handle, graph_object_id))
+    return handles, primitive_limit(params, 10)
+
+
+def real_expand(
+    params: dict[str, Any],
+    authorization: dict[str, Any],
+    resources: dict[str, dict[str, Any]],
+    claims: list[dict[str, Any]],
+) -> dict[str, Any]:
+    handles, limit = validate_real_expand_request(params, authorization, resources)
+    frontier_scores = {graph_object_id: handle["score"] for handle, graph_object_id in handles}
+    candidate_scores: dict[str, float] = {}
+    graph_edges: set[tuple[str, str]] = set()
+    for claim in claims:
+        if claim["subject"] in frontier_scores:
+            score = float(frontier_scores[claim["subject"]])
+            candidate_scores[claim["claim"]] = max(candidate_scores.get(claim["claim"], 0.0), score)
+            graph_edges.add((claim["subject"], claim["claim"]))
+        if claim["claim"] in frontier_scores:
+            score = float(frontier_scores[claim["claim"]])
+            candidate_scores[claim["object"]] = max(candidate_scores.get(claim["object"], 0.0), score)
+            graph_edges.add((claim["claim"], claim["object"]))
+    ranked = sorted(
+        candidate_scores,
+        key=lambda graph_object_id: (
+            -candidate_scores[graph_object_id],
+            resources[graph_object_id]["resource_id"],
+        ),
+    )[:limit]
+    included = set(ranked)
+    candidates = [
+        {"resource": resources[graph_object_id], "score": candidate_scores[graph_object_id]}
+        for graph_object_id in ranked
+    ]
+    expansions = sorted(
+        (
+            {
+                "from_resource_id": resources[source]["resource_id"],
+                "to_resource_id": resources[target]["resource_id"],
+                "hop": 1,
+            }
+            for source, target in graph_edges
+            if target in included
+        ),
+        key=lambda edge: (edge["hop"], edge["from_resource_id"], edge["to_resource_id"]),
+    )
+    frontier_ids = sorted(handle["resource"]["resource_id"] for handle, _ in handles)
+    output_ids = [candidate["resource"]["resource_id"] for candidate in candidates]
+    return add_test_stage_spy(
+        {"mode": "real", "candidates": candidates, "expansions": expansions},
+        [("expand.frontier_input", frontier_ids), ("expand.candidate_output", output_ids)],
+    )
+
+
+def validate_real_generate_request(
+    params: dict[str, Any],
+    authorization: dict[str, Any],
+    resources: dict[str, dict[str, Any]],
+) -> tuple[str, list[dict[str, Any]]]:
+    question = bounded_primitive_text(params.get("question"), "question").strip()
+    evidence = params.get("evidence")
+    if not isinstance(evidence, list) or not evidence or len(evidence) > 100:
+        raise AdapterRequestError("evidence must contain between 1 and 100 authorized evidence objects")
+    items: list[dict[str, Any]] = []
+    resource_ids: set[str] = set()
+    citation_handles: set[str] = set()
+    projection_version = ""
+    for index, value in enumerate(evidence):
+        item = validate_evidence(value, f"evidence[{index}]")
+        if len(item["content"].encode("utf-8")) > MAX_PRIMITIVE_TEXT_BYTES:
+            raise AdapterRequestError(f"evidence[{index}].content exceeds the primitive text limit")
+        require_authorization_scope(item["resource"], authorization, f"evidence[{index}].resource")
+        require_selected_resource(item["resource"], resources, f"evidence[{index}].resource")
+        resource_id = item["resource"]["resource_id"]
+        citation_handle = item["citation_handle"]
+        if resource_id in resource_ids:
+            raise AdapterRequestError("evidence contains duplicate resource_id values")
+        if citation_handle in citation_handles:
+            raise AdapterRequestError("evidence contains duplicate citation_handle values")
+        item_projection = item["resource"]["versions"]["projection"]
+        if projection_version and projection_version != item_projection:
+            raise AdapterRequestError("evidence crosses selected projection versions")
+        projection_version = item_projection
+        resource_ids.add(resource_id)
+        citation_handles.add(citation_handle)
+        items.append(item)
+    if not question:
+        raise AdapterRequestError("question must be a non-empty string")
+    return question, items
+
+
+def real_generate(
+    params: dict[str, Any],
+    authorization: dict[str, Any],
+    resources: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    question, items = validate_real_generate_request(params, authorization, resources)
+    projection_version = items[0]["resource"]["versions"]["projection"]
+    response = call_permissioned_provider(
+        permissioned_provider_context(params, authorization, projection_version),
+        "generate",
+        {
+            "version": 1,
+            "question": question,
+            "projection_version": projection_version,
+            "evidence": items,
+        },
+    )
+    try:
+        validate_exact_fields(response, frozenset({"answer"}), "provider generate response")
+        answer = bounded_primitive_text(response.get("answer"), "provider generate response.answer")
+    except AdapterRequestError as exc:
+        raise AdapterRequestError(
+            "permissioned generate provider returned an invalid response",
+            INVALID_PRIMITIVE_RESPONSE_CODE,
+        ) from exc
+    resource_ids = [item["resource"]["resource_id"] for item in items]
+    citations = [
+        {"handle": item["citation_handle"], "resource_id": item["resource"]["resource_id"]}
+        for item in items
+    ]
+    return add_test_stage_spy(
+        {
+            "mode": "real",
+            "answer": answer,
+            "citations": citations,
+            "evidence_resource_ids": resource_ids,
+            "trace": {"resource_ids": resource_ids, "count": len(resource_ids)},
+        },
+        [("generate.evidence_input", resource_ids), ("generate.citation_output", resource_ids)],
+    )
+
+
 def validate_candidate(value: Any, field: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise AdapterRequestError(f"{field} must be an object")
@@ -2228,15 +3129,13 @@ def real_response(req: dict[str, Any]) -> None:
     if method in PRIMITIVE_METHODS:
         params = primitive_params(req)
         authorization = validate_authorization(params.get("authorization"))
-        # The selected immutable bundle is the only identity authority. Real
-        # primitives remain disabled until #57, but no future result can be
-        # emitted without first passing this body-free binding validation.
-        load_current_graph_contract(params, authorization)
-        error(
-            req_id,
-            f"{method} is not supported by the real OpenSPG/KAG adapter",
-            UNSUPPORTED_PRIMITIVE_CODE,
-        )
+        resources, claims = load_current_graph_contract(params, authorization)
+        handlers = {
+            "kag.retrieve": lambda: real_retrieve(params, authorization, resources),
+            "kag.expand": lambda: real_expand(params, authorization, resources, claims),
+            "kag.generate": lambda: real_generate(params, authorization, resources),
+        }
+        result(req_id, handlers[method]())
         return
     if method == "kag.health":
         real_health(req)
@@ -2322,4 +3221,14 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    if len(sys.argv) == 4 and sys.argv[1] == PERMISSIONED_PROVIDER_RUNNER_ARG:
+        raise SystemExit(permissioned_provider_runner(sys.argv[2], int(sys.argv[3])))
+    if len(sys.argv) == 5 and sys.argv[1] == PERMISSIONED_PROVIDER_GUARDIAN_ARG:
+        raise SystemExit(
+            permissioned_provider_guardian(
+                int(sys.argv[2]),
+                int(sys.argv[3]),
+                int(sys.argv[4]),
+            )
+        )
     raise SystemExit(main())
