@@ -1142,18 +1142,37 @@ func TestArtifactBundleReadRejectsSymlinkedBundlesParent(t *testing.T) {
 func testBundleArtifactSet(t *testing.T, projectionID, summary string) repository.ArtifactSet {
 	t.Helper()
 	generatedAt := time.Unix(42, 0).UTC()
+	resourceID := protocol.ResourceID("res_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+	handle := protocol.ResourceHandle{
+		ResourceID: resourceID, Type: protocol.ResourceDocument, TenantID: "local", KnowledgeBaseID: "test",
+		AuthorizationID: "document:" + string(resourceID), AuthorizationResourceID: resourceID,
+		ContentDigest: protocol.NewContentDigest(summary),
+		Versions: protocol.ResourceVersions{
+			Source: "src_0123456789abcdef01234567", Content: "content_test_v1",
+			ACL: "authz_0123456789abcdef01234567", Index: "index_" + projectionID,
+			Graph: "graph_" + projectionID, Projection: projectionID,
+		},
+		ServingState: protocol.ServingActive,
+	}
+	binding, err := protocol.NewGraphResourceBinding(handle)
+	if err != nil {
+		t.Fatal(err)
+	}
 	manifest := protocol.ArtifactManifest{
 		Version: 1, Workspace: "test", GeneratedAt: generatedAt, SourceCount: 1, SummaryCount: 1,
 	}
 	set := repository.ArtifactSet{
-		Manifest:   manifest,
-		Summaries:  []protocol.Summary{{SummaryID: "summary", Text: summary, EvidenceChunkIDs: []string{}}},
-		SchemaYAML: "version: 1\n", BuildReport: "# report\n",
+		Manifest:      manifest,
+		Summaries:     []protocol.Summary{{SummaryID: "summary", Text: summary, EvidenceChunkIDs: []string{}}},
+		GraphBindings: []protocol.GraphResourceBinding{binding},
+		ClaimBindings: []protocol.ClaimTripleBinding{},
+		BuildReport:   "# report\n",
 		BundleManifest: protocol.ArtifactBundleManifest{
 			Version: 2, ProjectionID: projectionID, ProjectionVersion: projectionID,
-			Namespace:            "KnoteKB__" + projectionID,
-			AuthorizationObject:  "knowledge-base:test:" + projectionID,
-			AuthorizationVersion: "authz_0123456789abcdef01234567",
+			Namespace:                   "KnoteKB__" + projectionID,
+			AuthorizationObject:         "knowledge-base:test:" + projectionID,
+			AuthorizationVersion:        "authz_0123456789abcdef01234567",
+			GraphBindingContractVersion: protocol.GraphBindingContractVersion,
 			SourceSnapshot: protocol.ArtifactSourceSnapshot{
 				Version: "src_0123456789abcdef01234567",
 				Digest:  strings.Repeat("1", 64), DocumentCount: 1,

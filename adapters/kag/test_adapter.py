@@ -138,7 +138,149 @@ def initialize_checkout_projection(
     return base, runtime, projection_id
 
 
+def graph_contract_resource(
+    projection_id: str,
+    resource_id: str = "res_11111111111111111111111111111111",
+) -> dict[str, object]:
+    content = "permissioned body"
+    return {
+        "resource_id": resource_id,
+        "type": "document",
+        "tenant_id": "local",
+        "knowledge_base_id": "kb_test",
+        "authz_object": f"document:{resource_id}",
+        "authorization_resource_id": resource_id,
+        "content_digest": "sha256:" + hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        "versions": {
+            "source": "source_graph_v1",
+            "content": "content_graph_v1",
+            "acl": "acl_graph_v1",
+            "index": "index_" + projection_id,
+            "graph": "graph_" + projection_id,
+            "projection": projection_id,
+        },
+        "serving_state": "serving",
+    }
+
+
+def graph_contract_binding(
+    projection_id: str,
+    resource: dict[str, object] | None = None,
+    **overrides: object,
+) -> dict[str, object]:
+    resource = resource or graph_contract_resource(projection_id)
+    value: dict[str, object] = {
+        "version": adapter.GRAPH_BINDING_CONTRACT_VERSION,
+        "graph_object_id": adapter.expected_graph_object_id(
+            projection_id, str(resource["resource_id"])
+        ),
+        "resource": resource,
+    }
+    value.update(overrides)
+    return value
+
+
+def write_graph_contract_bundle(
+    workspace: Path,
+    *,
+    graph_rows: list[dict[str, object]] | None = None,
+    claim_rows: list[dict[str, object]] | None = None,
+) -> str:
+    projection_id = "prj_" + "a" * 32
+    if graph_rows is None:
+        graph_rows = [graph_contract_binding(projection_id)]
+    if claim_rows is None:
+        claim_rows = []
+
+    def jsonl(rows: list[dict[str, object]]) -> bytes:
+        return b"".join(
+            (json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+            for row in rows
+        )
+
+    payloads: dict[str, bytes] = {
+        "build_report.md": b"# graph contract fixture\n",
+        "chunks.jsonl": b"",
+        "claim_bindings.jsonl": jsonl(claim_rows),
+        "claims.jsonl": b"",
+        "documents.jsonl": b"",
+        "entities.jsonl": b"",
+        "graph_bindings.jsonl": jsonl(graph_rows),
+        "projection.json": (json.dumps({"version": projection_id}) + "\n").encode("utf-8"),
+        "relations.jsonl": b"",
+        "schema.yaml": b"version: 2\n",
+        "summaries.jsonl": b"",
+    }
+    files = [
+        {
+            "path": path,
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "count": (
+                len(graph_rows)
+                if path == "graph_bindings.jsonl"
+                else len(claim_rows)
+                if path == "claim_bindings.jsonl"
+                else 1
+                if path in {"build_report.md", "schema.yaml", "projection.json"}
+                else 0
+            ),
+            "size_bytes": len(data),
+        }
+        for path, data in sorted(payloads.items())
+    ]
+    manifest = {
+        "version": 2,
+        "projection_id": projection_id,
+        "projection_version": projection_id,
+        "namespace": "KnoteKB__" + projection_id,
+        "authz_object": "knowledge-base:kb_test",
+        "authz_version": "acl_graph_v1",
+        "graph_binding_contract_version": adapter.GRAPH_BINDING_CONTRACT_VERSION,
+        "source_snapshot": {
+            "version": "source_graph_v1",
+            "digest": "b" * 64,
+            "document_count": 1,
+        },
+        "generated_at": "1970-01-01T00:00:00Z",
+        "files": files,
+        "v1_compatibility": {
+            "version": 1,
+            "workspace": "kb_test",
+            "generated_at": "1970-01-01T00:00:00Z",
+            "source_count": 1,
+        },
+    }
+    bundle_dir = workspace / "artifacts" / "bundles" / projection_id
+    bundle_dir.mkdir(parents=True)
+    for path, data in payloads.items():
+        (bundle_dir / path).write_bytes(data)
+    manifest_data = json.dumps(manifest, sort_keys=True, indent=2).encode("utf-8") + b"\n"
+    (bundle_dir / "manifest.json").write_bytes(manifest_data)
+    current = {
+        "version": 2,
+        "projection_id": projection_id,
+        "projection_version": projection_id,
+        "manifest_sha256": hashlib.sha256(manifest_data).hexdigest(),
+    }
+    (workspace / "artifacts" / "current.json").write_text(
+        json.dumps(current, sort_keys=True, indent=2) + "\n", encoding="utf-8"
+    )
+    return projection_id
+
+
+def real_graph_authorization() -> dict[str, object]:
+    return authorization_context(tenant_id="local", knowledge_base_id="kb_test")
+
+
 class AdapterTest(unittest.TestCase):
+    def test_read_artifact_file_rejects_oversized_input_with_a_bounded_read(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "oversized.json"
+            path.write_bytes(b"123456789")
+            with self.assertRaises(adapter.AdapterRequestError):
+                adapter.read_artifact_file(path, root, "oversized fixture", 8)
+
     def test_fake_health(self) -> None:
         env = os.environ.copy()
         env["KNOTE_KAG_FAKE"] = "1"
@@ -690,27 +832,159 @@ class AdapterTest(unittest.TestCase):
         )
 
     def test_real_primitives_fail_before_any_kag_setup(self) -> None:
-        for method in sorted(adapter.PRIMITIVE_METHODS):
-            with self.subTest(method=method):
-                stdout = StringIO()
-                with (
-                    patch.object(adapter, "runtime_dir") as runtime_dir_mock,
-                    patch.object(adapter, "select_config") as select_config_mock,
-                    patch.object(adapter, "check_real_health") as health_mock,
-                    patch.object(adapter, "run_capturing_stdout") as capture_mock,
-                    redirect_stdout(stdout),
-                ):
-                    adapter.real_response({"id": "real", "method": method, "params": "malformed but unused"})
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            write_graph_contract_bundle(workspace)
+            for method in sorted(adapter.PRIMITIVE_METHODS):
+                with self.subTest(method=method):
+                    stdout = StringIO()
+                    with (
+                        patch.object(adapter, "runtime_dir") as runtime_dir_mock,
+                        patch.object(adapter, "select_config") as select_config_mock,
+                        patch.object(adapter, "check_real_health") as health_mock,
+                        patch.object(adapter, "run_capturing_stdout") as capture_mock,
+                        redirect_stdout(stdout),
+                    ):
+                        adapter.real_response(
+                            {
+                                "id": "real",
+                                "method": method,
+                                "params": {
+                                    "workspace": str(workspace),
+                                    "authorization": real_graph_authorization(),
+                                },
+                            }
+                        )
 
-                response = json.loads(stdout.getvalue())
-                self.assertEqual(response["id"], "real")
+                    response = json.loads(stdout.getvalue())
+                    self.assertEqual(response["id"], "real")
+                    self.assertEqual(response["type"], "error")
+                    self.assertEqual(response["code"], "unsupported_primitive")
+                    self.assertIn(method, response["error"])
+                    runtime_dir_mock.assert_not_called()
+                    select_config_mock.assert_not_called()
+                    health_mock.assert_not_called()
+                    capture_mock.assert_not_called()
+
+    def test_real_primitives_validate_selected_graph_bindings_before_setup(self) -> None:
+        projection_id = "prj_" + "a" * 32
+
+        def cloned_binding() -> dict[str, object]:
+            return json.loads(json.dumps(graph_contract_binding(projection_id)))
+
+        cases: list[tuple[str, list[dict[str, object]]]] = []
+        forged = cloned_binding()
+        forged["graph_object_id"] = "kg_" + "f" * 32
+        cases.append(("forged graph ID", [forged]))
+        for version_name, stale_value in (
+            ("projection", "prj_" + "b" * 32),
+            ("acl", "acl_stale"),
+            ("index", "index_stale"),
+            ("graph", "graph_stale"),
+        ):
+            stale = cloned_binding()
+            stale["resource"]["versions"][version_name] = stale_value
+            cases.append((f"stale {version_name}", [stale]))
+        cross_tenant = cloned_binding()
+        cross_tenant["resource"]["tenant_id"] = "other"
+        cases.append(("cross tenant", [cross_tenant]))
+        duplicate = cloned_binding()
+        cases.append(("duplicate binding", [duplicate, json.loads(json.dumps(duplicate))]))
+        hidden_label = cloned_binding()
+        hidden_label["relation_label"] = "secret_relation"
+        cases.append(("hidden relation label", [hidden_label]))
+        content_metadata = cloned_binding()
+        content_metadata["title"] = "protected title"
+        cases.append(("content-bearing candidate metadata", [content_metadata]))
+
+        for name, graph_rows in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                workspace = Path(directory)
+                write_graph_contract_bundle(workspace, graph_rows=graph_rows)
+                _, lines = call_adapter(
+                    {
+                        "id": "binding",
+                        "method": "kag.retrieve",
+                        "params": {
+                            "workspace": str(workspace),
+                            "authorization": real_graph_authorization(),
+                            "query": "knote",
+                            "limit": 10,
+                        },
+                    },
+                    fake=False,
+                )
+                response = lines[-1]
                 self.assertEqual(response["type"], "error")
-                self.assertEqual(response["code"], "unsupported_primitive")
-                self.assertIn(method, response["error"])
-                runtime_dir_mock.assert_not_called()
-                select_config_mock.assert_not_called()
-                health_mock.assert_not_called()
-                capture_mock.assert_not_called()
+                self.assertEqual(response["code"], "invalid_graph_binding")
+
+        with tempfile.TemporaryDirectory() as directory:
+            _, lines = call_adapter(
+                {
+                    "id": "missing",
+                    "method": "kag.retrieve",
+                    "params": {
+                        "workspace": directory,
+                        "authorization": real_graph_authorization(),
+                        "query": "knote",
+                        "limit": 10,
+                    },
+                },
+                fake=False,
+            )
+            self.assertEqual(lines[-1]["code"], "invalid_graph_binding")
+
+    def test_real_primitive_rejects_graph_file_tampering_against_manifest_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            projection_id = write_graph_contract_bundle(workspace)
+            graph_path = (
+                workspace
+                / "artifacts"
+                / "bundles"
+                / projection_id
+                / adapter.GRAPH_BINDINGS_ARTIFACT
+            )
+            graph_path.write_bytes(graph_path.read_bytes() + b"{}\n")
+            _, lines = call_adapter(
+                {
+                    "id": "tampered",
+                    "method": "kag.retrieve",
+                    "params": {
+                        "workspace": str(workspace),
+                        "authorization": real_graph_authorization(),
+                        "query": "knote",
+                        "limit": 10,
+                    },
+                },
+                fake=False,
+            )
+            self.assertEqual(lines[-1]["type"], "error")
+            self.assertEqual(lines[-1]["code"], "invalid_graph_binding")
+            self.assertIn("digest", lines[-1]["error"])
+
+    def test_real_primitive_ignores_flat_compatibility_graph_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            write_graph_contract_bundle(workspace)
+            (workspace / "artifacts" / adapter.GRAPH_BINDINGS_ARTIFACT).write_text(
+                '{"title":"forged compatibility metadata"}\n', encoding="utf-8"
+            )
+            _, lines = call_adapter(
+                {
+                    "id": "compatibility",
+                    "method": "kag.retrieve",
+                    "params": {
+                        "workspace": str(workspace),
+                        "authorization": real_graph_authorization(),
+                        "query": "knote",
+                        "limit": 10,
+                    },
+                },
+                fake=False,
+            )
+            self.assertEqual(lines[-1]["type"], "error")
+            self.assertEqual(lines[-1]["code"], "unsupported_primitive")
 
     def test_error_json_remains_compatible_when_code_is_absent(self) -> None:
         stdout = StringIO()

@@ -46,6 +46,29 @@ func TestStableResourceIdentityAndImmutableSourceSnapshot(t *testing.T) {
 	}
 }
 
+func TestResourceMetadataServingHandleRejectsNonServingLifecycle(t *testing.T) {
+	metadata := testMetadata(
+		t, testScope(), protocol.ResourceDocument, "sources/a.md", "body",
+		"source-v1", "content-v1", "projection-v1", "", "document:a",
+	)
+	if _, err := metadata.ServingHandle(); err == nil {
+		t.Fatal("staged resource produced a serving handle")
+	}
+	metadata = published(metadata)
+	handle, err := metadata.ServingHandle()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if handle.ResourceID != metadata.ResourceID || handle.AuthorizationID != metadata.AuthorizationObject ||
+		handle.Versions != metadata.Versions || handle.ServingState != protocol.ServingActive {
+		t.Fatalf("serving handle changed catalog identity: metadata=%+v handle=%+v", metadata, handle)
+	}
+	metadata.ServingState = StateRevoked
+	if _, err := metadata.ServingHandle(); err == nil {
+		t.Fatal("revoked resource produced a serving handle")
+	}
+}
+
 func TestSourceSnapshotRejectsMixedVersionAndSecurityDomainAndRoundTrips(t *testing.T) {
 	scope := testScope()
 	wrongVersion := []SourceDocumentSnapshot{testSnapshotDocument("sources/a.md", "source-v1", "a")}

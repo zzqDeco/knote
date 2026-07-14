@@ -255,6 +255,30 @@ func (m ResourceMetadata) IsServing() bool {
 	return m.ServingState.IsServing() && m.ProjectionStatus.Ready()
 }
 
+// ServingHandle returns the exact body-free protocol identity for a published
+// catalog resource. Staged, revoked, tombstoned, superseded, and failed
+// metadata cannot be projected into a query binding.
+func (m ResourceMetadata) ServingHandle() (protocol.ResourceHandle, error) {
+	if err := m.Validate(); err != nil {
+		return protocol.ResourceHandle{}, err
+	}
+	if !m.IsServing() {
+		return protocol.ResourceHandle{}, fmt.Errorf("resource %s is not serving", m.ResourceID)
+	}
+	handle := protocol.ResourceHandle{
+		ResourceID:              m.ResourceID,
+		Type:                    m.Type,
+		TenantID:                m.Scope.TenantID,
+		KnowledgeBaseID:         m.Scope.KnowledgeBaseID,
+		AuthorizationID:         m.AuthorizationObject,
+		AuthorizationResourceID: m.AuthorizationResourceID,
+		ContentDigest:           m.ContentDigest,
+		Versions:                m.Versions,
+		ServingState:            protocol.ServingActive,
+	}
+	return handle, handle.Validate()
+}
+
 // DocumentVersionRef pins provenance to an exact source document version.
 type DocumentVersionRef struct {
 	ResourceID        protocol.ResourceID `json:"resource_id"`

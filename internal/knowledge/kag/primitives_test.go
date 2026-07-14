@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/zzqDeco/knote/internal/protocol"
+	"github.com/zzqDeco/knote/internal/repository"
+	localrepo "github.com/zzqDeco/knote/internal/repository/local"
 )
 
 const (
@@ -78,14 +80,16 @@ func TestPrimitiveClientActualFakeAdapterRoundTrip(t *testing.T) {
 
 func TestPrimitiveClientActualRealAdapterReturnsUnsupportedBeforeKAGSetup(t *testing.T) {
 	repoRoot := primitiveTestRepoRoot(t)
+	workspace := t.TempDir()
+	resource := writePrimitiveGraphContract(t, workspace)
 	client := Client{
 		AdapterPath: filepath.Join(repoRoot, "adapters", "kag", "knote_kag_adapter.py"),
-		Workspace:   repoRoot,
+		Workspace:   workspace,
 		Fake:        false,
 	}
 	t.Setenv("KNOTE_PYTHON", pythonForTest())
 	t.Setenv("KNOTE_KAG_FAKE", "")
-	candidate := CandidateHandle{Resource: testPrimitiveResource(testResourceA), Score: 0.9}
+	candidate := CandidateHandle{Resource: resource, Score: 0.9}
 	evidence := AuthorizedEvidence{
 		Resource: candidate.Resource, Content: "allowed body", CitationHandle: "citation-1",
 	}
@@ -107,6 +111,22 @@ func TestPrimitiveClientActualRealAdapterReturnsUnsupportedBeforeKAGSetup(t *tes
 		if !errors.Is(err, ErrUnsupportedPrimitive) {
 			t.Fatalf("%s should return typed unsupported before KAG setup, got %T: %v", method, err, err)
 		}
+	}
+}
+
+func TestPrimitiveClientActualRealAdapterRejectsMissingGraphContractBeforeKAGSetup(t *testing.T) {
+	repoRoot := primitiveTestRepoRoot(t)
+	client := Client{
+		AdapterPath: filepath.Join(repoRoot, "adapters", "kag", "knote_kag_adapter.py"),
+		Workspace:   t.TempDir(),
+	}
+	t.Setenv("KNOTE_PYTHON", pythonForTest())
+	t.Setenv("KNOTE_KAG_FAKE", "")
+	_, err := client.Retrieve(context.Background(), RetrieveRequest{
+		Authorization: testAuthorizationContext(), Query: "knote", Limit: 10,
+	})
+	if !errors.Is(err, ErrInvalidGraphBinding) {
+		t.Fatalf("missing graph contract error = %T %v", err, err)
 	}
 }
 
@@ -623,6 +643,47 @@ func primitiveTestRepoRoot(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return filepath.Clean(filepath.Join(packageDir, "..", "..", ".."))
+}
+
+func writePrimitiveGraphContract(t *testing.T, workspace string) protocol.ResourceHandle {
+	t.Helper()
+	projectionID := "prj_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	generatedAt := time.Unix(0, 0).UTC()
+	resource := testPrimitiveResource(testResourceA)
+	resource.Versions.Index = "index_" + projectionID
+	resource.Versions.Graph = "graph_" + projectionID
+	resource.Versions.Projection = projectionID
+	binding, err := protocol.NewGraphResourceBinding(resource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := protocol.ArtifactManifest{
+		Version: 1, Workspace: "default", GeneratedAt: generatedAt, SourceCount: 1, DocumentCount: 1,
+	}
+	set := repository.ArtifactSet{
+		Manifest: manifest, GraphBindings: []protocol.GraphResourceBinding{binding},
+		ClaimBindings:  []protocol.ClaimTripleBinding{},
+		BuildReport:    "# graph contract\n",
+		ProjectionJSON: []byte("{\"version\":\"" + projectionID + "\"}\n"), ProjectionResourceCount: 1,
+		BundleManifest: protocol.ArtifactBundleManifest{
+			Version: protocol.ArtifactBundleManifestVersion, ProjectionID: projectionID, ProjectionVersion: projectionID,
+			Namespace: "KnoteKB__" + projectionID, AuthorizationObject: "knowledge-base:default",
+			AuthorizationVersion: "acl-v1", GraphBindingContractVersion: protocol.GraphBindingContractVersion,
+			SourceSnapshot: protocol.ArtifactSourceSnapshot{
+				Version: "source-v1", Digest: strings.Repeat("a", 64), DocumentCount: 1,
+			},
+			GeneratedAt: generatedAt, Compatibility: manifest,
+		},
+	}
+	payloads, err := repository.CanonicalArtifactFiles(set)
+	if err != nil {
+		t.Fatal(err)
+	}
+	set.BundleManifest.Files = repository.ArtifactFileDescriptors(payloads)
+	if err := localrepo.New(workspace).WriteArtifacts(context.Background(), set); err != nil {
+		t.Fatal(err)
+	}
+	return resource
 }
 
 func writePrimitiveAdapter(t *testing.T, workspace, script string) string {

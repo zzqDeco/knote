@@ -31,16 +31,17 @@ type ArtifactBundleFile struct {
 // legacy manifest remains embedded only to make v1 compatibility exports
 // reproducible from the same projection.
 type ArtifactBundleManifest struct {
-	Version              int                    `json:"version"`
-	ProjectionID         string                 `json:"projection_id"`
-	ProjectionVersion    string                 `json:"projection_version"`
-	Namespace            string                 `json:"namespace"`
-	AuthorizationObject  string                 `json:"authz_object"`
-	AuthorizationVersion string                 `json:"authz_version"`
-	SourceSnapshot       ArtifactSourceSnapshot `json:"source_snapshot"`
-	GeneratedAt          time.Time              `json:"generated_at"`
-	Files                []ArtifactBundleFile   `json:"files"`
-	Compatibility        ArtifactManifest       `json:"v1_compatibility"`
+	Version                     int                    `json:"version"`
+	ProjectionID                string                 `json:"projection_id"`
+	ProjectionVersion           string                 `json:"projection_version"`
+	Namespace                   string                 `json:"namespace"`
+	AuthorizationObject         string                 `json:"authz_object"`
+	AuthorizationVersion        string                 `json:"authz_version"`
+	GraphBindingContractVersion int                    `json:"graph_binding_contract_version,omitempty"`
+	SourceSnapshot              ArtifactSourceSnapshot `json:"source_snapshot"`
+	GeneratedAt                 time.Time              `json:"generated_at"`
+	Files                       []ArtifactBundleFile   `json:"files"`
+	Compatibility               ArtifactManifest       `json:"v1_compatibility"`
 }
 
 // ArtifactCurrentPointer is the only serving pointer for local artifacts.
@@ -101,6 +102,14 @@ func (m ArtifactBundleManifest) Validate() error {
 		"relations.jsonl": false, "claims.jsonl": false, "summaries.jsonl": false,
 		"schema.yaml": false, "build_report.md": false, "projection.json": false,
 	}
+	switch m.GraphBindingContractVersion {
+	case 0:
+	case GraphBindingContractVersion:
+		required[GraphBindingsArtifactPath] = false
+		required[ClaimBindingsArtifactPath] = false
+	default:
+		return fmt.Errorf("unsupported graph binding contract version %d", m.GraphBindingContractVersion)
+	}
 	for i, file := range m.Files {
 		if strings.TrimSpace(file.Path) == "" || file.Path != strings.TrimSpace(file.Path) ||
 			strings.Contains(file.Path, "\\") || strings.Contains(file.Path, "/") || file.Path == "." || file.Path == ".." {
@@ -128,6 +137,13 @@ func (m ArtifactBundleManifest) Validate() error {
 	for path, present := range required {
 		if !present {
 			return fmt.Errorf("artifact bundle is missing required file %q", path)
+		}
+	}
+	if m.GraphBindingContractVersion == 0 {
+		for _, path := range paths {
+			if path == GraphBindingsArtifactPath || path == ClaimBindingsArtifactPath {
+				return fmt.Errorf("artifact bundle graph bindings require a declared graph binding contract version")
+			}
 		}
 	}
 	return nil

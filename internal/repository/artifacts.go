@@ -27,6 +27,8 @@ func CanonicalArtifactFiles(set ArtifactSet) ([]ArtifactFilePayload, error) {
 	entities := append([]protocol.Entity(nil), set.Entities...)
 	relations := append([]protocol.Relation(nil), set.Relations...)
 	claims := append([]protocol.Claim(nil), set.Claims...)
+	graphBindings := append([]protocol.GraphResourceBinding(nil), set.GraphBindings...)
+	claimBindings := append([]protocol.ClaimTripleBinding(nil), set.ClaimBindings...)
 	summaries := append([]protocol.Summary(nil), set.Summaries...)
 	sort.Slice(documents, func(i, j int) bool {
 		if documents[i].DocumentID != documents[j].DocumentID {
@@ -38,7 +40,36 @@ func CanonicalArtifactFiles(set ArtifactSet) ([]ArtifactFilePayload, error) {
 	sort.Slice(entities, func(i, j int) bool { return entities[i].EntityID < entities[j].EntityID })
 	sort.Slice(relations, func(i, j int) bool { return relations[i].RelationID < relations[j].RelationID })
 	sort.Slice(claims, func(i, j int) bool { return claims[i].ClaimID < claims[j].ClaimID })
+	protocol.SortGraphResourceBindings(graphBindings)
+	protocol.SortClaimTripleBindings(claimBindings)
 	sort.Slice(summaries, func(i, j int) bool { return summaries[i].SummaryID < summaries[j].SummaryID })
+	if set.BundleManifest.GraphBindingContractVersion == 0 && (len(graphBindings) != 0 || len(claimBindings) != 0) {
+		return nil, fmt.Errorf("graph bindings require a declared graph binding contract version")
+	}
+	if set.BundleManifest.GraphBindingContractVersion != 0 {
+		if set.BundleManifest.GraphBindingContractVersion != protocol.GraphBindingContractVersion {
+			return nil, fmt.Errorf(
+				"unsupported graph binding contract version %d",
+				set.BundleManifest.GraphBindingContractVersion,
+			)
+		}
+		if err := protocol.ValidateGraphResourceBindings(graphBindings); err != nil {
+			return nil, err
+		}
+		versions := graphBindings[0].Resource.Versions
+		if versions.Source != set.BundleManifest.SourceSnapshot.Version {
+			return nil, fmt.Errorf("graph binding source version does not match bundle manifest")
+		}
+		if versions.ACL != set.BundleManifest.AuthorizationVersion {
+			return nil, fmt.Errorf("graph binding ACL version does not match bundle manifest")
+		}
+		if versions.Projection != set.BundleManifest.ProjectionVersion {
+			return nil, fmt.Errorf("graph binding projection version does not match bundle manifest")
+		}
+		if err := protocol.ValidateClaimTripleBindings(graphBindings, claimBindings); err != nil {
+			return nil, err
+		}
+	}
 
 	type jsonlFile struct {
 		name  string
@@ -53,6 +84,12 @@ func CanonicalArtifactFiles(set ArtifactSet) ([]ArtifactFilePayload, error) {
 		{name: "relations.jsonl", value: relations, count: len(relations)},
 		{name: "summaries.jsonl", value: summaries, count: len(summaries)},
 	}
+	if set.BundleManifest.GraphBindingContractVersion != 0 {
+		jsonl = append(jsonl,
+			jsonlFile{name: protocol.GraphBindingsArtifactPath, value: graphBindings, count: len(graphBindings)},
+			jsonlFile{name: protocol.ClaimBindingsArtifactPath, value: claimBindings, count: len(claimBindings)},
+		)
+	}
 	payloads := make([]ArtifactFilePayload, 0, len(jsonl)+2)
 	for _, file := range jsonl {
 		data, err := marshalJSONL(file.value)
@@ -61,7 +98,11 @@ func CanonicalArtifactFiles(set ArtifactSet) ([]ArtifactFilePayload, error) {
 		}
 		payloads = append(payloads, artifactPayload(file.name, file.count, data))
 	}
-	schema := firstArtifactText(set.SchemaYAML, defaultArtifactSchemaYAML)
+	defaultSchema := defaultArtifactSchemaYAML
+	if set.BundleManifest.GraphBindingContractVersion != 0 {
+		defaultSchema = defaultGraphArtifactSchemaYAML
+	}
+	schema := firstArtifactText(set.SchemaYAML, defaultSchema)
 	payloads = append(payloads,
 		artifactPayload("build_report.md", 1, []byte(set.BuildReport)),
 		artifactPayload("schema.yaml", 1, []byte(schema)),
@@ -125,6 +166,18 @@ func marshalJSONL(value any) ([]byte, error) {
 				return nil, err
 			}
 		}
+	case []protocol.GraphResourceBinding:
+		for _, item := range items {
+			if err := encoder.Encode(item); err != nil {
+				return nil, err
+			}
+		}
+	case []protocol.ClaimTripleBinding:
+		for _, item := range items {
+			if err := encoder.Encode(item); err != nil {
+				return nil, err
+			}
+		}
 	case []protocol.Summary:
 		for _, item := range items {
 			if err := encoder.Encode(item); err != nil {
@@ -154,4 +207,20 @@ artifacts:
   relations: relations.jsonl
   claims: claims.jsonl
   summaries: summaries.jsonl
+`
+
+const defaultGraphArtifactSchemaYAML = `version: 2
+artifacts:
+  documents: documents.jsonl
+  chunks: chunks.jsonl
+  entities: entities.jsonl
+  relations: relations.jsonl
+  claims: claims.jsonl
+  graph_bindings: graph_bindings.jsonl
+  claim_bindings: claim_bindings.jsonl
+  summaries: summaries.jsonl
+graph_binding_contract:
+  version: 1
+  graph_object_type: KnoteResource
+  claim_edge_type: KnoteClaimEdge
 `

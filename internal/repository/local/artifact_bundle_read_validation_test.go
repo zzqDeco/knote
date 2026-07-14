@@ -48,6 +48,16 @@ func TestReadCurrentArtifactManifestValidatesExactRegularBundleContents(t *testi
 			wantErr: "differs from projection",
 		},
 		{
+			name: "corrupt graph binding",
+			mutate: func(t *testing.T, bundleDir string) {
+				t.Helper()
+				if err := os.WriteFile(filepath.Join(bundleDir, "graph_bindings.jsonl"), []byte("corrupt\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantErr: "differs from projection",
+		},
+		{
 			name: "listed symlink",
 			mutate: func(t *testing.T, bundleDir string) {
 				t.Helper()

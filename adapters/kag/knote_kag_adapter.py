@@ -65,6 +65,7 @@ CONFIG_TEMPLATE_RE = re.compile(
 PRIMITIVE_METHODS = frozenset({"kag.retrieve", "kag.expand", "kag.generate"})
 UNSUPPORTED_PRIMITIVE_CODE = "unsupported_primitive"
 INVALID_REQUEST_CODE = "invalid_request"
+INVALID_GRAPH_BINDING_CODE = "invalid_graph_binding"
 TEST_STAGE_SPY_ENV = "KNOTE_KAG_TEST_STAGE_SPY"
 TEST_DELAY_MS_ENV = "KNOTE_KAG_TEST_DELAY_MS"
 
@@ -106,6 +107,50 @@ AUTHORIZATION_CONTEXT_VERSION = "v1"
 RESOURCE_ID_RE = re.compile(r"res_[0-9a-f]{32}\Z")
 CONTENT_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 RESOURCE_TYPES = frozenset({"document", "chunk", "entity", "claim", "derived_artifact"})
+GRAPH_BINDING_CONTRACT_VERSION = 1
+GRAPH_BINDINGS_ARTIFACT = "graph_bindings.jsonl"
+CLAIM_BINDINGS_ARTIFACT = "claim_bindings.jsonl"
+GRAPH_BINDING_FIELDS = frozenset({"version", "graph_object_id", "resource"})
+CLAIM_BINDING_FIELDS = frozenset(
+    {
+        "version",
+        "claim",
+        "subject",
+        "predicate_key",
+        "object",
+        "source_document",
+        "derivation",
+        "provenance",
+    }
+)
+CURRENT_POINTER_FIELDS = frozenset(
+    {"version", "projection_id", "projection_version", "manifest_sha256"}
+)
+BUNDLE_MANIFEST_FIELDS = frozenset(
+    {
+        "version",
+        "projection_id",
+        "projection_version",
+        "namespace",
+        "authz_object",
+        "authz_version",
+        "graph_binding_contract_version",
+        "source_snapshot",
+        "generated_at",
+        "files",
+        "v1_compatibility",
+    }
+)
+SOURCE_SNAPSHOT_FIELDS = frozenset({"version", "digest", "document_count"})
+ARTIFACT_DESCRIPTOR_FIELDS = frozenset({"path", "sha256", "count", "size_bytes"})
+GRAPH_OBJECT_ID_RE = re.compile(r"kg_[0-9a-f]{32}\Z")
+CLAIM_PREDICATE_KEY_RE = re.compile(r"pred_[0-9a-f]{32}\Z")
+PROJECTION_ID_RE = re.compile(r"prj_[0-9a-f]{32}\Z")
+SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
+MAX_GRAPH_BINDING_FILE_BYTES = 64 << 20
+MAX_GRAPH_BINDING_LINE_BYTES = 1 << 20
+MAX_ARTIFACT_CURRENT_POINTER_BYTES = 64 << 10
+MAX_ARTIFACT_BUNDLE_MANIFEST_BYTES = 4 << 20
 
 FAKE_INTRO_ID = "res_00000000000000000000000000000001"
 FAKE_DENIED_CANARY_ID = "res_00000000000000000000000000000002"
@@ -1315,6 +1360,452 @@ def validate_resource(value: Any, field: str) -> dict[str, Any]:
     }
 
 
+def expected_graph_object_id(projection_version: str, resource_id: str) -> str:
+    identity = (
+        f"{GRAPH_BINDING_CONTRACT_VERSION}\0{projection_version}\0{resource_id}"
+    )
+    return "kg_" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32]
+
+
+def require_artifact_directory(path: Path, field: str) -> None:
+    if path.is_symlink() or not path.is_dir():
+        raise AdapterRequestError(
+            f"{field} must be a real directory", INVALID_GRAPH_BINDING_CODE
+        )
+
+
+def read_artifact_file(path: Path, root: Path, field: str, max_bytes: int) -> bytes:
+    try:
+        resolved_root = root.resolve(strict=True)
+        resolved = path.resolve(strict=True)
+        resolved.relative_to(resolved_root)
+    except (OSError, ValueError) as exc:
+        raise AdapterRequestError(
+            f"{field} is outside the selected artifact bundle",
+            INVALID_GRAPH_BINDING_CODE,
+        ) from exc
+    if path.is_symlink() or not path.is_file():
+        raise AdapterRequestError(
+            f"{field} must be a regular file", INVALID_GRAPH_BINDING_CODE
+        )
+    current = path.parent
+    while current != root:
+        if current.is_symlink():
+            raise AdapterRequestError(
+                f"{field} has a symlinked parent", INVALID_GRAPH_BINDING_CODE
+            )
+        if root not in current.parents:
+            break
+        current = current.parent
+    try:
+        with path.open("rb") as stream:
+            data = stream.read(max_bytes + 1)
+    except OSError as exc:
+        raise AdapterRequestError(
+            f"cannot read {field}: {exc}", INVALID_GRAPH_BINDING_CODE
+        ) from exc
+    if len(data) > max_bytes:
+        raise AdapterRequestError(
+            f"{field} exceeds the file size limit", INVALID_GRAPH_BINDING_CODE
+        )
+    return data
+
+
+def decode_artifact_object(data: bytes, field: str) -> dict[str, Any]:
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError(f"duplicate object field {key!r}")
+            value[key] = item
+        return value
+
+    try:
+        value = json.loads(data, object_pairs_hook=unique_object)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise AdapterRequestError(
+            f"{field} is not valid JSON: {exc}", INVALID_GRAPH_BINDING_CODE
+        ) from exc
+    if not isinstance(value, dict):
+        raise AdapterRequestError(
+            f"{field} must be an object", INVALID_GRAPH_BINDING_CODE
+        )
+    return value
+
+
+def validate_artifact_descriptor(value: Any, field: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise AdapterRequestError(
+            f"{field} must be an object", INVALID_GRAPH_BINDING_CODE
+        )
+    validate_exact_fields(value, ARTIFACT_DESCRIPTOR_FIELDS, field)
+    path = required_authorization_token(value.get("path"), f"{field}.path")
+    if path in {".", ".."} or "/" in path or "\\" in path:
+        raise AdapterRequestError(
+            f"{field}.path must be a bundle file name", INVALID_GRAPH_BINDING_CODE
+        )
+    sha256 = required_authorization_token(value.get("sha256"), f"{field}.sha256")
+    if not SHA256_RE.fullmatch(sha256):
+        raise AdapterRequestError(
+            f"{field}.sha256 must be a SHA-256 digest", INVALID_GRAPH_BINDING_CODE
+        )
+    count = value.get("count")
+    size_bytes = value.get("size_bytes")
+    if (
+        isinstance(count, bool)
+        or not isinstance(count, int)
+        or count < 0
+        or isinstance(size_bytes, bool)
+        or not isinstance(size_bytes, int)
+        or size_bytes < 0
+    ):
+        raise AdapterRequestError(
+            f"{field} has an invalid count or size", INVALID_GRAPH_BINDING_CODE
+        )
+    return {"path": path, "sha256": sha256, "count": count, "size_bytes": size_bytes}
+
+
+def verified_jsonl_rows(
+    bundle_dir: Path, descriptor: dict[str, Any], field: str
+) -> list[dict[str, Any]]:
+    if descriptor["size_bytes"] > MAX_GRAPH_BINDING_FILE_BYTES:
+        raise AdapterRequestError(
+            f"{field} exceeds the graph binding file limit",
+            INVALID_GRAPH_BINDING_CODE,
+        )
+    data = read_artifact_file(
+        bundle_dir / descriptor["path"],
+        bundle_dir,
+        field,
+        MAX_GRAPH_BINDING_FILE_BYTES,
+    )
+    if hashlib.sha256(data).hexdigest() != descriptor["sha256"]:
+        raise AdapterRequestError(
+            f"{field} digest does not match the bundle manifest",
+            INVALID_GRAPH_BINDING_CODE,
+        )
+    if len(data) != descriptor["size_bytes"]:
+        raise AdapterRequestError(
+            f"{field} size does not match the bundle manifest",
+            INVALID_GRAPH_BINDING_CODE,
+        )
+    if data and not data.endswith(b"\n"):
+        raise AdapterRequestError(
+            f"{field} must end with a newline", INVALID_GRAPH_BINDING_CODE
+        )
+    lines = data.splitlines()
+    if len(lines) != descriptor["count"]:
+        raise AdapterRequestError(
+            f"{field} count does not match the bundle manifest",
+            INVALID_GRAPH_BINDING_CODE,
+        )
+    rows: list[dict[str, Any]] = []
+    for index, line in enumerate(lines):
+        if len(line) > MAX_GRAPH_BINDING_LINE_BYTES:
+            raise AdapterRequestError(
+                f"{field}[{index}] exceeds the graph binding row limit",
+                INVALID_GRAPH_BINDING_CODE,
+            )
+        if not line.strip():
+            raise AdapterRequestError(
+                f"{field}[{index}] is blank", INVALID_GRAPH_BINDING_CODE
+            )
+        rows.append(decode_artifact_object(line, f"{field}[{index}]"))
+    return rows
+
+
+def validate_graph_binding_row(
+    value: dict[str, Any],
+    field: str,
+    authorization: dict[str, Any],
+    manifest: dict[str, Any],
+) -> dict[str, Any]:
+    validate_exact_fields(value, GRAPH_BINDING_FIELDS, field)
+    if value.get("version") != GRAPH_BINDING_CONTRACT_VERSION:
+        raise AdapterRequestError(
+            f"{field}.version must be {GRAPH_BINDING_CONTRACT_VERSION}",
+            INVALID_GRAPH_BINDING_CODE,
+        )
+    graph_object_id = required_authorization_token(
+        value.get("graph_object_id"), f"{field}.graph_object_id"
+    )
+    if not GRAPH_OBJECT_ID_RE.fullmatch(graph_object_id):
+        raise AdapterRequestError(
+            f"{field}.graph_object_id must be an opaque kg_ identifier",
+            INVALID_GRAPH_BINDING_CODE,
+        )
+    resource = validate_resource(value.get("resource"), f"{field}.resource")
+    require_authorization_scope(resource, authorization, f"{field}.resource")
+    versions = resource["versions"]
+    expected_versions = {
+        "source": manifest["source_snapshot"]["version"],
+        "acl": manifest["authz_version"],
+        "index": "index_" + manifest["projection_version"],
+        "graph": "graph_" + manifest["projection_version"],
+        "projection": manifest["projection_version"],
+    }
+    for name, expected in expected_versions.items():
+        if versions[name] != expected:
+            raise AdapterRequestError(
+                f"{field}.resource.versions.{name} does not match the selected projection",
+                INVALID_GRAPH_BINDING_CODE,
+            )
+    expected_id = expected_graph_object_id(
+        manifest["projection_version"], resource["resource_id"]
+    )
+    if graph_object_id != expected_id:
+        raise AdapterRequestError(
+            f"{field}.graph_object_id does not match the exact serving resource",
+            INVALID_GRAPH_BINDING_CODE,
+        )
+    return {"version": GRAPH_BINDING_CONTRACT_VERSION, "graph_object_id": graph_object_id, "resource": resource}
+
+
+def validate_claim_binding_rows(
+    rows: list[dict[str, Any]], resources: dict[str, dict[str, Any]]
+) -> list[dict[str, Any]]:
+    claims: list[dict[str, Any]] = []
+    previous = ""
+    for index, value in enumerate(rows):
+        field = f"claim_bindings[{index}]"
+        validate_exact_fields(value, CLAIM_BINDING_FIELDS, field)
+        if value.get("version") != GRAPH_BINDING_CONTRACT_VERSION:
+            raise AdapterRequestError(
+                f"{field}.version must be {GRAPH_BINDING_CONTRACT_VERSION}",
+                INVALID_GRAPH_BINDING_CODE,
+            )
+        normalized: dict[str, Any] = {"version": GRAPH_BINDING_CONTRACT_VERSION}
+        for name in ("claim", "subject", "object", "source_document"):
+            graph_object_id = required_authorization_token(
+                value.get(name), f"{field}.{name}"
+            )
+            if not GRAPH_OBJECT_ID_RE.fullmatch(graph_object_id) or graph_object_id not in resources:
+                raise AdapterRequestError(
+                    f"{field}.{name} is not present in graph_bindings",
+                    INVALID_GRAPH_BINDING_CODE,
+                )
+            normalized[name] = graph_object_id
+        predicate_key = required_authorization_token(
+            value.get("predicate_key"), f"{field}.predicate_key"
+        )
+        if not CLAIM_PREDICATE_KEY_RE.fullmatch(predicate_key):
+            raise AdapterRequestError(
+                f"{field}.predicate_key must be an opaque pred_ identifier",
+                INVALID_GRAPH_BINDING_CODE,
+            )
+        normalized["predicate_key"] = predicate_key
+        derivation = required_authorization_token(
+            value.get("derivation"), f"{field}.derivation"
+        )
+        if derivation not in {"any_support", "all_required"}:
+            raise AdapterRequestError(
+                f"{field}.derivation is unsupported", INVALID_GRAPH_BINDING_CODE
+            )
+        normalized["derivation"] = derivation
+        provenance = value.get("provenance")
+        if not isinstance(provenance, list) or not provenance:
+            raise AdapterRequestError(
+                f"{field}.provenance is required", INVALID_GRAPH_BINDING_CODE
+            )
+        normalized_provenance: list[str] = []
+        for support_index, support_id in enumerate(provenance):
+            support_id = required_authorization_token(
+                support_id, f"{field}.provenance[{support_index}]"
+            )
+            if not GRAPH_OBJECT_ID_RE.fullmatch(support_id) or support_id not in resources:
+                raise AdapterRequestError(
+                    f"{field}.provenance[{support_index}] is not graph-bound",
+                    INVALID_GRAPH_BINDING_CODE,
+                )
+            normalized_provenance.append(support_id)
+        if normalized_provenance != sorted(set(normalized_provenance)):
+            raise AdapterRequestError(
+                f"{field}.provenance must be unique and sorted",
+                INVALID_GRAPH_BINDING_CODE,
+            )
+        normalized["provenance"] = normalized_provenance
+        if normalized["claim"] <= previous:
+            raise AdapterRequestError(
+                "claim_bindings must be unique and sorted by claim",
+                INVALID_GRAPH_BINDING_CODE,
+            )
+        previous = normalized["claim"]
+        claim_resource = resources[normalized["claim"]]
+        subject_resource = resources[normalized["subject"]]
+        object_resource = resources[normalized["object"]]
+        source_resource = resources[normalized["source_document"]]
+        if claim_resource["type"] != "claim":
+            raise AdapterRequestError(f"{field}.claim must reference a claim", INVALID_GRAPH_BINDING_CODE)
+        if subject_resource["type"] != "entity" or object_resource["type"] != "entity":
+            raise AdapterRequestError(f"{field} endpoints must reference entities", INVALID_GRAPH_BINDING_CODE)
+        if source_resource["type"] != "document":
+            raise AdapterRequestError(f"{field}.source_document must reference a document", INVALID_GRAPH_BINDING_CODE)
+        source_id = source_resource["resource_id"]
+        for support_id in normalized_provenance:
+            support = resources[support_id]
+            if support["type"] not in {"document", "chunk"} or (
+                support["resource_id"] != source_id
+                and support["authorization_resource_id"] != source_id
+            ):
+                raise AdapterRequestError(
+                    f"{field}.provenance is outside the source document",
+                    INVALID_GRAPH_BINDING_CODE,
+                )
+        claims.append(normalized)
+    return claims
+
+
+def load_current_graph_contract(
+    params: dict[str, Any], authorization: dict[str, Any]
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
+    try:
+        return _load_current_graph_contract(params, authorization)
+    except AdapterRequestError as exc:
+        if exc.code == INVALID_GRAPH_BINDING_CODE:
+            raise
+        raise AdapterRequestError(str(exc), INVALID_GRAPH_BINDING_CODE) from exc
+    except Exception as exc:
+        raise AdapterRequestError(
+            f"invalid selected graph binding contract: {exc}",
+            INVALID_GRAPH_BINDING_CODE,
+        ) from exc
+
+
+def _load_current_graph_contract(
+    params: dict[str, Any], authorization: dict[str, Any]
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
+    workspace = workspace_path(params)
+    artifacts_dir = workspace / "artifacts"
+    bundles_dir = artifacts_dir / "bundles"
+    require_artifact_directory(artifacts_dir, "artifacts directory")
+    require_artifact_directory(bundles_dir, "artifact bundles directory")
+    current_data = read_artifact_file(
+        artifacts_dir / "current.json",
+        artifacts_dir,
+        "artifact current pointer",
+        MAX_ARTIFACT_CURRENT_POINTER_BYTES,
+    )
+    current = decode_artifact_object(current_data, "artifact current pointer")
+    validate_exact_fields(current, CURRENT_POINTER_FIELDS, "artifact current pointer")
+    if current.get("version") != 2:
+        raise AdapterRequestError("artifact current pointer version must be 2", INVALID_GRAPH_BINDING_CODE)
+    projection_id = required_authorization_token(
+        current.get("projection_id"), "artifact current pointer.projection_id"
+    )
+    if not PROJECTION_ID_RE.fullmatch(projection_id) or current.get("projection_version") != projection_id:
+        raise AdapterRequestError("artifact current pointer has an invalid projection", INVALID_GRAPH_BINDING_CODE)
+    manifest_digest = required_authorization_token(
+        current.get("manifest_sha256"), "artifact current pointer.manifest_sha256"
+    )
+    if not SHA256_RE.fullmatch(manifest_digest):
+        raise AdapterRequestError("artifact current pointer has an invalid manifest digest", INVALID_GRAPH_BINDING_CODE)
+    bundle_dir = bundles_dir / projection_id
+    require_artifact_directory(bundle_dir, "selected artifact bundle")
+    manifest_data = read_artifact_file(
+        bundle_dir / "manifest.json",
+        bundle_dir,
+        "artifact bundle manifest",
+        MAX_ARTIFACT_BUNDLE_MANIFEST_BYTES,
+    )
+    if hashlib.sha256(manifest_data).hexdigest() != manifest_digest:
+        raise AdapterRequestError("artifact bundle manifest digest does not match current pointer", INVALID_GRAPH_BINDING_CODE)
+    manifest = decode_artifact_object(manifest_data, "artifact bundle manifest")
+    validate_exact_fields(manifest, BUNDLE_MANIFEST_FIELDS, "artifact bundle manifest")
+    if (
+        manifest.get("version") != 2
+        or manifest.get("projection_id") != projection_id
+        or manifest.get("projection_version") != projection_id
+        or manifest.get("graph_binding_contract_version") != GRAPH_BINDING_CONTRACT_VERSION
+    ):
+        raise AdapterRequestError("artifact bundle has no supported graph binding contract", INVALID_GRAPH_BINDING_CODE)
+    required_authorization_token(manifest.get("namespace"), "artifact bundle manifest.namespace")
+    authz_object = required_authorization_token(
+        manifest.get("authz_object"), "artifact bundle manifest.authz_object"
+    )
+    if authz_object != "knowledge-base:" + authorization["knowledge_base_id"]:
+        raise AdapterRequestError(
+            "artifact bundle authorization object is outside the request knowledge base",
+            INVALID_GRAPH_BINDING_CODE,
+        )
+    required_authorization_token(manifest.get("authz_version"), "artifact bundle manifest.authz_version")
+    source_snapshot = manifest.get("source_snapshot")
+    if not isinstance(source_snapshot, dict):
+        raise AdapterRequestError("artifact bundle source_snapshot must be an object", INVALID_GRAPH_BINDING_CODE)
+    validate_exact_fields(source_snapshot, SOURCE_SNAPSHOT_FIELDS, "artifact bundle source_snapshot")
+    required_authorization_token(source_snapshot.get("version"), "artifact bundle source_snapshot.version")
+    digest = required_authorization_token(source_snapshot.get("digest"), "artifact bundle source_snapshot.digest")
+    if not SHA256_RE.fullmatch(digest):
+        raise AdapterRequestError("artifact bundle source_snapshot.digest is invalid", INVALID_GRAPH_BINDING_CODE)
+    document_count = source_snapshot.get("document_count")
+    if isinstance(document_count, bool) or not isinstance(document_count, int) or document_count < 1:
+        raise AdapterRequestError(
+            "artifact bundle source_snapshot.document_count must be positive",
+            INVALID_GRAPH_BINDING_CODE,
+        )
+    files = manifest.get("files")
+    if not isinstance(files, list):
+        raise AdapterRequestError("artifact bundle files must be a list", INVALID_GRAPH_BINDING_CODE)
+    descriptors: dict[str, dict[str, Any]] = {}
+    ordered_paths: list[str] = []
+    for index, value in enumerate(files):
+        descriptor = validate_artifact_descriptor(value, f"artifact bundle files[{index}]")
+        path = descriptor["path"]
+        if path in descriptors:
+            raise AdapterRequestError(f"artifact bundle file {path} is duplicated", INVALID_GRAPH_BINDING_CODE)
+        descriptors[path] = descriptor
+        ordered_paths.append(path)
+    if ordered_paths != sorted(ordered_paths):
+        raise AdapterRequestError("artifact bundle files must be sorted by path", INVALID_GRAPH_BINDING_CODE)
+    for required_path in (GRAPH_BINDINGS_ARTIFACT, CLAIM_BINDINGS_ARTIFACT):
+        if required_path not in descriptors:
+            raise AdapterRequestError(
+                f"artifact bundle is missing {required_path}", INVALID_GRAPH_BINDING_CODE
+            )
+    graph_rows = verified_jsonl_rows(
+        bundle_dir, descriptors[GRAPH_BINDINGS_ARTIFACT], GRAPH_BINDINGS_ARTIFACT
+    )
+    if not graph_rows:
+        raise AdapterRequestError("graph_bindings.jsonl is empty", INVALID_GRAPH_BINDING_CODE)
+    resources: dict[str, dict[str, Any]] = {}
+    seen_resource_ids: set[str] = set()
+    previous = ""
+    for index, row in enumerate(graph_rows):
+        binding = validate_graph_binding_row(
+            row, f"graph_bindings[{index}]", authorization, manifest
+        )
+        graph_object_id = binding["graph_object_id"]
+        resource_id = binding["resource"]["resource_id"]
+        if graph_object_id <= previous or resource_id in seen_resource_ids:
+            raise AdapterRequestError(
+                "graph_bindings must have unique sorted graph and resource identities",
+                INVALID_GRAPH_BINDING_CODE,
+            )
+        previous = graph_object_id
+        seen_resource_ids.add(resource_id)
+        resources[graph_object_id] = binding["resource"]
+    resources_by_id = {
+        resource["resource_id"]: resource for resource in resources.values()
+    }
+    for resource in resources.values():
+        if resource["type"] != "chunk":
+            continue
+        parent = resources_by_id.get(resource["authorization_resource_id"])
+        if (
+            parent is None
+            or parent["type"] != "document"
+            or parent["authz_object"] != resource["authz_object"]
+        ):
+            raise AdapterRequestError(
+                f"chunk {resource['resource_id']} has no exact graph-bound authorization document",
+                INVALID_GRAPH_BINDING_CODE,
+            )
+    claim_rows = verified_jsonl_rows(
+        bundle_dir, descriptors[CLAIM_BINDINGS_ARTIFACT], CLAIM_BINDINGS_ARTIFACT
+    )
+    claims = validate_claim_binding_rows(claim_rows, resources)
+    return resources, claims
+
+
 def validate_candidate(value: Any, field: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise AdapterRequestError(f"{field} must be an object")
@@ -1735,6 +2226,12 @@ def real_response(req: dict[str, Any]) -> None:
     req_id = req.get("id", "")
     method = req.get("method", "")
     if method in PRIMITIVE_METHODS:
+        params = primitive_params(req)
+        authorization = validate_authorization(params.get("authorization"))
+        # The selected immutable bundle is the only identity authority. Real
+        # primitives remain disabled until #57, but no future result can be
+        # emitted without first passing this body-free binding validation.
+        load_current_graph_contract(params, authorization)
         error(
             req_id,
             f"{method} is not supported by the real OpenSPG/KAG adapter",
