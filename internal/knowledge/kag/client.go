@@ -205,6 +205,10 @@ func (c Client) call(ctx context.Context, method string, params map[string]any) 
 	}
 
 	cmd := exec.CommandContext(ctx, pythonBin(), path)
+	configureAdapterCommand(cmd)
+	cmd.Cancel = func() error {
+		return killAdapterCommand(cmd)
+	}
 	cmd.Dir = c.Workspace
 	cmd.Env = os.Environ()
 	if c.Fake {
@@ -231,12 +235,12 @@ func (c Client) call(ctx context.Context, method string, params map[string]any) 
 	for scanner.Scan() {
 		var resp Response
 		if err := json.Unmarshal(scanner.Bytes(), &resp); err != nil {
-			_ = cmd.Process.Kill()
+			_ = killAdapterCommand(cmd)
 			_ = cmd.Wait()
 			return Response{}, err
 		}
 		if resp.ID != req.ID {
-			_ = cmd.Process.Kill()
+			_ = killAdapterCommand(cmd)
 			_ = cmd.Wait()
 			return Response{}, fmt.Errorf("kag adapter response id %q does not match request %q", resp.ID, req.ID)
 		}

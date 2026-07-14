@@ -1881,6 +1881,27 @@ def write_all(fd: int, payload: bytes) -> None:
         view = view[written:]
 
 
+def deny_provider_parent_fd_access() -> None:
+    """Prevent Linux provider children from reopening adapter descriptors via procfs."""
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        prctl = libc.prctl
+        prctl.restype = ctypes.c_int
+        if prctl(4, 0, 0, 0, 0) != 0:  # PR_SET_DUMPABLE
+            raise OSError(ctypes.get_errno(), "prctl(PR_SET_DUMPABLE) failed")
+        if prctl(3, 0, 0, 0, 0) != 0:  # PR_GET_DUMPABLE
+            raise OSError("adapter process remained dumpable")
+    except BaseException as exc:
+        raise AdapterRequestError(
+            "permissioned primitive provider isolation failed",
+            PRIMITIVE_UNAVAILABLE_CODE,
+        ) from exc
+
+
 def permissioned_provider_runner(response_path: str) -> int:
     """Run provider code without inheriting the adapter's output descriptors."""
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
@@ -1991,6 +2012,7 @@ def call_permissioned_provider(
         allow_nan=False,
         separators=(",", ":"),
     )
+    deny_provider_parent_fd_access()
     with tempfile.TemporaryDirectory(prefix="knote-kag-provider-") as directory:
         response_path = Path(directory) / "response.json"
         try:
@@ -2008,7 +2030,6 @@ def call_permissioned_provider(
                 timeout=PROVIDER_RUNNER_TIMEOUT_SECONDS,
                 check=False,
                 close_fds=True,
-                start_new_session=True,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise AdapterRequestError(

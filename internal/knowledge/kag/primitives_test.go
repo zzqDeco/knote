@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -193,6 +194,69 @@ def create(context):
 	})
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("actual provider deadline error = %T %v", err, err)
+	}
+}
+
+func TestPrimitiveClientActualRealProviderStopsAfterCancellation(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("adapter process-group cancellation is Unix-specific")
+	}
+	repoRoot := primitiveTestRepoRoot(t)
+	workspace := t.TempDir()
+	writePrimitiveGraphContract(t, workspace)
+	provider := writePrimitiveProvider(t, workspace, `
+import os
+import time
+class Provider:
+    def retrieve(self, request):
+        with open(os.environ["KNOTE_PROVIDER_STARTED"], "w", encoding="utf-8") as stream:
+            stream.write("started")
+        time.sleep(0.25)
+        with open(os.environ["KNOTE_PROVIDER_COMPLETED"], "w", encoding="utf-8") as stream:
+            stream.write("completed")
+        return {"candidates": []}
+def create(context):
+    return Provider()
+`)
+	started := filepath.Join(workspace, "provider-started")
+	completed := filepath.Join(workspace, "provider-completed")
+	t.Setenv("KNOTE_PROVIDER_STARTED", started)
+	t.Setenv("KNOTE_PROVIDER_COMPLETED", completed)
+	t.Setenv("KNOTE_PYTHON", pythonForTest())
+	t.Setenv("KNOTE_KAG_FAKE", "")
+	client := Client{
+		AdapterPath:          filepath.Join(repoRoot, "adapters", "kag", "knote_kag_adapter.py"),
+		Workspace:            workspace,
+		PermissionedProvider: provider,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := client.Retrieve(ctx, RetrieveRequest{
+			Authorization: testAuthorizationContext(), Query: "knote", Limit: 10,
+		})
+		result <- err
+	}()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if _, err := os.Stat(started); err == nil {
+			break
+		} else if !errors.Is(err, os.ErrNotExist) {
+			t.Fatal(err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("provider did not start before cancellation")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("actual provider cancellation error = %T %v", err, err)
+	}
+	time.Sleep(350 * time.Millisecond)
+	if _, err := os.Stat(completed); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("provider completed side effects after cancellation: %v", err)
 	}
 }
 

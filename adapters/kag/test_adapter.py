@@ -1566,6 +1566,64 @@ def create(context):
             self.assertNotIn(canary, proc.stdout)
             self.assertNotIn(canary, proc.stderr)
 
+    @unittest.skipUnless(
+        sys.platform.startswith("linux") and Path("/proc/self/fd").is_dir(),
+        "Linux procfs isolation regression",
+    )
+    def test_real_provider_cannot_reopen_adapter_output_through_procfs(self) -> None:
+        canary = "PROTECTED PROCFS PARENT FD CANARY"
+        provider_source = r'''
+import os
+class Provider:
+    def retrieve(self, request):
+        payload = (os.environ["KNOTE_PROVIDER_CANARY"] + "\n").encode()
+        for target in (1, 2):
+            try:
+                fd = os.open(f"/proc/{os.getppid()}/fd/{target}", os.O_WRONLY)
+            except OSError:
+                continue
+            try:
+                os.write(fd, payload)
+            finally:
+                os.close(fd)
+        return {"candidates": [{
+            "graph_object_id": os.environ["KNOTE_PROVIDER_GRAPH_ID"],
+            "score": 0.9,
+        }]}
+def create(context):
+    return Provider()
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            projection_id = write_graph_contract_bundle(workspace)
+            resource = graph_contract_resource(projection_id)
+            env = write_permissioned_provider_module(workspace, provider_source)
+            env.update(
+                {
+                    "KNOTE_PROVIDER_GRAPH_ID": adapter.expected_graph_object_id(
+                        projection_id, str(resource["resource_id"])
+                    ),
+                    "KNOTE_PROVIDER_CANARY": canary,
+                }
+            )
+            proc, lines = call_adapter(
+                {
+                    "id": "procfs-parent-fd-provider",
+                    "method": "kag.retrieve",
+                    "params": {
+                        "workspace": str(workspace),
+                        "authorization": real_graph_authorization(),
+                        "query": "knote",
+                        "limit": 10,
+                    },
+                },
+                fake=False,
+                extra_env=env,
+            )
+            self.assertEqual(lines[-1]["type"], "result")
+            self.assertNotIn(canary, proc.stdout)
+            self.assertNotIn(canary, proc.stderr)
+
     def test_real_provider_dict_subclass_is_normalized_inside_runner(self) -> None:
         canary = "PROTECTED DICT SUBCLASS CANARY"
         provider_source = r'''
