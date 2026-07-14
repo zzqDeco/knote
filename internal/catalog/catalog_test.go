@@ -261,6 +261,27 @@ func TestPlanResourcesRejectsIncompleteDesiredDependencyClosure(t *testing.T) {
 	})
 }
 
+func TestPlanResourcesRejectsDesiredDerivedArtifactWithoutSecurityRecord(t *testing.T) {
+	scope := testScope()
+	currentSnapshot := testSnapshot(t, scope, "source-v1")
+	current := testProjection(t, scope, "projection-v1", currentSnapshot.Ref(), nil)
+	nextSnapshot := testSnapshot(t, scope, "source-v2", "sources/a.md")
+	run := testRun(scope, current.Version, "projection-v2", nextSnapshot.Ref())
+	document := testMetadata(
+		t, scope, protocol.ResourceDocument, "sources/a.md", "document", "source-v2",
+		"content-document-v2", run.ProjectionVersion, "", "doc:a",
+	)
+	artifact := testMetadata(
+		t, scope, protocol.ResourceDerivedArtifact, "artifact:summary", "summary", "source-v2",
+		"content-artifact-v2", run.ProjectionVersion, "", "artifact:summary",
+	)
+	artifact.Dependencies = []protocol.ResourceID{document.ResourceID}
+
+	if _, err := PlanResources(run, current, []ResourceMetadata{document, artifact}); err == nil {
+		t.Fatal("planner accepted a desired derived artifact without a security record")
+	}
+}
+
 func TestPlanResourcesAllowsClosedInitialDerivedProjection(t *testing.T) {
 	scope := testScope()
 	currentSnapshot := testSnapshot(t, scope, "source-v1")

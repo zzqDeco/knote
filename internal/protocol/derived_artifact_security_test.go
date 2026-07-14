@@ -136,6 +136,26 @@ func TestDerivedArtifactAnySupportRequiresCompleteIndependentGroups(t *testing.T
 	}
 }
 
+func TestDerivedArtifactAllRequiredAllowsIncompleteGroups(t *testing.T) {
+	artifact, supports, auth := derivedArtifactSecurityFixture(t, "projection-v1")
+	supports[0].Complete = false
+	record, err := NewDerivedArtifactSecurityRecord(
+		"summary", DerivationAllRequired, artifact, supports, "repo:knote", auth,
+	)
+	if err != nil {
+		t.Fatalf("all_required rejected a collectively required incomplete group: %v", err)
+	}
+	incomplete := 0
+	for _, support := range record.Supports {
+		if !support.Complete {
+			incomplete++
+		}
+	}
+	if incomplete != 1 {
+		t.Fatalf("incomplete support count = %d, want 1", incomplete)
+	}
+}
+
 func TestDerivedArtifactSecurityRecordInvalidatesAuthorizationWatermarkDrift(t *testing.T) {
 	artifact, supports, auth := derivedArtifactSecurityFixture(t, "projection-v1")
 	record, err := NewDerivedArtifactSecurityRecord(

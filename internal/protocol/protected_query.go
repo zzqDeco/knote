@@ -26,6 +26,8 @@ const (
 	maxProtectedQueryStringLength = 512
 	maxProtectedQueryValues       = 256
 	maxProtectedPageTokenLength   = 16 * 1024
+	protectedPageTokenNonceSize   = 12
+	protectedPageTokenTagSize     = 16
 )
 
 type ProtectedQueryOperation string
@@ -209,8 +211,7 @@ func (result ProtectedQueryVisibleResult) Validate() error {
 		}
 	}
 	if result.Page.NextPageToken != "" {
-		if len(result.Page.NextPageToken) > maxProtectedPageTokenLength ||
-			strings.IndexFunc(result.Page.NextPageToken, unicode.IsSpace) >= 0 {
+		if err := validateProtectedPageTokenStructure(result.Page.NextPageToken); err != nil {
 			return fmt.Errorf("protected query next page token is malformed")
 		}
 	}
@@ -498,7 +499,7 @@ func (codec *ProtectedPageTokenCodec) Decode(
 	now time.Time,
 ) (ProtectedPagePosition, error) {
 	fail := func() (ProtectedPagePosition, error) { return ProtectedPagePosition{}, ErrInvalidProtectedPageToken }
-	if codec == nil || now.IsZero() || len(token) == 0 || len(token) > maxProtectedPageTokenLength {
+	if codec == nil || now.IsZero() || validateProtectedPageTokenStructure(token) != nil {
 		return fail()
 	}
 	expectedClaims, err := protectedPageTokenContextClaimsFor(expected)
@@ -554,6 +555,30 @@ func (codec *ProtectedPageTokenCodec) Decode(
 		return fail()
 	}
 	return ProtectedPagePosition{Position: claims.Position, Limit: claims.Limit}, nil
+}
+
+func validateProtectedPageTokenStructure(token string) error {
+	if len(token) == 0 || len(token) > maxProtectedPageTokenLength ||
+		strings.IndexFunc(token, unicode.IsSpace) >= 0 {
+		return ErrInvalidProtectedPageToken
+	}
+	parts := strings.Split(token, ".")
+	if len(parts) != 4 || parts[0] != ProtectedPageTokenVersion {
+		return ErrInvalidProtectedPageToken
+	}
+	keyID, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil || validateProtectedPageTokenKeyID(string(keyID)) != nil {
+		return ErrInvalidProtectedPageToken
+	}
+	body, err := base64.RawURLEncoding.DecodeString(parts[2])
+	if err != nil || len(body) < protectedPageTokenNonceSize+protectedPageTokenTagSize {
+		return ErrInvalidProtectedPageToken
+	}
+	signature, err := base64.RawURLEncoding.DecodeString(parts[3])
+	if err != nil || len(signature) != sha256.Size {
+		return ErrInvalidProtectedPageToken
+	}
+	return nil
 }
 
 type protectedPageTokenClaims struct {

@@ -230,6 +230,29 @@ func TestProtectedQueryPublicErrorsAndMetadataHaveFixedSchema(t *testing.T) {
 	}
 }
 
+func TestProtectedQueryVisibleResultRequiresProtectedNextPageTokenStructure(t *testing.T) {
+	result := EmptyProtectedQueryVisibleResult()
+	result.Page.NextPageToken = "res_ffffffffffffffffffffffffffffffff"
+	if err := result.Validate(); err == nil {
+		t.Fatal("visible result accepted an internal resource ID as a next page token")
+	}
+	result.Page.NextPageToken = "pqt1.a2lk.b2Zmc2V0.c2lnbmF0dXJl"
+	if err := result.Validate(); err == nil {
+		t.Fatal("visible result accepted a truncated protected token structure")
+	}
+
+	now := time.Unix(1_750_000_000, 0).UTC()
+	codec := protectedQueryTestCodec(t, "current", protectedQueryTestKey("current", 1))
+	token, err := codec.Encode(protectedQueryTestPageTokenRequest(t, now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	result.Page.NextPageToken = token
+	if err := result.Validate(); err != nil {
+		t.Fatalf("visible result rejected a protected page token: %v", err)
+	}
+}
+
 func TestProtectedTraversalPlanIdentityIsStableAndRestricted(t *testing.T) {
 	plan := protectedQueryTestPlan(t)
 	first, err := NewProtectedTraversalPlanIdentity(plan)

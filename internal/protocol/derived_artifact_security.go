@@ -190,7 +190,7 @@ func (r DerivedArtifactSecurityRecord) Validate() error {
 		if i > 0 && r.Supports[i-1].SupportID >= support.SupportID {
 			return fmt.Errorf("derived artifact support groups are not in canonical order")
 		}
-		if !support.Complete {
+		if r.DerivationMode == DerivationAnySupport && !support.Complete {
 			return fmt.Errorf("support %s is not proven complete", support.SupportID)
 		}
 		if len(support.Resources) == 0 {

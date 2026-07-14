@@ -3,6 +3,7 @@ package runtime
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"reflect"
@@ -120,7 +121,7 @@ func TestProjectProtectedQueryAllowsOnlyTypedMetadataAndVisibleResult(t *testing
 			},
 			Page: protocol.ProtectedQueryPage{
 				Items:         []protocol.ProtectedQueryPageItem{{Value: "first"}, {Value: "second"}},
-				NextPageToken: "pqt1.a2lk.b2Zmc2V0.c2lnbmF0dXJl",
+				NextPageToken: protectedQueryRuntimePageToken(),
 			},
 		},
 		ProjectionVersion: plan.ProjectionVersion, VisibilityFingerprint: fingerprint,
@@ -153,6 +154,15 @@ func TestProjectProtectedQueryAllowsOnlyTypedMetadataAndVisibleResult(t *testing
 	}
 	assertProtectedQueryRuntimeNoCanary(t, envelope)
 	assertProtectedQueryRuntimeMetadataKeys(t, envelope)
+}
+
+func protectedQueryRuntimePageToken() string {
+	return strings.Join([]string{
+		protocol.ProtectedPageTokenVersion,
+		base64.RawURLEncoding.EncodeToString([]byte("kid")),
+		base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{1}, 28)),
+		base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{2}, 32)),
+	}, ".")
 }
 
 func TestProjectProtectedQueryFailsClosedOnMalformedAllowedSurface(t *testing.T) {

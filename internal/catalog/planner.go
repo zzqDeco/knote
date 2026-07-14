@@ -647,8 +647,13 @@ func planResources(
 			return ProjectionPlan{}, fmt.Errorf("desired resource %s has another projection version", resource.ResourceID)
 		}
 		resource.Versions.Projection = run.ProjectionVersion
-		if resource.Type == protocol.ResourceDerivedArtifact && len(resource.Dependencies) == 0 {
-			return ProjectionPlan{}, fmt.Errorf("desired derived artifact %s has no canonical dependencies", resource.ResourceID)
+		if resource.Type == protocol.ResourceDerivedArtifact {
+			if len(resource.Dependencies) == 0 {
+				return ProjectionPlan{}, fmt.Errorf("desired derived artifact %s has no canonical dependencies", resource.ResourceID)
+			}
+			if resource.DerivedArtifactSecurity == nil {
+				return ProjectionPlan{}, fmt.Errorf("desired derived artifact %s has no security record", resource.ResourceID)
+			}
 		}
 		resource.ServingState = StateStaged
 		resource.ProjectionStatus = PendingProjectionStatus()
