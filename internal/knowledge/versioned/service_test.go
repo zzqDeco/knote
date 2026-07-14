@@ -202,6 +202,25 @@ func TestServiceBuildArtifactsAreStableAndClaimsAreSourceBacked(t *testing.T) {
 	if err := protocol.ValidateGraphResourceBindings(repo.artifacts.GraphBindings); err != nil {
 		t.Fatalf("graph bindings: %v", err)
 	}
+	var derivedSecurity *protocol.DerivedArtifactSecurityRecord
+	var projection catalog.Projection
+	if err := json.Unmarshal(repo.artifacts.ProjectionJSON, &projection); err != nil {
+		t.Fatalf("projection JSON: %v", err)
+	}
+	for index := range projection.Resources {
+		if projection.Resources[index].Type == protocol.ResourceDerivedArtifact {
+			derivedSecurity = projection.Resources[index].DerivedArtifactSecurity
+			break
+		}
+	}
+	if derivedSecurity == nil || derivedSecurity.Kind != string(protocol.DerivedArtifactSummary) ||
+		derivedSecurity.DerivationMode != protocol.DerivationAllRequired || len(derivedSecurity.Supports) != 1 ||
+		len(derivedSecurity.Supports[0].Resources) != len(repo.artifacts.Documents) {
+		t.Fatalf("materialized summary security = %#v", derivedSecurity)
+	}
+	if err := derivedSecurity.Validate(); err != nil {
+		t.Fatalf("materialized summary security: %v", err)
+	}
 	if got, want := len(repo.artifacts.ClaimBindings), len(repo.artifacts.Claims); got != want {
 		t.Fatalf("source-backed Claim binding count = %d, want %d: %+v", got, want, repo.artifacts.ClaimBindings)
 	}

@@ -127,6 +127,59 @@ func TestClaimBindingPreservesSupportGroupsWithIdenticalFlattenedProvenance(t *t
 	}
 }
 
+func TestProjectionGraphBindingsRequireMaterializedDerivedArtifactSecurity(t *testing.T) {
+	scope := testScope()
+	snapshot := testSnapshot(t, scope, "source-v1", "sources/a.md")
+	document := Document{
+		Metadata: testMetadata(t, scope, protocol.ResourceDocument, "sources/a.md", "document", "source-v1", "content-document-v1", "projection-v1", "", "doc:a"),
+		Snapshot: snapshot.Ref(), Path: "sources/a.md",
+	}
+	artifact := DerivedArtifact{
+		Metadata: testMetadata(t, scope, protocol.ResourceDerivedArtifact, "artifact:summary", "artifact", "source-v1", "content-artifact-v1", "projection-v1", "", "artifact:summary"),
+		Kind:     "summary",
+		Provenance: Provenance{DerivationMode: protocol.DerivationAllRequired, Supports: []Support{{
+			SupportID: "support-document", Evidence: []EvidenceRef{document.EvidenceRef()}, Complete: true,
+		}}},
+	}
+	materializeDerivedArtifactSecurity(t, &artifact, document.Metadata)
+	resources, err := (Catalog{Documents: []Document{document}, DerivedArtifacts: []DerivedArtifact{artifact}}).ResourceMetadata()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range resources {
+		resources[i] = published(resources[i])
+	}
+	projection := testProjection(t, scope, "projection-v1", snapshot.Ref(), resources)
+	bindings, _, err := ProjectionGraphBindings(projection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundArtifact := false
+	for _, binding := range bindings {
+		foundArtifact = foundArtifact || binding.Resource.ResourceID == artifact.Metadata.ResourceID
+	}
+	if !foundArtifact {
+		t.Fatal("materialized derived artifact was omitted from graph bindings")
+	}
+
+	legacyResources := append([]ResourceMetadata(nil), resources...)
+	for i := range legacyResources {
+		if legacyResources[i].ResourceID == artifact.Metadata.ResourceID {
+			legacyResources[i].DerivedArtifactSecurity = nil
+		}
+	}
+	legacy := testProjection(t, scope, "projection-v1", snapshot.Ref(), legacyResources)
+	legacyBindings, _, err := ProjectionGraphBindings(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, binding := range legacyBindings {
+		if binding.Resource.ResourceID == artifact.Metadata.ResourceID {
+			t.Fatal("legacy derived artifact without a security record leaked into graph bindings")
+		}
+	}
+}
+
 func TestSourceBackedClaimRejectsCrossDocumentVersionAndUndeclaredKeys(t *testing.T) {
 	fixture := newSourceBackedClaimFixture(t, "source-v2", "projection-v2", protocol.DerivationAllRequired)
 	otherDocumentID, err := protocol.NewStableResourceID(

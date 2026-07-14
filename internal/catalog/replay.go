@@ -286,6 +286,7 @@ func validateReplayPlan(plan ProjectionPlan, current Projection) error {
 		expectedSupersede.Versions.Projection = plan.Run.ProjectionVersion
 		expectedSupersede.ServingState = StateSuperseded
 		expectedSupersede.ClaimRecord = nil
+		expectedSupersede.DerivedArtifactSecurity = nil
 		if hasSupersede && !resourceMetadataEqual(group.byKind[OperationSupersede].Resource, expectedSupersede) {
 			return fmt.Errorf("supersede operation for resource %s does not match the current resource", resourceID)
 		}

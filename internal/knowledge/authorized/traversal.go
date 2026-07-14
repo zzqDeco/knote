@@ -1089,7 +1089,6 @@ func (s *Service) finalizeTraversalEvidence(
 		return nil, nil, checkedEvidence{}, errInvalidTraversalResponse
 	}
 	projection := groups[0].paths[0].candidate.Resource.Versions.Projection
-	itemAuthorizations := make([]traversalItemAuthorization, len(items))
 	allHandles := make([]protocol.ResourceHandle, 0)
 	seenHandles := make(map[protocol.ResourceID]protocol.ResourceHandle)
 	appendExact := func(resource protocol.ResourceHandle) error {
@@ -1118,12 +1117,11 @@ func (s *Service) finalizeTraversalEvidence(
 			}
 		}
 	}
-	for index, item := range items {
-		handles, boundaries, itemProjection, err := collectEvidenceHandles(authorization, []protocol.EvidenceItem{item})
+	for _, item := range items {
+		handles, _, itemProjection, err := collectEvidenceHandles(authorization, []protocol.EvidenceItem{item})
 		if err != nil || itemProjection != projection {
 			return nil, nil, checkedEvidence{}, errInvalidTraversalResponse
 		}
-		itemAuthorizations[index] = traversalItemAuthorization{handles: handles, boundaries: boundaries}
 		for _, resource := range handles {
 			if err := appendExact(resource); err != nil {
 				return nil, nil, checkedEvidence{}, err
@@ -1139,19 +1137,32 @@ func (s *Service) finalizeTraversalEvidence(
 	}
 
 	type survivingTraversalItem struct {
-		index int
-		path  traversalPath
+		item          protocol.EvidenceItem
+		path          traversalPath
+		authorization traversalItemAuthorization
 	}
 	survivors := make([]survivingTraversalItem, 0, len(groups))
 	consideredPaths := 0
 	for index, group := range groups {
-		itemAllowed := traversalHandlesAllowed(itemAuthorizations[index].handles, checks)
+		selectedItem, itemAllowed := selectAuthorizedEvidenceItem(items[index], checks)
+		var selectedAuthorization traversalItemAuthorization
+		if itemAllowed {
+			handles, boundaries, itemProjection, err := collectEvidenceHandles(
+				authorization, []protocol.EvidenceItem{selectedItem},
+			)
+			if err != nil || itemProjection != projection {
+				return nil, nil, checkedEvidence{}, errInvalidTraversalResponse
+			}
+			selectedAuthorization = traversalItemAuthorization{handles: handles, boundaries: boundaries}
+		}
 		for _, path := range group.paths {
 			consideredPaths++
 			if !itemAllowed || !traversalHandlesAllowed(path.resources, checks) {
 				continue
 			}
-			survivors = append(survivors, survivingTraversalItem{index: index, path: cloneTraversalPath(path)})
+			survivors = append(survivors, survivingTraversalItem{
+				item: selectedItem, path: cloneTraversalPath(path), authorization: selectedAuthorization,
+			})
 			break
 		}
 	}
@@ -1168,7 +1179,7 @@ func (s *Service) finalizeTraversalEvidence(
 	survivingItems := make([]protocol.EvidenceItem, len(survivors))
 	survivingPaths := make([]traversalPath, len(survivors))
 	for index, survivor := range survivors {
-		survivingItems[index] = items[survivor.index]
+		survivingItems[index] = survivor.item
 		survivingPaths[index] = cloneTraversalPath(survivor.path)
 	}
 
@@ -1193,12 +1204,12 @@ func (s *Service) finalizeTraversalEvidence(
 				return nil, nil, checkedEvidence{}, err
 			}
 		}
-		for _, resource := range itemAuthorizations[survivor.index].handles {
+		for _, resource := range survivor.authorization.handles {
 			if err := appendSurviving(resource); err != nil {
 				return nil, nil, checkedEvidence{}, err
 			}
 		}
-		for resourceID, boundary := range itemAuthorizations[survivor.index].boundaries {
+		for resourceID, boundary := range survivor.authorization.boundaries {
 			if existing, duplicate := boundaries[resourceID]; duplicate && existing != boundary {
 				return nil, nil, checkedEvidence{}, errInvalidTraversalResponse
 			}
