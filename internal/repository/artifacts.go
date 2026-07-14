@@ -59,6 +59,9 @@ func CanonicalArtifactFiles(set ArtifactSet) ([]ArtifactFilePayload, error) {
 				set.BundleManifest.GraphBindingContractVersion,
 			)
 		}
+		if len(graphBindings) == 0 {
+			return nil, ErrArtifactProjectionMismatch
+		}
 		if err := protocol.ValidateGraphResourceBindings(graphBindings); err != nil {
 			return nil, ErrArtifactProjectionMismatch
 		}
@@ -151,6 +154,9 @@ func ValidateGraphArtifactPayloads(
 	if err != nil {
 		return ErrArtifactProjectionMismatch
 	}
+	if len(graphBindings) == 0 {
+		return ErrArtifactProjectionMismatch
+	}
 	claimBindings, err := decodeJSONL[protocol.ClaimTripleBinding](files[protocol.ClaimBindingsArtifactPath])
 	if err != nil {
 		return ErrArtifactProjectionMismatch
@@ -230,7 +236,8 @@ func validateLegacyGraphArtifactProjection(
 		version != manifest.ProjectionVersion {
 		return ErrArtifactProjectionMismatch
 	}
-	if len(claimBindings) != 0 || protocol.ValidateGraphResourceBindings(graphBindings) != nil {
+	if len(graphBindings) == 0 || len(claimBindings) != 0 ||
+		protocol.ValidateGraphResourceBindings(graphBindings) != nil {
 		return ErrArtifactProjectionMismatch
 	}
 	versions := graphBindings[0].Resource.Versions

@@ -60,6 +60,12 @@ func TestSourceBackedClaimSupportModesAreCompleteSourceScopedAndDeterministic(t 
 	if err := fixture.claim.Validate(); err == nil {
 		t.Fatal("any_support accepted a branch that was not independently complete")
 	}
+
+	fixture = newSourceBackedClaimFixture(t, "source-v1", "projection-v1", protocol.DerivationAllRequired)
+	fixture.claim.Provenance.Supports[1].Complete = false
+	if err := fixture.claim.Validate(); err == nil {
+		t.Fatal("source-backed all_required claim accepted incomplete support")
+	}
 }
 
 func TestSourceBackedClaimRejectsCrossDocumentVersionAndUndeclaredKeys(t *testing.T) {

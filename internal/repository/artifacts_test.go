@@ -64,6 +64,15 @@ func TestCanonicalArtifactFilesRejectsGraphBindingsOutsideManifestVersions(t *te
 	}
 }
 
+func TestCanonicalArtifactFilesRejectsEmptyGraphProjection(t *testing.T) {
+	set := ArtifactSet{BundleManifest: protocol.ArtifactBundleManifest{
+		GraphBindingContractVersion: protocol.GraphBindingContractVersion,
+	}}
+	if _, err := CanonicalArtifactFiles(set); !errors.Is(err, ErrArtifactProjectionMismatch) {
+		t.Fatalf("empty graph projection error = %v, want generic projection mismatch", err)
+	}
+}
+
 func TestCanonicalArtifactFilesEmitExactSourceBackedClaimBindingsWithoutRawGraphInput(t *testing.T) {
 	set := sourceBackedArtifactSet(t)
 	payloads, err := CanonicalArtifactFiles(set)
@@ -119,6 +128,25 @@ func TestValidateGraphArtifactPayloadsPreservesLegacyV2WithoutGraphContract(t *t
 	}
 	if err := ValidateGraphArtifactPayloads(manifest, files); err != nil {
 		t.Fatalf("legacy v2 bundle without a graph contract was reinterpreted: %v", err)
+	}
+}
+
+func TestValidateGraphArtifactPayloadsRejectsEmptyLegacyGraphProjection(t *testing.T) {
+	projectionVersion := "prj_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	manifest := protocol.ArtifactBundleManifest{
+		ProjectionVersion:           projectionVersion,
+		AuthorizationVersion:        "acl-v1",
+		GraphBindingContractVersion: protocol.GraphBindingContractVersion,
+		SourceSnapshot:              protocol.ArtifactSourceSnapshot{Version: "source-v1"},
+	}
+	files := map[string][]byte{
+		"projection.json":                  []byte(`{"version":"` + projectionVersion + `"}`),
+		"claims.jsonl":                     nil,
+		protocol.GraphBindingsArtifactPath: nil,
+		protocol.ClaimBindingsArtifactPath: nil,
+	}
+	if err := ValidateGraphArtifactPayloads(manifest, files); !errors.Is(err, ErrArtifactProjectionMismatch) {
+		t.Fatalf("empty legacy graph projection error = %v, want generic projection mismatch", err)
 	}
 }
 

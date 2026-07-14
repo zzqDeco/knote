@@ -490,6 +490,9 @@ func (r ClaimProjectionRecord) validate() error {
 			return err
 		}
 		for _, support := range r.Provenance.Supports {
+			if !support.Complete {
+				return ErrInvalidClaimRecord
+			}
 			for _, evidence := range support.Evidence {
 				if evidence.Type != protocol.ResourceDocument && evidence.Type != protocol.ResourceChunk {
 					return ErrInvalidClaimRecord
