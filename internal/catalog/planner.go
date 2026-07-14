@@ -532,7 +532,7 @@ func PlanRevocations(
 			if _, alreadySelected := selected[dependent]; alreadySelected {
 				continue
 			}
-			if !resourceInvalidatedBySelection(resourcesByID[dependent], selected) {
+			if !resourceInvalidatedBySelection(resourcesByID[dependent], selected, resourcesByID) {
 				continue
 			}
 			selected[dependent] = struct{}{}
@@ -560,6 +560,7 @@ func PlanRevocations(
 func resourceInvalidatedBySelection(
 	resource ResourceMetadata,
 	selected map[protocol.ResourceID]struct{},
+	resourcesByID map[protocol.ResourceID]ResourceMetadata,
 ) bool {
 	if resource.Type == protocol.ResourceChunk && len(resource.Dependencies) == 0 {
 		_, invalidated := selected[resource.AuthorizationResourceID]
@@ -579,7 +580,9 @@ func resourceInvalidatedBySelection(
 		for _, support := range record.Supports {
 			unaffected := support.Complete
 			for _, identity := range support.Resources {
-				if _, invalidated := selected[identity.ResourceID]; invalidated {
+				current, exists := resourcesByID[identity.ResourceID]
+				_, invalidated := selected[identity.ResourceID]
+				if !exists || !current.IsServing() || invalidated {
 					unaffected = false
 					break
 				}
@@ -592,7 +595,9 @@ func resourceInvalidatedBySelection(
 	case protocol.DerivationAllRequired:
 		for _, support := range record.Supports {
 			for _, identity := range support.Resources {
-				if _, invalidated := selected[identity.ResourceID]; invalidated {
+				current, exists := resourcesByID[identity.ResourceID]
+				_, invalidated := selected[identity.ResourceID]
+				if !exists || !current.IsServing() || invalidated {
 					return true
 				}
 			}

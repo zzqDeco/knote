@@ -165,7 +165,7 @@ func (s service) prepareArtifactProjection(ctx context.Context) (repository.Arti
 
 	var set repository.ArtifactSet
 	resources := make([]catalog.ResourceMetadata, 0)
-	allDocumentIDs := make([]protocol.ResourceID, 0, len(loaded))
+	artifactDependencyIDs := make([]protocol.ResourceID, 0, len(loaded))
 	artifactSupportResources := make([]protocol.DerivedArtifactResourceIdentity, 0, len(loaded))
 	for _, source := range loaded {
 		documentID := documentIDs[source.source.Path]
@@ -178,7 +178,7 @@ func (s service) prepareArtifactProjection(ctx context.Context) (repository.Arti
 			return repository.ArtifactSet{}, projectionBuild{}, err
 		}
 		resources = append(resources, documentMetadata)
-		allDocumentIDs = append(allDocumentIDs, documentID)
+		artifactDependencyIDs = append(artifactDependencyIDs, documentID)
 		artifactSupportResources = append(artifactSupportResources, derivedArtifactSecurityIdentity(documentMetadata))
 		doc := protocol.Document{
 			DocumentID: string(documentID), Path: source.source.Path,
@@ -218,6 +218,8 @@ func (s service) prepareArtifactProjection(ctx context.Context) (repository.Arti
 			}
 			chunkMetadata.Dependencies = []protocol.ResourceID{documentID}
 			resources = append(resources, chunkMetadata)
+			artifactDependencyIDs = append(artifactDependencyIDs, chunkID)
+			artifactSupportResources = append(artifactSupportResources, derivedArtifactSecurityIdentity(chunkMetadata))
 			entityDependencies = append(entityDependencies, chunkID)
 			item := protocol.Chunk{
 				ChunkID: string(chunkID), DocumentID: string(documentID), Span: chunk.span,
@@ -311,7 +313,7 @@ func (s service) prepareArtifactProjection(ctx context.Context) (repository.Arti
 			Aliases: []string{doc.Path}, EvidenceChunkIDs: evidenceChunkIDs,
 		})
 	}
-	sort.Slice(allDocumentIDs, func(i, j int) bool { return allDocumentIDs[i] < allDocumentIDs[j] })
+	sort.Slice(artifactDependencyIDs, func(i, j int) bool { return artifactDependencyIDs[i] < artifactDependencyIDs[j] })
 	artifactID, err := protocol.NewStableResourceID(scope.TenantID, scope.KnowledgeBaseID, protocol.ResourceDerivedArtifact, "artifacts/bundle")
 	if err != nil {
 		return repository.ArtifactSet{}, projectionBuild{}, err
@@ -324,7 +326,7 @@ func (s service) prepareArtifactProjection(ctx context.Context) (repository.Arti
 	if err != nil {
 		return repository.ArtifactSet{}, projectionBuild{}, err
 	}
-	artifactMetadata.Dependencies = allDocumentIDs
+	artifactMetadata.Dependencies = artifactDependencyIDs
 	artifactSecurity, err := protocol.NewDerivedArtifactSecurityRecord(
 		string(protocol.DerivedArtifactSummary), "", derivedArtifactSecurityIdentity(artifactMetadata),
 		[]protocol.DerivedArtifactSupportGroup{{

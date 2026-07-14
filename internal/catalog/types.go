@@ -770,8 +770,15 @@ func validateDerivedArtifactRecordProvenance(
 			len(securitySupport.Resources) != len(support.Evidence) {
 			return fmt.Errorf("derived artifact security record does not match support %s", support.SupportID)
 		}
-		for j, evidence := range support.Evidence {
-			identity := securitySupport.Resources[j]
+		resourcesByID := make(map[protocol.ResourceID]protocol.DerivedArtifactResourceIdentity, len(securitySupport.Resources))
+		for _, identity := range securitySupport.Resources {
+			resourcesByID[identity.ResourceID] = identity
+		}
+		for _, evidence := range support.Evidence {
+			identity, ok := resourcesByID[evidence.ResourceID]
+			if !ok {
+				return fmt.Errorf("derived artifact security record does not match support %s", support.SupportID)
+			}
 			if identity.ResourceID != evidence.ResourceID || identity.Type != evidence.Type ||
 				identity.Versions != evidence.Versions {
 				return fmt.Errorf("derived artifact security record does not match support %s", support.SupportID)

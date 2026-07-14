@@ -1457,6 +1457,62 @@ func TestDerivedArtifactRevocationHonorsAnySupportAlternatives(t *testing.T) {
 			t.Fatalf("any_support artifact survived loss of every complete group: %+v", resource)
 		}
 	})
+
+	t.Run("alternatives revoked across runs", func(t *testing.T) {
+		scope := testScope()
+		documentA := Document{Metadata: testMetadata(t, scope, protocol.ResourceDocument, "sources/a.md", "a", "source-v1", "content-a-v1", "projection-v1", "", "doc:a"), Path: "sources/a.md"}
+		documentB := Document{Metadata: testMetadata(t, scope, protocol.ResourceDocument, "sources/b.md", "b", "source-v1", "content-b-v1", "projection-v1", "", "doc:b"), Path: "sources/b.md"}
+		artifact := DerivedArtifact{
+			Metadata: testMetadata(t, scope, protocol.ResourceDerivedArtifact, "artifact:summary", "artifact", "source-v1", "content-artifact-v1", "projection-v1", "", "artifact:summary"),
+			Kind:     "summary", Provenance: Provenance{DerivationMode: protocol.DerivationAnySupport, Supports: []Support{
+				{SupportID: "support-a", Evidence: []EvidenceRef{documentA.EvidenceRef()}, Complete: true},
+				{SupportID: "support-b", Evidence: []EvidenceRef{documentB.EvidenceRef()}, Complete: true},
+			}},
+		}
+		materializeDerivedArtifactSecurity(t, &artifact, documentA.Metadata, documentB.Metadata)
+		documentA.Metadata = published(documentA.Metadata)
+		documentA.Metadata.ServingState = StateRevoked
+		documentB.Metadata = published(documentB.Metadata)
+		artifact.Metadata = published(artifact.Metadata)
+		resourcesByID := map[protocol.ResourceID]ResourceMetadata{
+			documentA.Metadata.ResourceID: documentA.Metadata,
+			documentB.Metadata.ResourceID: documentB.Metadata,
+			artifact.Metadata.ResourceID:  artifact.Metadata,
+		}
+		selected := map[protocol.ResourceID]struct{}{documentB.Metadata.ResourceID: {}}
+		if !resourceInvalidatedBySelection(artifact.Metadata, selected, resourcesByID) {
+			t.Fatal("any_support artifact treated an already-revoked support as an unaffected alternative")
+		}
+	})
+}
+
+func TestDerivedArtifactSecurityComparisonIgnoresIndependentCanonicalOrdering(t *testing.T) {
+	versions := protocol.ResourceVersions{
+		Source: "source-v1", Content: "content-v1", ACL: "acl-v1",
+		Index: "index-v1", Graph: "graph-v1", Projection: "projection-v1",
+	}
+	firstID := protocol.ResourceID("res_00000000000000000000000000000001")
+	secondID := protocol.ResourceID("res_00000000000000000000000000000002")
+	provenance := Provenance{DerivationMode: protocol.DerivationAllRequired, Supports: []Support{{
+		SupportID: "support", Complete: true, Evidence: []EvidenceRef{
+			{ResourceID: secondID, Type: protocol.ResourceDocument, Versions: versions},
+			{ResourceID: firstID, Type: protocol.ResourceDocument, Versions: versions},
+		},
+	}}}
+	record := protocol.DerivedArtifactSecurityRecord{
+		Kind: "summary", DerivationMode: protocol.DerivationAllRequired,
+		Supports: []protocol.DerivedArtifactSupportGroup{{
+			SupportID: "support", Complete: true, Resources: []protocol.DerivedArtifactResourceIdentity{
+				{ResourceID: firstID, Type: protocol.ResourceDocument, Versions: versions},
+				{ResourceID: secondID, Type: protocol.ResourceDocument, Versions: versions},
+			},
+		}},
+	}
+	if err := validateDerivedArtifactRecordProvenance(
+		DerivedArtifact{Kind: "summary"}, provenance, record,
+	); err != nil {
+		t.Fatalf("equivalent support resources depended on canonical ordering: %v", err)
+	}
 }
 
 func TestRevocationRejectsDependencylessDerivedProjection(t *testing.T) {

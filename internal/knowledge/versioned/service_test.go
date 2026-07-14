@@ -202,21 +202,37 @@ func TestServiceBuildArtifactsAreStableAndClaimsAreSourceBacked(t *testing.T) {
 	if err := protocol.ValidateGraphResourceBindings(repo.artifacts.GraphBindings); err != nil {
 		t.Fatalf("graph bindings: %v", err)
 	}
-	var derivedSecurity *protocol.DerivedArtifactSecurityRecord
+	var derivedMetadata *catalog.ResourceMetadata
 	var projection catalog.Projection
 	if err := json.Unmarshal(repo.artifacts.ProjectionJSON, &projection); err != nil {
 		t.Fatalf("projection JSON: %v", err)
 	}
 	for index := range projection.Resources {
 		if projection.Resources[index].Type == protocol.ResourceDerivedArtifact {
-			derivedSecurity = projection.Resources[index].DerivedArtifactSecurity
+			derivedMetadata = &projection.Resources[index]
 			break
 		}
 	}
+	var derivedSecurity *protocol.DerivedArtifactSecurityRecord
+	if derivedMetadata != nil {
+		derivedSecurity = derivedMetadata.DerivedArtifactSecurity
+	}
 	if derivedSecurity == nil || derivedSecurity.Kind != string(protocol.DerivedArtifactSummary) ||
 		derivedSecurity.DerivationMode != protocol.DerivationAllRequired || len(derivedSecurity.Supports) != 1 ||
-		len(derivedSecurity.Supports[0].Resources) != len(repo.artifacts.Documents) {
+		len(derivedSecurity.Supports[0].Resources) != len(repo.artifacts.Documents)+len(repo.artifacts.Chunks) {
 		t.Fatalf("materialized summary security = %#v", derivedSecurity)
+	}
+	if len(derivedMetadata.Dependencies) != len(repo.artifacts.Documents)+len(repo.artifacts.Chunks) {
+		t.Fatalf("materialized summary dependencies = %v", derivedMetadata.Dependencies)
+	}
+	boundResources := make(map[protocol.ResourceID]struct{}, len(derivedSecurity.Supports[0].Resources))
+	for _, resource := range derivedSecurity.Supports[0].Resources {
+		boundResources[resource.ResourceID] = struct{}{}
+	}
+	for _, chunk := range repo.artifacts.Chunks {
+		if _, ok := boundResources[protocol.ResourceID(chunk.ChunkID)]; !ok {
+			t.Fatalf("summary security omitted chunk %s", chunk.ChunkID)
+		}
 	}
 	if err := derivedSecurity.Validate(); err != nil {
 		t.Fatalf("materialized summary security: %v", err)
