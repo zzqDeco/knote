@@ -71,15 +71,22 @@ func claimPredicateKeyForSource(sourceIdentity string) ClaimPredicateKey {
 }
 
 func (key ClaimPredicateKey) Validate() error {
+	if err := key.validateOpaque(); err != nil {
+		return err
+	}
+	if !isSupportedClaimPredicateKey(key) {
+		return fmt.Errorf("predicate_key is not declared by the active allowlist")
+	}
+	return nil
+}
+
+func (key ClaimPredicateKey) validateOpaque() error {
 	value := string(key)
 	if !strings.HasPrefix(value, "pred_") || len(value) != len("pred_")+32 {
 		return fmt.Errorf("predicate_key must be an opaque pred_ identifier")
 	}
 	if _, err := hex.DecodeString(strings.TrimPrefix(value, "pred_")); err != nil {
 		return fmt.Errorf("predicate_key must be hexadecimal: %w", err)
-	}
-	if !isSupportedClaimPredicateKey(key) {
-		return fmt.Errorf("predicate_key is not declared by the active allowlist")
 	}
 	return nil
 }
@@ -214,8 +221,12 @@ func (b ClaimTripleBinding) Validate() error {
 			return fmt.Errorf("%s: %w", name, err)
 		}
 	}
-	if err := b.PredicateKey.Validate(); err != nil {
-		return err
+	predicateErr := b.PredicateKey.Validate()
+	if b.Version == GraphBindingContractVersionV1 {
+		predicateErr = b.PredicateKey.validateOpaque()
+	}
+	if predicateErr != nil {
+		return predicateErr
 	}
 	if b.Derivation != DerivationAnySupport && b.Derivation != DerivationAllRequired {
 		return fmt.Errorf("unsupported claim derivation %q", b.Derivation)
@@ -461,6 +472,11 @@ func UpgradeGraphBindingContract(
 
 	upgradedClaims := make([]ClaimTripleBinding, 0, len(claims))
 	for _, claim := range claims {
+		// V1 accepted opaque predicate digests before the checked-in allowlist.
+		// Keep those bundles readable without promoting undeclared edges into v2.
+		if !isSupportedClaimPredicateKey(claim.PredicateKey) {
+			continue
+		}
 		upgraded := claim
 		upgraded.Version = GraphBindingContractVersion
 		upgraded.Claim = upgradedGraphIDs[claim.Claim]

@@ -161,6 +161,8 @@ func ValidateGraphArtifactPayloads(
 	if err != nil {
 		return ErrArtifactProjectionMismatch
 	}
+	graphBindingCount := len(graphBindings)
+	claimBindingCount := len(claimBindings)
 	if manifest.GraphBindingContractVersion == protocol.GraphBindingContractVersionV1 {
 		graphBindings, claimBindings, err = protocol.UpgradeGraphBindingContract(graphBindings, claimBindings)
 		if err != nil {
@@ -180,8 +182,8 @@ func ValidateGraphArtifactPayloads(
 	counts := map[string]int{
 		"projection.json":                  projectionResourceCount,
 		"claims.jsonl":                     len(claims),
-		protocol.GraphBindingsArtifactPath: len(graphBindings),
-		protocol.ClaimBindingsArtifactPath: len(claimBindings),
+		protocol.GraphBindingsArtifactPath: graphBindingCount,
+		protocol.ClaimBindingsArtifactPath: claimBindingCount,
 	}
 	for _, descriptor := range manifest.Files {
 		if count, ok := counts[descriptor.Path]; ok && descriptor.Count != count {
@@ -242,6 +244,9 @@ func validateLegacyGraphArtifactProjection(
 		version != manifest.ProjectionVersion {
 		return ErrArtifactProjectionMismatch
 	}
+	if manifest.GraphBindingContractVersion != protocol.GraphBindingContractVersionV1 {
+		return ErrArtifactProjectionMismatch
+	}
 	if len(graphBindings) == 0 || len(claimBindings) != 0 ||
 		protocol.ValidateGraphResourceBindings(graphBindings) != nil {
 		return ErrArtifactProjectionMismatch
@@ -258,9 +263,6 @@ func validateLegacyGraphArtifactProjection(
 		}
 	}
 	sort.Strings(graphClaimIDs)
-	if manifest.GraphBindingContractVersion == protocol.GraphBindingContractVersion && len(graphClaimIDs) != 0 {
-		return ErrArtifactProjectionMismatch
-	}
 	claimIDs := make([]string, len(claims))
 	for index, claim := range claims {
 		claimIDs[index] = claim.ClaimID
@@ -320,13 +322,30 @@ func validateUpgradedV1ProjectionGraphBindings(
 	graphBindings []protocol.GraphResourceBinding,
 	claimBindings []protocol.ClaimTripleBinding,
 ) error {
-	expectedGraph, expectedClaims, err := catalog.ProjectionGraphBindings(projection)
-	if err != nil || !reflect.DeepEqual(expectedGraph, graphBindings) || len(expectedClaims) != len(claimBindings) {
+	expectedGraph, err := legacyV1ProjectionGraphBindings(projection)
+	if err != nil || !reflect.DeepEqual(expectedGraph, graphBindings) {
+		return ErrArtifactProjectionMismatch
+	}
+	_, expectedClaims, err := catalog.ProjectionGraphBindings(projection)
+	if err != nil {
+		return ErrArtifactProjectionMismatch
+	}
+	expectedClaimGraphIDs := make(map[protocol.GraphObjectID]struct{}, len(expectedClaims))
+	for _, expected := range expectedClaims {
+		expectedClaimGraphIDs[expected.Claim] = struct{}{}
+	}
+	actualClaims := make([]protocol.ClaimTripleBinding, 0, len(expectedClaims))
+	for _, actual := range claimBindings {
+		if _, ok := expectedClaimGraphIDs[actual.Claim]; ok {
+			actualClaims = append(actualClaims, actual)
+		}
+	}
+	if len(expectedClaims) != len(actualClaims) {
 		return ErrArtifactProjectionMismatch
 	}
 	for index := range expectedClaims {
 		expected := expectedClaims[index]
-		actual := claimBindings[index]
+		actual := actualClaims[index]
 		expected.Supports = nil
 		actual.Supports = nil
 		if !reflect.DeepEqual(expected, actual) {
@@ -334,6 +353,29 @@ func validateUpgradedV1ProjectionGraphBindings(
 		}
 	}
 	return nil
+}
+
+func legacyV1ProjectionGraphBindings(projection catalog.Projection) ([]protocol.GraphResourceBinding, error) {
+	bindings := make([]protocol.GraphResourceBinding, 0, len(projection.Resources))
+	for _, resource := range projection.Resources {
+		if !resource.IsServing() {
+			continue
+		}
+		handle, err := resource.ServingHandle()
+		if err != nil {
+			return nil, err
+		}
+		binding, err := protocol.NewGraphResourceBinding(handle)
+		if err != nil {
+			return nil, err
+		}
+		bindings = append(bindings, binding)
+	}
+	protocol.SortGraphResourceBindings(bindings)
+	if err := protocol.ValidateGraphResourceBindings(bindings); err != nil {
+		return nil, err
+	}
+	return bindings, nil
 }
 
 func decodeProjection(data []byte) (catalog.Projection, error) {

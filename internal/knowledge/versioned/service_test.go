@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -191,6 +192,9 @@ func TestServiceBuildArtifactsAreStableAndClaimsAreSourceBacked(t *testing.T) {
 	}
 	if first.BundleManifest.GraphBindingContractVersion != protocol.GraphBindingContractVersion {
 		t.Fatalf("graph binding contract version = %d", first.BundleManifest.GraphBindingContractVersion)
+	}
+	if want := fmt.Sprintf("graph_binding_contract:\n  version: %d\n", protocol.GraphBindingContractVersion); !strings.Contains(repo.artifacts.SchemaYAML, want) {
+		t.Fatalf("build schema graph binding contract = %q, want %q", repo.artifacts.SchemaYAML, want)
 	}
 	if got, want := len(repo.artifacts.GraphBindings), repo.artifacts.ProjectionResourceCount; got != want {
 		t.Fatalf("graph binding count = %d, want %d", got, want)

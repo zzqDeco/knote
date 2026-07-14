@@ -186,6 +186,25 @@ func TestUpgradeGraphBindingContractPreservesV1DerivationSemantics(t *testing.T)
 	}
 }
 
+func TestUpgradeGraphBindingContractKeepsUndeclaredV1PredicatesInert(t *testing.T) {
+	resources, claims := v1ClaimBindingFixture(t, DerivationAllRequired)
+	claims[0].PredicateKey = ClaimPredicateKey("pred_ffffffffffffffffffffffffffffffff")
+	if err := ValidateClaimTripleBindings(resources, claims); err != nil {
+		t.Fatalf("legacy v1 predicate was rejected: %v", err)
+	}
+
+	upgradedResources, upgradedClaims, err := UpgradeGraphBindingContract(resources, claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(upgradedClaims) != 0 {
+		t.Fatalf("undeclared v1 predicate was promoted into v2: %+v", upgradedClaims)
+	}
+	if err := ValidateClaimTripleBindings(upgradedResources, upgradedClaims); err != nil {
+		t.Fatalf("safe v1 upgrade is invalid: %v", err)
+	}
+}
+
 func v1ClaimBindingFixture(t *testing.T, derivation DerivationMode) ([]GraphResourceBinding, []ClaimTripleBinding) {
 	t.Helper()
 	document := graphTestHandle(t, "00000000000000000000000000000001", ResourceDocument)
