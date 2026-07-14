@@ -1781,7 +1781,11 @@ def validate_claim_binding_rows(
                 f"{field}.predicate_key must be an opaque pred_ identifier",
                 INVALID_GRAPH_BINDING_CODE,
             )
-        if predicate_key not in SUPPORTED_CLAIM_PREDICATE_KEYS:
+        predicate_is_supported = predicate_key in SUPPORTED_CLAIM_PREDICATE_KEYS
+        if (
+            not predicate_is_supported
+            and contract_version != GRAPH_BINDING_CONTRACT_VERSION_V1
+        ):
             raise AdapterRequestError(
                 f"{field}.predicate_key is not declared by the active allowlist",
                 INVALID_GRAPH_BINDING_CODE,
@@ -1962,7 +1966,8 @@ def validate_claim_binding_rows(
                 source_id,
                 f"{field}.supports[{support_index}].provenance",
             )
-        claims.append(normalized)
+        if predicate_is_supported:
+            claims.append(normalized)
     return claims
 
 

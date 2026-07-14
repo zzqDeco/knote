@@ -330,22 +330,12 @@ func validateUpgradedV1ProjectionGraphBindings(
 	if err != nil {
 		return ErrArtifactProjectionMismatch
 	}
-	expectedClaimGraphIDs := make(map[protocol.GraphObjectID]struct{}, len(expectedClaims))
-	for _, expected := range expectedClaims {
-		expectedClaimGraphIDs[expected.Claim] = struct{}{}
-	}
-	actualClaims := make([]protocol.ClaimTripleBinding, 0, len(expectedClaims))
-	for _, actual := range claimBindings {
-		if _, ok := expectedClaimGraphIDs[actual.Claim]; ok {
-			actualClaims = append(actualClaims, actual)
-		}
-	}
-	if len(expectedClaims) != len(actualClaims) {
+	if len(expectedClaims) != len(claimBindings) {
 		return ErrArtifactProjectionMismatch
 	}
 	for index := range expectedClaims {
 		expected := expectedClaims[index]
-		actual := actualClaims[index]
+		actual := claimBindings[index]
 		expected.Supports = nil
 		actual.Supports = nil
 		if !reflect.DeepEqual(expected, actual) {

@@ -1149,6 +1149,28 @@ class AdapterTest(unittest.TestCase):
                         len(support["provenance_resource_ids"]), want_group_size
                     )
 
+    def test_v1_claim_contract_upgrade_drops_undeclared_predicate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            projection_id = "prj_" + "a" * 32
+            graph_rows, claim_row = source_backed_claim_contract(
+                projection_id, adapter.GRAPH_BINDING_CONTRACT_VERSION_V1
+            )
+            claim_row["predicate_key"] = "pred_" + "f" * 32
+            write_graph_contract_bundle(
+                workspace,
+                graph_rows=graph_rows,
+                claim_rows=[claim_row],
+                contract_version=adapter.GRAPH_BINDING_CONTRACT_VERSION_V1,
+            )
+
+            resources, upgraded = adapter.load_current_graph_contract(
+                {"workspace": str(workspace)}, real_graph_authorization()
+            )
+
+            self.assertEqual(len(resources), len(graph_rows))
+            self.assertEqual(upgraded, [])
+
     def test_real_primitive_rejects_invalid_source_backed_claim_contracts(self) -> None:
         projection_id = "prj_" + "a" * 32
         graph_rows, valid_claim = source_backed_claim_contract(projection_id)

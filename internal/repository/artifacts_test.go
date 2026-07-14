@@ -274,6 +274,47 @@ func TestValidateGraphArtifactPayloadsPreservesLegacyV1ClaimResourcesAndPredicat
 	}
 }
 
+func TestValidateGraphArtifactPayloadsRejectsSupportedV1ClaimOutsideProjection(t *testing.T) {
+	set := sourceBackedArtifactSet(t)
+	var projection catalog.Projection
+	if err := json.Unmarshal(set.ProjectionJSON, &projection); err != nil {
+		t.Fatal(err)
+	}
+	for index := range projection.Resources {
+		if projection.Resources[index].Type == protocol.ResourceClaim {
+			projection.Resources[index].ClaimRecord = nil
+		}
+	}
+	projectionJSON, err := json.Marshal(projection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v1Resources, v1Claims := v1GraphArtifactBindings(set)
+	claims, err := marshalJSONL(set.Claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	graphBindings, err := marshalJSONL(v1Resources)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimBindings, err := marshalJSONL(v1Claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := set.BundleManifest
+	manifest.GraphBindingContractVersion = protocol.GraphBindingContractVersionV1
+	files := map[string][]byte{
+		"projection.json":                  projectionJSON,
+		"claims.jsonl":                     claims,
+		protocol.GraphBindingsArtifactPath: graphBindings,
+		protocol.ClaimBindingsArtifactPath: claimBindings,
+	}
+	if err := ValidateGraphArtifactPayloads(manifest, files); !errors.Is(err, ErrArtifactProjectionMismatch) {
+		t.Fatalf("supported v1 Claim outside projection error = %v, want generic projection mismatch", err)
+	}
+}
+
 func TestValidateGraphArtifactPayloadsRejectsEmptyLegacyGraphProjection(t *testing.T) {
 	projectionVersion := "prj_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	manifest := protocol.ArtifactBundleManifest{
