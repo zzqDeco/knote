@@ -143,7 +143,7 @@ func ValidateGraphArtifactPayloads(
 	if manifest.GraphBindingContractVersion == 0 {
 		return nil
 	}
-	if manifest.GraphBindingContractVersion != protocol.GraphBindingContractVersion {
+	if !protocol.IsSupportedGraphBindingContractVersion(manifest.GraphBindingContractVersion) {
 		return ErrArtifactProjectionMismatch
 	}
 	claims, err := decodeJSONL[protocol.Claim](files["claims.jsonl"])
@@ -160,6 +160,12 @@ func ValidateGraphArtifactPayloads(
 	claimBindings, err := decodeJSONL[protocol.ClaimTripleBinding](files[protocol.ClaimBindingsArtifactPath])
 	if err != nil {
 		return ErrArtifactProjectionMismatch
+	}
+	if manifest.GraphBindingContractVersion == protocol.GraphBindingContractVersionV1 {
+		graphBindings, claimBindings, err = protocol.UpgradeGraphBindingContract(graphBindings, claimBindings)
+		if err != nil {
+			return ErrArtifactProjectionMismatch
+		}
 	}
 	projection, projectionErr := decodeProjection(files["projection.json"])
 	projectionResourceCount := len(projection.Resources)
@@ -274,7 +280,13 @@ func validateDecodedGraphArtifactProjection(
 		projection.SourceSnapshot.DocumentCount != manifest.SourceSnapshot.DocumentCount {
 		return fmt.Errorf("projection identity differs from manifest")
 	}
-	if err := catalog.ValidateProjectionGraphBindings(projection, graphBindings, claimBindings); err != nil {
+	var err error
+	if manifest.GraphBindingContractVersion == protocol.GraphBindingContractVersionV1 {
+		err = validateUpgradedV1ProjectionGraphBindings(projection, graphBindings, claimBindings)
+	} else {
+		err = catalog.ValidateProjectionGraphBindings(projection, graphBindings, claimBindings)
+	}
+	if err != nil {
 		return fmt.Errorf("graph bindings: %w", err)
 	}
 	expectedClaimIDs := make([]string, 0)
@@ -294,6 +306,27 @@ func validateDecodedGraphArtifactProjection(
 	if !reflect.DeepEqual(actualClaimIDs, expectedClaimIDs) ||
 		manifest.Compatibility.ClaimCount != len(claims) {
 		return fmt.Errorf("claim artifacts differ from projection")
+	}
+	return nil
+}
+
+func validateUpgradedV1ProjectionGraphBindings(
+	projection catalog.Projection,
+	graphBindings []protocol.GraphResourceBinding,
+	claimBindings []protocol.ClaimTripleBinding,
+) error {
+	expectedGraph, expectedClaims, err := catalog.ProjectionGraphBindings(projection)
+	if err != nil || !reflect.DeepEqual(expectedGraph, graphBindings) || len(expectedClaims) != len(claimBindings) {
+		return ErrArtifactProjectionMismatch
+	}
+	for index := range expectedClaims {
+		expected := expectedClaims[index]
+		actual := claimBindings[index]
+		expected.Supports = nil
+		actual.Supports = nil
+		if !reflect.DeepEqual(expected, actual) {
+			return ErrArtifactProjectionMismatch
+		}
 	}
 	return nil
 }

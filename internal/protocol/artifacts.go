@@ -104,7 +104,7 @@ func (m ArtifactBundleManifest) Validate() error {
 	}
 	switch m.GraphBindingContractVersion {
 	case 0:
-	case GraphBindingContractVersion:
+	case GraphBindingContractVersionV1, GraphBindingContractVersion:
 		required[GraphBindingsArtifactPath] = false
 		required[ClaimBindingsArtifactPath] = false
 	default:

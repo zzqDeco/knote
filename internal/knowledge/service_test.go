@@ -103,7 +103,7 @@ func TestServiceBuildFailsBeforeWritingArtifactsWhenBackendFails(t *testing.T) {
 	}
 }
 
-func TestServiceBuildArtifactsAreStableAndEntityIsPerDocument(t *testing.T) {
+func TestServiceBuildArtifactsAreStableAndClaimsAreSourceBacked(t *testing.T) {
 	ctx := context.Background()
 	repo := newMemoryRepo()
 	repo.sourceModTimes["sources/long.md"] = time.Unix(42, 0).UTC()
@@ -140,11 +140,27 @@ func TestServiceBuildArtifactsAreStableAndEntityIsPerDocument(t *testing.T) {
 	if len(repo.artifacts.Chunks) < 2 {
 		t.Fatalf("test source did not split into multiple chunks: %+v", repo.artifacts.Chunks)
 	}
-	if len(repo.artifacts.Entities) != 1 {
-		t.Fatalf("expected one document entity, got %d: %+v", len(repo.artifacts.Entities), repo.artifacts.Entities)
+	if got, want := len(repo.artifacts.Entities), len(repo.artifacts.Chunks)+1; got != want {
+		t.Fatalf("entity count = %d, want one statement per chunk plus one document entity (%d): %+v", got, want, repo.artifacts.Entities)
 	}
-	if got, want := len(repo.artifacts.Entities[0].EvidenceChunkIDs), len(repo.artifacts.Chunks); got != want {
+	var documentEntity protocol.Entity
+	for _, entity := range repo.artifacts.Entities {
+		if entity.Type == "Document" {
+			documentEntity = entity
+			break
+		}
+	}
+	if documentEntity.EntityID == "" {
+		t.Fatalf("document entity was not emitted: %+v", repo.artifacts.Entities)
+	}
+	if got, want := len(documentEntity.EvidenceChunkIDs), len(repo.artifacts.Chunks); got != want {
 		t.Fatalf("document entity evidence chunk count = %d, want %d", got, want)
+	}
+	if got, want := len(repo.artifacts.ClaimBindings), len(repo.artifacts.Claims); got != want {
+		t.Fatalf("source-backed Claim binding count = %d, want %d", got, want)
+	}
+	if err := protocol.ValidateClaimTripleBindings(repo.artifacts.GraphBindings, repo.artifacts.ClaimBindings); err != nil {
+		t.Fatalf("Claim bindings: %v", err)
 	}
 }
 

@@ -30,6 +30,11 @@ func TestArtifactBundleManifestRequiresVersionedGraphBindingPair(t *testing.T) {
 	if err := manifest.Validate(); err != nil {
 		t.Fatal(err)
 	}
+	legacy := manifest
+	legacy.GraphBindingContractVersion = GraphBindingContractVersionV1
+	if err := legacy.Validate(); err != nil {
+		t.Fatalf("valid v1 graph binding manifest was rejected: %v", err)
+	}
 
 	missing := manifest
 	missing.Files = append([]ArtifactBundleFile(nil), manifest.Files...)

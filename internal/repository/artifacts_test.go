@@ -2,8 +2,10 @@ package repository
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sort"
 	"strings"
 	"testing"
@@ -128,6 +130,79 @@ func TestValidateGraphArtifactPayloadsPreservesLegacyV2WithoutGraphContract(t *t
 	}
 	if err := ValidateGraphArtifactPayloads(manifest, files); err != nil {
 		t.Fatalf("legacy v2 bundle without a graph contract was reinterpreted: %v", err)
+	}
+}
+
+func TestValidateGraphArtifactPayloadsUpgradesV1ClaimBindings(t *testing.T) {
+	set := sourceBackedArtifactSet(t)
+	payloads, err := CanonicalArtifactFiles(set)
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := make(map[string][]byte, len(payloads))
+	for _, payload := range payloads {
+		files[payload.Descriptor.Path] = payload.Data
+	}
+
+	v1GraphIDs := make(map[protocol.GraphObjectID]protocol.GraphObjectID, len(set.GraphBindings))
+	v1Resources := append([]protocol.GraphResourceBinding(nil), set.GraphBindings...)
+	for index := range v1Resources {
+		v1Resources[index].Version = protocol.GraphBindingContractVersionV1
+		identity := fmt.Sprintf(
+			"%d\x00%s\x00%s",
+			protocol.GraphBindingContractVersionV1,
+			v1Resources[index].Resource.Versions.Projection,
+			v1Resources[index].Resource.ResourceID,
+		)
+		digest := sha256.Sum256([]byte(identity))
+		v1Resources[index].GraphObjectID = protocol.GraphObjectID(fmt.Sprintf("kg_%x", digest[:16]))
+		v1GraphIDs[set.GraphBindings[index].GraphObjectID] = v1Resources[index].GraphObjectID
+	}
+	protocol.SortGraphResourceBindings(v1Resources)
+	v1Claims := append([]protocol.ClaimTripleBinding(nil), set.ClaimBindings...)
+	for index := range v1Claims {
+		v1Claims[index].Provenance = append([]protocol.GraphObjectID(nil), v1Claims[index].Provenance...)
+		v1Claims[index].Version = protocol.GraphBindingContractVersionV1
+		v1Claims[index].Claim = v1GraphIDs[v1Claims[index].Claim]
+		v1Claims[index].Subject = v1GraphIDs[v1Claims[index].Subject]
+		v1Claims[index].Object = v1GraphIDs[v1Claims[index].Object]
+		v1Claims[index].SourceDocument = v1GraphIDs[v1Claims[index].SourceDocument]
+		for provenanceIndex, graphObjectID := range v1Claims[index].Provenance {
+			v1Claims[index].Provenance[provenanceIndex] = v1GraphIDs[graphObjectID]
+		}
+		sort.Slice(v1Claims[index].Provenance, func(left, right int) bool {
+			return v1Claims[index].Provenance[left] < v1Claims[index].Provenance[right]
+		})
+		v1Claims[index].Supports = nil
+		v1Claims[index].SubjectResourceID = ""
+		v1Claims[index].ObjectResourceID = ""
+		v1Claims[index].SourceDocumentResourceID = ""
+		v1Claims[index].SourceVersion = ""
+		v1Claims[index].ProvenanceResourceIDs = nil
+	}
+	protocol.SortClaimTripleBindings(v1Claims)
+	v1Manifest := set.BundleManifest
+	v1Manifest.GraphBindingContractVersion = protocol.GraphBindingContractVersionV1
+	files["projection.json"] = set.ProjectionJSON
+	files[protocol.GraphBindingsArtifactPath], err = marshalJSONL(v1Resources)
+	if err != nil {
+		t.Fatal(err)
+	}
+	files[protocol.ClaimBindingsArtifactPath], err = marshalJSONL(v1Claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, v2Field := range [][]byte{
+		[]byte(`"subject_resource_id"`), []byte(`"object_resource_id"`),
+		[]byte(`"source_document_resource_id"`), []byte(`"source_version"`),
+		[]byte(`"provenance_resource_ids"`), []byte(`"supports"`),
+	} {
+		if bytes.Contains(files[protocol.ClaimBindingsArtifactPath], v2Field) {
+			t.Fatalf("v1 compatibility fixture contains v2 field %s", v2Field)
+		}
+	}
+	if err := ValidateGraphArtifactPayloads(v1Manifest, files); err != nil {
+		t.Fatalf("valid v1 graph payload was rejected: %v", err)
 	}
 }
 

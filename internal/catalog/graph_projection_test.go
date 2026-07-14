@@ -2,6 +2,7 @@ package catalog
 
 import (
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 
@@ -35,8 +36,25 @@ func TestSourceBackedClaimSupportModesAreCompleteSourceScopedAndDeterministic(t 
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(claims) != 1 || claims[0].Derivation != mode || len(claims[0].ProvenanceResourceIDs) != 2 {
+			if len(claims) != 1 || claims[0].Derivation != mode || len(claims[0].ProvenanceResourceIDs) != 2 ||
+				len(claims[0].Supports) != 2 {
 				t.Fatalf("Claim binding did not preserve the complete support combination: %+v", claims)
+			}
+			documentSupport, err := protocol.NewClaimSupportKey("support-document")
+			if err != nil {
+				t.Fatal(err)
+			}
+			spanSupport, err := protocol.NewClaimSupportKey("support-span")
+			if err != nil {
+				t.Fatal(err)
+			}
+			gotSupports := []protocol.ClaimSupportKey{claims[0].Supports[0].SupportKey, claims[0].Supports[1].SupportKey}
+			wantSupports := []protocol.ClaimSupportKey{documentSupport, spanSupport}
+			sort.Slice(wantSupports, func(i, j int) bool { return wantSupports[i] < wantSupports[j] })
+			if !reflect.DeepEqual(gotSupports, wantSupports) ||
+				len(claims[0].Supports[0].ProvenanceResourceIDs) != 1 ||
+				len(claims[0].Supports[1].ProvenanceResourceIDs) != 1 {
+				t.Fatalf("Claim support boundaries were flattened: %+v", claims[0].Supports)
 			}
 			claimGraphBound := false
 			for _, binding := range resources {
@@ -65,6 +83,47 @@ func TestSourceBackedClaimSupportModesAreCompleteSourceScopedAndDeterministic(t 
 	fixture.claim.Provenance.Supports[1].Complete = false
 	if err := fixture.claim.Validate(); err == nil {
 		t.Fatal("source-backed all_required claim accepted incomplete support")
+	}
+}
+
+func TestClaimBindingPreservesSupportGroupsWithIdenticalFlattenedProvenance(t *testing.T) {
+	separate := newSourceBackedClaimFixture(t, "source-v1", "projection-v1", protocol.DerivationAnySupport)
+	separateCanonical, err := separate.catalog.Canonical()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, separateBindings, err := ProjectionGraphBindings(
+		publishedProjectionFromCatalog(t, separateCanonical, separate.document.Snapshot),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	combined := newSourceBackedClaimFixture(t, "source-v1", "projection-v1", protocol.DerivationAnySupport)
+	combined.claim.Provenance.Supports = []Support{{
+		SupportID: "support-combined",
+		Evidence:  []EvidenceRef{combined.document.EvidenceRef(), combined.chunk.EvidenceRef()},
+		Complete:  true,
+	}}
+	combined.catalog.Claims[0] = combined.claim
+	combinedCanonical, err := combined.catalog.Canonical()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, combinedBindings, err := ProjectionGraphBindings(
+		publishedProjectionFromCatalog(t, combinedCanonical, combined.document.Snapshot),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !reflect.DeepEqual(separateBindings[0].Provenance, combinedBindings[0].Provenance) ||
+		!reflect.DeepEqual(separateBindings[0].ProvenanceResourceIDs, combinedBindings[0].ProvenanceResourceIDs) {
+		t.Fatal("fixtures did not produce identical flattened provenance")
+	}
+	if reflect.DeepEqual(separateBindings[0].Supports, combinedBindings[0].Supports) ||
+		len(separateBindings[0].Supports) != 2 || len(combinedBindings[0].Supports) != 1 {
+		t.Fatalf("support grouping was not preserved: separate=%+v combined=%+v", separateBindings[0].Supports, combinedBindings[0].Supports)
 	}
 }
 

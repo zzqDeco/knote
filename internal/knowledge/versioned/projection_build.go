@@ -158,6 +158,10 @@ func (s service) prepareArtifactProjection(ctx context.Context) (repository.Arti
 			Projection: projectionVersion,
 		}
 	}
+	partOfPredicate, err := protocol.NewClaimPredicateKey(string(protocol.ClaimPredicatePartOf))
+	if err != nil {
+		return repository.ArtifactSet{}, projectionBuild{}, err
+	}
 
 	var set repository.ArtifactSet
 	resources := make([]catalog.ResourceMetadata, 0)
@@ -184,6 +188,13 @@ func (s service) prepareArtifactProjection(ctx context.Context) (repository.Arti
 			ResourceID: documentID, SourceVersion: documentMetadata.Versions.Source,
 			ContentVersion: documentMetadata.Versions.Content, ACLVersion: documentMetadata.Versions.ACL,
 			ProjectionVersion: documentMetadata.Versions.Projection,
+		}
+		documentEntityKey := source.source.Path + "#entity:document"
+		documentEntityID, err := protocol.NewStableResourceID(
+			scope.TenantID, scope.KnowledgeBaseID, protocol.ResourceEntity, documentEntityKey,
+		)
+		if err != nil {
+			return repository.ArtifactSet{}, projectionBuild{}, err
 		}
 		chunks := splitChunks(string(source.data), 1000)
 		evidenceChunkIDs := make([]string, 0, len(chunks))
@@ -213,12 +224,34 @@ func (s service) prepareArtifactProjection(ctx context.Context) (repository.Arti
 			set.Chunks = append(set.Chunks, item)
 			evidenceChunkIDs = append(evidenceChunkIDs, item.ChunkID)
 
-			claimKey := chunkKey + "#claim"
+			claimText := compactClaim(item.Text)
+			chunkEntityKey := chunkKey + "#entity:statement"
+			chunkEntityID, err := protocol.NewStableResourceID(
+				scope.TenantID, scope.KnowledgeBaseID, protocol.ResourceEntity, chunkEntityKey,
+			)
+			if err != nil {
+				return repository.ArtifactSet{}, projectionBuild{}, err
+			}
+			chunkEntityMetadata, err := catalog.NewResourceMetadata(
+				scope, protocol.ResourceEntity, chunkEntityKey, "entity:"+string(chunkEntityID), chunkEntityID,
+				protocol.NewContentDigest(claimText), versions("content_"+fullHash([]byte(claimText))[:24]),
+				catalog.SensitivityInternal, localSecurityDomain,
+			)
+			if err != nil {
+				return repository.ArtifactSet{}, projectionBuild{}, err
+			}
+			chunkEntityMetadata.Dependencies = []protocol.ResourceID{chunkID}
+			resources = append(resources, chunkEntityMetadata)
+			set.Entities = append(set.Entities, protocol.Entity{
+				EntityID: string(chunkEntityID), Name: claimText, Type: "Statement",
+				Aliases: []string{chunkKey}, EvidenceChunkIDs: []string{item.ChunkID},
+			})
+
+			claimKey := chunkKey + "#claim:part-of-document"
 			claimID, err := protocol.NewStableResourceID(scope.TenantID, scope.KnowledgeBaseID, protocol.ResourceClaim, claimKey)
 			if err != nil {
 				return repository.ArtifactSet{}, projectionBuild{}, err
 			}
-			claimText := compactClaim(item.Text)
 			claimMetadata, err := catalog.NewResourceMetadata(
 				scope, protocol.ResourceClaim, claimKey, "claim:"+string(claimID), claimID,
 				protocol.NewContentDigest(claimText), versions("content_"+fullHash([]byte(claimText))[:24]),
@@ -227,13 +260,18 @@ func (s service) prepareArtifactProjection(ctx context.Context) (repository.Arti
 			if err != nil {
 				return repository.ArtifactSet{}, projectionBuild{}, err
 			}
-			claimMetadata.Dependencies = []protocol.ResourceID{documentID, chunkID}
+			claimMetadata.Dependencies = []protocol.ResourceID{
+				documentID, chunkID, chunkEntityID, documentEntityID,
+			}
 			sort.Slice(claimMetadata.Dependencies, func(i, j int) bool {
 				return claimMetadata.Dependencies[i] < claimMetadata.Dependencies[j]
 			})
 			claimMetadata.ClaimRecord = &catalog.ClaimProjectionRecord{
-				BindingState:   catalog.ClaimBindingUnbound,
-				SourceDocument: documentRef,
+				BindingState:      catalog.ClaimBindingSourceBacked,
+				SubjectResourceID: chunkEntityID,
+				PredicateKey:      partOfPredicate,
+				ObjectResourceID:  documentEntityID,
+				SourceDocument:    documentRef,
 				Provenance: catalog.Provenance{
 					DerivationMode: protocol.DerivationAnySupport,
 					Supports: []catalog.Support{{
@@ -256,12 +294,8 @@ func (s service) prepareArtifactProjection(ctx context.Context) (repository.Arti
 		if len(entityDependencies) == 0 {
 			entityDependencies = []protocol.ResourceID{documentID}
 		}
-		entityID, err := protocol.NewStableResourceID(scope.TenantID, scope.KnowledgeBaseID, protocol.ResourceEntity, source.source.Path+"#entity:document")
-		if err != nil {
-			return repository.ArtifactSet{}, projectionBuild{}, err
-		}
 		entityMetadata, err := catalog.NewResourceMetadata(
-			scope, protocol.ResourceEntity, source.source.Path+"#entity:document", "entity:"+string(entityID), entityID,
+			scope, protocol.ResourceEntity, documentEntityKey, "entity:"+string(documentEntityID), documentEntityID,
 			protocol.NewContentDigest(firstNonEmpty(doc.Title, doc.Path)), versions("content_"+fullHash([]byte(firstNonEmpty(doc.Title, doc.Path)))[:24]),
 			catalog.SensitivityInternal, localSecurityDomain,
 		)
@@ -271,7 +305,7 @@ func (s service) prepareArtifactProjection(ctx context.Context) (repository.Arti
 		entityMetadata.Dependencies = entityDependencies
 		resources = append(resources, entityMetadata)
 		set.Entities = append(set.Entities, protocol.Entity{
-			EntityID: string(entityID), Name: firstNonEmpty(doc.Title, doc.Path), Type: "Document",
+			EntityID: string(documentEntityID), Name: firstNonEmpty(doc.Title, doc.Path), Type: "Document",
 			Aliases: []string{doc.Path}, EvidenceChunkIDs: evidenceChunkIDs,
 		})
 	}

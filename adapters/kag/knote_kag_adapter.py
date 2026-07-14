@@ -116,11 +116,36 @@ AUTHORIZATION_CONTEXT_VERSION = "v1"
 RESOURCE_ID_RE = re.compile(r"res_[0-9a-f]{32}\Z")
 CONTENT_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 RESOURCE_TYPES = frozenset({"document", "chunk", "entity", "claim", "derived_artifact"})
-GRAPH_BINDING_CONTRACT_VERSION = 1
+GRAPH_BINDING_CONTRACT_VERSION_V1 = 1
+GRAPH_BINDING_CONTRACT_VERSION = 2
+SUPPORTED_GRAPH_BINDING_CONTRACT_VERSIONS = frozenset(
+    {GRAPH_BINDING_CONTRACT_VERSION_V1, GRAPH_BINDING_CONTRACT_VERSION}
+)
 GRAPH_BINDINGS_ARTIFACT = "graph_bindings.jsonl"
 CLAIM_BINDINGS_ARTIFACT = "claim_bindings.jsonl"
 GRAPH_BINDING_FIELDS = frozenset({"version", "graph_object_id", "resource"})
+CLAIM_SUPPORT_FIELDS = frozenset(
+    {"support_key", "provenance", "provenance_resource_ids"}
+)
 CLAIM_BINDING_FIELDS = frozenset(
+    {
+        "version",
+        "claim",
+        "subject",
+        "predicate_key",
+        "object",
+        "source_document",
+        "derivation",
+        "provenance",
+        "subject_resource_id",
+        "object_resource_id",
+        "source_document_resource_id",
+        "source_version",
+        "provenance_resource_ids",
+        "supports",
+    }
+)
+CLAIM_BINDING_V1_FIELDS = frozenset(
     {
         "version",
         "claim",
@@ -154,6 +179,21 @@ SOURCE_SNAPSHOT_FIELDS = frozenset({"version", "digest", "document_count"})
 ARTIFACT_DESCRIPTOR_FIELDS = frozenset({"path", "sha256", "count", "size_bytes"})
 GRAPH_OBJECT_ID_RE = re.compile(r"kg_[0-9a-f]{32}\Z")
 CLAIM_PREDICATE_KEY_RE = re.compile(r"pred_[0-9a-f]{32}\Z")
+CLAIM_SUPPORT_KEY_RE = re.compile(r"sup_[0-9a-f]{32}\Z")
+SUPPORTED_CLAIM_PREDICATE_KEYS = frozenset(
+    {
+        "pred_117dbb19db72ab17c98e4ef1274d5981",
+        "pred_2f262980c75e6161b9b4e515b2de1e39",
+        "pred_5b962d789a179c3b0fef884c6ce16d3c",
+        "pred_66312e5e57ebd0b4fff4ef544c5a4abd",
+        "pred_6671808c414ad4b875384b8fa3bfc59c",
+        "pred_70a81d065c4e01846e6f7ab070e14be4",
+        "pred_8f3dc3703e8d493b1c38906cd34a06cc",
+        "pred_a3b0b7f1948c58d586d3af99fee4704e",
+        "pred_c2a0b72a30d819c4cd2a9024a1a2cbf9",
+        "pred_f394e7077977ae111ead3df2693e7b22",
+    }
+)
 PROJECTION_ID_RE = re.compile(r"prj_[0-9a-f]{32}\Z")
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 PROVIDER_SPEC_RE = re.compile(
@@ -1375,9 +1415,13 @@ def validate_resource(value: Any, field: str) -> dict[str, Any]:
     }
 
 
-def expected_graph_object_id(projection_version: str, resource_id: str) -> str:
+def expected_graph_object_id(
+    projection_version: str,
+    resource_id: str,
+    contract_version: int = GRAPH_BINDING_CONTRACT_VERSION,
+) -> str:
     identity = (
-        f"{GRAPH_BINDING_CONTRACT_VERSION}\0{projection_version}\0{resource_id}"
+        f"{contract_version}\0{projection_version}\0{resource_id}"
     )
     return "kg_" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32]
 
@@ -1536,9 +1580,10 @@ def validate_graph_binding_row(
     manifest: dict[str, Any],
 ) -> dict[str, Any]:
     validate_exact_fields(value, GRAPH_BINDING_FIELDS, field)
-    if value.get("version") != GRAPH_BINDING_CONTRACT_VERSION:
+    contract_version = manifest["graph_binding_contract_version"]
+    if value.get("version") != contract_version:
         raise AdapterRequestError(
-            f"{field}.version must be {GRAPH_BINDING_CONTRACT_VERSION}",
+            f"{field}.version does not match the selected contract",
             INVALID_GRAPH_BINDING_CODE,
         )
     graph_object_id = required_authorization_token(
@@ -1566,27 +1611,155 @@ def validate_graph_binding_row(
                 INVALID_GRAPH_BINDING_CODE,
             )
     expected_id = expected_graph_object_id(
-        manifest["projection_version"], resource["resource_id"]
+        manifest["projection_version"], resource["resource_id"], contract_version
     )
     if graph_object_id != expected_id:
         raise AdapterRequestError(
             f"{field}.graph_object_id does not match the exact serving resource",
             INVALID_GRAPH_BINDING_CODE,
         )
-    return {"version": GRAPH_BINDING_CONTRACT_VERSION, "graph_object_id": graph_object_id, "resource": resource}
+    return {
+        "version": contract_version,
+        "graph_object_id": graph_object_id,
+        "resource": resource,
+    }
+
+
+def validate_claim_provenance_ids(
+    value: Any, resources: dict[str, dict[str, Any]], field: str
+) -> list[str]:
+    if not isinstance(value, list) or not value:
+        raise AdapterRequestError(
+            f"{field} is required", INVALID_GRAPH_BINDING_CODE
+        )
+    normalized: list[str] = []
+    for index, graph_object_id in enumerate(value):
+        graph_object_id = required_authorization_token(
+            graph_object_id, f"{field}[{index}]"
+        )
+        if (
+            not GRAPH_OBJECT_ID_RE.fullmatch(graph_object_id)
+            or graph_object_id not in resources
+        ):
+            raise AdapterRequestError(
+                f"{field}[{index}] is not graph-bound",
+                INVALID_GRAPH_BINDING_CODE,
+            )
+        normalized.append(graph_object_id)
+    if normalized != sorted(set(normalized)):
+        raise AdapterRequestError(
+            f"{field} must be unique and sorted", INVALID_GRAPH_BINDING_CODE
+        )
+    return normalized
+
+
+def validate_claim_provenance_resource_ids(value: Any, field: str) -> list[str]:
+    if not isinstance(value, list) or not value:
+        raise AdapterRequestError(
+            f"{field} is required", INVALID_GRAPH_BINDING_CODE
+        )
+    normalized: list[str] = []
+    for index, resource_id in enumerate(value):
+        resource_id = required_authorization_token(resource_id, f"{field}[{index}]")
+        if not RESOURCE_ID_RE.fullmatch(resource_id):
+            raise AdapterRequestError(
+                f"{field}[{index}] must be an opaque res_ identifier",
+                INVALID_GRAPH_BINDING_CODE,
+            )
+        normalized.append(resource_id)
+    if normalized != sorted(set(normalized)):
+        raise AdapterRequestError(
+            f"{field} must be unique and sorted", INVALID_GRAPH_BINDING_CODE
+        )
+    return normalized
+
+
+def validate_claim_provenance_mapping(
+    graph_ids: list[str],
+    stable_ids: list[str],
+    resources: dict[str, dict[str, Any]],
+    source_resource_id: str,
+    field: str,
+) -> None:
+    graph_resource_ids: list[str] = []
+    for graph_object_id in graph_ids:
+        support = resources[graph_object_id]
+        if support["type"] not in {"document", "chunk"} or (
+            support["resource_id"] != source_resource_id
+            and support["authorization_resource_id"] != source_resource_id
+        ):
+            raise AdapterRequestError(
+                f"{field} is outside the source document",
+                INVALID_GRAPH_BINDING_CODE,
+            )
+        graph_resource_ids.append(support["resource_id"])
+    if sorted(graph_resource_ids) != stable_ids:
+        raise AdapterRequestError(
+            f"{field} stable identities do not match graph bindings",
+            INVALID_GRAPH_BINDING_CODE,
+        )
+
+
+def derived_v1_claim_support_key(
+    claim_resource_id: str, derivation: str, provenance_resource_ids: list[str]
+) -> str:
+    source_identity = (
+        f"v1:{claim_resource_id}:{derivation}:"
+        + ",".join(provenance_resource_ids)
+    )
+    return "sup_" + hashlib.sha256(source_identity.encode("utf-8")).hexdigest()[:32]
+
+
+def upgrade_v1_claim_supports(
+    claim_resource_id: str,
+    derivation: str,
+    provenance: list[str],
+    provenance_resource_ids: list[str],
+    resources: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if derivation == "all_required":
+        return [
+            {
+                "support_key": derived_v1_claim_support_key(
+                    claim_resource_id, derivation, provenance_resource_ids
+                ),
+                "provenance": list(provenance),
+                "provenance_resource_ids": list(provenance_resource_ids),
+            }
+        ]
+    supports = []
+    for graph_object_id in provenance:
+        resource_id = resources[graph_object_id]["resource_id"]
+        supports.append(
+            {
+                "support_key": derived_v1_claim_support_key(
+                    claim_resource_id, derivation, [resource_id]
+                ),
+                "provenance": [graph_object_id],
+                "provenance_resource_ids": [resource_id],
+            }
+        )
+    return sorted(supports, key=lambda support: support["support_key"])
 
 
 def validate_claim_binding_rows(
-    rows: list[dict[str, Any]], resources: dict[str, dict[str, Any]]
+    rows: list[dict[str, Any]],
+    resources: dict[str, dict[str, Any]],
+    contract_version: int,
 ) -> list[dict[str, Any]]:
     claims: list[dict[str, Any]] = []
     previous = ""
     for index, value in enumerate(rows):
         field = f"claim_bindings[{index}]"
-        validate_exact_fields(value, CLAIM_BINDING_FIELDS, field)
-        if value.get("version") != GRAPH_BINDING_CONTRACT_VERSION:
+        expected_fields = (
+            CLAIM_BINDING_V1_FIELDS
+            if contract_version == GRAPH_BINDING_CONTRACT_VERSION_V1
+            else CLAIM_BINDING_FIELDS
+        )
+        validate_exact_fields(value, expected_fields, field)
+        if value.get("version") != contract_version:
             raise AdapterRequestError(
-                f"{field}.version must be {GRAPH_BINDING_CONTRACT_VERSION}",
+                f"{field}.version does not match the selected contract",
                 INVALID_GRAPH_BINDING_CODE,
             )
         normalized: dict[str, Any] = {"version": GRAPH_BINDING_CONTRACT_VERSION}
@@ -1608,6 +1781,11 @@ def validate_claim_binding_rows(
                 f"{field}.predicate_key must be an opaque pred_ identifier",
                 INVALID_GRAPH_BINDING_CODE,
             )
+        if predicate_key not in SUPPORTED_CLAIM_PREDICATE_KEYS:
+            raise AdapterRequestError(
+                f"{field}.predicate_key is not declared by the active allowlist",
+                INVALID_GRAPH_BINDING_CODE,
+            )
         normalized["predicate_key"] = predicate_key
         derivation = required_authorization_token(
             value.get("derivation"), f"{field}.derivation"
@@ -1617,28 +1795,122 @@ def validate_claim_binding_rows(
                 f"{field}.derivation is unsupported", INVALID_GRAPH_BINDING_CODE
             )
         normalized["derivation"] = derivation
-        provenance = value.get("provenance")
-        if not isinstance(provenance, list) or not provenance:
+        if contract_version == GRAPH_BINDING_CONTRACT_VERSION_V1:
+            normalized["subject_resource_id"] = resources[normalized["subject"]][
+                "resource_id"
+            ]
+            normalized["object_resource_id"] = resources[normalized["object"]][
+                "resource_id"
+            ]
+            normalized["source_document_resource_id"] = resources[
+                normalized["source_document"]
+            ]["resource_id"]
+            normalized["source_version"] = resources[normalized["source_document"]][
+                "versions"
+            ]["source"]
+        else:
+            for name in (
+                "subject_resource_id",
+                "object_resource_id",
+                "source_document_resource_id",
+            ):
+                resource_id = required_authorization_token(
+                    value.get(name), f"{field}.{name}"
+                )
+                if not RESOURCE_ID_RE.fullmatch(resource_id):
+                    raise AdapterRequestError(
+                        f"{field}.{name} must be an opaque res_ identifier",
+                        INVALID_GRAPH_BINDING_CODE,
+                    )
+                normalized[name] = resource_id
+            normalized["source_version"] = required_authorization_token(
+                value.get("source_version"), f"{field}.source_version"
+            )
+        normalized_provenance = validate_claim_provenance_ids(
+            value.get("provenance"), resources, f"{field}.provenance"
+        )
+        normalized["provenance"] = normalized_provenance
+        if contract_version == GRAPH_BINDING_CONTRACT_VERSION_V1:
+            normalized_provenance_resource_ids = sorted(
+                resources[graph_object_id]["resource_id"]
+                for graph_object_id in normalized_provenance
+            )
+        else:
+            normalized_provenance_resource_ids = validate_claim_provenance_resource_ids(
+                value.get("provenance_resource_ids"),
+                f"{field}.provenance_resource_ids",
+            )
+        normalized["provenance_resource_ids"] = normalized_provenance_resource_ids
+        supports = value.get("supports")
+        if contract_version == GRAPH_BINDING_CONTRACT_VERSION_V1:
+            supports = upgrade_v1_claim_supports(
+                resources[normalized["claim"]]["resource_id"],
+                derivation,
+                normalized_provenance,
+                normalized_provenance_resource_ids,
+                resources,
+            )
+        if not isinstance(supports, list) or not supports:
             raise AdapterRequestError(
-                f"{field}.provenance is required", INVALID_GRAPH_BINDING_CODE
+                f"{field}.supports is required", INVALID_GRAPH_BINDING_CODE
             )
-        normalized_provenance: list[str] = []
-        for support_index, support_id in enumerate(provenance):
-            support_id = required_authorization_token(
-                support_id, f"{field}.provenance[{support_index}]"
-            )
-            if not GRAPH_OBJECT_ID_RE.fullmatch(support_id) or support_id not in resources:
+        normalized_supports: list[dict[str, Any]] = []
+        previous_support_key = ""
+        grouped_graph_ids: list[str] = []
+        grouped_resource_ids: list[str] = []
+        for support_index, support in enumerate(supports):
+            support_field = f"{field}.supports[{support_index}]"
+            if not isinstance(support, dict):
                 raise AdapterRequestError(
-                    f"{field}.provenance[{support_index}] is not graph-bound",
+                    f"{support_field} must be an object",
                     INVALID_GRAPH_BINDING_CODE,
                 )
-            normalized_provenance.append(support_id)
-        if normalized_provenance != sorted(set(normalized_provenance)):
+            validate_exact_fields(support, CLAIM_SUPPORT_FIELDS, support_field)
+            support_key = required_authorization_token(
+                support.get("support_key"), f"{support_field}.support_key"
+            )
+            if not CLAIM_SUPPORT_KEY_RE.fullmatch(support_key):
+                raise AdapterRequestError(
+                    f"{support_field}.support_key must be an opaque sup_ identifier",
+                    INVALID_GRAPH_BINDING_CODE,
+                )
+            if support_key <= previous_support_key:
+                raise AdapterRequestError(
+                    f"{field}.supports must be unique and sorted by support_key",
+                    INVALID_GRAPH_BINDING_CODE,
+                )
+            previous_support_key = support_key
+            support_provenance = validate_claim_provenance_ids(
+                support.get("provenance"),
+                resources,
+                f"{support_field}.provenance",
+            )
+            support_resource_ids = validate_claim_provenance_resource_ids(
+                support.get("provenance_resource_ids"),
+                f"{support_field}.provenance_resource_ids",
+            )
+            if len(support_provenance) != len(support_resource_ids):
+                raise AdapterRequestError(
+                    f"{support_field} graph and stable provenance counts differ",
+                    INVALID_GRAPH_BINDING_CODE,
+                )
+            normalized_supports.append(
+                {
+                    "support_key": support_key,
+                    "provenance": support_provenance,
+                    "provenance_resource_ids": support_resource_ids,
+                }
+            )
+            grouped_graph_ids.extend(support_provenance)
+            grouped_resource_ids.extend(support_resource_ids)
+        if sorted(set(grouped_graph_ids)) != normalized_provenance or sorted(
+            set(grouped_resource_ids)
+        ) != normalized_provenance_resource_ids:
             raise AdapterRequestError(
-                f"{field}.provenance must be unique and sorted",
+                f"{field}.supports does not match flattened provenance",
                 INVALID_GRAPH_BINDING_CODE,
             )
-        normalized["provenance"] = normalized_provenance
+        normalized["supports"] = normalized_supports
         if normalized["claim"] <= previous:
             raise AdapterRequestError(
                 "claim_bindings must be unique and sorted by claim",
@@ -1655,17 +1927,41 @@ def validate_claim_binding_rows(
             raise AdapterRequestError(f"{field} endpoints must reference entities", INVALID_GRAPH_BINDING_CODE)
         if source_resource["type"] != "document":
             raise AdapterRequestError(f"{field}.source_document must reference a document", INVALID_GRAPH_BINDING_CODE)
+        if subject_resource["resource_id"] != normalized["subject_resource_id"]:
+            raise AdapterRequestError(
+                f"{field}.subject_resource_id does not match its graph binding",
+                INVALID_GRAPH_BINDING_CODE,
+            )
+        if object_resource["resource_id"] != normalized["object_resource_id"]:
+            raise AdapterRequestError(
+                f"{field}.object_resource_id does not match its graph binding",
+                INVALID_GRAPH_BINDING_CODE,
+            )
+        if (
+            source_resource["resource_id"]
+            != normalized["source_document_resource_id"]
+            or source_resource["versions"]["source"] != normalized["source_version"]
+        ):
+            raise AdapterRequestError(
+                f"{field} source identity or version does not match its graph binding",
+                INVALID_GRAPH_BINDING_CODE,
+            )
         source_id = source_resource["resource_id"]
-        for support_id in normalized_provenance:
-            support = resources[support_id]
-            if support["type"] not in {"document", "chunk"} or (
-                support["resource_id"] != source_id
-                and support["authorization_resource_id"] != source_id
-            ):
-                raise AdapterRequestError(
-                    f"{field}.provenance is outside the source document",
-                    INVALID_GRAPH_BINDING_CODE,
-                )
+        validate_claim_provenance_mapping(
+            normalized_provenance,
+            normalized_provenance_resource_ids,
+            resources,
+            source_id,
+            f"{field}.provenance",
+        )
+        for support_index, support in enumerate(normalized_supports):
+            validate_claim_provenance_mapping(
+                support["provenance"],
+                support["provenance_resource_ids"],
+                resources,
+                source_id,
+                f"{field}.supports[{support_index}].provenance",
+            )
         claims.append(normalized)
     return claims
 
@@ -1676,12 +1972,13 @@ def load_current_graph_contract(
     try:
         return _load_current_graph_contract(params, authorization)
     except AdapterRequestError as exc:
-        if exc.code == INVALID_GRAPH_BINDING_CODE:
-            raise
-        raise AdapterRequestError(str(exc), INVALID_GRAPH_BINDING_CODE) from exc
+        raise AdapterRequestError(
+            "selected graph binding contract is invalid",
+            INVALID_GRAPH_BINDING_CODE,
+        ) from exc
     except Exception as exc:
         raise AdapterRequestError(
-            f"invalid selected graph binding contract: {exc}",
+            "selected graph binding contract is invalid",
             INVALID_GRAPH_BINDING_CODE,
         ) from exc
 
@@ -1730,7 +2027,8 @@ def _load_current_graph_contract(
         manifest.get("version") != 2
         or manifest.get("projection_id") != projection_id
         or manifest.get("projection_version") != projection_id
-        or manifest.get("graph_binding_contract_version") != GRAPH_BINDING_CONTRACT_VERSION
+        or manifest.get("graph_binding_contract_version")
+        not in SUPPORTED_GRAPH_BINDING_CONTRACT_VERSIONS
     ):
         raise AdapterRequestError("artifact bundle has no supported graph binding contract", INVALID_GRAPH_BINDING_CODE)
     required_authorization_token(manifest.get("namespace"), "artifact bundle manifest.namespace")
@@ -1817,7 +2115,9 @@ def _load_current_graph_contract(
     claim_rows = verified_jsonl_rows(
         bundle_dir, descriptors[CLAIM_BINDINGS_ARTIFACT], CLAIM_BINDINGS_ARTIFACT
     )
-    claims = validate_claim_binding_rows(claim_rows, resources)
+    claims = validate_claim_binding_rows(
+        claim_rows, resources, manifest["graph_binding_contract_version"]
+    )
     return resources, claims
 
 

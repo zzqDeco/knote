@@ -52,11 +52,33 @@ func ProjectionGraphBindings(
 		}
 		record := resource.ClaimRecord
 		provenanceResourceIDs := make([]protocol.ResourceID, 0)
+		supports := make([]protocol.ClaimSupportBinding, 0, len(record.Provenance.Supports))
 		for _, support := range record.Provenance.Supports {
+			supportKey, err := protocol.NewClaimSupportKey(support.SupportID)
+			if err != nil {
+				return nil, nil, ErrInvalidClaimRecord
+			}
+			supportResourceIDs := make([]protocol.ResourceID, 0, len(support.Evidence))
 			for _, evidence := range support.Evidence {
 				provenanceResourceIDs = append(provenanceResourceIDs, evidence.ResourceID)
+				supportResourceIDs = append(supportResourceIDs, evidence.ResourceID)
 			}
+			supportResourceIDs = canonicalResourceIDs(supportResourceIDs)
+			supportProvenance := make([]protocol.GraphObjectID, 0, len(supportResourceIDs))
+			for _, resourceID := range supportResourceIDs {
+				graphObjectID, ok := byResourceID[resourceID]
+				if !ok {
+					return nil, nil, ErrInvalidClaimRecord
+				}
+				supportProvenance = append(supportProvenance, graphObjectID)
+			}
+			sort.Slice(supportProvenance, func(i, j int) bool { return supportProvenance[i] < supportProvenance[j] })
+			supports = append(supports, protocol.ClaimSupportBinding{
+				SupportKey: supportKey, Provenance: supportProvenance,
+				ProvenanceResourceIDs: supportResourceIDs,
+			})
 		}
+		sort.Slice(supports, func(i, j int) bool { return supports[i].SupportKey < supports[j].SupportKey })
 		provenanceResourceIDs = canonicalResourceIDs(provenanceResourceIDs)
 		provenance := make([]protocol.GraphObjectID, 0, len(provenanceResourceIDs))
 		for _, resourceID := range provenanceResourceIDs {
@@ -77,6 +99,7 @@ func ProjectionGraphBindings(
 			SourceDocumentResourceID: record.SourceDocument.ResourceID,
 			SourceVersion:            record.SourceDocument.SourceVersion,
 			ProvenanceResourceIDs:    provenanceResourceIDs,
+			Supports:                 supports,
 		}
 		claims = append(claims, binding)
 	}
