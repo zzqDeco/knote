@@ -22,6 +22,7 @@ import sys
 import tempfile
 import time
 from copy import deepcopy
+from functools import cmp_to_key
 from ipaddress import ip_address
 from contextlib import contextmanager, redirect_stdout
 from io import StringIO
@@ -66,7 +67,9 @@ BUILD_SUMMARY_RE = re.compile(
 CONFIG_TEMPLATE_RE = re.compile(
     r"\{\{\s*(?P<name>[A-Za-z_][A-Za-z0-9_]*)(?:\s*\|\s*default\(\s*(?P<default>[^)]*)\s*\))?\s*\}\}"
 )
-PRIMITIVE_METHODS = frozenset({"kag.retrieve", "kag.expand", "kag.generate"})
+PRIMITIVE_METHODS = frozenset(
+    {"kag.discover", "kag.retrieve", "kag.expand", "kag.generate"}
+)
 UNSUPPORTED_PRIMITIVE_CODE = "unsupported_primitive"
 INVALID_REQUEST_CODE = "invalid_request"
 INVALID_GRAPH_BINDING_CODE = "invalid_graph_binding"
@@ -94,6 +97,15 @@ RESOURCE_FIELDS = frozenset(
 )
 RESOURCE_VERSION_FIELDS = frozenset({"source", "content", "acl", "index", "graph", "projection"})
 EVIDENCE_FIELDS = frozenset({"resource", "content", "citation_handle"})
+GENERATE_PATH_FIELDS = frozenset({"resources", "claim_bindings"})
+GENERATE_PATH_CLAIM_BINDING_FIELDS = frozenset(
+    {
+        "parent_resource_id",
+        "claim_resource_id",
+        "object_resource_id",
+        "predicate_key",
+    }
+)
 AUTHORIZATION_REQUIRED_FIELDS = frozenset(
     {
         "version",
@@ -206,6 +218,94 @@ MAX_ARTIFACT_BUNDLE_MANIFEST_BYTES = 4 << 20
 MAX_PRIMITIVE_TEXT_BYTES = 1 << 20
 MAX_PROVIDER_RESPONSE_BYTES = 2 << 20
 PROVIDER_RUNNER_TIMEOUT_SECONDS = 30
+MAX_PRIMITIVE_ITEMS = 100
+
+PRIMITIVE_TRANSPORT_FIELDS = frozenset(
+    {
+        "workspace",
+        "host",
+        "config_path",
+        "project_id",
+        "namespace",
+        "language",
+        "runtime_dir",
+    }
+)
+GRAPH_OPERATION_FIELDS = frozenset({"version", "template", "parameters"})
+TRAVERSAL_PLAN_REQUIRED_FIELDS = frozenset(
+    {
+        "version",
+        "predicate_allowlist_version",
+        "resource_kind_allowlist_version",
+        "projection_version",
+        "identity_version",
+        "start_resource_ids",
+        "predicate_keys",
+        "resource_kinds",
+        "direction",
+        "fields",
+        "order",
+        "limits",
+    }
+)
+TRAVERSAL_PLAN_OPTIONAL_FIELDS = frozenset({"filters"})
+TRAVERSAL_LIMIT_FIELDS = frozenset(
+    {
+        "max_depth",
+        "max_frontier_width",
+        "max_candidates_per_hop",
+        "max_total_resources",
+        "max_batch_checks",
+        "max_wall_clock_millis",
+    }
+)
+GRAPH_FILTER_RESOURCE_KINDS = frozenset(
+    {
+        "claim_id_in",
+        "object_id_in",
+        "source_document_id_in",
+        "subject_id_in",
+    }
+)
+GRAPH_FILTER_KINDS = GRAPH_FILTER_RESOURCE_KINDS | frozenset({"derivation_in"})
+GRAPH_ORDER_KEYS = frozenset(
+    {"claim_id", "object_id", "predicate_key", "source_document_id", "subject_id"}
+)
+GRAPH_ORDER_DIRECTIONS = frozenset({"ascending", "descending"})
+GRAPH_FIELDS = frozenset(
+    {
+        "claim_id",
+        "derivation_mode",
+        "object_id",
+        "predicate_key",
+        "provenance_ids",
+        "resource_kind",
+        "source_document_id",
+        "source_version",
+        "subject_id",
+    }
+)
+REQUIRED_GRAPH_FIELDS = frozenset(
+    {
+        "claim_id",
+        "derivation_mode",
+        "object_id",
+        "predicate_key",
+        "provenance_ids",
+        "source_document_id",
+        "source_version",
+        "subject_id",
+    }
+)
+GRAPH_RESOURCE_KINDS = frozenset(
+    {"chunk", "claim", "derived_artifact", "document", "entity"}
+)
+PROVIDER_GRAPH_RESOURCE_KINDS = frozenset({"claim", "entity"})
+EXPAND_PHASES = frozenset({"entity_to_claim", "claim_to_object"})
+GRAPH_OPERATION_TEMPLATE = "claim_traversal_v1"
+GRAPH_QUERY_CONTRACT_VERSION = 1
+CLAIM_PREDICATE_ALLOWLIST_VERSION = 1
+GRAPH_RESOURCE_KIND_ALLOWLIST_VERSION = 1
 
 FAKE_INTRO_ID = "res_00000000000000000000000000000001"
 FAKE_DENIED_CANARY_ID = "res_00000000000000000000000000000002"
@@ -215,6 +315,8 @@ FAKE_DENIED_FRONTIER_ID = "res_00000000000000000000000000000005"
 FAKE_DENIED_CANARY_DETAIL_ID = "res_00000000000000000000000000000006"
 FAKE_DENIED_NEXT_HOP_ID = "res_00000000000000000000000000000007"
 FAKE_RUNTIME_ID = "res_00000000000000000000000000000008"
+FAKE_PROJECTION_VERSION = "prj_ffffffffffffffffffffffffffffffff"
+FAKE_PREDICATE_KEY = "pred_a3b0b7f1948c58d586d3af99fee4704e"
 FAKE_CONTENT_BY_ID = {
     FAKE_INTRO_ID: "knote is local-first.",
     FAKE_DENIED_CANARY_ID: "DENIED CANARY BODY must never cross the authorization boundary",
@@ -241,37 +343,54 @@ def fake_resource(resource_id: str, resource_type: str) -> dict[str, Any]:
             "source": "source_fake_v1",
             "content": "content_fake_v1",
             "acl": "acl_fake_v1",
-            "index": "index_fake_v1",
-            "graph": "graph_fake_v1",
-            "projection": "projection_fake_v1",
+            "index": "index_" + FAKE_PROJECTION_VERSION,
+            "graph": "graph_" + FAKE_PROJECTION_VERSION,
+            "projection": FAKE_PROJECTION_VERSION,
         },
         "serving_state": "serving",
     }
 
 
 FAKE_CANDIDATES = (
-    {"resource": fake_resource(FAKE_INTRO_ID, "document"), "score": 0.99},
-    {"resource": fake_resource(FAKE_DENIED_CANARY_ID, "document"), "score": 0.98},
+    {"resource": fake_resource(FAKE_INTRO_ID, "entity"), "score": 0.99},
+    {"resource": fake_resource(FAKE_DENIED_CANARY_ID, "entity"), "score": 0.98},
     {"resource": fake_resource(FAKE_OVERVIEW_ID, "document"), "score": 0.90},
     {"resource": fake_resource(FAKE_LOCAL_FIRST_ID, "claim"), "score": 0.96},
     {"resource": fake_resource(FAKE_DENIED_FRONTIER_ID, "claim"), "score": 0.95},
     {"resource": fake_resource(FAKE_DENIED_CANARY_DETAIL_ID, "claim"), "score": 0.94},
-    {"resource": fake_resource(FAKE_DENIED_NEXT_HOP_ID, "document"), "score": 0.93},
-    {"resource": fake_resource(FAKE_RUNTIME_ID, "document"), "score": 0.91},
+    {"resource": fake_resource(FAKE_DENIED_NEXT_HOP_ID, "entity"), "score": 0.93},
+    {"resource": fake_resource(FAKE_RUNTIME_ID, "entity"), "score": 0.91},
 )
 FAKE_CANDIDATES_BY_ID = {
     candidate["resource"]["resource_id"]: candidate for candidate in FAKE_CANDIDATES
 }
 FAKE_RETRIEVE_IDS = (FAKE_INTRO_ID, FAKE_DENIED_CANARY_ID, FAKE_OVERVIEW_ID)
-FAKE_EXPANSIONS = {
-    FAKE_INTRO_ID: (
-        (FAKE_LOCAL_FIRST_ID, 1),
-        (FAKE_DENIED_FRONTIER_ID, 1),
-    ),
-    FAKE_DENIED_CANARY_ID: ((FAKE_DENIED_CANARY_DETAIL_ID, 1),),
-    FAKE_LOCAL_FIRST_ID: ((FAKE_RUNTIME_ID, 2),),
-    FAKE_DENIED_FRONTIER_ID: ((FAKE_DENIED_NEXT_HOP_ID, 2),),
-}
+FAKE_CLAIMS = (
+    {
+        "subject_resource_id": FAKE_INTRO_ID,
+        "claim_resource_id": FAKE_LOCAL_FIRST_ID,
+        "predicate_key": FAKE_PREDICATE_KEY,
+        "object_resource_id": FAKE_RUNTIME_ID,
+        "source_document_resource_id": FAKE_OVERVIEW_ID,
+        "derivation": "any_support",
+    },
+    {
+        "subject_resource_id": FAKE_INTRO_ID,
+        "claim_resource_id": FAKE_DENIED_FRONTIER_ID,
+        "predicate_key": FAKE_PREDICATE_KEY,
+        "object_resource_id": FAKE_DENIED_NEXT_HOP_ID,
+        "source_document_resource_id": FAKE_OVERVIEW_ID,
+        "derivation": "all_required",
+    },
+    {
+        "subject_resource_id": FAKE_DENIED_CANARY_ID,
+        "claim_resource_id": FAKE_DENIED_CANARY_DETAIL_ID,
+        "predicate_key": FAKE_PREDICATE_KEY,
+        "object_resource_id": FAKE_DENIED_NEXT_HOP_ID,
+        "source_document_resource_id": FAKE_OVERVIEW_ID,
+        "derivation": "any_support",
+    },
+)
 
 
 class AdapterRequestError(RuntimeError):
@@ -1314,6 +1433,334 @@ def validate_exact_fields(value: dict[str, Any], expected: frozenset[str], field
     raise AdapterRequestError(f"{field} has invalid fields ({'; '.join(details)})")
 
 
+def validate_allowed_fields(
+    value: dict[str, Any],
+    required: frozenset[str],
+    optional: frozenset[str],
+    field: str,
+) -> None:
+    actual = set(value)
+    missing = sorted(required - actual)
+    unexpected = sorted(actual - required - optional)
+    if not missing and not unexpected:
+        return
+    details: list[str] = []
+    if missing:
+        details.append("missing " + ", ".join(missing))
+    if unexpected:
+        details.append("unexpected " + ", ".join(unexpected))
+    raise AdapterRequestError(f"{field} has invalid fields ({'; '.join(details)})")
+
+
+def required_integer(value: Any, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise AdapterRequestError(f"{field} must be an integer")
+    return value
+
+
+def full_expansion_scan_limit(params: dict[str, Any]) -> int:
+    value = required_integer(params.get("limit"), "limit")
+    if value != MAX_PRIMITIVE_ITEMS:
+        raise AdapterRequestError(
+            f"limit must equal the full expansion scan limit of {MAX_PRIMITIVE_ITEMS}"
+        )
+    return value
+
+
+def full_discovery_scan_limit(params: dict[str, Any]) -> int:
+    value = required_integer(params.get("limit"), "limit")
+    if value != MAX_PRIMITIVE_ITEMS:
+        raise AdapterRequestError(
+            f"limit must equal the full discovery scan limit of {MAX_PRIMITIVE_ITEMS}"
+        )
+    return value
+
+
+def validate_sorted_unique_strings(
+    value: Any,
+    field: str,
+    *,
+    minimum: int,
+    maximum: int,
+) -> list[str]:
+    if not isinstance(value, list) or not minimum <= len(value) <= maximum:
+        raise AdapterRequestError(
+            f"{field} must contain between {minimum} and {maximum} values"
+        )
+    normalized = [
+        required_authorization_token(item, f"{field}[{index}]")
+        for index, item in enumerate(value)
+    ]
+    if normalized != sorted(set(normalized)):
+        raise AdapterRequestError(f"{field} must be unique and sorted")
+    return normalized
+
+
+def validate_graph_filter(value: Any, field: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise AdapterRequestError(f"{field} must be an object")
+    kind = required_authorization_token(value.get("kind"), f"{field}.kind")
+    if kind in GRAPH_FILTER_RESOURCE_KINDS:
+        validate_exact_fields(value, frozenset({"kind", "resource_ids"}), field)
+        resource_ids = validate_sorted_unique_strings(
+            value.get("resource_ids"),
+            f"{field}.resource_ids",
+            minimum=1,
+            maximum=256,
+        )
+        for index, resource_id in enumerate(resource_ids):
+            if not RESOURCE_ID_RE.fullmatch(resource_id):
+                raise AdapterRequestError(
+                    f"{field}.resource_ids[{index}] must be an opaque res_ identifier"
+                )
+        return {"kind": kind, "resource_ids": resource_ids}
+    if kind == "derivation_in":
+        validate_exact_fields(value, frozenset({"kind", "derivations"}), field)
+        derivations = validate_sorted_unique_strings(
+            value.get("derivations"),
+            f"{field}.derivations",
+            minimum=1,
+            maximum=2,
+        )
+        if any(
+            derivation not in {"all_required", "any_support"}
+            for derivation in derivations
+        ):
+            raise AdapterRequestError(f"{field}.derivations is unsupported")
+        return {"kind": kind, "derivations": derivations}
+    raise AdapterRequestError(f"{field}.kind is unsupported")
+
+
+def validate_graph_order(value: Any, field: str, priority: int) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise AdapterRequestError(f"{field} must be an object")
+    validate_exact_fields(value, frozenset({"key", "direction", "priority"}), field)
+    key = required_authorization_token(value.get("key"), f"{field}.key")
+    direction = required_authorization_token(
+        value.get("direction"), f"{field}.direction"
+    )
+    actual_priority = required_integer(value.get("priority"), f"{field}.priority")
+    if key not in GRAPH_ORDER_KEYS:
+        raise AdapterRequestError(f"{field}.key is unsupported")
+    if direction not in GRAPH_ORDER_DIRECTIONS:
+        raise AdapterRequestError(f"{field}.direction is unsupported")
+    if actual_priority != priority:
+        raise AdapterRequestError("operation.parameters.order priorities are not normalized")
+    return {"key": key, "direction": direction, "priority": actual_priority}
+
+
+def validate_traversal_limits(value: Any, start_count: int) -> dict[str, int]:
+    field = "operation.parameters.limits"
+    if not isinstance(value, dict):
+        raise AdapterRequestError(f"{field} must be an object")
+    validate_exact_fields(value, TRAVERSAL_LIMIT_FIELDS, field)
+    limits = {
+        name: required_integer(value.get(name), f"{field}.{name}")
+        for name in sorted(TRAVERSAL_LIMIT_FIELDS)
+    }
+    if not 1 <= limits["max_depth"] <= 8:
+        raise AdapterRequestError(f"{field}.max_depth is unsupported for expansion")
+    if not 1 <= limits["max_frontier_width"] <= 256:
+        raise AdapterRequestError(f"{field}.max_frontier_width is invalid")
+    if not 1 <= limits["max_candidates_per_hop"] <= 512:
+        raise AdapterRequestError(f"{field}.max_candidates_per_hop is invalid")
+    if limits["max_frontier_width"] > MAX_PRIMITIVE_ITEMS:
+        raise AdapterRequestError(f"{field}.max_frontier_width exceeds provider limit")
+    if limits["max_candidates_per_hop"] > MAX_PRIMITIVE_ITEMS:
+        raise AdapterRequestError(
+            f"{field}.max_candidates_per_hop exceeds provider limit"
+        )
+    if not start_count <= limits["max_total_resources"] <= 2048:
+        raise AdapterRequestError(f"{field}.max_total_resources is invalid")
+    if not 1 <= limits["max_batch_checks"] <= 128:
+        raise AdapterRequestError(f"{field}.max_batch_checks is invalid")
+    if not 1 <= limits["max_wall_clock_millis"] <= 30_000:
+        raise AdapterRequestError(f"{field}.max_wall_clock_millis is invalid")
+    return limits
+
+
+def validate_graph_operation(
+    value: Any,
+    *,
+    expected_projection: str | None = None,
+    expected_identity_version: int | None = None,
+) -> dict[str, Any]:
+    field = "operation"
+    if not isinstance(value, dict):
+        raise AdapterRequestError(f"{field} must be an object")
+    validate_exact_fields(value, GRAPH_OPERATION_FIELDS, field)
+    if required_integer(value.get("version"), f"{field}.version") != GRAPH_QUERY_CONTRACT_VERSION:
+        raise AdapterRequestError(f"{field}.version is unsupported")
+    template = required_authorization_token(value.get("template"), f"{field}.template")
+    if template != GRAPH_OPERATION_TEMPLATE:
+        raise AdapterRequestError(f"{field}.template is unsupported")
+    plan = value.get("parameters")
+    if not isinstance(plan, dict):
+        raise AdapterRequestError(f"{field}.parameters must be an object")
+    validate_allowed_fields(
+        plan,
+        TRAVERSAL_PLAN_REQUIRED_FIELDS,
+        TRAVERSAL_PLAN_OPTIONAL_FIELDS,
+        f"{field}.parameters",
+    )
+    if required_integer(plan.get("version"), f"{field}.parameters.version") != GRAPH_QUERY_CONTRACT_VERSION:
+        raise AdapterRequestError(f"{field}.parameters.version is unsupported")
+    if (
+        required_integer(
+            plan.get("predicate_allowlist_version"),
+            f"{field}.parameters.predicate_allowlist_version",
+        )
+        != CLAIM_PREDICATE_ALLOWLIST_VERSION
+    ):
+        raise AdapterRequestError(
+            f"{field}.parameters.predicate_allowlist_version is unsupported"
+        )
+    if (
+        required_integer(
+            plan.get("resource_kind_allowlist_version"),
+            f"{field}.parameters.resource_kind_allowlist_version",
+        )
+        != GRAPH_RESOURCE_KIND_ALLOWLIST_VERSION
+    ):
+        raise AdapterRequestError(
+            f"{field}.parameters.resource_kind_allowlist_version is unsupported"
+        )
+    projection_version = required_authorization_token(
+        plan.get("projection_version"), f"{field}.parameters.projection_version"
+    )
+    if not PROJECTION_ID_RE.fullmatch(projection_version):
+        raise AdapterRequestError(f"{field}.parameters.projection_version is invalid")
+    if expected_projection is not None and projection_version != expected_projection:
+        raise AdapterRequestError(
+            f"{field}.parameters.projection_version does not match the selected projection"
+        )
+    identity_version = required_integer(
+        plan.get("identity_version"), f"{field}.parameters.identity_version"
+    )
+    if identity_version != GRAPH_BINDING_CONTRACT_VERSION:
+        raise AdapterRequestError(f"{field}.parameters.identity_version is unsupported")
+    if (
+        expected_identity_version is not None
+        and identity_version != expected_identity_version
+    ):
+        raise AdapterRequestError(
+            f"{field}.parameters.identity_version does not match the selected identity contract"
+        )
+    start_resource_ids = validate_sorted_unique_strings(
+        plan.get("start_resource_ids"),
+        f"{field}.parameters.start_resource_ids",
+        minimum=1,
+        maximum=64,
+    )
+    for index, resource_id in enumerate(start_resource_ids):
+        if not RESOURCE_ID_RE.fullmatch(resource_id):
+            raise AdapterRequestError(
+                f"{field}.parameters.start_resource_ids[{index}] must be an opaque res_ identifier"
+            )
+    predicate_keys = validate_sorted_unique_strings(
+        plan.get("predicate_keys"),
+        f"{field}.parameters.predicate_keys",
+        minimum=1,
+        maximum=len(SUPPORTED_CLAIM_PREDICATE_KEYS),
+    )
+    for index, predicate_key in enumerate(predicate_keys):
+        if (
+            not CLAIM_PREDICATE_KEY_RE.fullmatch(predicate_key)
+            or predicate_key not in SUPPORTED_CLAIM_PREDICATE_KEYS
+        ):
+            raise AdapterRequestError(
+                f"{field}.parameters.predicate_keys[{index}] is not declared by the active allowlist"
+            )
+    resource_kinds = validate_sorted_unique_strings(
+        plan.get("resource_kinds"),
+        f"{field}.parameters.resource_kinds",
+        minimum=1,
+        maximum=len(GRAPH_RESOURCE_KINDS),
+    )
+    if any(kind not in GRAPH_RESOURCE_KINDS for kind in resource_kinds):
+        raise AdapterRequestError(f"{field}.parameters.resource_kinds is unsupported")
+    if any(kind not in PROVIDER_GRAPH_RESOURCE_KINDS for kind in resource_kinds):
+        raise AdapterRequestError(
+            f"{field}.parameters.resource_kinds is unsupported by the provider"
+        )
+    direction = required_authorization_token(
+        plan.get("direction"), f"{field}.parameters.direction"
+    )
+    if direction != "outbound":
+        raise AdapterRequestError(f"{field}.parameters.direction is unsupported")
+    fields = validate_sorted_unique_strings(
+        plan.get("fields"),
+        f"{field}.parameters.fields",
+        minimum=1,
+        maximum=len(GRAPH_FIELDS),
+    )
+    if any(item not in GRAPH_FIELDS for item in fields) or not REQUIRED_GRAPH_FIELDS.issubset(fields):
+        raise AdapterRequestError(f"{field}.parameters.fields is unsupported")
+    filter_values = plan.get("filters", [])
+    if not isinstance(filter_values, list) or len(filter_values) > 5:
+        raise AdapterRequestError(f"{field}.parameters.filters is invalid")
+    filters = [
+        validate_graph_filter(item, f"{field}.parameters.filters[{index}]")
+        for index, item in enumerate(filter_values)
+    ]
+    filter_kinds = [item["kind"] for item in filters]
+    if filter_kinds != sorted(set(filter_kinds)):
+        raise AdapterRequestError(f"{field}.parameters.filters must be unique and sorted")
+    order_values = plan.get("order")
+    if not isinstance(order_values, list) or not 1 <= len(order_values) <= 5:
+        raise AdapterRequestError(f"{field}.parameters.order is invalid")
+    order = [
+        validate_graph_order(item, f"{field}.parameters.order[{index}]", index)
+        for index, item in enumerate(order_values)
+    ]
+    order_keys = [item["key"] for item in order]
+    if len(order_keys) != len(set(order_keys)) or "claim_id" not in order_keys:
+        raise AdapterRequestError(f"{field}.parameters.order is not normalized")
+    limits = validate_traversal_limits(plan.get("limits"), len(start_resource_ids))
+    return {
+        "version": GRAPH_QUERY_CONTRACT_VERSION,
+        "template": template,
+        "parameters": {
+            "version": GRAPH_QUERY_CONTRACT_VERSION,
+            "predicate_allowlist_version": CLAIM_PREDICATE_ALLOWLIST_VERSION,
+            "resource_kind_allowlist_version": GRAPH_RESOURCE_KIND_ALLOWLIST_VERSION,
+            "projection_version": projection_version,
+            "identity_version": identity_version,
+            "start_resource_ids": start_resource_ids,
+            "predicate_keys": predicate_keys,
+            "resource_kinds": resource_kinds,
+            "direction": direction,
+            "fields": fields,
+            "filters": filters,
+            "order": order,
+            "limits": limits,
+        },
+    }
+
+
+def validate_expand_contract(
+    params: dict[str, Any],
+    *,
+    expected_projection: str | None = None,
+    expected_identity_version: int | None = None,
+) -> tuple[dict[str, Any], str]:
+    validate_allowed_fields(
+        params,
+        frozenset({"authorization", "operation", "phase", "frontier", "limit"}),
+        PRIMITIVE_TRANSPORT_FIELDS,
+        "expand params",
+    )
+    operation = validate_graph_operation(
+        params.get("operation"),
+        expected_projection=expected_projection,
+        expected_identity_version=expected_identity_version,
+    )
+    phase = required_authorization_token(params.get("phase"), "phase")
+    if phase not in EXPAND_PHASES:
+        raise AdapterRequestError("phase is unsupported")
+    return operation, phase
+
+
 def validate_authorization(value: Any) -> dict[str, Any]:
     field = "authorization"
     if not isinstance(value, dict):
@@ -1368,16 +1815,22 @@ def validate_resource(value: Any, field: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise AdapterRequestError(f"{field} must be an object")
     validate_exact_fields(value, RESOURCE_FIELDS, field)
-    resource_id = required_string(value.get("resource_id"), f"{field}.resource_id")
+    resource_id = required_authorization_token(
+        value.get("resource_id"), f"{field}.resource_id"
+    )
     if not RESOURCE_ID_RE.fullmatch(resource_id):
         raise AdapterRequestError(f"{field}.resource_id must be an opaque res_ identifier")
-    resource_type = required_string(value.get("type"), f"{field}.type")
+    resource_type = required_authorization_token(value.get("type"), f"{field}.type")
     if resource_type not in RESOURCE_TYPES:
         raise AdapterRequestError(f"{field}.type is unsupported")
-    tenant_id = required_string(value.get("tenant_id"), f"{field}.tenant_id")
-    knowledge_base_id = required_string(value.get("knowledge_base_id"), f"{field}.knowledge_base_id")
-    authz_object = required_string(value.get("authz_object"), f"{field}.authz_object")
-    authorization_resource_id = required_string(
+    tenant_id = required_authorization_token(value.get("tenant_id"), f"{field}.tenant_id")
+    knowledge_base_id = required_authorization_token(
+        value.get("knowledge_base_id"), f"{field}.knowledge_base_id"
+    )
+    authz_object = required_authorization_token(
+        value.get("authz_object"), f"{field}.authz_object"
+    )
+    authorization_resource_id = required_authorization_token(
         value.get("authorization_resource_id"), f"{field}.authorization_resource_id"
     )
     if not RESOURCE_ID_RE.fullmatch(authorization_resource_id):
@@ -1388,7 +1841,9 @@ def validate_resource(value: Any, field: str) -> dict[str, Any]:
         raise AdapterRequestError(
             f"{field}.authorization_resource_id must match non-chunk resource_id"
         )
-    content_digest = required_string(value.get("content_digest"), f"{field}.content_digest")
+    content_digest = required_authorization_token(
+        value.get("content_digest"), f"{field}.content_digest"
+    )
     if not CONTENT_DIGEST_RE.fullmatch(content_digest):
         raise AdapterRequestError(f"{field}.content_digest must be a sha256 digest")
     versions = value.get("versions")
@@ -1396,10 +1851,14 @@ def validate_resource(value: Any, field: str) -> dict[str, Any]:
         raise AdapterRequestError(f"{field}.versions must be an object")
     validate_exact_fields(versions, RESOURCE_VERSION_FIELDS, f"{field}.versions")
     normalized_versions = {
-        name: required_string(versions.get(name), f"{field}.versions.{name}")
+        name: required_authorization_token(
+            versions.get(name), f"{field}.versions.{name}"
+        )
         for name in sorted(RESOURCE_VERSION_FIELDS)
     }
-    serving_state = required_string(value.get("serving_state"), f"{field}.serving_state")
+    serving_state = required_authorization_token(
+        value.get("serving_state"), f"{field}.serving_state"
+    )
     if serving_state != "serving":
         raise AdapterRequestError(f"{field}.serving_state must be serving")
     return {
@@ -1973,7 +2432,7 @@ def validate_claim_binding_rows(
 
 def load_current_graph_contract(
     params: dict[str, Any], authorization: dict[str, Any]
-) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]], int]:
     try:
         return _load_current_graph_contract(params, authorization)
     except AdapterRequestError as exc:
@@ -1990,7 +2449,7 @@ def load_current_graph_contract(
 
 def _load_current_graph_contract(
     params: dict[str, Any], authorization: dict[str, Any]
-) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]], int]:
     workspace = workspace_path(params)
     artifacts_dir = workspace / "artifacts"
     bundles_dir = artifacts_dir / "bundles"
@@ -2123,7 +2582,7 @@ def _load_current_graph_contract(
     claims = validate_claim_binding_rows(
         claim_rows, resources, manifest["graph_binding_contract_version"]
     )
-    return resources, claims
+    return resources, claims, manifest["graph_binding_contract_version"]
 
 
 def bounded_primitive_text(value: Any, field: str) -> str:
@@ -2165,8 +2624,9 @@ def permissioned_provider_context(
     params: dict[str, Any],
     authorization: dict[str, Any],
     projection_version: str,
+    allowed_graph_object_ids: list[str] | None = None,
 ) -> dict[str, Any]:
-    return {
+    context = {
         "version": 1,
         "workspace": str(workspace_path(params).resolve()),
         "tenant_id": authorization["tenant_id"],
@@ -2178,6 +2638,9 @@ def permissioned_provider_context(
         "namespace": str(params.get("namespace") or "").strip(),
         "language": str(params.get("language") or "").strip(),
     }
+    if allowed_graph_object_ids is not None:
+        context["allowed_graph_object_ids"] = list(allowed_graph_object_ids)
+    return context
 
 
 def write_all(fd: int, payload: bytes) -> None:
@@ -2778,14 +3241,104 @@ def call_permissioned_provider(
     return response
 
 
-def validate_real_retrieve_request(
+def validate_discover_request(
     params: dict[str, Any], authorization: dict[str, Any]
-) -> tuple[str, int]:
+) -> tuple[list[str], int]:
+    validate_allowed_fields(
+        params,
+        frozenset({"authorization", "resource_types", "limit"}),
+        PRIMITIVE_TRANSPORT_FIELDS,
+        "discover params",
+    )
+    resource_types = validate_sorted_unique_strings(
+        params.get("resource_types"),
+        "resource_types",
+        minimum=1,
+        maximum=len(RESOURCE_TYPES),
+    )
+    for index, resource_type in enumerate(resource_types):
+        if resource_type not in RESOURCE_TYPES:
+            raise AdapterRequestError(f"resource_types[{index}] is unsupported")
+    return resource_types, full_discovery_scan_limit(params)
+
+
+def discover_resources(
+    params: dict[str, Any],
+    authorization: dict[str, Any],
+    resources: dict[str, dict[str, Any]],
+    mode: str,
+) -> dict[str, Any]:
+    resource_types, limit = validate_discover_request(params, authorization)
+    selected = sorted(
+        (
+            deepcopy(resource)
+            for resource in resources.values()
+            if resource["type"] in resource_types
+        ),
+        key=lambda resource: resource["resource_id"],
+    )
+    for index, resource in enumerate(selected):
+        require_authorization_scope(resource, authorization, f"resources[{index}]")
+    complete = len(selected) <= limit
+    selected = selected[:limit]
+    return add_test_stage_spy(
+        {"mode": mode, "resources": selected, "complete": complete},
+        [("discover.output", [resource["resource_id"] for resource in selected])],
+    )
+
+
+def validate_retrieve_request(
+    params: dict[str, Any],
+    authorization: dict[str, Any],
+    *,
+    require_resource: Any,
+) -> tuple[str, int, list[tuple[dict[str, Any], Any]]]:
+    validate_allowed_fields(
+        params,
+        frozenset({"authorization", "query", "allowed_resources", "limit"}),
+        PRIMITIVE_TRANSPORT_FIELDS,
+        "retrieve params",
+    )
     query = bounded_primitive_text(params.get("query"), "query").strip()
     limit = primitive_limit(params, 10)
     if not query:
         raise AdapterRequestError("query must be a non-empty string")
-    return query, limit
+    values = params.get("allowed_resources")
+    if not isinstance(values, list) or not 1 <= len(values) <= MAX_PRIMITIVE_ITEMS:
+        raise AdapterRequestError(
+            f"allowed_resources must contain between 1 and {MAX_PRIMITIVE_ITEMS} handles"
+        )
+    allowed: list[tuple[dict[str, Any], Any]] = []
+    projection = ""
+    previous_resource_id = ""
+    for index, value in enumerate(values):
+        field = f"allowed_resources[{index}]"
+        resource = validate_resource(value, field)
+        require_authorization_scope(resource, authorization, field)
+        binding = require_resource(resource, field)
+        resource_id = resource["resource_id"]
+        if previous_resource_id and resource_id <= previous_resource_id:
+            raise AdapterRequestError(
+                "allowed_resources must be strictly sorted and unique"
+            )
+        previous_resource_id = resource_id
+        resource_projection = resource["versions"]["projection"]
+        if not projection:
+            projection = resource_projection
+        elif resource_projection != projection:
+            raise AdapterRequestError(
+                f"{field}.versions.projection does not match the allowed resource set"
+            )
+        allowed.append((resource, binding))
+    return query, limit, allowed
+
+
+def real_discover(
+    params: dict[str, Any],
+    authorization: dict[str, Any],
+    resources: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    return discover_resources(params, authorization, resources, "real")
 
 
 def real_retrieve(
@@ -2793,16 +3346,30 @@ def real_retrieve(
     authorization: dict[str, Any],
     resources: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
-    query, limit = validate_real_retrieve_request(params, authorization)
-    projection_version = next(iter(resources.values()))["versions"]["projection"]
+    query, limit, allowed = validate_retrieve_request(
+        params,
+        authorization,
+        require_resource=lambda resource, field: require_selected_resource(
+            resource, resources, field
+        ),
+    )
+    projection_version = allowed[0][0]["versions"]["projection"]
+    allowed_graph_object_ids = sorted(binding for _resource, binding in allowed)
+    allowed_graph_object_id_set = set(allowed_graph_object_ids)
     response = call_permissioned_provider(
-        permissioned_provider_context(params, authorization, projection_version),
+        permissioned_provider_context(
+            params,
+            authorization,
+            projection_version,
+            allowed_graph_object_ids,
+        ),
         "retrieve",
         {
             "version": 1,
             "query": query,
             "limit": limit,
             "projection_version": projection_version,
+            "allowed_graph_object_ids": allowed_graph_object_ids,
         },
     )
     try:
@@ -2837,6 +3404,7 @@ def real_retrieve(
         score = value.get("score")
         if (
             graph_object_id not in resources
+            or graph_object_id not in allowed_graph_object_id_set
             or graph_object_id in seen
             or isinstance(score, bool)
             or not isinstance(score, (int, float))
@@ -2858,28 +3426,220 @@ def real_retrieve(
     )
 
 
-def validate_real_expand_request(
+def validate_expand_frontier(
     params: dict[str, Any],
     authorization: dict[str, Any],
-    resources: dict[str, dict[str, Any]],
-) -> tuple[list[tuple[dict[str, Any], str]], int]:
+    operation: dict[str, Any],
+    phase: str,
+    *,
+    require_resource: Any,
+) -> tuple[list[dict[str, Any]], int]:
     frontier = params.get("frontier")
-    if not isinstance(frontier, list) or not frontier or len(frontier) > 100:
+    max_frontier = operation["parameters"]["limits"]["max_frontier_width"]
+    if (
+        not isinstance(frontier, list)
+        or not frontier
+        or len(frontier) > max_frontier
+    ):
         raise AdapterRequestError("frontier must contain between 1 and 100 candidate handles")
-    handles: list[tuple[dict[str, Any], str]] = []
+    handles: list[dict[str, Any]] = []
     seen: set[str] = set()
+    expected_type = "entity" if phase == "entity_to_claim" else "claim"
+    projection_version = operation["parameters"]["projection_version"]
     for index, value in enumerate(frontier):
         handle = validate_candidate(value, f"frontier[{index}]")
         require_authorization_scope(handle["resource"], authorization, f"frontier[{index}].resource")
-        graph_object_id = require_selected_resource(
-            handle["resource"], resources, f"frontier[{index}].resource"
-        )
+        require_resource(handle["resource"], f"frontier[{index}].resource")
         resource_id = handle["resource"]["resource_id"]
         if resource_id in seen:
             raise AdapterRequestError("frontier contains duplicate resource_id values")
+        if handle["resource"]["versions"]["projection"] != projection_version:
+            raise AdapterRequestError(
+                f"frontier[{index}].resource does not match the operation projection"
+            )
+        if handle["resource"]["type"] != expected_type:
+            raise AdapterRequestError(
+                f"frontier[{index}].resource type is unsupported for phase"
+            )
         seen.add(resource_id)
-        handles.append((handle, graph_object_id))
-    return handles, primitive_limit(params, 10)
+        handles.append(handle)
+    ordered = sorted(
+        handles,
+        key=lambda handle: (-handle["score"], handle["resource"]["resource_id"]),
+    )
+    if handles != ordered:
+        raise AdapterRequestError("frontier candidate handles are not deterministically sorted")
+    limit = full_expansion_scan_limit(params)
+    return handles, limit
+
+
+def stable_claim_row(
+    claim: dict[str, Any], resources: dict[str, dict[str, Any]]
+) -> dict[str, str]:
+    return {
+        "claim_resource_id": resources[claim["claim"]]["resource_id"],
+        "subject_resource_id": claim["subject_resource_id"],
+        "predicate_key": claim["predicate_key"],
+        "object_resource_id": claim["object_resource_id"],
+        "source_document_resource_id": claim["source_document_resource_id"],
+        "derivation": claim["derivation"],
+    }
+
+
+def claim_matches_filters(
+    claim: dict[str, str], filters: list[dict[str, Any]]
+) -> bool:
+    values = {
+        "claim_id_in": claim["claim_resource_id"],
+        "object_id_in": claim["object_resource_id"],
+        "source_document_id_in": claim["source_document_resource_id"],
+        "subject_id_in": claim["subject_resource_id"],
+    }
+    for item in filters:
+        kind = item["kind"]
+        if kind == "derivation_in":
+            if claim["derivation"] not in item["derivations"]:
+                return False
+        elif values[kind] not in item["resource_ids"]:
+            return False
+    return True
+
+
+def compare_claim_rows(
+    left: dict[str, str],
+    right: dict[str, str],
+    order: list[dict[str, Any]],
+) -> int:
+    fields = {
+        "claim_id": "claim_resource_id",
+        "object_id": "object_resource_id",
+        "predicate_key": "predicate_key",
+        "source_document_id": "source_document_resource_id",
+        "subject_id": "subject_resource_id",
+    }
+    for item in order:
+        field = fields[item["key"]]
+        if left[field] == right[field]:
+            continue
+        comparison = -1 if left[field] < right[field] else 1
+        if item["direction"] == "descending":
+            comparison = -comparison
+        return comparison
+    return 0
+
+
+def phase_expansion(
+    handles: list[dict[str, Any]],
+    limit: int,
+    operation: dict[str, Any],
+    phase: str,
+    resources_by_id: dict[str, dict[str, Any]],
+    claims: list[dict[str, str]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if limit != MAX_PRIMITIVE_ITEMS:
+        raise AdapterRequestError(
+            f"limit must equal the full expansion scan limit of {MAX_PRIMITIVE_ITEMS}"
+        )
+    plan = operation["parameters"]
+    frontier_scores = {
+        handle["resource"]["resource_id"]: handle["score"] for handle in handles
+    }
+    matching: list[dict[str, str]] = []
+    for claim in claims:
+        if claim["predicate_key"] not in plan["predicate_keys"]:
+            continue
+        if not claim_matches_filters(claim, plan["filters"]):
+            continue
+        object_resource = resources_by_id.get(claim["object_resource_id"])
+        claim_resource = resources_by_id.get(claim["claim_resource_id"])
+        if object_resource is None or claim_resource is None:
+            raise AdapterRequestError(
+                "selected source-backed Claim binding is incomplete",
+                INVALID_GRAPH_BINDING_CODE,
+            )
+        if claim_resource["type"] != "claim" or object_resource["type"] != "entity":
+            raise AdapterRequestError(
+                "selected source-backed Claim binding has an unsupported edge shape",
+                INVALID_GRAPH_BINDING_CODE,
+            )
+        if phase == "entity_to_claim":
+            if claim["subject_resource_id"] not in frontier_scores:
+                continue
+            if not ({"claim", object_resource["type"]} & set(plan["resource_kinds"])):
+                continue
+        else:
+            if claim["claim_resource_id"] not in frontier_scores:
+                continue
+            if object_resource["type"] not in plan["resource_kinds"]:
+                continue
+        matching.append(claim)
+    matching.sort(
+        key=cmp_to_key(
+            lambda left, right: compare_claim_rows(left, right, plan["order"])
+        )
+    )
+
+    selected_target_ids: list[str] = []
+    seen_targets: set[str] = set()
+    for claim in matching:
+        target_id = (
+            claim["claim_resource_id"]
+            if phase == "entity_to_claim"
+            else claim["object_resource_id"]
+        )
+        if target_id in seen_targets:
+            continue
+        if len(selected_target_ids) == limit:
+            raise AdapterRequestError(
+                "expansion candidate limit exceeded",
+                INVALID_PRIMITIVE_RESPONSE_CODE,
+            )
+        seen_targets.add(target_id)
+        selected_target_ids.append(target_id)
+    selected_targets = set(selected_target_ids)
+    candidate_scores: dict[str, float] = {}
+    expansions: list[dict[str, Any]] = []
+    for claim in matching:
+        target_id = (
+            claim["claim_resource_id"]
+            if phase == "entity_to_claim"
+            else claim["object_resource_id"]
+        )
+        if target_id not in selected_targets:
+            continue
+        source_id = (
+            claim["subject_resource_id"]
+            if phase == "entity_to_claim"
+            else claim["claim_resource_id"]
+        )
+        score = float(frontier_scores[source_id])
+        candidate_scores[target_id] = max(candidate_scores.get(target_id, 0.0), score)
+        expansions.append(
+            {
+                "from_resource_id": source_id,
+                "to_resource_id": target_id,
+                "claim_resource_id": claim["claim_resource_id"],
+                "predicate_key": claim["predicate_key"],
+                "hop": 1,
+            }
+        )
+    candidates = [
+        {"resource": resources_by_id[resource_id], "score": score}
+        for resource_id, score in candidate_scores.items()
+    ]
+    candidates.sort(
+        key=lambda candidate: (-candidate["score"], candidate["resource"]["resource_id"])
+    )
+    expansions.sort(
+        key=lambda edge: (
+            edge["hop"],
+            edge["from_resource_id"],
+            edge["to_resource_id"],
+            edge["claim_resource_id"],
+            edge["predicate_key"],
+        )
+    )
+    return candidates, expansions
 
 
 def real_expand(
@@ -2887,45 +3647,38 @@ def real_expand(
     authorization: dict[str, Any],
     resources: dict[str, dict[str, Any]],
     claims: list[dict[str, Any]],
+    identity_version: int,
+    operation: dict[str, Any],
+    phase: str,
 ) -> dict[str, Any]:
-    handles, limit = validate_real_expand_request(params, authorization, resources)
-    frontier_scores = {graph_object_id: handle["score"] for handle, graph_object_id in handles}
-    candidate_scores: dict[str, float] = {}
-    graph_edges: set[tuple[str, str]] = set()
-    for claim in claims:
-        if claim["subject"] in frontier_scores:
-            score = float(frontier_scores[claim["subject"]])
-            candidate_scores[claim["claim"]] = max(candidate_scores.get(claim["claim"], 0.0), score)
-            graph_edges.add((claim["subject"], claim["claim"]))
-        if claim["claim"] in frontier_scores:
-            score = float(frontier_scores[claim["claim"]])
-            candidate_scores[claim["object"]] = max(candidate_scores.get(claim["object"], 0.0), score)
-            graph_edges.add((claim["claim"], claim["object"]))
-    ranked = sorted(
-        candidate_scores,
-        key=lambda graph_object_id: (
-            -candidate_scores[graph_object_id],
-            resources[graph_object_id]["resource_id"],
-        ),
-    )[:limit]
-    included = set(ranked)
-    candidates = [
-        {"resource": resources[graph_object_id], "score": candidate_scores[graph_object_id]}
-        for graph_object_id in ranked
-    ]
-    expansions = sorted(
-        (
-            {
-                "from_resource_id": resources[source]["resource_id"],
-                "to_resource_id": resources[target]["resource_id"],
-                "hop": 1,
-            }
-            for source, target in graph_edges
-            if target in included
-        ),
-        key=lambda edge: (edge["hop"], edge["from_resource_id"], edge["to_resource_id"]),
+    projection_version = next(iter(resources.values()))["versions"]["projection"]
+    operation = validate_graph_operation(
+        operation,
+        expected_projection=projection_version,
+        expected_identity_version=identity_version,
     )
-    frontier_ids = sorted(handle["resource"]["resource_id"] for handle, _ in handles)
+    resources_by_id = {
+        resource["resource_id"]: resource for resource in resources.values()
+    }
+    handles, limit = validate_expand_frontier(
+        params,
+        authorization,
+        operation,
+        phase,
+        require_resource=lambda resource, field: require_selected_resource(
+            resource, resources, field
+        ),
+    )
+    stable_claims = [stable_claim_row(claim, resources) for claim in claims]
+    candidates, expansions = phase_expansion(
+        handles,
+        limit,
+        operation,
+        phase,
+        resources_by_id,
+        stable_claims,
+    )
+    frontier_ids = [handle["resource"]["resource_id"] for handle in handles]
     output_ids = [candidate["resource"]["resource_id"] for candidate in candidates]
     return add_test_stage_spy(
         {"mode": "real", "candidates": candidates, "expansions": expansions},
@@ -2933,11 +3686,172 @@ def real_expand(
     )
 
 
+def validate_generate_path_binding(value: Any, field: str) -> dict[str, str]:
+    if not isinstance(value, dict):
+        raise AdapterRequestError(f"{field} must be an object")
+    validate_exact_fields(value, GENERATE_PATH_CLAIM_BINDING_FIELDS, field)
+    binding = {
+        name: required_authorization_token(value.get(name), f"{field}.{name}")
+        for name in sorted(GENERATE_PATH_CLAIM_BINDING_FIELDS)
+    }
+    for name in ("parent_resource_id", "claim_resource_id", "object_resource_id"):
+        if not RESOURCE_ID_RE.fullmatch(binding[name]):
+            raise AdapterRequestError(f"{field}.{name} must be an opaque res_ identifier")
+    if (
+        not CLAIM_PREDICATE_KEY_RE.fullmatch(binding["predicate_key"])
+        or binding["predicate_key"] not in SUPPORTED_CLAIM_PREDICATE_KEYS
+    ):
+        raise AdapterRequestError(
+            f"{field}.predicate_key is not declared by the active allowlist"
+        )
+    if len(
+        {
+            binding["parent_resource_id"],
+            binding["claim_resource_id"],
+            binding["object_resource_id"],
+        }
+    ) != 3:
+        raise AdapterRequestError(f"{field} resources must be distinct")
+    return binding
+
+
+def validate_generate_paths(
+    value: Any,
+    evidence: list[dict[str, Any]],
+    authorization: dict[str, Any],
+    *,
+    require_resource: Any,
+    claims: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+) -> list[dict[str, Any]]:
+    if not isinstance(value, list) or len(value) != len(evidence):
+        raise AdapterRequestError(
+            "paths must contain exactly one complete path per evidence item"
+        )
+    claims_by_id: dict[str, dict[str, Any]] = {}
+    for claim in claims:
+        claim_resource_id = claim["claim_resource_id"]
+        if claim_resource_id in claims_by_id:
+            raise AdapterRequestError(
+                "selected Claim bindings contain duplicate claim_resource_id values",
+                INVALID_GRAPH_BINDING_CODE,
+            )
+        claims_by_id[claim_resource_id] = claim
+
+    paths: list[dict[str, Any]] = []
+    seen_paths: set[str] = set()
+    for path_index, path_value in enumerate(value):
+        field = f"paths[{path_index}]"
+        if not isinstance(path_value, dict):
+            raise AdapterRequestError(f"{field} must be an object")
+        validate_exact_fields(path_value, GENERATE_PATH_FIELDS, field)
+        resource_values = path_value.get("resources")
+        binding_values = path_value.get("claim_bindings")
+        if (
+            not isinstance(resource_values, list)
+            or not resource_values
+            or len(resource_values) > MAX_PRIMITIVE_ITEMS
+        ):
+            raise AdapterRequestError(
+                f"{field}.resources must contain between 1 and {MAX_PRIMITIVE_ITEMS} handles"
+            )
+        if not isinstance(binding_values, list) or len(binding_values) > MAX_PRIMITIVE_ITEMS:
+            raise AdapterRequestError(
+                f"{field}.claim_bindings must contain at most {MAX_PRIMITIVE_ITEMS} bindings"
+            )
+        if len(resource_values) != 2 * len(binding_values) + 1:
+            raise AdapterRequestError(
+                f"{field} must contain complete entity/Claim/entity segments"
+            )
+
+        resources: list[dict[str, Any]] = []
+        resource_ids: set[str] = set()
+        projection_version = evidence[path_index]["resource"]["versions"]["projection"]
+        for resource_index, resource_value in enumerate(resource_values):
+            resource_field = f"{field}.resources[{resource_index}]"
+            resource = validate_resource(resource_value, resource_field)
+            require_authorization_scope(resource, authorization, resource_field)
+            require_resource(resource, resource_field)
+            expected_type = "entity" if resource_index % 2 == 0 else "claim"
+            if resource["type"] != expected_type:
+                raise AdapterRequestError(
+                    f"{resource_field} does not match the entity/Claim/entity path shape"
+                )
+            if resource["versions"]["projection"] != projection_version:
+                raise AdapterRequestError(
+                    f"{resource_field} does not match the evidence projection"
+                )
+            resource_id = resource["resource_id"]
+            if resource_id in resource_ids:
+                raise AdapterRequestError(f"{field} contains duplicate resource_id values")
+            resource_ids.add(resource_id)
+            resources.append(resource)
+
+        bindings: list[dict[str, str]] = []
+        seen_bindings: set[tuple[str, str, str, str]] = set()
+        for binding_index, binding_value in enumerate(binding_values):
+            binding_field = f"{field}.claim_bindings[{binding_index}]"
+            binding = validate_generate_path_binding(binding_value, binding_field)
+            parent = resources[binding_index * 2]
+            claim_resource = resources[binding_index * 2 + 1]
+            object_resource = resources[binding_index * 2 + 2]
+            if (
+                binding["parent_resource_id"] != parent["resource_id"]
+                or binding["claim_resource_id"] != claim_resource["resource_id"]
+                or binding["object_resource_id"] != object_resource["resource_id"]
+            ):
+                raise AdapterRequestError(
+                    f"{binding_field} does not match the resource sequence"
+                )
+            selected = claims_by_id.get(binding["claim_resource_id"])
+            selected_binding = None
+            if selected is not None:
+                selected_binding = {
+                    "parent_resource_id": selected["subject_resource_id"],
+                    "claim_resource_id": selected["claim_resource_id"],
+                    "object_resource_id": selected["object_resource_id"],
+                    "predicate_key": selected["predicate_key"],
+                }
+            if selected_binding != binding:
+                raise AdapterRequestError(
+                    f"{binding_field} does not match the exact selected Claim binding",
+                    INVALID_GRAPH_BINDING_CODE,
+                )
+            binding_key = (
+                binding["parent_resource_id"],
+                binding["claim_resource_id"],
+                binding["object_resource_id"],
+                binding["predicate_key"],
+            )
+            if binding_key in seen_bindings:
+                raise AdapterRequestError(f"{field} contains duplicate Claim bindings")
+            seen_bindings.add(binding_key)
+            bindings.append(binding)
+
+        if resources[-1] != evidence[path_index]["resource"]:
+            raise AdapterRequestError(
+                f"{field} terminal resource does not exactly match the paired evidence"
+            )
+        path = {"resources": resources, "claim_bindings": bindings}
+        path_key = json.dumps(path, sort_keys=True, separators=(",", ":"))
+        if path_key in seen_paths:
+            raise AdapterRequestError("paths contains duplicate complete paths")
+        seen_paths.add(path_key)
+        paths.append(path)
+    return paths
+
+
 def validate_real_generate_request(
     params: dict[str, Any],
     authorization: dict[str, Any],
     resources: dict[str, dict[str, Any]],
-) -> tuple[str, list[dict[str, Any]]]:
+    claims: list[dict[str, Any]],
+) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]] | None]:
+    validate_allowed_fields(
+        params,
+        frozenset({"authorization", "question", "evidence"}),
+        PRIMITIVE_TRANSPORT_FIELDS | frozenset({"paths"}),
+        "generate params",
+    )
     question = bounded_primitive_text(params.get("question"), "question").strip()
     evidence = params.get("evidence")
     if not isinstance(evidence, list) or not evidence or len(evidence) > 100:
@@ -2967,25 +3881,43 @@ def validate_real_generate_request(
         items.append(item)
     if not question:
         raise AdapterRequestError("question must be a non-empty string")
-    return question, items
+    paths = None
+    if "paths" in params:
+        stable_claims = [stable_claim_row(claim, resources) for claim in claims]
+        paths = validate_generate_paths(
+            params.get("paths"),
+            items,
+            authorization,
+            require_resource=lambda resource, field: require_selected_resource(
+                resource, resources, field
+            ),
+            claims=stable_claims,
+        )
+    return question, items, paths
 
 
 def real_generate(
     params: dict[str, Any],
     authorization: dict[str, Any],
     resources: dict[str, dict[str, Any]],
+    claims: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    question, items = validate_real_generate_request(params, authorization, resources)
+    question, items, paths = validate_real_generate_request(
+        params, authorization, resources, claims
+    )
     projection_version = items[0]["resource"]["versions"]["projection"]
+    provider_request: dict[str, Any] = {
+        "version": 1,
+        "question": question,
+        "projection_version": projection_version,
+        "evidence": items,
+    }
+    if paths is not None:
+        provider_request["paths"] = paths
     response = call_permissioned_provider(
         permissioned_provider_context(params, authorization, projection_version),
         "generate",
-        {
-            "version": 1,
-            "question": question,
-            "projection_version": projection_version,
-            "evidence": items,
-        },
+        provider_request,
     )
     try:
         validate_exact_fields(response, frozenset({"answer"}), "provider generate response")
@@ -3008,7 +3940,7 @@ def real_generate(
             "evidence_resource_ids": resource_ids,
             "trace": {"resource_ids": resource_ids, "count": len(resource_ids)},
         },
-        [("generate.evidence_input", resource_ids), ("generate.citation_output", resource_ids)],
+        generate_stage_spy(resource_ids, paths),
     )
 
 
@@ -3088,15 +4020,49 @@ def add_test_stage_spy(
     return data
 
 
+def generate_stage_spy(
+    evidence_resource_ids: list[str],
+    paths: list[dict[str, Any]] | None,
+) -> list[tuple[str, list[str]]]:
+    stages = [("generate.evidence_input", evidence_resource_ids)]
+    if paths is not None:
+        stages.extend(
+            (
+                "generate.path_input",
+                [resource["resource_id"] for resource in path["resources"]],
+            )
+            for path in paths
+        )
+    stages.append(("generate.citation_output", evidence_resource_ids))
+    return stages
+
+
+def fake_discover(params: dict[str, Any]) -> dict[str, Any]:
+    authorization = validate_authorization(params.get("authorization"))
+    resources = {
+        resource_id: deepcopy(candidate["resource"])
+        for resource_id, candidate in FAKE_CANDIDATES_BY_ID.items()
+    }
+    return discover_resources(params, authorization, resources, "fake")
+
+
 def fake_retrieve(params: dict[str, Any]) -> dict[str, Any]:
     authorization = validate_authorization(params.get("authorization"))
-    required_string(params.get("query"), "query")
-    limit = primitive_limit(params, len(FAKE_RETRIEVE_IDS))
+    _query, limit, allowed = validate_retrieve_request(
+        params,
+        authorization,
+        require_resource=lambda resource, field: require_fake_resource_binding(
+            resource, field
+        ),
+    )
+    allowed_resource_ids = {resource["resource_id"] for resource, _binding in allowed}
     maybe_test_primitive_delay()
     retrieved = [
         (copy_fake_candidate(resource_id), FAKE_CONTENT_BY_ID[resource_id])
-        for resource_id in FAKE_RETRIEVE_IDS[:limit]
+        for resource_id in FAKE_RETRIEVE_IDS
+        if resource_id in allowed_resource_ids
     ]
+    retrieved = retrieved[:limit]
     candidates = [candidate for candidate, _protected_content in retrieved]
     for index, candidate in enumerate(candidates):
         require_authorization_scope(
@@ -3111,47 +4077,40 @@ def fake_retrieve(params: dict[str, Any]) -> dict[str, Any]:
 
 def fake_expand(params: dict[str, Any]) -> dict[str, Any]:
     authorization = validate_authorization(params.get("authorization"))
-    frontier = params.get("frontier")
-    if not isinstance(frontier, list) or not frontier:
-        raise AdapterRequestError("frontier must be a list of candidate handles")
-    handles = [validate_candidate(value, f"frontier[{index}]") for index, value in enumerate(frontier)]
-    for index, handle in enumerate(handles):
-        require_authorization_scope(
-            handle["resource"], authorization, f"frontier[{index}].resource"
-        )
-        require_fake_resource_binding(handle["resource"], f"frontier[{index}].resource")
-    frontier_ids = sorted(handle["resource"]["resource_id"] for handle in handles)
-    if len(frontier_ids) != len(set(frontier_ids)):
-        raise AdapterRequestError("frontier contains duplicate resource_id values")
-    limit = primitive_limit(params, 10)
+    operation, phase = validate_expand_contract(
+        params,
+        expected_projection=FAKE_PROJECTION_VERSION,
+        expected_identity_version=GRAPH_BINDING_CONTRACT_VERSION,
+    )
+    handles, limit = validate_expand_frontier(
+        params,
+        authorization,
+        operation,
+        phase,
+        require_resource=require_fake_resource_binding,
+    )
     maybe_test_primitive_delay()
-
-    edges: list[dict[str, Any]] = []
-    candidate_ids: set[str] = set()
-    for from_resource_id in frontier_ids:
-        for to_resource_id, hop in FAKE_EXPANSIONS.get(from_resource_id, ()):
-            candidate_ids.add(to_resource_id)
-            edges.append(
-                {
-                    "from_resource_id": from_resource_id,
-                    "to_resource_id": to_resource_id,
-                    "hop": hop,
-                }
-            )
-    candidates = sorted(
-        (copy_fake_candidate(resource_id) for resource_id in candidate_ids),
-        key=lambda candidate: (-candidate["score"], candidate["resource"]["resource_id"]),
-    )[:limit]
+    resources_by_id = {
+        resource_id: deepcopy(candidate["resource"])
+        for resource_id, candidate in FAKE_CANDIDATES_BY_ID.items()
+    }
+    candidates, expansions = phase_expansion(
+        handles,
+        limit,
+        operation,
+        phase,
+        resources_by_id,
+        list(FAKE_CLAIMS),
+    )
     for index, candidate in enumerate(candidates):
         require_authorization_scope(
             candidate["resource"], authorization, f"candidates[{index}].resource"
         )
+        expected_type = "claim" if phase == "entity_to_claim" else "entity"
+        if candidate["resource"]["type"] != expected_type:
+            raise AdapterRequestError("fake expansion produced an unsupported edge shape")
+    frontier_ids = [handle["resource"]["resource_id"] for handle in handles]
     output_ids = [candidate["resource"]["resource_id"] for candidate in candidates]
-    included = set(output_ids)
-    expansions = sorted(
-        (edge for edge in edges if edge["to_resource_id"] in included),
-        key=lambda edge: (edge["hop"], edge["from_resource_id"], edge["to_resource_id"]),
-    )
     return add_test_stage_spy(
         {"mode": "fake", "candidates": candidates, "expansions": expansions},
         [
@@ -3163,12 +4122,24 @@ def fake_expand(params: dict[str, Any]) -> dict[str, Any]:
 
 def fake_generate(params: dict[str, Any]) -> dict[str, Any]:
     authorization = validate_authorization(params.get("authorization"))
-    question = required_string(params.get("question"), "question")
+    validate_allowed_fields(
+        params,
+        frozenset({"authorization", "question", "evidence"}),
+        PRIMITIVE_TRANSPORT_FIELDS | frozenset({"paths"}),
+        "generate params",
+    )
+    question = bounded_primitive_text(params.get("question"), "question").strip()
     evidence = params.get("evidence")
-    if not isinstance(evidence, list) or not evidence:
-        raise AdapterRequestError("evidence must be a non-empty list of already-authorized evidence objects")
+    if not isinstance(evidence, list) or not 1 <= len(evidence) <= MAX_PRIMITIVE_ITEMS:
+        raise AdapterRequestError(
+            "evidence must be a non-empty list of already-authorized evidence objects"
+        )
     items = [validate_evidence(value, f"evidence[{index}]") for index, value in enumerate(evidence)]
     for index, item in enumerate(items):
+        if len(item["content"].encode("utf-8")) > MAX_PRIMITIVE_TEXT_BYTES:
+            raise AdapterRequestError(
+                f"evidence[{index}].content exceeds the primitive text limit"
+            )
         require_authorization_scope(
             item["resource"], authorization, f"evidence[{index}].resource"
         )
@@ -3179,6 +4150,15 @@ def fake_generate(params: dict[str, Any]) -> dict[str, Any]:
         raise AdapterRequestError("evidence contains duplicate resource_id values")
     if len(citation_handles) != len(set(citation_handles)):
         raise AdapterRequestError("evidence contains duplicate citation_handle values")
+    paths = None
+    if "paths" in params:
+        paths = validate_generate_paths(
+            params.get("paths"),
+            items,
+            authorization,
+            require_resource=require_fake_resource_binding,
+            claims=FAKE_CLAIMS,
+        )
     maybe_test_primitive_delay()
 
     answer = f"Fake generated answer for: {question} Supported by: " + " ".join(
@@ -3196,10 +4176,7 @@ def fake_generate(params: dict[str, Any]) -> dict[str, Any]:
             "evidence_resource_ids": resource_ids,
             "trace": {"resource_ids": resource_ids, "count": len(resource_ids)},
         },
-        [
-            ("generate.evidence_input", resource_ids),
-            ("generate.citation_output", resource_ids),
-        ],
+        generate_stage_spy(resource_ids, paths),
     )
 
 
@@ -3209,6 +4186,7 @@ def fake_response(req: dict[str, Any]) -> None:
     if method in PRIMITIVE_METHODS:
         params = primitive_params(req)
         handlers = {
+            "kag.discover": fake_discover,
             "kag.retrieve": fake_retrieve,
             "kag.expand": fake_expand,
             "kag.generate": fake_generate,
@@ -3434,11 +4412,30 @@ def real_response(req: dict[str, Any]) -> None:
     if method in PRIMITIVE_METHODS:
         params = primitive_params(req)
         authorization = validate_authorization(params.get("authorization"))
-        resources, claims = load_current_graph_contract(params, authorization)
+        operation: dict[str, Any] | None = None
+        phase = ""
+        if method == "kag.expand":
+            operation, phase = validate_expand_contract(params)
+        resources, claims, identity_version = load_current_graph_contract(
+            params, authorization
+        )
         handlers = {
+            "kag.discover": lambda: real_discover(
+                params, authorization, resources
+            ),
             "kag.retrieve": lambda: real_retrieve(params, authorization, resources),
-            "kag.expand": lambda: real_expand(params, authorization, resources, claims),
-            "kag.generate": lambda: real_generate(params, authorization, resources),
+            "kag.expand": lambda: real_expand(
+                params,
+                authorization,
+                resources,
+                claims,
+                identity_version,
+                operation or {},
+                phase,
+            ),
+            "kag.generate": lambda: real_generate(
+                params, authorization, resources, claims
+            ),
         }
         result(req_id, handlers[method]())
         return

@@ -20,7 +20,7 @@ import (
 )
 
 const (
-	permissionedAcceptanceProjectionVersion = "projection_fake_v1"
+	permissionedAcceptanceProjectionVersion = fixture.ProjectionVersion
 	permissionedAcceptanceRetrieverVersion  = "fixture-retriever-v1"
 	permissionedAcceptancePromptVersion     = "fixture-prompt-v1"
 
@@ -149,12 +149,31 @@ func TestPermissionedAcceptanceSideChannelSurfacesHideCanaries(t *testing.T) {
 	permissionedAcceptanceRequire(t, invariant, !hasEvent(events, protocol.EventError),
 		"Bob permissioned query failed: %+v", events)
 
+	rawDiscoveries := harness.probe.discoverSnapshots()
+	permissionedAcceptanceRequire(t, invariant, len(rawDiscoveries) == 1,
+		"raw discover calls = %d, want 1", len(rawDiscoveries))
+	permissionedAcceptanceRequire(t, invariant,
+		permissionedAcceptanceResourcesContain(rawDiscoveries[0].Resources, permissionedAcceptanceDeniedID),
+		"trusted discovery did not contain hidden handle %s", permissionedAcceptanceDeniedID)
+
+	retrieveRequests := harness.probe.retrieveRequestSnapshots()
+	permissionedAcceptanceRequire(t, invariant, len(retrieveRequests) == 1,
+		"raw retrieve requests = %d, want 1", len(retrieveRequests))
+	permissionedAcceptanceRequire(t, invariant,
+		!permissionedAcceptanceResourcesContain(retrieveRequests[0].AllowedResources, permissionedAcceptanceDeniedID),
+		"hidden candidate %s crossed the pre-ranking authorization boundary", permissionedAcceptanceDeniedID)
+	permissionedAcceptanceRequire(t, invariant,
+		len(retrieveRequests[0].AllowedResources) == 1 &&
+			retrieveRequests[0].AllowedResources[0].ResourceID == permissionedAcceptanceOverviewID,
+		"retrieval allowlist = %#v, want only %s",
+		retrieveRequests[0].AllowedResources, permissionedAcceptanceOverviewID)
+
 	rawRetrievals := harness.probe.retrieveSnapshots()
 	permissionedAcceptanceRequire(t, invariant, len(rawRetrievals) == 1,
 		"raw retrieve calls = %d, want 1", len(rawRetrievals))
 	permissionedAcceptanceRequire(t, invariant,
-		permissionedAcceptanceCandidatesContain(rawRetrievals[0].Candidates, permissionedAcceptanceDeniedID),
-		"fake KAG oracle did not contain hidden candidate %s", permissionedAcceptanceDeniedID)
+		!permissionedAcceptanceCandidatesContain(rawRetrievals[0].Candidates, permissionedAcceptanceDeniedID),
+		"hidden candidate %s reached provider-ranked results", permissionedAcceptanceDeniedID)
 
 	generated := harness.probe.generateSnapshots()
 	permissionedAcceptanceRequire(t, invariant, len(generated) == 1,
@@ -495,21 +514,49 @@ func permissionedAcceptanceSurfaces(result authorized.QueryResult) map[string]an
 type permissionedAcceptanceKAGProbe struct {
 	backend kag.PrimitiveBackend
 
-	mu        sync.Mutex
-	retrieved []kag.RetrieveResult
-	generated []kag.GenerateRequest
+	mu               sync.Mutex
+	discovered       []kag.DiscoverResult
+	retrieveRequests []kag.RetrieveRequest
+	retrieved        []kag.RetrieveResult
+	generated        []kag.GenerateRequest
+}
+
+func (p *permissionedAcceptanceKAGProbe) Discover(ctx context.Context, request kag.DiscoverRequest) (kag.DiscoverResult, error) {
+	result, err := p.backend.Discover(ctx, request)
+	if err != nil {
+		return result, err
+	}
+	result.Resources = append([]protocol.ResourceHandle(nil), result.Resources...)
+	p.mu.Lock()
+	p.discovered = append(p.discovered, result)
+	p.mu.Unlock()
+	return result, nil
 }
 
 func (p *permissionedAcceptanceKAGProbe) Retrieve(ctx context.Context, request kag.RetrieveRequest) (kag.RetrieveResult, error) {
+	request.AllowedResources = append([]protocol.ResourceHandle(nil), request.AllowedResources...)
 	result, err := p.backend.Retrieve(ctx, request)
 	if err != nil {
 		return result, err
 	}
 	result.Candidates = append([]kag.CandidateHandle(nil), result.Candidates...)
 	p.mu.Lock()
+	p.retrieveRequests = append(p.retrieveRequests, request)
 	p.retrieved = append(p.retrieved, result)
 	p.mu.Unlock()
 	return result, nil
+}
+
+func (p *permissionedAcceptanceKAGProbe) discoverSnapshots() []kag.DiscoverResult {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]kag.DiscoverResult(nil), p.discovered...)
+}
+
+func (p *permissionedAcceptanceKAGProbe) retrieveRequestSnapshots() []kag.RetrieveRequest {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]kag.RetrieveRequest(nil), p.retrieveRequests...)
 }
 
 func (p *permissionedAcceptanceKAGProbe) Expand(ctx context.Context, request kag.ExpandRequest) (kag.ExpandResult, error) {
@@ -517,8 +564,7 @@ func (p *permissionedAcceptanceKAGProbe) Expand(ctx context.Context, request kag
 }
 
 func (p *permissionedAcceptanceKAGProbe) Generate(ctx context.Context, request kag.GenerateRequest) (kag.GenerateResult, error) {
-	copy := request
-	copy.Evidence = append([]kag.AuthorizedEvidence(nil), request.Evidence...)
+	copy := request.Clone()
 	p.mu.Lock()
 	p.generated = append(p.generated, copy)
 	p.mu.Unlock()
@@ -549,6 +595,15 @@ func permissionedAcceptanceEvidenceByID(result authorized.QueryResult, resourceI
 func permissionedAcceptanceCandidatesContain(candidates []kag.CandidateHandle, resourceID protocol.ResourceID) bool {
 	for _, candidate := range candidates {
 		if candidate.Resource.ResourceID == resourceID {
+			return true
+		}
+	}
+	return false
+}
+
+func permissionedAcceptanceResourcesContain(resources []protocol.ResourceHandle, resourceID protocol.ResourceID) bool {
+	for _, resource := range resources {
+		if resource.ResourceID == resourceID {
 			return true
 		}
 	}

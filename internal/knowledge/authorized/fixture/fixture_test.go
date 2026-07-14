@@ -94,10 +94,13 @@ func TestServiceFailsClosedForUnknownPrincipal(t *testing.T) {
 func TestServiceRejectsChangedFakeRetrieveHandle(t *testing.T) {
 	changed := fixtureResource(introResourceID, introContent)
 	changed.Versions.Content = "content_fake_v2"
-	backend := &fakePrimitiveBackend{retrieveResult: &kag.RetrieveResult{
-		Mode:       "fake",
-		Candidates: []kag.CandidateHandle{{Resource: changed, Score: 0.99}},
-	}}
+	backend := &fakePrimitiveBackend{
+		retrieveResult: &kag.RetrieveResult{
+			Mode:       "fake",
+			Candidates: []kag.CandidateHandle{{Resource: changed, Score: 0.99}},
+		},
+		bypassRetrieveScope: true,
+	}
 	service, err := New(backend)
 	if err != nil {
 		t.Fatal(err)
@@ -107,7 +110,7 @@ func TestServiceRejectsChangedFakeRetrieveHandle(t *testing.T) {
 		Question:      "What is knote?",
 		Authorization: Authorization(Alice, "session-changed-handle"),
 	})
-	if err == nil || !strings.Contains(err.Error(), "does not match the exact fake retrieve handle") {
+	if err == nil || !strings.Contains(err.Error(), "outside the exact authorized retrieval scope") {
 		t.Fatalf("changed handle error = %v", err)
 	}
 	if len(backend.generateRequests) != 0 {
@@ -175,25 +178,57 @@ func TestApplicationRevocationHidesRevokedEvidenceWithoutPoisoningUnrelatedResou
 }
 
 type fakePrimitiveBackend struct {
-	retrieveResult   *kag.RetrieveResult
-	retrieveRequests []kag.RetrieveRequest
-	generateRequests []kag.GenerateRequest
-	expandCalls      int
+	discoverRequests    []kag.DiscoverRequest
+	retrieveResult      *kag.RetrieveResult
+	bypassRetrieveScope bool
+	retrieveRequests    []kag.RetrieveRequest
+	generateRequests    []kag.GenerateRequest
+	expandCalls         int
+}
+
+func (b *fakePrimitiveBackend) Discover(_ context.Context, request kag.DiscoverRequest) (kag.DiscoverResult, error) {
+	b.discoverRequests = append(b.discoverRequests, request)
+	return kag.DiscoverResult{
+		Mode: "fake",
+		Resources: []protocol.ResourceHandle{
+			fixtureResource(introResourceID, introContent),
+			fixtureResource(deniedCanaryResourceID, deniedCanaryContent),
+			fixtureResource(overviewResourceID, overviewContent),
+		},
+		Complete: true,
+	}, nil
 }
 
 func (b *fakePrimitiveBackend) Retrieve(_ context.Context, request kag.RetrieveRequest) (kag.RetrieveResult, error) {
 	b.retrieveRequests = append(b.retrieveRequests, request)
+	var result kag.RetrieveResult
 	if b.retrieveResult != nil {
-		return *b.retrieveResult, nil
+		result = *b.retrieveResult
+	} else {
+		result = kag.RetrieveResult{
+			Mode: "fake",
+			Candidates: []kag.CandidateHandle{
+				{Resource: fixtureResource(introResourceID, introContent), Score: 0.99},
+				{Resource: fixtureResource(deniedCanaryResourceID, deniedCanaryContent), Score: 0.98},
+				{Resource: fixtureResource(overviewResourceID, overviewContent), Score: 0.90},
+			},
+		}
 	}
-	return kag.RetrieveResult{
-		Mode: "fake",
-		Candidates: []kag.CandidateHandle{
-			{Resource: fixtureResource(introResourceID, introContent), Score: 0.99},
-			{Resource: fixtureResource(deniedCanaryResourceID, deniedCanaryContent), Score: 0.98},
-			{Resource: fixtureResource(overviewResourceID, overviewContent), Score: 0.90},
-		},
-	}, nil
+	if b.bypassRetrieveScope {
+		return result, nil
+	}
+	allowed := make(map[protocol.ResourceID]protocol.ResourceHandle, len(request.AllowedResources))
+	for _, resource := range request.AllowedResources {
+		allowed[resource.ResourceID] = resource
+	}
+	filtered := result
+	filtered.Candidates = nil
+	for _, candidate := range result.Candidates {
+		if resource, ok := allowed[candidate.Resource.ResourceID]; ok && resource == candidate.Resource {
+			filtered.Candidates = append(filtered.Candidates, candidate)
+		}
+	}
+	return filtered, nil
 }
 
 func (b *fakePrimitiveBackend) Expand(context.Context, kag.ExpandRequest) (kag.ExpandResult, error) {
@@ -202,7 +237,7 @@ func (b *fakePrimitiveBackend) Expand(context.Context, kag.ExpandRequest) (kag.E
 }
 
 func (b *fakePrimitiveBackend) Generate(_ context.Context, request kag.GenerateRequest) (kag.GenerateResult, error) {
-	b.generateRequests = append(b.generateRequests, request)
+	b.generateRequests = append(b.generateRequests, request.Clone())
 	result := kag.GenerateResult{Mode: "fake"}
 	contents := make([]string, len(request.Evidence))
 	for index, evidence := range request.Evidence {

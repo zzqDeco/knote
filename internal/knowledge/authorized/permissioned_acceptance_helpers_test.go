@@ -18,12 +18,12 @@ import (
 )
 
 const (
-	acceptanceProjectionVersion = "projection_fake_v1"
+	acceptanceProjectionVersion = fixture.ProjectionVersion
 	acceptanceSourceVersion     = "source_fake_v1"
 	acceptanceContentVersion    = "content_fake_v1"
 	acceptanceACLVersion        = "acl_fake_v1"
-	acceptanceIndexVersion      = "index_fake_v1"
-	acceptanceGraphVersion      = "graph_fake_v1"
+	acceptanceIndexVersion      = "index_" + acceptanceProjectionVersion
+	acceptanceGraphVersion      = "graph_" + acceptanceProjectionVersion
 
 	fixtureIntroID        protocol.ResourceID = "res_00000000000000000000000000000001"
 	fixtureDeniedCanaryID protocol.ResourceID = "res_00000000000000000000000000000002"
@@ -93,7 +93,13 @@ func acceptanceAuthorization(sessionID string) protocol.AuthorizationContext {
 }
 
 func fixtureResource(id protocol.ResourceID, content string) protocol.ResourceHandle {
-	return acceptanceResource(id, protocol.ResourceDocument, content)
+	resourceType := protocol.ResourceDocument
+	if id == fixtureIntroID || id == fixtureDeniedCanaryID {
+		resourceType = protocol.ResourceEntity
+	}
+	resource := acceptanceResource(id, resourceType, content)
+	resource.AuthorizationID = string(resourceType) + ":" + string(id)
+	return resource
 }
 
 func acceptanceResource(id protocol.ResourceID, resourceType protocol.ResourceType, content string) protocol.ResourceHandle {
@@ -139,6 +145,29 @@ func newAcceptanceBackend(candidates ...kag.CandidateHandle) *acceptanceBackend 
 	return &acceptanceBackend{candidates: append([]kag.CandidateHandle(nil), candidates...)}
 }
 
+func (b *acceptanceBackend) Discover(_ context.Context, request kag.DiscoverRequest) (kag.DiscoverResult, error) {
+	b.mu.Lock()
+	candidates := append([]kag.CandidateHandle(nil), b.candidates...)
+	b.mu.Unlock()
+	resources := make([]protocol.ResourceHandle, 0, len(candidates))
+	for _, candidate := range candidates {
+		if acceptanceContainsResourceType(request.ResourceTypes, candidate.Resource.Type) {
+			resources = append(resources, candidate.Resource)
+		}
+	}
+	sort.Slice(resources, func(i, j int) bool { return resources[i].ResourceID < resources[j].ResourceID })
+	return kag.DiscoverResult{Mode: "acceptance-fixture", Resources: resources, Complete: true}, nil
+}
+
+func acceptanceContainsResourceType(types []protocol.ResourceType, target protocol.ResourceType) bool {
+	for _, resourceType := range types {
+		if resourceType == target {
+			return true
+		}
+	}
+	return false
+}
+
 func (b *acceptanceBackend) Retrieve(_ context.Context, request kag.RetrieveRequest) (kag.RetrieveResult, error) {
 	started := time.Now()
 	b.mu.Lock()
@@ -150,7 +179,17 @@ func (b *acceptanceBackend) Retrieve(_ context.Context, request kag.RetrieveRequ
 	if err != nil {
 		return kag.RetrieveResult{}, err
 	}
-	return kag.RetrieveResult{Mode: "acceptance-fixture", Candidates: candidates}, nil
+	allowed := make(map[protocol.ResourceID]protocol.ResourceHandle, len(request.AllowedResources))
+	for _, resource := range request.AllowedResources {
+		allowed[resource.ResourceID] = resource
+	}
+	filtered := make([]kag.CandidateHandle, 0, len(candidates))
+	for _, candidate := range candidates {
+		if resource, ok := allowed[candidate.Resource.ResourceID]; ok && resource == candidate.Resource {
+			filtered = append(filtered, candidate)
+		}
+	}
+	return kag.RetrieveResult{Mode: "acceptance-fixture", Candidates: filtered}, nil
 }
 
 func (b *acceptanceBackend) Expand(context.Context, kag.ExpandRequest) (kag.ExpandResult, error) {
@@ -203,9 +242,7 @@ func (b *acceptanceBackend) stats() acceptanceBackendStats {
 }
 
 func cloneGenerateRequest(request kag.GenerateRequest) kag.GenerateRequest {
-	clone := request
-	clone.Evidence = append([]kag.AuthorizedEvidence(nil), request.Evidence...)
-	return clone
+	return request.Clone()
 }
 
 type acceptanceLoader struct {

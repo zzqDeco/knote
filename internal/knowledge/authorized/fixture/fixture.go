@@ -19,6 +19,7 @@ const (
 	TenantID             = "tenant_fake"
 	KnowledgeBaseID      = "kb_fake"
 	AuthorizationModelID = "01GAHCE4YVKPQEKZQHT2R89MQV"
+	ProjectionVersion    = "prj_ffffffffffffffffffffffffffffffff"
 
 	introResourceID        protocol.ResourceID = "res_00000000000000000000000000000001"
 	deniedCanaryResourceID protocol.ResourceID = "res_00000000000000000000000000000002"
@@ -49,9 +50,9 @@ type Application struct {
 	authorizer  *authz.LocalAuthorizer
 }
 
-// New returns a deterministic Phase 1 service for the fake KAG retrieve
-// projection. Graph expansion is deliberately disabled because the fake claim
-// objects are outside the document-only authorization boundary.
+// New returns a deterministic service for the fake KAG retrieve projection.
+// Graph expansion stays disabled so this fixture continues to exercise the
+// non-traversal permissioned query path.
 func New(backend kag.PrimitiveBackend) (*authorized.Service, error) {
 	service, _, err := newService(backend, ApplicationOptions{})
 	return service, err
@@ -176,14 +177,18 @@ func fixtureEvidence() map[protocol.ResourceID]protocol.EvidenceItem {
 
 func fixtureItem(id protocol.ResourceID, content, citation string) protocol.EvidenceItem {
 	resource := fixtureResource(id, content)
+	supportResource := resource
+	if resource.Type == protocol.ResourceEntity {
+		supportResource = fixtureResource(overviewResourceID, overviewContent)
+	}
 	return protocol.EvidenceItem{
 		Resource:   resource,
 		Content:    content,
 		Derivation: protocol.DerivationAnySupport,
 		Supports: []protocol.ProvenanceSupport{{
 			SupportID: "support_" + string(id),
-			Resource:  resource,
-			Evidence:  []protocol.ResourceHandle{resource},
+			Resource:  supportResource,
+			Evidence:  []protocol.ResourceHandle{supportResource},
 			Complete:  true,
 		}},
 		Citation: protocol.Citation{Handle: citation, Resource: resource},
@@ -191,21 +196,25 @@ func fixtureItem(id protocol.ResourceID, content, citation string) protocol.Evid
 }
 
 func fixtureResource(id protocol.ResourceID, content string) protocol.ResourceHandle {
+	resourceType := protocol.ResourceDocument
+	if id == introResourceID || id == deniedCanaryResourceID {
+		resourceType = protocol.ResourceEntity
+	}
 	return protocol.ResourceHandle{
 		ResourceID:              id,
-		Type:                    protocol.ResourceDocument,
+		Type:                    resourceType,
 		TenantID:                TenantID,
 		KnowledgeBaseID:         KnowledgeBaseID,
-		AuthorizationID:         "document:" + string(id),
+		AuthorizationID:         string(resourceType) + ":" + string(id),
 		AuthorizationResourceID: id,
 		ContentDigest:           protocol.NewContentDigest(content),
 		Versions: protocol.ResourceVersions{
 			Source:     "source_fake_v1",
 			Content:    "content_fake_v1",
 			ACL:        "acl_fake_v1",
-			Index:      "index_fake_v1",
-			Graph:      "graph_fake_v1",
-			Projection: "projection_fake_v1",
+			Index:      "index_" + ProjectionVersion,
+			Graph:      "graph_" + ProjectionVersion,
+			Projection: ProjectionVersion,
 		},
 		ServingState: protocol.ServingActive,
 	}

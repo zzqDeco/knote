@@ -18,9 +18,9 @@ func TestPermissionedAcceptanceEntityVisibleProtectedClaimHidden(t *testing.T) {
 	const invariant = "visible entity must not imply visibility of its protected claim"
 	authorizer := permissionedAcceptanceAuthorizer(t, invariant)
 	entity := permissionedAcceptanceMetadata(t, invariant, protocol.ResourceEntity,
-		"entities/visible", "document:entity-visible")
+		"entities/visible", "entity:visible")
 	claim := permissionedAcceptanceMetadata(t, invariant, protocol.ResourceClaim,
-		"claims/protected", "document:claim-protected")
+		"claims/protected", "claim:protected")
 
 	decisions, err := authorizer.BatchCheck(context.Background(), BatchCheckRequest{
 		AuthorizationModelID: permissionedAcceptanceModelID,
@@ -47,9 +47,9 @@ func TestPermissionedAcceptanceDeniedIntermediateClaimBlocksPathParticipation(t 
 	const invariant = "denied intermediate claim must block downstream path participation"
 	authorizer := permissionedAcceptanceAuthorizer(t, invariant)
 	checks := []BatchCheckItem{
-		{CorrelationID: "path-source", User: "user:alice", Relation: RelationCanView, Object: "document:entity-visible"},
-		{CorrelationID: "path-claim", User: "user:alice", Relation: RelationCanView, Object: "document:claim-protected"},
-		{CorrelationID: "path-target", User: "user:alice", Relation: RelationCanView, Object: "document:downstream-visible"},
+		{CorrelationID: "path-source", User: "user:alice", Relation: RelationCanView, Object: "entity:visible"},
+		{CorrelationID: "path-claim", User: "user:alice", Relation: RelationCanView, Object: "claim:protected"},
+		{CorrelationID: "path-target", User: "user:alice", Relation: RelationCanView, Object: "entity:downstream"},
 	}
 	decisions, err := authorizer.BatchCheck(context.Background(), BatchCheckRequest{
 		AuthorizationModelID: permissionedAcceptanceModelID,
@@ -97,22 +97,25 @@ func permissionedAcceptanceAuthorizer(t *testing.T, invariant string) *LocalAuth
 	tuple := func(user, relation, object string) Tuple {
 		return Tuple{User: user, Relation: relation, Object: object}
 	}
-	twoVisibleDocuments := []string{"document:entity-visible", "document:downstream-visible"}
 	tuples := []Tuple{
 		tuple("user:alice", RelationMember, "organization:acme"),
 		tuple("organization:acme", RelationOrganization, "knowledge_base:acceptance"),
 		tuple("user:alice", RelationViewer, "knowledge_base:acceptance"),
+		tuple("organization:acme", RelationOrganization, "document:source"),
+		tuple("knowledge_base:acceptance", RelationParent, "document:source"),
 	}
-	for _, object := range twoVisibleDocuments {
+	for _, object := range []string{"entity:visible", "entity:downstream"} {
 		tuples = append(tuples,
 			tuple("organization:acme", RelationOrganization, object),
-			tuple("knowledge_base:acceptance", RelationParent, object),
+			tuple("document:source", RelationSourceDocument, object),
 		)
 	}
 	tuples = append(tuples,
-		tuple("organization:acme", RelationOrganization, "document:claim-protected"),
-		tuple("knowledge_base:acceptance", RelationParent, "document:claim-protected"),
-		tuple("user:*", RelationRestricted, "document:claim-protected"),
+		tuple("organization:acme", RelationOrganization, "claim:protected"),
+		tuple("document:source", RelationSourceDocument, "claim:protected"),
+		tuple("entity:visible", RelationSubject, "claim:protected"),
+		tuple("entity:downstream", RelationObject, "claim:protected"),
+		tuple("user:*", RelationRestricted, "claim:protected"),
 	)
 	authorizer, err := NewLocalAuthorizer(permissionedAcceptanceModelID, tuples)
 	permissionedAcceptanceNoError(t, invariant, err)

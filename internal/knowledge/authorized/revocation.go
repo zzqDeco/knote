@@ -127,16 +127,19 @@ func (s *Service) validateProtectedEvidence(
 		return ErrProtectedContentUnavailable
 	}
 	handles, boundaries, _, err := collectEvidenceHandles(current, loaded)
-	if err != nil || len(handles) != len(binding.Resources) {
+	if err != nil {
 		return ErrProtectedContentUnavailable
 	}
-	exact := make(map[protocol.ResourceID]protocol.ResourceHandle, len(handles))
-	for _, handle := range handles {
-		exact[handle.ResourceID] = handle
-	}
+	// Traversal path resources are authorization-only binding entries. Every
+	// handle recovered from exact-loaded evidence must still match its binding.
+	bound := make(map[protocol.ResourceID]protocol.ProtectedResourceBinding, len(binding.Resources))
 	for _, resource := range binding.Resources {
-		if exact[resource.Resource.ResourceID] != resource.Resource ||
-			boundaries[resource.Resource.ResourceID] != resource.AuthorizationResource {
+		bound[resource.Resource.ResourceID] = resource
+	}
+	for _, handle := range handles {
+		resource, ok := bound[handle.ResourceID]
+		if !ok || resource.Resource != handle ||
+			resource.AuthorizationResource != boundaries[handle.ResourceID] {
 			return ErrProtectedContentUnavailable
 		}
 	}

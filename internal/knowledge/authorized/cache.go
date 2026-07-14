@@ -26,22 +26,23 @@ type QueryCache struct {
 }
 
 type queryCacheKey struct {
-	questionDigest     [sha256.Size]byte
-	contractVersion    string
-	tenantID           string
-	knowledgeBaseID    string
-	principalID        string
-	authorizationModel string
-	identityWatermark  string
-	aclWatermark       string
-	agentID            string
-	taskID             string
-	consistency        protocol.ConsistencyPreference
-	retrieverVersion   string
-	promptVersion      string
-	retrieveLimit      int
-	evidenceLimit      int
-	expandLimit        int
+	questionDigest      [sha256.Size]byte
+	contractVersion     string
+	tenantID            string
+	knowledgeBaseID     string
+	principalID         string
+	authorizationModel  string
+	identityWatermark   string
+	aclWatermark        string
+	agentID             string
+	taskID              string
+	consistency         protocol.ConsistencyPreference
+	retrieverVersion    string
+	promptVersion       string
+	retrieveLimit       int
+	evidenceLimit       int
+	traversalPlanDigest traversalPlanDigest
+	traversalPathDigest traversalPlanDigest
 }
 
 type queryCacheEntry struct {
@@ -90,26 +91,28 @@ func newQueryCacheKey(
 	promptVersion string,
 	retrieveLimit int,
 	evidenceLimit int,
-	expandLimit int,
+	traversalPlanDigest traversalPlanDigest,
+	traversalPathDigest traversalPlanDigest,
 ) queryCacheKey {
 	authorization := request.Authorization
 	return queryCacheKey{
-		questionDigest:     sha256.Sum256([]byte(request.Question)),
-		contractVersion:    authorization.Version,
-		tenantID:           authorization.TenantID,
-		knowledgeBaseID:    authorization.KnowledgeBaseID,
-		principalID:        authorization.PrincipalID,
-		authorizationModel: authorization.AuthorizationModelID,
-		identityWatermark:  authorization.IdentityWatermark,
-		aclWatermark:       authorization.ACLWatermark,
-		agentID:            authorization.AgentID,
-		taskID:             authorization.TaskID,
-		consistency:        authorization.Consistency,
-		retrieverVersion:   retrieverVersion,
-		promptVersion:      promptVersion,
-		retrieveLimit:      retrieveLimit,
-		evidenceLimit:      evidenceLimit,
-		expandLimit:        expandLimit,
+		questionDigest:      sha256.Sum256([]byte(request.Question)),
+		contractVersion:     authorization.Version,
+		tenantID:            authorization.TenantID,
+		knowledgeBaseID:     authorization.KnowledgeBaseID,
+		principalID:         authorization.PrincipalID,
+		authorizationModel:  authorization.AuthorizationModelID,
+		identityWatermark:   authorization.IdentityWatermark,
+		aclWatermark:        authorization.ACLWatermark,
+		agentID:             authorization.AgentID,
+		taskID:              authorization.TaskID,
+		consistency:         authorization.Consistency,
+		retrieverVersion:    retrieverVersion,
+		promptVersion:       promptVersion,
+		retrieveLimit:       retrieveLimit,
+		evidenceLimit:       evidenceLimit,
+		traversalPlanDigest: traversalPlanDigest,
+		traversalPathDigest: traversalPathDigest,
 	}
 }
 
@@ -279,6 +282,7 @@ func (c *QueryCache) evictOldestLocked() {
 
 func cloneQueryResult(source QueryResult) QueryResult {
 	clone := source
+	clone.Traversal = nil
 	clone.Generation = cloneGeneration(source.Generation)
 	clone.Evidence.Items = cloneEvidenceItems(source.Evidence.Items)
 	if source.Evidence.Decisions != nil {
