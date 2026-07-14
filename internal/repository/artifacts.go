@@ -258,6 +258,9 @@ func validateLegacyGraphArtifactProjection(
 		}
 	}
 	sort.Strings(graphClaimIDs)
+	if manifest.GraphBindingContractVersion == protocol.GraphBindingContractVersion && len(graphClaimIDs) != 0 {
+		return ErrArtifactProjectionMismatch
+	}
 	claimIDs := make([]string, len(claims))
 	for index, claim := range claims {
 		claimIDs[index] = claim.ClaimID
@@ -277,6 +280,8 @@ func validateDecodedGraphArtifactProjection(
 ) error {
 	if projection.Version != manifest.ProjectionVersion ||
 		projection.SourceSnapshot.Version != manifest.SourceSnapshot.Version ||
+		projection.SourceSnapshot.Digest != protocol.ContentDigest("sha256:"+manifest.SourceSnapshot.Digest) ||
+		graphBindings[0].Resource.Versions.ACL != manifest.AuthorizationVersion ||
 		projection.SourceSnapshot.DocumentCount != manifest.SourceSnapshot.DocumentCount {
 		return fmt.Errorf("projection identity differs from manifest")
 	}
@@ -478,7 +483,7 @@ artifacts:
   claim_bindings: claim_bindings.jsonl
   summaries: summaries.jsonl
 graph_binding_contract:
-  version: 1
+  version: 2
   graph_object_type: KnoteResource
   claim_edge_type: KnoteClaimEdge
 `

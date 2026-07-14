@@ -122,6 +122,63 @@ func TestCanonicalArtifactFilesEmitExactSourceBackedClaimBindingsWithoutRawGraph
 	}
 }
 
+func TestGraphArtifactValidationRejectsProjectionIdentityOutsideManifest(t *testing.T) {
+	set := sourceBackedArtifactSet(t)
+	payloads, err := CanonicalArtifactFiles(set)
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := make(map[string][]byte, len(payloads))
+	for _, payload := range payloads {
+		files[payload.Descriptor.Path] = payload.Data
+	}
+	files["projection.json"] = set.ProjectionJSON
+	manifest := set.BundleManifest
+	manifest.Files = ArtifactFileDescriptors(payloads)
+
+	t.Run("canonical snapshot digest", func(t *testing.T) {
+		mismatched := set
+		mismatched.BundleManifest.SourceSnapshot.Digest = strings.Repeat("f", 64)
+		if _, err := CanonicalArtifactFiles(mismatched); !errors.Is(err, ErrArtifactProjectionMismatch) {
+			t.Fatalf("snapshot digest mismatch error = %v, want generic projection mismatch", err)
+		}
+	})
+	t.Run("payload snapshot digest", func(t *testing.T) {
+		mismatched := manifest
+		mismatched.SourceSnapshot.Digest = strings.Repeat("f", 64)
+		if err := ValidateGraphArtifactPayloads(mismatched, files); !errors.Is(err, ErrArtifactProjectionMismatch) {
+			t.Fatalf("snapshot digest mismatch error = %v, want generic projection mismatch", err)
+		}
+	})
+	t.Run("payload ACL version", func(t *testing.T) {
+		mismatched := manifest
+		mismatched.AuthorizationVersion = "acl-other"
+		if err := ValidateGraphArtifactPayloads(mismatched, files); !errors.Is(err, ErrArtifactProjectionMismatch) {
+			t.Fatalf("ACL version mismatch error = %v, want generic projection mismatch", err)
+		}
+	})
+}
+
+func TestCanonicalArtifactFilesEmitsCurrentGraphBindingContractSchemaVersion(t *testing.T) {
+	payloads, err := CanonicalArtifactFiles(sourceBackedArtifactSet(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []byte(fmt.Sprintf(
+		"graph_binding_contract:\n  version: %d\n",
+		protocol.GraphBindingContractVersion,
+	))
+	for _, payload := range payloads {
+		if payload.Descriptor.Path == "schema.yaml" {
+			if !bytes.Contains(payload.Data, want) {
+				t.Fatalf("schema graph binding contract = %q, want %q", payload.Data, want)
+			}
+			return
+		}
+	}
+	t.Fatal("schema.yaml was not emitted")
+}
+
 func TestValidateGraphArtifactPayloadsPreservesLegacyV2WithoutGraphContract(t *testing.T) {
 	manifest := protocol.ArtifactBundleManifest{GraphBindingContractVersion: 0}
 	files := map[string][]byte{
@@ -225,6 +282,27 @@ func TestValidateGraphArtifactPayloadsRejectsEmptyLegacyGraphProjection(t *testi
 	}
 }
 
+func TestValidateGraphArtifactPayloadsRejectsCurrentContractLegacyClaimsWithoutBindings(t *testing.T) {
+	set := sourceBackedArtifactSet(t)
+	claims, err := marshalJSONL(set.Claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	graphBindings, err := marshalJSONL(set.GraphBindings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := map[string][]byte{
+		"projection.json":                  []byte(`{"version":"` + set.BundleManifest.ProjectionVersion + `"}`),
+		"claims.jsonl":                     claims,
+		protocol.GraphBindingsArtifactPath: graphBindings,
+		protocol.ClaimBindingsArtifactPath: nil,
+	}
+	if err := ValidateGraphArtifactPayloads(set.BundleManifest, files); !errors.Is(err, ErrArtifactProjectionMismatch) {
+		t.Fatalf("current legacy projection with unbound Claims error = %v, want generic projection mismatch", err)
+	}
+}
+
 func sourceBackedArtifactSet(t *testing.T) ArtifactSet {
 	t.Helper()
 	scope := catalog.Scope{TenantID: "tenant", KnowledgeBaseID: "knowledge-base"}
@@ -306,10 +384,14 @@ func sourceBackedArtifactSet(t *testing.T) ArtifactSet {
 	return ArtifactSet{
 		Manifest: protocol.ArtifactManifest{Version: 1, ClaimCount: 1},
 		BundleManifest: protocol.ArtifactBundleManifest{
-			ProjectionVersion: projectionVersion, AuthorizationVersion: versions.ACL,
+			ProjectionVersion:           projectionVersion,
+			AuthorizationObject:         "knowledge-base:" + scope.KnowledgeBaseID,
+			AuthorizationVersion:        versions.ACL,
 			GraphBindingContractVersion: protocol.GraphBindingContractVersion,
-			SourceSnapshot:              protocol.ArtifactSourceSnapshot{Version: versions.Source, DocumentCount: 1},
-			Compatibility:               protocol.ArtifactManifest{Version: 1, ClaimCount: 1},
+			SourceSnapshot: protocol.ArtifactSourceSnapshot{
+				Version: versions.Source, Digest: strings.TrimPrefix(string(snapshot.Digest), "sha256:"), DocumentCount: 1,
+			},
+			Compatibility: protocol.ArtifactManifest{Version: 1, ClaimCount: 1},
 		},
 		ProjectionJSON: projectionJSON, ProjectionResourceCount: len(projection.Resources),
 		Claims: []protocol.Claim{{
