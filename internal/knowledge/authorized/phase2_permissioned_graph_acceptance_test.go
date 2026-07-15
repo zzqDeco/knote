@@ -549,7 +549,9 @@ func TestPhase2PermissionedGraphCacheCitationRevocationAndSessionReplay(t *testi
 func TestPhase2PermissionedGraphRevocationLatencyBudget(t *testing.T) {
 	const (
 		invariant = "Phase 2 graph revocation propagation remains bounded in one clock domain"
-		samples   = 16
+		samples   = 128
+		p95Budget = 25 * time.Millisecond
+		p99Budget = 100 * time.Millisecond
 	)
 	latencies := make([]time.Duration, 0, samples)
 	for sample := 0; sample < samples; sample++ {
@@ -598,12 +600,12 @@ func TestPhase2PermissionedGraphRevocationLatencyBudget(t *testing.T) {
 	}
 	p95 := percentileDuration(latencies, 0.95)
 	p99 := percentileDuration(latencies, 0.99)
-	if p95 > acceptanceRevocationSLO || p99 > acceptanceRevocationSLO {
-		acceptanceFatalf(t, invariant, "revocation p95=%s p99=%s exceeds %s", p95, p99, acceptanceRevocationSLO)
+	if p95 > p95Budget || p99 > p99Budget {
+		acceptanceFatalf(t, invariant, "revocation p95=%s budget=%s p99=%s budget=%s", p95, p95Budget, p99, p99Budget)
 	}
 	t.Logf(
-		"projection=%s authz_model=%s samples=%d graph_revocation_p95=%s graph_revocation_p99=%s revocation_slo=%s false_allow=0",
-		acceptanceProjectionVersion, fixture.AuthorizationModelID, samples, p95, p99, acceptanceRevocationSLO,
+		"projection=%s authz_model=%s samples=%d graph_revocation_p95=%s graph_revocation_p95_budget=%s graph_revocation_p99=%s graph_revocation_p99_budget=%s false_allow=0",
+		acceptanceProjectionVersion, fixture.AuthorizationModelID, samples, p95, p95Budget, p99, p99Budget,
 	)
 }
 
