@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import select
@@ -138,6 +139,36 @@ def wait_file(path: Path, timeout: float = 30) -> None:
     raise AssertionError(f"timed out waiting for file {path}")
 
 
+def wait_session_tool(workspace: Path, tool_name: str, timeout: float = 30) -> None:
+    session_dir = workspace / ".knote" / "sessions"
+    deadline = time.monotonic() + timeout
+    observed: set[str] = set()
+    while time.monotonic() < deadline:
+        for path in session_dir.glob("*.jsonl"):
+            try:
+                lines = path.read_text(encoding="utf-8").splitlines()
+            except (FileNotFoundError, OSError):
+                continue
+            for line in lines:
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                payload = event.get("payload")
+                if event.get("type") != "tool.complete" or not isinstance(payload, dict):
+                    continue
+                observed_name = payload.get("tool")
+                if isinstance(observed_name, str):
+                    observed.add(observed_name)
+                if observed_name == tool_name and isinstance(event.get("protected_content"), dict):
+                    return
+        time.sleep(0.1)
+    raise AssertionError(
+        f"timed out waiting for protected {tool_name} completion in {session_dir}; "
+        f"observed tools: {sorted(observed)}"
+    )
+
+
 def wait_git_clean(workspace: Path, timeout: float = 30) -> None:
     deadline = time.monotonic() + timeout
     pathspec = [".knote/config.yaml", "sources", "artifacts", "evals"]
@@ -192,10 +223,11 @@ def run_fake_mvp(driver: PTYDriver, workspace: Path) -> None:
     driver.expect("eval is unavail", timeout=10)
 
 
-def run_eino_local_proxy(driver: PTYDriver) -> None:
+def run_eino_local_proxy(driver: PTYDriver, workspace: Path) -> None:
     run_startup(driver)
     driver.send('Use knote_query to answer the current workspace knowledge-base question "What is knote?". After the tool succeeds, reply only with knote-authorized-ok.\r')
     driver.expect("knote-authorized-ok", timeout=60)
+    wait_session_tool(workspace, "knote_query")
 
 
 def main() -> int:
@@ -227,7 +259,7 @@ def main() -> int:
             elif args.scenario == "fake-mvp":
                 run_fake_mvp(driver, workspace)
             elif args.scenario == "eino-local-proxy":
-                run_eino_local_proxy(driver)
+                run_eino_local_proxy(driver, workspace)
             return 0
         except AssertionError as exc:
             last_error = exc
