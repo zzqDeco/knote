@@ -3,7 +3,7 @@
 - Status: accepted
 - Date: 2026-07-10
 - Parent: GitHub issue #34
-- Implements: GitHub issue #36
+- Implements: GitHub issues #36 and #39
 - Inspected package: OpenSPG/KAG `0.8.0`
 - Inspected source: local `v0.8.0-9-gfdab15b3`
 
@@ -11,13 +11,14 @@
 
 The complete OpenSPG/KAG solver is a **No-Go** as knote's permissioned query boundary. KAG remains the builder and storage integration. Knote owns retrieval orchestration, authorization, per-frontier expansion decisions, evidence loading, and generation.
 
-The production path will use three explicit adapter primitives:
+The production path uses four explicit adapter primitives:
 
-1. `kag.retrieve` returns ID-only candidate handles.
-2. `kag.expand` accepts an already-authorized frontier and returns ID-only expansion handles.
-3. `kag.generate` accepts only an already-authorized evidence set.
+1. `kag.discover` returns the complete body-free serving catalog.
+2. `kag.retrieve` returns ID-only candidate handles.
+3. `kag.expand` accepts an already-authorized frontier and returns ID-only expansion handles.
+4. `kag.generate` accepts only an already-authorized evidence set.
 
-The fake adapter implements these contracts for deterministic contract and leak tests. Real mode returns the typed error code `unsupported_primitive` until issue #39 supplies a proven low-level implementation. It must return that error before config loading, health checks, solver construction, graph access, trace creation, or LLM calls.
+The fake adapter implements these contracts for deterministic contract and leak tests. Issue #39 subsequently implemented real mode through the operator-supplied provider contract recorded in ADR 0004. Real mode validates the immutable graph bundle before provider loading; provider output remains constrained to allowlisted opaque IDs, and generation receives only digest-verified authorized evidence. The normal CLI does not yet select this real permissioned composition.
 
 Legacy `kag.query` and `kag.explain` remain compatibility methods for existing non-permissioned smoke coverage. They are not a secure production query path and must not be selected by the future authorized gateway.
 
@@ -127,7 +128,7 @@ Authorization context is not part of these adapter JSON parameters. The trusted 
 
 - Missing or malformed primitive inputs fail before the subprocess is started.
 - Unknown methods remain ordinary adapter errors.
-- Unimplemented real primitives return `unsupported_primitive` without touching KAG.
+- Missing, invalid, or unavailable real providers fail closed without falling back to legacy `kag.query` or `kag.explain`.
 - Go context cancellation and deadlines terminate the adapter subprocess through `exec.CommandContext` and return the original context error.
 - `kag.cancel` is only a protocol acknowledgement in the current one-request subprocess model; it is not the production cancellation mechanism.
 - Partial, malformed, or oversized adapter output remains an error and cannot produce candidates or evidence.
@@ -142,8 +143,8 @@ Authorization context is not part of these adapter JSON parameters. The trusted 
 
 ## Consequences
 
-- Issue #37 can implement authorization without importing KAG internals.
-- Issue #38 must produce stable projection/index handles and a catalog that loads bodies only after authorization.
-- Issue #39 owns the real retrieval primitive, the authorized gateway, and runtime wiring.
-- Phase 1 graph expansion may remain disabled if an ID-only low-level primitive cannot be proven safe.
+- Issue #37 implemented authorization without importing KAG internals.
+- Issue #38 produced stable projection/index handles and a catalog that loads bodies only after authorization.
+- Issue #39 implemented the real provider-backed primitives, authorized gateway, and deterministic fake runtime wiring.
+- Phase 2 added immutable graph and Claim bindings plus bounded per-hop expansion; default real CLI composition remains out of scope for `v0.2.0`.
 - Real KAG build smoke remains valid. Legacy real query/explain smoke is compatibility evidence only and is not a permissioned-query acceptance gate.

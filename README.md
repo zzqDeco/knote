@@ -4,7 +4,7 @@
 
 ## Version Status
 
-`v0.1.0` is the published MVP baseline. The next release candidate is `v0.1.1`, which makes the Eino ChatModel runner the only runtime path, keeps runtime confirmation bridging for mutating Eino tools, and includes local CLIProxyAPI/OpenAI-compatible smoke coverage plus hardened local proxy smoke portability.
+`v0.1.1` is the published runtime/Eino baseline. The `v0.2.0` release line adds the permissioned KAG serving foundation and real primitive-provider path: OpenFGA-backed authorization, deterministic projection and graph bindings, body-free retrieval primitives, bounded per-hop authorized Claim traversal, revocation-safe cache/citation/session replay, and deterministic plus live OpenFGA/OpenSPG acceptance gates. The CLI currently selects the authorization-aware query tools only in deterministic fake mode; real operator runtime composition is not enabled by default.
 
 This MVP is Go-first:
 
@@ -40,10 +40,9 @@ Inside the TUI:
 > /versions
 > /diff
 > /commit
-> /eval
 ```
 
-Side-effecting commands (`/build`, `/commit`, `/release`, `/checkout`, `/eval`) open an inline confirmation prompt. Press `Enter` or `y` to approve once, and `n` or `Esc` to cancel.
+Side-effecting commands (`/build`, `/commit`, `/release`, `/checkout`) open an inline confirmation prompt. Press `Enter` or `y` to approve once, and `n` or `Esc` to cancel. `/eval` currently fails closed because the legacy evaluation path calls non-permissioned explain; it will remain unavailable until evaluation runs entirely through the authorized evidence boundary.
 
 Useful startup flags:
 
@@ -72,7 +71,7 @@ For real KAG execution:
 1. Start OpenSPG locally at `http://127.0.0.1:8887`.
 2. Install `openspg-kag` in the Python environment used by `KNOTE_PYTHON`.
 3. Put Markdown or text sources under `sources/`.
-4. Run `scripts/smoke_real_kag.sh` before a release candidate.
+4. Run `scripts/smoke_real_kag.sh` against a disposable OpenSPG project or stack before a release candidate. The compatibility smoke does not remove server-side project data.
 
 The Phase 2 permissioned graph smoke is separate from that legacy compatibility
 check. It starts pinned disposable OpenFGA and OpenSPG containers, uses only the
@@ -112,7 +111,7 @@ KNOTE_EINO_BASE_URL=https://api.openai.com/v1 \
 
 `KNOTE_EINO_MODEL_PROFILE` selects a profile from `.knote/config.yaml` and defaults to `default`. Environment variables override the selected profile. `OPENAI_MODEL`, `OPENAI_API_KEY`, and `OPENAI_BASE_URL` are also accepted; when those overrides are present, provider defaults to `openai-compatible`. `KNOTE_EINO_REASONING_EFFORT` accepts `low`, `medium`, or `high`. `KNOTE_RUNTIME_MODE=direct` is rejected.
 
-Mutating Eino tools require a runtime side-effect gate, matching the TUI confirmation rule for `/build`, `/commit`, `/release`, `/checkout`, and `/eval`.
+Mutating Eino tools require a runtime side-effect gate, matching the TUI confirmation rule for `/build`, `/commit`, `/release`, and `/checkout`.
 
 For a local CLIProxyAPI/OpenAI-compatible smoke, keep the proxy running and use:
 
@@ -123,7 +122,7 @@ KNOTE_EINO_REASONING_EFFORT=low \
 scripts/smoke_eino_local_proxy.sh
 ```
 
-The script probes `/v1/models`, starts the Eino-only TUI, sends a fixed PTY prompt, and waits for `knote-eino-ok`. Set `KNOTE_EINO_API_KEY` explicitly, set `KNOTE_CLIPROXY_CONFIG`, or let the script try documented CLIProxyAPI default config paths such as `~/.cli-proxy-api/config.yaml` and Homebrew `etc/cliproxyapi.conf`.
+The script probes `/v1/models`, starts the Eino-only TUI, requires the model to call the permissioned `knote_query` tool, and waits for the evidence-bound `knote-authorized-ok` response. Set `KNOTE_EINO_API_KEY` explicitly, set `KNOTE_CLIPROXY_CONFIG`, or let the script try documented CLIProxyAPI default config paths such as `~/.cli-proxy-api/config.yaml` and Homebrew `etc/cliproxyapi.conf`.
 
 ## Versions And Eval
 
@@ -133,16 +132,20 @@ The script probes `/v1/models`, starts the Eino-only TUI, sends a fixed PTY prom
 - `/commit [message]` stages only those knowledge paths and creates a commit after confirmation.
 - `/versions` lists recent commits, tags, and the current marker.
 - `/checkout <ref>` requires confirmation, with an extra dirty-workspace warning.
-- `/eval` reads `evals/questions.jsonl` or uses an internal smoke question, writes `evals/results.jsonl` and `evals/report.md`, and feeds the release gate.
-- `/release [tag]` requires a clean workspace and a non-stale eval report with no adapter errors.
+- The versioned service can read `evals/questions.jsonl`, write `evals/results.jsonl` and `evals/report.md`, and feed the knowledge release gate, but `/eval` is not exposed by the current permissioned runtime because its legacy explain dependency is outside the authorized boundary.
+- `/release [tag]` requires a clean workspace and a non-stale eval report with no adapter errors. The repository's product releases use the reviewed GitHub release workflow while permissioned evaluation is unavailable.
 
 ## Acceptance
 
 Default validation:
 
+Use Python 3.11 for the Python gates to match CI.
+
 ```bash
 KNOTE_KAG_FAKE=1 go test ./...
 python3 -m unittest discover -s adapters/kag -p '*test*.py'
+GOTOOLCHAIN=go1.25.12 go run github.com/openfga/cli/cmd/fga@v0.7.17 model test --tests internal/authz/model/authorization.fga.yaml
+python3 tests/smoke/permissioned_graph_real_smoke.py --self-test
 CGO_ENABLED=0 go build -o bin/knote ./cmd/knote
 PYTHON=/usr/bin/python3 KNOTE_SMOKE_FORCE_BIN=1 scripts/smoke_fake_mvp.sh
 ```
@@ -184,7 +187,12 @@ MVP scope includes:
 - Eino tool adapters and OpenAI-compatible ADK runner bridge as the only runtime path
 - Git diff/log/commit/tag wrappers
 - release-oriented CI skeleton
+- OpenFGA authorization contracts and a permission-safe graph identity model
+- deterministic catalog/projection bundles with exact resource, graph, and Claim bindings
+- body-free discovery/retrieve/expand primitives and evidence-only generation
+- bounded multi-hop Claim traversal with authorization at every participating hop
+- revocation-safe authorized caches, citations, and permission-bound session replay
+- protected query surfaces and derived-output visibility enforcement
+- credential-free permissioned acceptance tests plus a pinned disposable OpenFGA/OpenSPG live smoke
 
-Not in v0.1.0: web UI, desktop app, cloud sync, multi-user collaboration, independent version database, graph-database versioning, or MCP dependency.
-
-Not in v0.1.1: main-branch promotion without a release PR, or automatic tag creation without explicit confirmation.
+Out of scope for `v0.2.0`: web UI, desktop app, cloud sync, multi-user collaboration UI, an independent version database, OpenSPG as the serving authorization boundary, default real-CLI composition of the operator permissioned provider, permissioned `/eval`, or an MCP dependency. Main-branch promotion still requires a reviewed release PR, and release tags still require explicit confirmation.

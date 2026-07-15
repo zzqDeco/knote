@@ -46,15 +46,20 @@ The MVP is a single Go CLI/TUI binary with a Python KAG subprocess adapter. Bubb
 - PR #25 `docs/release-v0.1.1-readiness`: prepares `v0.1.1` release-candidate documentation.
 - PR #30 `refactor/eino-only-runtime`: completed and merged to `dev`.
 - PR #31 `refactor/remove-direct-agent`: removes the legacy direct agent package and updates Eino-only docs.
+- PRs #42-#54: complete the Phase 1 permissioned KAG contracts, interception boundary, OpenFGA foundation, deterministic projection store, authorized retrieval/runtime wiring, revocation-safe state, and acceptance suite.
+- PRs #62-#67: complete the Phase 2 graph identity bindings, real permissioned primitives, restricted Claim traversal, bounded per-hop authorization, protected derived/query surfaces, and pinned live acceptance gate.
 
 ## Acceptance
 
 - `KNOTE_KAG_FAKE=1 go test ./...` passes.
-- `/usr/bin/python3 -m unittest discover -s adapters/kag -p '*test*.py'` passes.
+- `python3 -m unittest discover -s adapters/kag -p '*test*.py'` passes with Python 3.11.
 - `CGO_ENABLED=0 go build -o bin/knote ./cmd/knote` succeeds.
-- `PYTHON=/usr/bin/python3 KNOTE_SMOKE_FORCE_BIN=1 bash scripts/smoke_fake_mvp.sh` starts the TUI in a PTY, runs fake build/diff/commit/resume/eval, and exits cleanly. `go test ./...` also covers the `knote_query` Eino tool against fake KAG.
-- `KNOTE_EINO_BASE_URL=http://127.0.0.1:8317/v1 KNOTE_EINO_MODEL=gpt-5.3-codex-spark KNOTE_EINO_REASONING_EFFORT=low bash scripts/smoke_eino_local_proxy.sh` manually validates the OpenAI-compatible Eino runner path when a local proxy and API key are available.
+- `PYTHON=/usr/bin/python3 KNOTE_SMOKE_FORCE_BIN=1 bash scripts/smoke_fake_mvp.sh` starts the TUI in a PTY, runs fake build/diff/commit/resume, verifies `/eval` fails closed, and exits cleanly. `go test ./...` also covers the `knote_query` Eino tool against fake KAG.
+- `KNOTE_EINO_BASE_URL=http://127.0.0.1:8317/v1 KNOTE_EINO_MODEL=gpt-5.3-codex-spark KNOTE_EINO_REASONING_EFFORT=low bash scripts/smoke_eino_local_proxy.sh` manually validates the OpenAI-compatible Eino runner and evidence-bound permissioned query path when a local proxy and API key are available.
 - `KNOTE_PYTHON=/path/to/python KNOTE_KAG_HOST=http://127.0.0.1:8887 scripts/smoke_real_kag.sh` passes in a local real OpenSPG/KAG environment.
+- `GOTOOLCHAIN=go1.25.12 go run github.com/openfga/cli/cmd/fga@v0.7.17 model test --tests internal/authz/model/authorization.fga.yaml` validates the OpenFGA model.
+- `python3 tests/smoke/permissioned_graph_real_smoke.py --self-test` validates the credential-free deterministic half of the permissioned graph smoke.
+- `KNOTE_PERMISSIONED_GRAPH_REAL_SMOKE=1 KNOTE_PYTHON=/path/to/openspg-kag-0.8-python scripts/smoke_permissioned_graph_real.sh` validates the pinned disposable OpenFGA/OpenSPG/KAG path and its cleanup.
 
 ## Release Candidate Checklist
 
@@ -63,17 +68,35 @@ The MVP is a single Go CLI/TUI binary with a Python KAG subprocess adapter. Bubb
 3. Promote release branches to `main` only after explicit confirmation.
 4. Create release tags only after explicit confirmation.
 
-## v0.1.1 Release Candidate
+## v0.1.1 Release
 
-`v0.1.1` is the post-`v0.1.0` runtime/Eino release candidate. It uses the Eino ChatModel path as the only runtime, keeps the Eino mutating-tool confirmation bridge, and includes local CLIProxyAPI/OpenAI-compatible smoke plus hardened smoke portability.
+`v0.1.1` is the published post-`v0.1.0` runtime/Eino release. It uses the Eino ChatModel path as the only runtime, keeps the Eino mutating-tool confirmation bridge, and includes local CLIProxyAPI/OpenAI-compatible smoke plus hardened smoke portability.
 
 Candidate validation must pass on `dev` and again on `release/v0.1.1`:
 
 - `KNOTE_KAG_FAKE=1 go test ./...`
-- `/usr/bin/python3 -m unittest discover -s adapters/kag -p '*test*.py'`
+- `python3 -m unittest discover -s adapters/kag -p '*test*.py'` with Python 3.11
 - `CGO_ENABLED=0 go build -o bin/knote ./cmd/knote`
 - `PYTHON=/usr/bin/python3 KNOTE_SMOKE_FORCE_BIN=1 bash scripts/smoke_fake_mvp.sh`
 - `KNOTE_EINO_BASE_URL=http://127.0.0.1:8317/v1 KNOTE_EINO_MODEL=gpt-5.3-codex-spark KNOTE_EINO_REASONING_EFFORT=low bash scripts/smoke_eino_local_proxy.sh`
 - `KNOTE_PYTHON=/path/to/kag-venv/python KNOTE_KAG_HOST=http://127.0.0.1:8887 bash scripts/smoke_real_kag.sh`
 
-After these pass, create `release/v0.1.1` from `dev`, open `release/v0.1.1 -> main`, and trigger `@codex review`. Merging to `main`, creating `v0.1.1`, and publishing release assets require separate explicit confirmation.
+The release was promoted through `release/v0.1.1 -> main`, reviewed, tagged, and published with the repository release workflow.
+
+## v0.2.0 Release Candidate
+
+`v0.2.0` is the permissioned KAG release candidate. Phase 1 adds the fail-closed authorization boundary and durable serving projection; Phase 2 adds permission-safe graph identity, real body-free primitives, restricted Claim traversal with per-hop authorization, protected derived/query surfaces, and live OpenFGA/OpenSPG evidence. Permissioned `/eval` remains fail closed because the legacy explain dependency is outside this boundary.
+
+Candidate validation must pass on `dev` and again on `release/v0.2.0`:
+
+- `KNOTE_KAG_FAKE=1 go test ./...`
+- `/usr/bin/python3 -m unittest discover -s adapters/kag -p '*test*.py'`
+- `CGO_ENABLED=0 go build -o /tmp/knote-v0.2.0 ./cmd/knote`
+- `GOTOOLCHAIN=go1.25.12 go run github.com/openfga/cli/cmd/fga@v0.7.17 model test --tests internal/authz/model/authorization.fga.yaml`
+- `python3 tests/smoke/permissioned_graph_real_smoke.py --self-test`
+- `PYTHON=/usr/bin/python3 KNOTE_SMOKE_FORCE_BIN=1 bash scripts/smoke_fake_mvp.sh`
+- `KNOTE_EINO_BASE_URL=http://127.0.0.1:8317/v1 KNOTE_EINO_MODEL=gpt-5.3-codex-spark KNOTE_EINO_REASONING_EFFORT=low bash scripts/smoke_eino_local_proxy.sh`
+- `KNOTE_PYTHON=/path/to/kag-venv/python KNOTE_KAG_HOST=http://127.0.0.1:8887 bash scripts/smoke_real_kag.sh` against a disposable project or stack
+- `KNOTE_PERMISSIONED_GRAPH_REAL_SMOKE=1 KNOTE_PYTHON=/path/to/openspg-kag-0.8-python bash scripts/smoke_permissioned_graph_real.sh`
+
+After these pass, merge the release-readiness PR into `dev`, create `release/v0.2.0` from that exact head, open `release/v0.2.0 -> main`, and trigger a fresh current-head `@codex review`. The tag-triggered release workflow reruns the offline gates and checks version stamping before it can publish assets. Merging to `main`, creating `v0.2.0`, and publishing release assets still require explicit confirmation.

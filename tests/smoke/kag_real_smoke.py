@@ -32,7 +32,6 @@ def call_adapter(
     host: str,
     method: str,
     params: dict[str, Any] | None = None,
-    expected_error_code: str = "",
 ) -> dict[str, Any]:
     payload = {
         "id": method.replace(".", "_"),
@@ -62,11 +61,7 @@ def call_adapter(
         raise SystemExit(f"{method} returned no NDJSON output\nstderr:\n{proc.stderr}")
     last = lines[-1]
     if last.get("type") == "error":
-        if expected_error_code and last.get("code") == expected_error_code:
-            return last
         raise SystemExit(f"{method} adapter error: {last.get('error')}\nstderr:\n{proc.stderr}")
-    if expected_error_code:
-        raise SystemExit(f"{method} returned a result; expected error code {expected_error_code}: {last}")
     if last.get("type") != "result":
         raise SystemExit(f"{method} did not end with a result: {last}")
     return last
@@ -91,16 +86,6 @@ def main() -> int:
     ]:
         result = call_adapter(adapter, workspace, args.host, method, params)
         print(json.dumps({"method": method, "message": result.get("message"), "data": result.get("data")}, ensure_ascii=False))
-
-    for method in ("kag.retrieve", "kag.expand", "kag.generate"):
-        result = call_adapter(
-            adapter,
-            workspace,
-            args.host,
-            method,
-            expected_error_code="unsupported_primitive",
-        )
-        print(json.dumps({"method": method, "error_code": result.get("code")}, ensure_ascii=False))
 
     return 0
 
