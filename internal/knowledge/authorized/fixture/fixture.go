@@ -10,6 +10,7 @@ import (
 	"github.com/zzqDeco/knote/internal/knowledge/authorized"
 	"github.com/zzqDeco/knote/internal/knowledge/kag"
 	"github.com/zzqDeco/knote/internal/protocol"
+	"github.com/zzqDeco/knote/internal/telemetry"
 )
 
 const (
@@ -40,6 +41,7 @@ type ApplicationOptions struct {
 	Cache            *authorized.QueryCache
 	RetrieverVersion string
 	PromptVersion    string
+	Telemetry        telemetry.Sink
 }
 
 // Application exposes the fake permissioned service and its revocation path as
@@ -121,6 +123,7 @@ func newService(
 		RetrieveLimit:    3,
 		EvidenceLimit:    3,
 		ExpandLimit:      0,
+		Telemetry:        options.Telemetry,
 		Now: func() time.Time {
 			return time.Date(2026, time.July, 13, 0, 0, 0, 0, time.UTC)
 		},

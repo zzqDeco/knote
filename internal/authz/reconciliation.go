@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/zzqDeco/knote/internal/protocol"
+	"github.com/zzqDeco/knote/internal/telemetry"
 )
 
 var (
@@ -370,6 +372,11 @@ type TupleReconciler struct {
 	writer    TupleWriter
 	revisions RevisionPublisher
 	lifecycle RevocationLifecycle
+	telemetry telemetry.Sink
+}
+
+type TupleReconcilerOptions struct {
+	Telemetry telemetry.Sink
 }
 
 func NewTupleReconciler(
@@ -377,20 +384,38 @@ func NewTupleReconciler(
 	revisions RevisionPublisher,
 	lifecycle RevocationLifecycle,
 ) (*TupleReconciler, error) {
+	return NewTupleReconcilerWithOptions(writer, revisions, lifecycle, TupleReconcilerOptions{})
+}
+
+func NewTupleReconcilerWithOptions(
+	writer TupleWriter,
+	revisions RevisionPublisher,
+	lifecycle RevocationLifecycle,
+	options TupleReconcilerOptions,
+) (*TupleReconciler, error) {
 	if writer == nil || revisions == nil || lifecycle == nil {
 		return nil, fmt.Errorf("%w: tuple reconciler dependencies are required", ErrInvalidRequest)
 	}
-	return &TupleReconciler{writer: writer, revisions: revisions, lifecycle: lifecycle}, nil
+	if options.Telemetry == nil {
+		options.Telemetry = telemetry.NopSink{}
+	}
+	return &TupleReconciler{
+		writer: writer, revisions: revisions, lifecycle: lifecycle, telemetry: options.Telemetry,
+	}, nil
 }
 
 func (r *TupleReconciler) Reconcile(
 	ctx context.Context,
 	plan TupleReconciliationPlan,
-) (ReconciliationReport, error) {
-	report := reconciliationReport(plan)
+) (report ReconciliationReport, err error) {
+	report = reconciliationReport(plan)
 	if r == nil || r.writer == nil || r.revisions == nil || r.lifecycle == nil || ctx == nil {
 		return report, fmt.Errorf("%w: tuple reconciler is not initialized", ErrReconciliation)
 	}
+	startedAt := time.Now()
+	defer func() {
+		_ = r.telemetry.Emit(ctx, reconciliationTelemetryRecord(report, err, time.Since(startedAt)))
+	}()
 	if err := plan.Validate(); err != nil {
 		return report, fmt.Errorf("%w: %w", ErrReconciliation, err)
 	}
@@ -460,6 +485,36 @@ func (r *TupleReconciler) Reconcile(
 	report.Outcome = ReconciliationSucceeded
 	report.RevisionPublished = true
 	return report, nil
+}
+
+func reconciliationTelemetryRecord(
+	report ReconciliationReport,
+	reconcileErr error,
+	elapsed time.Duration,
+) telemetry.Record {
+	outcome := telemetry.OutcomeFailed
+	if reconcileErr == nil {
+		outcome = telemetry.OutcomeOK
+	}
+	budgetResult := telemetry.BudgetPass
+	if elapsed > time.Second {
+		budgetResult = telemetry.BudgetFail
+	}
+	return telemetry.Record{
+		ContractVersion: telemetry.ContractVersion1,
+		MetricScope:     telemetry.MetricScopeOperational,
+		Event:           telemetry.EventPermissionedReconciliation,
+		Stage:           telemetry.StageReconciliation,
+		Outcome:         outcome,
+		Budget: telemetry.Budget{
+			Name: telemetry.BudgetLocalHardLatency, Result: budgetResult,
+		},
+		Counts: telemetry.Counts{
+			Samples: 1, ReconciliationAdditions: uint64(report.WriteCount),
+			ReconciliationRemovals: uint64(report.DeleteCount),
+		},
+		Durations: telemetry.Durations{Elapsed: uint64(elapsed / time.Millisecond)},
+	}
 }
 
 func reconciliationReport(plan TupleReconciliationPlan) ReconciliationReport {

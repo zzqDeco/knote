@@ -12,6 +12,7 @@ import (
 	"github.com/zzqDeco/knote/internal/authz"
 	"github.com/zzqDeco/knote/internal/knowledge/kag"
 	"github.com/zzqDeco/knote/internal/protocol"
+	"github.com/zzqDeco/knote/internal/telemetry"
 )
 
 var (
@@ -41,6 +42,7 @@ type Options struct {
 	EvidenceLimit    int
 	ExpandLimit      int
 	Now              func() time.Time
+	Telemetry        telemetry.Sink
 }
 
 type Service struct {
@@ -55,6 +57,7 @@ type Service struct {
 	traversal        traversalConfig
 	traversalDigest  traversalPlanDigest
 	now              func() time.Time
+	telemetry        telemetry.Sink
 }
 
 type QueryResult struct {
@@ -106,12 +109,15 @@ func New(options Options) (*Service, error) {
 	if options.Now == nil {
 		options.Now = time.Now
 	}
+	if options.Telemetry == nil {
+		options.Telemetry = telemetry.NopSink{}
+	}
 	return &Service{
 		kag: options.KAG, authorizer: options.Authorizer, loader: options.Loader, cache: options.Cache,
 		retrieverVersion: options.RetrieverVersion, promptVersion: options.PromptVersion,
 		retrieveLimit: options.RetrieveLimit, evidenceLimit: options.EvidenceLimit,
 		traversal: traversal, traversalDigest: traversalDigest,
-		now: options.Now,
+		now: options.Now, telemetry: options.Telemetry,
 	}, nil
 }
 
@@ -131,6 +137,7 @@ func (s *Service) Query(ctx context.Context, request protocol.QueryRequest) (res
 		defer func() {
 			report := budget.report()
 			result.Traversal = &report
+			_ = s.telemetry.Emit(ctx, traversalTelemetryRecord(report, result, err))
 		}()
 		if err := budget.check(); err != nil {
 			return QueryResult{}, err

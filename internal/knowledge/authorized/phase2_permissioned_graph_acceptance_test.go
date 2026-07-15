@@ -28,6 +28,13 @@ func TestPhase2PermissionedGraphPolicyOracleAcceptanceMetrics(t *testing.T) {
 		wantHopDrops    []authorized.TraversalHopDrop
 		wantExpandCalls int
 	}
+	type positiveMetric struct {
+		truePositives      int
+		authorizedRelevant int
+		returned           int
+		queries            int
+		emptyResults       int
+	}
 	cohorts := []cohort{
 		{
 			principal:    fixture.Alice,
@@ -77,7 +84,10 @@ func TestPhase2PermissionedGraphPolicyOracleAcceptanceMetrics(t *testing.T) {
 		truePositives                 int
 		authorizedRelevant            int
 		returned                      int
-		emptyResults                  int
+		positiveQueries               int
+		positiveEmptyResults          int
+		negativeQueries               int
+		negativeEmptyResults          int
 		falseAllows                   int
 		unauthorizedPathParticipation int
 		unauthorizedGeneratorUse      int
@@ -86,12 +96,16 @@ func TestPhase2PermissionedGraphPolicyOracleAcceptanceMetrics(t *testing.T) {
 		hopCandidates                 int
 		hopAllowed                    int
 		hopDropped                    int
+		finalFilterCandidates         int
+		finalFilterAllowed            int
+		finalFilterDropped            int
 		batchSizes                    []int
 		batchRPCs                     []int
 		batchLatencies                []time.Duration
 		queryLatencies                []time.Duration
 	)
 	queryByPrincipal := make(map[string][]time.Duration, len(cohorts))
+	positiveByPrincipal := make(map[string]*positiveMetric, len(cohorts)-1)
 	baselines := make(map[string]phase2CohortFingerprint, len(cohorts))
 
 	for round := 0; round < rounds; round++ {
@@ -142,6 +156,9 @@ func TestPhase2PermissionedGraphPolicyOracleAcceptanceMetrics(t *testing.T) {
 				hopAllowed += drop.AllowedCount
 				hopDropped += drop.DroppedCount
 			}
+			finalFilterCandidates += report.FinalFilterCandidateCount
+			finalFilterAllowed += report.FinalFilterAllowedCount
+			finalFilterDropped += report.FinalFilterDroppedCount
 			for _, retrieve := range backendStats.retrieveRequests {
 				for _, resource := range retrieve.AllowedResources {
 					if !allowed[resource.ResourceID] {
@@ -162,7 +179,10 @@ func TestPhase2PermissionedGraphPolicyOracleAcceptanceMetrics(t *testing.T) {
 			}
 
 			if len(cohort.wantEvidence) == 0 {
-				emptyResults++
+				negativeQueries++
+				if err != nil && len(result.Evidence.Items) == 0 {
+					negativeEmptyResults++
+				}
 				if err == nil {
 					acceptanceFatalf(t, invariant, "%s round %d unexpectedly returned evidence", cohort.principal, round)
 				}
@@ -171,6 +191,17 @@ func TestPhase2PermissionedGraphPolicyOracleAcceptanceMetrics(t *testing.T) {
 					acceptanceFatalf(t, invariant, "%s crossed retrieval/content/generation after policy denial", cohort.principal)
 				}
 				continue
+			}
+			positiveQueries++
+			principalMetric := positiveByPrincipal[cohort.principal]
+			if principalMetric == nil {
+				principalMetric = &positiveMetric{}
+				positiveByPrincipal[cohort.principal] = principalMetric
+			}
+			principalMetric.queries++
+			if err != nil || len(result.Evidence.Items) == 0 {
+				positiveEmptyResults++
+				principalMetric.emptyResults++
 			}
 
 			if err != nil {
@@ -204,9 +235,12 @@ func TestPhase2PermissionedGraphPolicyOracleAcceptanceMetrics(t *testing.T) {
 
 			authorizedRelevant += len(cohort.wantEvidence)
 			returned += len(gotEvidence)
+			principalMetric.authorizedRelevant += len(cohort.wantEvidence)
+			principalMetric.returned += len(gotEvidence)
 			for _, resourceID := range gotEvidence {
 				if allowed[resourceID] {
 					truePositives++
+					principalMetric.truePositives++
 				}
 			}
 			for _, decision := range result.Evidence.Decisions {
@@ -239,23 +273,42 @@ func TestPhase2PermissionedGraphPolicyOracleAcceptanceMetrics(t *testing.T) {
 
 	recallAt4 := float64(truePositives) / float64(authorizedRelevant)
 	precisionAt4 := float64(truePositives) / float64(returned)
-	emptyRate := float64(emptyResults) / float64(rounds*len(cohorts))
+	positiveEmptyRate := float64(positiveEmptyResults) / float64(positiveQueries)
+	negativeEmptyRate := float64(negativeEmptyResults) / float64(negativeQueries)
 	pathCompleteness := float64(completePaths) / float64(selectedPaths)
-	postFilterDropRate := float64(hopDropped) / float64(hopCandidates)
-	if recallAt4 != 1 || precisionAt4 != 1 || emptyRate != 1.0/3.0 || pathCompleteness != 1 {
+	hopAuthorizationDropRate := float64(hopDropped) / float64(hopCandidates)
+	postFilterDropRate := float64(finalFilterDropped) / float64(finalFilterCandidates)
+	if recallAt4 != 1 || precisionAt4 != 1 || positiveEmptyRate != 0 || negativeEmptyRate != 1 || pathCompleteness != 1 {
 		acceptanceFatalf(t, invariant,
-			"recall@4=%.3f precision@4=%.3f empty_rate=%.3f path_completeness=%.3f",
-			recallAt4, precisionAt4, emptyRate, pathCompleteness)
+			"recall@4=%.3f precision@4=%.3f positive_empty_rate=%.3f negative_empty_rate=%.3f path_completeness=%.3f",
+			recallAt4, precisionAt4, positiveEmptyRate, negativeEmptyRate, pathCompleteness)
 	}
 	if falseAllows != 0 || unauthorizedPathParticipation != 0 || unauthorizedGeneratorUse != 0 {
 		acceptanceFatalf(t, invariant,
 			"false_allow=%d unauthorized_path_participation=%d unauthorized_generator_participation=%d",
 			falseAllows, unauthorizedPathParticipation, unauthorizedGeneratorUse)
 	}
-	if hopCandidates != rounds*40 || hopAllowed != rounds*24 || hopDropped != rounds*16 || postFilterDropRate != 0.4 {
+	if hopCandidates != rounds*40 || hopAllowed != rounds*24 || hopDropped != rounds*16 || hopAuthorizationDropRate != 0.4 {
 		acceptanceFatalf(t, invariant,
-			"aggregate hops candidates=%d allowed=%d dropped=%d drop_rate=%.3f",
-			hopCandidates, hopAllowed, hopDropped, postFilterDropRate)
+			"aggregate hops candidates=%d allowed=%d dropped=%d authorization_drop_rate=%.3f",
+			hopCandidates, hopAllowed, hopDropped, hopAuthorizationDropRate)
+	}
+	if finalFilterCandidates != rounds*3 || finalFilterAllowed != rounds*3 || finalFilterDropped != 0 || postFilterDropRate != 0 {
+		acceptanceFatalf(t, invariant,
+			"final filter candidates=%d allowed=%d dropped=%d drop_rate=%.3f",
+			finalFilterCandidates, finalFilterAllowed, finalFilterDropped, postFilterDropRate)
+	}
+	for principal, metric := range positiveByPrincipal {
+		principalRecallAt4 := float64(metric.truePositives) / float64(metric.authorizedRelevant)
+		principalPrecisionAt4 := float64(metric.truePositives) / float64(metric.returned)
+		principalEmptyRate := float64(metric.emptyResults) / float64(metric.queries)
+		if principalRecallAt4 != 1 || principalPrecisionAt4 != 1 || principalEmptyRate != 0 {
+			acceptanceFatalf(t, invariant,
+				"%s recall@4=%.3f precision@4=%.3f positive_empty_rate=%.3f",
+				principal, principalRecallAt4, principalPrecisionAt4, principalEmptyRate)
+		}
+		t.Logf("principal=%s recall@4=%.3f precision@4=%.3f positive_empty_rate=%.3f samples=%d",
+			principal, principalRecallAt4, principalPrecisionAt4, principalEmptyRate, metric.queries)
 	}
 	for principal, durations := range queryByPrincipal {
 		if variance := phase2DurationVariance(durations); variance != 0 {
@@ -269,10 +322,11 @@ func TestPhase2PermissionedGraphPolicyOracleAcceptanceMetrics(t *testing.T) {
 		acceptanceFatalf(t, invariant, "BatchCheck size=%d exceeds provider max=%d", maximum, authz.MaxBatchChecks)
 	}
 	t.Logf(
-		"projection=%s authz_model=%s samples=%d recall@4=%.3f precision@4=%.3f empty_rate=%.3f path_completeness=%.3f false_allow=%d unauthorized_path_participation=%d unauthorized_generator_participation=%d hop_candidates=%d hop_allowed=%d hop_dropped=%d post_filter_drop_rate=%.3f BatchCheck_size_p95=%d BatchCheck_size_p99=%d BatchCheck_RPC_p95=%d BatchCheck_RPC_p99=%d BatchCheck_latency_p95=%s BatchCheck_latency_p99=%s graph_query_p95=%s graph_query_p99=%s timing_variance=0s",
+		"projection=%s authz_model=%s samples=%d recall@4=%.3f precision@4=%.3f positive_empty_rate=%.3f negative_empty_rate=%.3f path_completeness=%.3f false_allow=%d unauthorized_path_participation=%d unauthorized_generator_participation=%d hop_candidates=%d hop_allowed=%d hop_dropped=%d hop_authorization_drop_rate=%.3f final_filter_candidates=%d final_filter_allowed=%d final_filter_dropped=%d post_filter_drop_rate=%.3f BatchCheck_size_p95=%d BatchCheck_size_p99=%d BatchCheck_RPC_p95=%d BatchCheck_RPC_p99=%d BatchCheck_latency_p95=%s BatchCheck_latency_p99=%s graph_query_p95=%s graph_query_p99=%s timing_variance=0s",
 		acceptanceProjectionVersion, fixture.AuthorizationModelID, rounds*len(cohorts),
-		recallAt4, precisionAt4, emptyRate, pathCompleteness, falseAllows,
+		recallAt4, precisionAt4, positiveEmptyRate, negativeEmptyRate, pathCompleteness, falseAllows,
 		unauthorizedPathParticipation, unauthorizedGeneratorUse, hopCandidates, hopAllowed, hopDropped,
+		hopAuthorizationDropRate, finalFilterCandidates, finalFilterAllowed, finalFilterDropped,
 		postFilterDropRate, phase2PercentileInt(batchSizes, 0.95), phase2PercentileInt(batchSizes, 0.99),
 		phase2PercentileInt(batchRPCs, 0.95), phase2PercentileInt(batchRPCs, 0.99),
 		percentileDuration(batchLatencies, 0.95), percentileDuration(batchLatencies, 0.99),
@@ -300,7 +354,9 @@ func TestPhase2PermissionedGraphDerivationBudgetsAndFailures(t *testing.T) {
 			acceptanceFatalf(t, invariant, "generation evidence=%v, want %v", got, want)
 		}
 		if result.Traversal == nil || result.Traversal.SelectedPathCount != 2 ||
-			result.Traversal.CompletePathCount != 1 || result.Traversal.AuthorizedPathCompleteness != 0.5 {
+			result.Traversal.CompletePathCount != 1 || result.Traversal.AuthorizedPathCompleteness != 0.5 ||
+			result.Traversal.FinalFilterCandidateCount != 2 || result.Traversal.FinalFilterAllowedCount != 1 ||
+			result.Traversal.FinalFilterDroppedCount != 1 {
 			acceptanceFatalf(t, invariant, "all-required denial report=%+v", result.Traversal)
 		}
 		if strings.Contains(result.Generation.Answer, "deep authorized terminal") {

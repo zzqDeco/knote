@@ -13,6 +13,7 @@ import (
 	"github.com/zzqDeco/knote/internal/authz"
 	"github.com/zzqDeco/knote/internal/knowledge/kag"
 	"github.com/zzqDeco/knote/internal/protocol"
+	"github.com/zzqDeco/knote/internal/telemetry"
 )
 
 var (
@@ -62,6 +63,9 @@ type TraversalReport struct {
 	AuthorizedPathCompleteness float64            `json:"authorized_path_completeness"`
 	SelectedPathCount          int                `json:"selected_path_count"`
 	CompletePathCount          int                `json:"complete_path_count"`
+	FinalFilterCandidateCount  int                `json:"final_filter_candidate_count"`
+	FinalFilterAllowedCount    int                `json:"final_filter_allowed_count"`
+	FinalFilterDroppedCount    int                `json:"final_filter_dropped_count"`
 	HopDrops                   []TraversalHopDrop `json:"hop_drops"`
 	BatchCheckRPCCount         int                `json:"batch_check_rpc_count"`
 	BatchCheckLatency          time.Duration      `json:"batch_check_latency"`
@@ -243,6 +247,8 @@ type traversalBudget struct {
 	batchCheckLatency time.Duration
 	selectedPaths     int
 	completePaths     int
+	finalCandidates   int
+	finalAllowed      int
 	hopDrops          []TraversalHopDrop
 	resources         map[protocol.ResourceID]protocol.ResourceHandle
 }
@@ -293,6 +299,11 @@ func (b *traversalBudget) setCompletePaths(count int) {
 	b.completePaths = count
 }
 
+func (b *traversalBudget) setFinalFilter(candidateCount, allowedCount int) {
+	b.finalCandidates = candidateCount
+	b.finalAllowed = allowedCount
+}
+
 func (b *traversalBudget) report() TraversalReport {
 	latency := b.now().UTC().Sub(b.startedAt)
 	if latency < 0 {
@@ -306,11 +317,88 @@ func (b *traversalBudget) report() TraversalReport {
 		AuthorizedPathCompleteness: completeness,
 		SelectedPathCount:          b.selectedPaths,
 		CompletePathCount:          b.completePaths,
+		FinalFilterCandidateCount:  b.finalCandidates,
+		FinalFilterAllowedCount:    b.finalAllowed,
+		FinalFilterDroppedCount:    b.finalCandidates - b.finalAllowed,
 		HopDrops:                   append([]TraversalHopDrop(nil), b.hopDrops...),
 		BatchCheckRPCCount:         b.batchChecks,
 		BatchCheckLatency:          b.batchCheckLatency,
 		QueryLatency:               latency,
 	}
+}
+
+func traversalTelemetryRecord(report TraversalReport, result QueryResult, queryErr error) telemetry.Record {
+	var hopCandidates, hopAllowed, hopDropped int
+	for _, drop := range report.HopDrops {
+		hopCandidates += drop.CandidateCount
+		hopAllowed += drop.AllowedCount
+		hopDropped += drop.DroppedCount
+	}
+	outcome := telemetry.OutcomeAllowed
+	switch {
+	case queryErr == nil:
+	case errors.Is(queryErr, errNoEvidence):
+		outcome = telemetry.OutcomeNotFound
+		if traversalReportShowsAuthorizationDenial(report) {
+			outcome = telemetry.OutcomeDenied
+		}
+	case errors.Is(queryErr, errTraversalBudgetExceeded), errors.Is(queryErr, context.DeadlineExceeded):
+		outcome = telemetry.OutcomeBudgetExceeded
+	case errors.Is(queryErr, errTraversalUnsupported), errors.Is(queryErr, errTraversalUnavailable):
+		outcome = telemetry.OutcomeProviderUnavailable
+	default:
+		outcome = telemetry.OutcomeFailed
+	}
+	budgetResult := telemetry.BudgetPass
+	if report.QueryLatency > time.Second {
+		budgetResult = telemetry.BudgetFail
+	}
+	return telemetry.Record{
+		ContractVersion: telemetry.ContractVersion1,
+		MetricScope:     telemetry.MetricScopeOperational,
+		Event:           telemetry.EventPermissionedQuery,
+		Stage:           telemetry.StageTraversal,
+		Outcome:         outcome,
+		Budget: telemetry.Budget{
+			Name: telemetry.BudgetLocalHardLatency, Result: budgetResult,
+		},
+		Counts: telemetry.Counts{
+			Samples: 1, Candidates: uint64(hopCandidates), Allowed: uint64(hopAllowed), Dropped: uint64(hopDropped),
+			EvidenceItems: uint64(len(result.Evidence.Items)), SelectedPaths: uint64(report.SelectedPathCount),
+			CompletePaths: uint64(report.CompletePathCount), BatchCheckRPCs: uint64(report.BatchCheckRPCCount),
+			FinalFilterCandidates: uint64(report.FinalFilterCandidateCount),
+			FinalFilterAllowed:    uint64(report.FinalFilterAllowedCount),
+			FinalFilterDropped:    uint64(report.FinalFilterDroppedCount),
+		},
+		Rates: telemetry.Rates{
+			AuthorizedPathCompleteness: report.AuthorizedPathCompleteness,
+			HopAuthorizationDrop:       telemetryRate(hopDropped, hopCandidates),
+			PostFilterDrop:             telemetryRate(report.FinalFilterDroppedCount, report.FinalFilterCandidateCount),
+		},
+		Durations: telemetry.Durations{
+			Latency:           uint64(report.QueryLatency / time.Millisecond),
+			BatchCheckLatency: uint64(report.BatchCheckLatency / time.Millisecond),
+		},
+	}
+}
+
+func traversalReportShowsAuthorizationDenial(report TraversalReport) bool {
+	if report.FinalFilterCandidateCount > 0 && report.FinalFilterAllowedCount == 0 {
+		return true
+	}
+	for _, drop := range report.HopDrops {
+		if drop.CandidateCount > 0 && drop.AllowedCount == 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func telemetryRate(numerator, denominator int) float64 {
+	if denominator == 0 {
+		return 0
+	}
+	return float64(numerator) / float64(denominator)
 }
 
 func (b *traversalBudget) check() error {
@@ -1167,6 +1255,7 @@ func (s *Service) finalizeTraversalEvidence(
 		}
 	}
 	budget.setSelectedPaths(consideredPaths)
+	budget.setFinalFilter(len(groups), len(survivors))
 	if len(survivors) == 0 {
 		return nil, nil, checkedEvidence{}, errNoEvidence
 	}
