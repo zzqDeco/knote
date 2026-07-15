@@ -237,14 +237,35 @@ func (m *Manager) SendMessage(ctx context.Context, input string) []protocol.Even
 func (m *Manager) Confirm(ctx context.Context, req protocol.ConfirmRequest, approved bool) []protocol.Event {
 	m.mu.Lock()
 	einoSessionID := m.einoSession.ID
+	authorizationProvider := m.deps.AuthorizationContextProvider
 	m.mu.Unlock()
 	if einoSessionID == "" {
 		return m.emitAndReturn(m.runtimeError("runtime has not started"))
 	}
 	if m.deps.SideEffects != nil {
-		return m.persistEmitAndReturn(m.deps.SideEffects.Confirm(ctx, einoSessionID, req, approved))
+		confirmCtx := ctx
+		if approved && authorizationProvider != nil {
+			authorization, err := authorizationProvider.authorizationContext(ctx, einoSessionID)
+			if err != nil {
+				return m.confirmBeforeConsumptionError(einoSessionID, req, err)
+			}
+			confirmCtx, err = protocol.WithAuthorizationContext(ctx, authorization)
+			if err != nil {
+				return m.confirmBeforeConsumptionError(einoSessionID, req, err)
+			}
+			if err := m.bindSessionAuthorization(ctx, einoSessionID, authorization); err != nil {
+				return m.confirmBeforeConsumptionError(einoSessionID, req, err)
+			}
+		}
+		return m.persistEmitAndReturn(m.deps.SideEffects.Confirm(confirmCtx, einoSessionID, req, approved))
 	}
 	return m.persistEmitAndReturn([]protocol.Event{protocol.NewEvent(protocol.EventError, einoSessionID, "confirm is not available without a side-effect bridge", nil)})
+}
+
+func (m *Manager) confirmBeforeConsumptionError(sessionID string, req protocol.ConfirmRequest, err error) []protocol.Event {
+	events := []protocol.Event{protocol.NewEvent(protocol.EventError, sessionID, err.Error(), nil)}
+	events = append(events, m.deps.SideEffects.retryEvents(sessionID, req)...)
+	return m.persistEmitAndReturn(events)
 }
 
 func (m *Manager) Interrupt(context.Context) []protocol.Event {

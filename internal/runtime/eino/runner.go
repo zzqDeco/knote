@@ -100,22 +100,29 @@ func (r *Runner) Run(ctx context.Context, input runtime.EinoRunInput) ([]protoco
 		events = append(events, protocol.NewEvent(protocol.EventError, input.SessionID, generic.Error(), nil))
 		return events, generic
 	}
-	for _, event := range agentEvents {
-		projected := projectEvent(input.SessionID, event)
-		if permissioned {
-			bindProjectedEvents(projected, binding)
-		} else if permissionedContext {
-			sanitizePermissionedErrors(projected)
-			if hasAssistantOutput(projected) && !allowUnboundAssistant {
-				generic := fmt.Errorf("%s", protectedContentUnavailableMessage)
-				events = append(events, protocol.NewEvent(protocol.EventError, input.SessionID, generic.Error(), nil))
-				return events, generic
-			}
-			if allowUnboundAssistant {
-				classifySafeToolAssistantEvents(projected)
-			}
+	if permissionedContext && !permissioned {
+		projectedEvents := make([]protocol.Event, 0, len(agentEvents))
+		for _, event := range agentEvents {
+			projectedEvents = append(projectedEvents, projectEvent(input.SessionID, event)...)
 		}
-		events = append(events, projected...)
+		sanitizePermissionedErrors(projectedEvents)
+		if hasAssistantOutput(projectedEvents) && (!allowUnboundAssistant || hasProtectedHistory(input.History)) {
+			generic := fmt.Errorf("%s", protectedContentUnavailableMessage)
+			events = append(events, protocol.NewEvent(protocol.EventError, input.SessionID, generic.Error(), nil))
+			return events, generic
+		}
+		if allowUnboundAssistant {
+			classifySafeToolAssistantEvents(projectedEvents)
+		}
+		events = append(events, projectedEvents...)
+	} else {
+		for _, event := range agentEvents {
+			projected := projectEvent(input.SessionID, event)
+			if permissioned {
+				bindProjectedEvents(projected, binding)
+			}
+			events = append(events, projected...)
+		}
 	}
 	if err != nil {
 		if permissionedContext {
@@ -135,7 +142,7 @@ func protectedBindingFromAgentEvents(
 ) (*protocol.ProtectedContentBinding, bool, bool, error) {
 	authorization, authorized := protocol.AuthorizationContextFrom(ctx)
 	var packages []protocol.EvidencePackage
-	hasNonPermissionedTool := false
+	hasSafeUnboundTool := false
 	permissionedToolAttempted := false
 	for _, event := range events {
 		if authorized {
@@ -156,7 +163,10 @@ func protectedBindingFromAgentEvents(
 			return nil, true, false, errors.New("permissioned run received unnamed tool output")
 		}
 		if !permissionedToolName(toolName) {
-			hasNonPermissionedTool = true
+			if authorized && !safeUnboundAssistantToolName(toolName) {
+				return nil, false, false, fmt.Errorf("permissioned run received untrusted tool output %q", toolName)
+			}
+			hasSafeUnboundTool = true
 			continue
 		}
 		if !authorized {
@@ -169,7 +179,7 @@ func protectedBindingFromAgentEvents(
 		packages = append(packages, evidencePackage)
 	}
 	if len(packages) == 0 {
-		return nil, false, hasNonPermissionedTool && !permissionedToolAttempted, nil
+		return nil, false, hasSafeUnboundTool && !permissionedToolAttempted, nil
 	}
 	binding, err := protocol.NewProtectedContentBinding(authorization, packages...)
 	if err != nil {
@@ -238,13 +248,22 @@ func hasAssistantOutput(events []protocol.Event) bool {
 	return false
 }
 
+func hasProtectedHistory(events []protocol.Event) bool {
+	for _, event := range events {
+		if event.ProtectedContent != nil {
+			return true
+		}
+	}
+	return false
+}
+
 func classifySafeToolAssistantEvents(events []protocol.Event) {
 	for index := range events {
 		event := &events[index]
 		switch event.Type {
 		case protocol.EventToolComplete:
 			toolName := eventToolName(event.Payload)
-			if toolName == "" || permissionedToolName(toolName) {
+			if !safeUnboundAssistantToolName(toolName) {
 				continue
 			}
 		case protocol.EventAssistantDone:
@@ -288,6 +307,7 @@ func bindProjectedEvents(events []protocol.Event, binding *protocol.ProtectedCon
 	for index := range events {
 		event := &events[index]
 		sanitizePermissionedErrors(events[index : index+1])
+		redactPermissionedToolEvent(event)
 		if event.Type == protocol.EventAssistantDone ||
 			event.Type == protocol.EventError ||
 			event.Type == protocol.EventApprovalRequest ||
@@ -297,6 +317,22 @@ func bindProjectedEvents(events []protocol.Event, binding *protocol.ProtectedCon
 			event.ProtectedContent = &copy
 		}
 	}
+}
+
+func redactPermissionedToolEvent(event *protocol.Event) {
+	if event == nil || (event.Type != protocol.EventToolComplete && event.Type != protocol.EventToolError) {
+		return
+	}
+	toolName := eventToolName(event.Payload)
+	if !permissionedToolName(toolName) {
+		return
+	}
+	event.Payload = map[string]string{"tool": toolName}
+	if event.Type == protocol.EventToolError {
+		event.Message = protectedContentUnavailableMessage
+		return
+	}
+	event.Message = toolName + " complete"
 }
 
 func (r *Runner) RunnerConfig(agent adk.Agent) adk.RunnerConfig {

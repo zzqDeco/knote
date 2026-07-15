@@ -72,7 +72,7 @@ git -C "${WORKSPACE}" init -q
 git -C "${WORKSPACE}" config user.email knote@example.com
 git -C "${WORKSPACE}" config user.name knote
 
-echo "==> Running fake KAG build/diff/commit/resume and fail-closed eval smoke"
+echo "==> Running fake KAG build/permissioned-diff-block/commit/resume and fail-closed eval smoke"
 KNOTE_KAG_FAKE=1 "${PYTHON}" tests/smoke/tui_smoke.py \
   "${FAKE_TARGET[@]}" \
   --workspace "${WORKSPACE}" \

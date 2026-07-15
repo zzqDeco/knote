@@ -90,6 +90,19 @@ func TestToolExecutorRendersVersionsMessage(t *testing.T) {
 	}
 }
 
+func TestToolExecutorRendersEmptyVersionsMessage(t *testing.T) {
+	executor := NewToolExecutor([]einotool.InvokableTool{
+		staticTool{name: einotools.NameVersions, out: `{"versions":[]}`},
+	})
+	events, err := executor.Invoke(context.Background(), "sess_eino", einotools.NameVersions, "{}")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasToolMessageContaining(events, protocol.EventVersionChanged, "No versions yet.") {
+		t.Fatalf("empty versions should render a friendly message: %+v", events)
+	}
+}
+
 func TestToolExecutorBindsPermissionedEvidenceAndAnswerToOneBlock(t *testing.T) {
 	authorization := testEinoAuthorization("sess_eino")
 	evidencePackage := testEinoEvidencePackage(t, authorization, "sources/allowed.md", "AUTHORIZED_CONTENT_CANARY")

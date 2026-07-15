@@ -109,11 +109,14 @@ jobs:
             GOOS="${goos}" GOARCH="${goarch}" go build -trimpath -ldflags "${ldflags}" -o "${bin}" ./cmd/knote
             cp -R adapters "${name}/"
             if [[ "${goos}" == "windows" ]]; then
-              (cd "${name}" && zip -q "../dist/${name}.zip" ./*)
+              (cd "${name}" && zip -qr "../dist/${name}.zip" ./*)
             else
               tar -czf "dist/${name}.tar.gz" "${name}"
             fi
             rm -rf "${name}"
+          done
+          for archive in dist/knote_${RELEASE_TAG}_windows_*.zip; do
+            unzip -Z1 "${archive}" | grep -Fx 'adapters/kag/knote_kag_adapter.py'
           done
           (cd dist && shasum -a 256 * > checksums.txt)
 

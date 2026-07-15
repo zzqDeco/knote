@@ -123,6 +123,14 @@ func (s Store) PublishArtifacts(
 	if err := validateArtifactBundleDirectory(bundlesDir); err != nil {
 		return err
 	}
+	publicationLock, err := acquireArtifactPublicationLock(ctx, artifactsDir)
+	if err != nil {
+		return err
+	}
+	defer publicationLock.release()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	bundleDir := filepath.Join(bundlesDir, manifest.ProjectionID)
 	if err := validateArtifactBundleDirectory(bundleDir); err != nil {
 		return err
@@ -151,14 +159,6 @@ func (s Store) PublishArtifacts(
 		}
 	}
 	if err := verifyStagedArtifactBundle(bundleDir, manifest, manifestData); err != nil {
-		return err
-	}
-	publicationLock, err := acquireArtifactPublicationLock(ctx, artifactsDir)
-	if err != nil {
-		return err
-	}
-	defer publicationLock.release()
-	if err := ctx.Err(); err != nil {
 		return err
 	}
 	if err := compareArtifactPublicationBase(currentPath, base); err != nil {
@@ -355,7 +355,11 @@ func (s Store) committableArtifactPaths(ctx context.Context) ([]string, bool, er
 	}
 	manifest, err := s.ReadCurrentArtifactManifest(ctx)
 	if errors.Is(err, repository.ErrArtifactCurrentNotFound) {
-		return nil, true, nil
+		// Commit prunes unpublished bundles before adding paths. Keep only flat
+		// exports so a staged v2 build cannot delete active v1 data or stage the
+		// publication lock that protects this commit.
+		paths, legacyErr := committableLegacyArtifactPaths(artifactsDir)
+		return paths, true, legacyErr
 	}
 	if err != nil {
 		return nil, true, fmt.Errorf("validate selected artifacts for commit: %w", err)
@@ -393,27 +397,64 @@ func (s Store) committableArtifactPaths(ctx context.Context) ([]string, bool, er
 	return paths, true, nil
 }
 
+func committableLegacyArtifactPaths(artifactsDir string) ([]string, error) {
+	entries, err := os.ReadDir(artifactsDir)
+	if err != nil {
+		return nil, err
+	}
+	var paths []string
+	for _, entry := range entries {
+		switch entry.Name() {
+		case "bundles", "current.json", artifactPublicationLockName:
+			continue
+		}
+		path := filepath.Join(artifactsDir, entry.Name())
+		info, err := os.Lstat(path)
+		if err != nil {
+			return nil, err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return nil, fmt.Errorf("legacy artifact is not a regular file: %s", path)
+		}
+		if info.IsDir() {
+			continue
+		}
+		if !info.Mode().IsRegular() {
+			return nil, fmt.Errorf("legacy artifact is not a regular file: %s", path)
+		}
+		paths = append(paths, filepath.ToSlash(filepath.Join("artifacts", entry.Name())))
+	}
+	sort.Strings(paths)
+	return paths, nil
+}
+
 func (s Store) pruneUnselectedArtifactBundles(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	artifactsDir := filepath.Join(s.workspace, "artifacts")
 	bundlesDir := filepath.Join(artifactsDir, "bundles")
-	if _, err := os.Lstat(bundlesDir); errors.Is(err, os.ErrNotExist) {
+	if err := validateArtifactBundleDirectory(bundlesDir); errors.Is(err, os.ErrNotExist) {
 		return nil
 	} else if err != nil {
-		return err
+		return fmt.Errorf("validate artifact bundles before pruning: %w", err)
 	}
 	manifest, err := s.ReadCurrentArtifactManifest(ctx)
-	if err != nil {
+	selectedProjectionID := ""
+	if errors.Is(err, repository.ErrArtifactCurrentNotFound) {
+		// A staged first build may be interrupted before current.json is
+		// published. With no selected bundle, every candidate is disposable.
+	} else if err != nil {
 		return fmt.Errorf("validate selected artifacts before pruning: %w", err)
+	} else {
+		selectedProjectionID = manifest.ProjectionID
 	}
 	entries, err := os.ReadDir(bundlesDir)
 	if err != nil {
 		return err
 	}
 	for _, entry := range entries {
-		if entry.Name() == manifest.ProjectionID {
+		if entry.Name() == selectedProjectionID {
 			continue
 		}
 		if err := os.RemoveAll(filepath.Join(bundlesDir, entry.Name())); err != nil {

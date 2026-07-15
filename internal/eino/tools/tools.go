@@ -326,7 +326,11 @@ func checkoutTool(opts Options) einotool.InvokableTool {
 				return nil, fmt.Errorf("ref is required")
 			}
 			checkoutOpts := repository.CheckoutOptions{AllowDirty: req.AllowDirty}
-			if err := requireSideEffectGate(ctx, opts, NameCheckout, "checkout", args, "Checkout a knowledge version."); err != nil {
+			summary := "Checkout a knowledge version."
+			if checkoutOpts.AllowDirty {
+				summary = "Workspace is dirty. Confirm checkout only if these local changes should remain in the working tree."
+			}
+			if err := requireSideEffectGate(ctx, opts, NameCheckout, "checkout", args, summary); err != nil {
 				return nil, err
 			}
 			if err := opts.Service.Checkout(ctx, req.Ref, checkoutOpts); err != nil {

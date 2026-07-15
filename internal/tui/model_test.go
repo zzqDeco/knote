@@ -64,6 +64,49 @@ func TestConfirmRejectClosesOverlayWithoutRunningBuild(t *testing.T) {
 	}
 }
 
+func TestConfirmAuthorizationFailureRestoresCanonicalOverlayAndRetriesOnce(t *testing.T) {
+	providerCalls := 0
+	model := newTestModelWithAuthorizationProvider(t, func(_ context.Context, sessionID string) (protocol.AuthorizationContext, error) {
+		providerCalls++
+		if providerCalls == 2 {
+			return protocol.AuthorizationContext{}, fmt.Errorf("authorization service temporarily unavailable")
+		}
+		return testTUIAuthorizationContext(sessionID), nil
+	})
+
+	model.composer.SetValue("/build")
+	updateModel(t, &model, tea.KeyMsg{Type: tea.KeyEnter})
+	if model.pendingConfirm == nil || model.overlayMode != overlayConfirm {
+		t.Fatalf("build did not enter confirm overlay: pending=%v overlay=%s", model.pendingConfirm, model.overlayMode)
+	}
+	canonical := *model.pendingConfirm
+
+	updateModel(t, &model, tea.KeyMsg{Type: tea.KeyEnter})
+	if providerCalls != 2 {
+		t.Fatalf("authorization calls after failed approval = %d, want 2", providerCalls)
+	}
+	if model.pendingConfirm == nil || *model.pendingConfirm != canonical {
+		t.Fatalf("failed approval did not restore canonical confirmation: got=%+v want=%+v", model.pendingConfirm, canonical)
+	}
+	if model.overlayMode != overlayConfirm {
+		t.Fatalf("failed approval overlay = %s, want %s", model.overlayMode, overlayConfirm)
+	}
+	if got := countTUIEvents(model.events, protocol.EventToolComplete); got != 0 {
+		t.Fatalf("failed approval executed build %d times", got)
+	}
+
+	updateModel(t, &model, tea.KeyMsg{Type: tea.KeyEnter})
+	if providerCalls != 3 {
+		t.Fatalf("authorization calls after retry = %d, want 3", providerCalls)
+	}
+	if model.pendingConfirm != nil || model.overlayMode != overlayNone {
+		t.Fatalf("successful retry did not clear confirmation: pending=%+v overlay=%s", model.pendingConfirm, model.overlayMode)
+	}
+	if got := countTUIEvents(model.events, protocol.EventToolComplete); got != 1 {
+		t.Fatalf("successful retry executions = %d, want 1", got)
+	}
+}
+
 func TestOverlaySwitchAndEsc(t *testing.T) {
 	model := newTestModel(t)
 
@@ -135,10 +178,15 @@ func TestResumeDoesNotReviveStaleConfirmation(t *testing.T) {
 
 func newTestModel(t *testing.T) Model {
 	t.Helper()
+	return newTestModelWithAuthorizationProvider(t, nil)
+}
+
+func newTestModelWithAuthorizationProvider(t *testing.T, provider runtime.AuthorizationContextProvider) Model {
+	t.Helper()
 	workspace := t.TempDir()
 	mustRun(t, workspace, "git", "init")
 	t.Setenv("KNOTE_KAG_FAKE", "1")
-	rt, initial, err := newTestAgent(t, workspace)
+	rt, initial, err := newTestAgent(t, workspace, provider)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +199,7 @@ func newTestModel(t *testing.T) Model {
 	return model
 }
 
-func newTestAgent(t *testing.T, workspace string) (runtime.Runtime, []protocol.Event, error) {
+func newTestAgent(t *testing.T, workspace string, provider runtime.AuthorizationContextProvider) (runtime.Runtime, []protocol.Event, error) {
 	t.Helper()
 	ctx := context.Background()
 	repo := local.New(workspace)
@@ -179,15 +227,16 @@ func newTestAgent(t *testing.T, workspace string) (runtime.Runtime, []protocol.E
 		})
 	}
 	rt := runtime.New(runtime.Dependencies{
-		Workspace:     workspace,
-		Config:        cfg,
-		Sessions:      repo,
-		Versions:      repo,
-		WorkspaceRepo: repo,
-		EinoRunner:    fakeEinoRunner{},
-		SideEffects:   bridge,
-		ToolExecutor:  toolExecutor,
-		NewSessionID:  local.NewSessionID,
+		Workspace:                    workspace,
+		Config:                       cfg,
+		Sessions:                     repo,
+		Versions:                     repo,
+		WorkspaceRepo:                repo,
+		EinoRunner:                   fakeEinoRunner{},
+		AuthorizationContextProvider: provider,
+		SideEffects:                  bridge,
+		ToolExecutor:                 toolExecutor,
+		NewSessionID:                 local.NewSessionID,
 	})
 	initial, err := rt.Start(ctx, runtime.StartOptions{})
 	return rt, initial, err
@@ -235,6 +284,33 @@ func hasTUIEvent(events []protocol.Event, eventType protocol.EventType) bool {
 		}
 	}
 	return false
+}
+
+func countTUIEvents(events []protocol.Event, eventType protocol.EventType) int {
+	count := 0
+	for _, event := range events {
+		if event.Type == eventType {
+			count++
+		}
+	}
+	return count
+}
+
+func testTUIAuthorizationContext(sessionID string) protocol.AuthorizationContext {
+	return protocol.AuthorizationContext{
+		Version:              protocol.SecurityContractVersion,
+		TenantID:             "local",
+		KnowledgeBaseID:      "default",
+		PrincipalID:          "local-user",
+		SessionID:            sessionID,
+		RequestID:            "request-1",
+		AgentID:              "agent-1",
+		TaskID:               "task-1",
+		AuthorizationModelID: "local-v1",
+		IdentityWatermark:    "identity-v1",
+		ACLWatermark:         "acl-v1",
+		Consistency:          protocol.ConsistencyHigherConsistency,
+	}
 }
 
 func mustRun(t *testing.T, dir string, name string, args ...string) {

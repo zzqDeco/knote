@@ -1246,6 +1246,16 @@ func TestEvalQuestionsFallbackAndSorting(t *testing.T) {
 	}
 }
 
+func TestVersionsReturnsEmptyForUnbornRepository(t *testing.T) {
+	versions, err := New(initRepo(t)).Versions(context.Background(), 20)
+	if err != nil {
+		t.Fatalf("list versions in unborn repository: %v", err)
+	}
+	if len(versions) != 0 {
+		t.Fatalf("unborn repository versions = %+v, want none", versions)
+	}
+}
+
 func TestVersionsContract(t *testing.T) {
 	ctx := context.Background()
 	workspace := initRepo(t)
@@ -1330,6 +1340,32 @@ func TestCommitOnlyIncludesKnowledgePaths(t *testing.T) {
 	cached := runGit(t, workspace, "diff", "--cached", "--name-only")
 	if strings.TrimSpace(cached) != "unrelated.txt" {
 		t.Fatalf("unrelated staged file should remain staged, got %q", cached)
+	}
+}
+
+func TestCommitPreservesBothSidesOfUnrelatedStagedRename(t *testing.T) {
+	ctx := context.Background()
+	workspace := initRepo(t)
+	store := New(workspace)
+	mustWrite(t, filepath.Join(workspace, ".knote", "config.yaml"), "workspace: test\n")
+	mustWrite(t, filepath.Join(workspace, "sources", "intro.md"), "intro\n")
+	mustWrite(t, filepath.Join(workspace, "unrelated-old.txt"), "keep staged\n")
+	runGit(t, workspace, "add", ".")
+	runGit(t, workspace, "commit", "-m", "initial")
+
+	runGit(t, workspace, "mv", "unrelated-old.txt", "unrelated-new.txt")
+	mustWrite(t, filepath.Join(workspace, "sources", "intro.md"), "updated\n")
+	if _, err := store.Commit(ctx, "knowledge update"); err != nil {
+		t.Fatal(err)
+	}
+
+	show := runGit(t, workspace, "show", "--name-only", "--format=", "HEAD")
+	if strings.Contains(show, "unrelated-old.txt") || strings.Contains(show, "unrelated-new.txt") {
+		t.Fatalf("knowledge commit included unrelated rename:\n%s", show)
+	}
+	cached := runGit(t, workspace, "diff", "--cached", "--name-status", "-M")
+	if !strings.Contains(cached, "R100\tunrelated-old.txt\tunrelated-new.txt") {
+		t.Fatalf("unrelated rename should remain fully staged, got %q", cached)
 	}
 }
 

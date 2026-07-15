@@ -103,7 +103,7 @@ func permissionedTools(tools []einotool.InvokableTool, enabled bool) []einotool.
 			continue
 		}
 		info, err := candidate.Info(context.Background())
-		if err != nil || info == nil || info.Name == einotools.NameEval || (!enabled && (info.Name == einotools.NameQuery || info.Name == einotools.NameExplain)) {
+		if err != nil || info == nil || !permissionedToolAllowed(info.Name, enabled) {
 			continue
 		}
 		out = append(out, candidate)
@@ -112,10 +112,27 @@ func permissionedTools(tools []einotool.InvokableTool, enabled bool) []einotool.
 }
 
 func permissionedToolMap(tools map[string]einotool.InvokableTool, enabled bool) map[string]einotool.InvokableTool {
-	delete(tools, einotools.NameEval)
-	if !enabled {
-		delete(tools, einotools.NameQuery)
-		delete(tools, einotools.NameExplain)
+	for name := range tools {
+		if !permissionedToolAllowed(name, enabled) {
+			delete(tools, name)
+		}
 	}
 	return tools
+}
+
+func permissionedToolAllowed(name string, enabled bool) bool {
+	if !enabled {
+		return name != einotools.NameEval && name != einotools.NameQuery && name != einotools.NameExplain
+	}
+
+	// Permissioned ADK registration is fail-closed. These are the authorized
+	// query, safe metadata, and confirmation-gated side-effect tools.
+	switch name {
+	case einotools.NameQuery, einotools.NameExplain,
+		einotools.NameVersions,
+		einotools.NameBuild, einotools.NameCommit, einotools.NameRelease, einotools.NameCheckout:
+		return true
+	default:
+		return false
+	}
 }
