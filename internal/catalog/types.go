@@ -140,20 +140,21 @@ func (s ProjectionStatus) Failed() bool {
 // ResourceMetadata is the catalog-wide metadata shared by every resource kind.
 // ResourceID is derived only from Scope, Type, and SourceKey, never content.
 type ResourceMetadata struct {
-	ResourceID              protocol.ResourceID       `json:"resource_id"`
-	Type                    protocol.ResourceType     `json:"type"`
-	Scope                   Scope                     `json:"scope"`
-	SourceKey               string                    `json:"source_key"`
-	AuthorizationObject     string                    `json:"authz_object"`
-	AuthorizationResourceID protocol.ResourceID       `json:"authorization_resource_id"`
-	ContentDigest           protocol.ContentDigest    `json:"content_digest"`
-	Versions                protocol.ResourceVersions `json:"versions"`
-	ServingState            LifecycleState            `json:"serving_state"`
-	ProjectionStatus        ProjectionStatus          `json:"projection_status"`
-	Sensitivity             Sensitivity               `json:"sensitivity"`
-	SecurityDomain          string                    `json:"security_domain"`
-	Dependencies            []protocol.ResourceID     `json:"dependencies,omitempty"`
-	ClaimRecord             *ClaimProjectionRecord    `json:"claim_record,omitempty"`
+	ResourceID              protocol.ResourceID                     `json:"resource_id"`
+	Type                    protocol.ResourceType                   `json:"type"`
+	Scope                   Scope                                   `json:"scope"`
+	SourceKey               string                                  `json:"source_key"`
+	AuthorizationObject     string                                  `json:"authz_object"`
+	AuthorizationResourceID protocol.ResourceID                     `json:"authorization_resource_id"`
+	ContentDigest           protocol.ContentDigest                  `json:"content_digest"`
+	Versions                protocol.ResourceVersions               `json:"versions"`
+	ServingState            LifecycleState                          `json:"serving_state"`
+	ProjectionStatus        ProjectionStatus                        `json:"projection_status"`
+	Sensitivity             Sensitivity                             `json:"sensitivity"`
+	SecurityDomain          string                                  `json:"security_domain"`
+	Dependencies            []protocol.ResourceID                   `json:"dependencies,omitempty"`
+	ClaimRecord             *ClaimProjectionRecord                  `json:"claim_record,omitempty"`
+	DerivedArtifactSecurity *protocol.DerivedArtifactSecurityRecord `json:"derived_artifact_security,omitempty"`
 }
 
 func NewResourceMetadata(
@@ -257,6 +258,15 @@ func (m ResourceMetadata) Validate() error {
 	} else if m.ClaimRecord != nil {
 		return ErrInvalidClaimRecord
 	}
+	if m.Type == protocol.ResourceDerivedArtifact {
+		if m.DerivedArtifactSecurity != nil {
+			if err := validateDerivedArtifactMetadataSecurity(m, *m.DerivedArtifactSecurity); err != nil {
+				return err
+			}
+		}
+	} else if m.DerivedArtifactSecurity != nil {
+		return fmt.Errorf("only derived artifacts may carry derived artifact security records")
+	}
 	for i, dependency := range m.Dependencies {
 		if err := dependency.Validate(); err != nil {
 			return fmt.Errorf("dependency %d: %w", i, err)
@@ -272,7 +282,37 @@ func (m ResourceMetadata) Validate() error {
 }
 
 func (m ResourceMetadata) IsServing() bool {
-	return m.ServingState.IsServing() && m.ProjectionStatus.Ready()
+	if !m.ServingState.IsServing() || !m.ProjectionStatus.Ready() {
+		return false
+	}
+	return m.Type != protocol.ResourceDerivedArtifact || m.DerivedArtifactSecurity != nil
+}
+
+func validateDerivedArtifactMetadataSecurity(
+	metadata ResourceMetadata,
+	record protocol.DerivedArtifactSecurityRecord,
+) error {
+	if err := record.Validate(); err != nil {
+		return fmt.Errorf("derived artifact security: %w", err)
+	}
+	if record.Artifact != derivedArtifactResourceIdentity(metadata) {
+		return fmt.Errorf("derived artifact security record does not match resource identity")
+	}
+	if record.TenantID != metadata.Scope.TenantID ||
+		record.KnowledgeBaseID != metadata.Scope.KnowledgeBaseID ||
+		record.SecurityDomain != metadata.SecurityDomain {
+		return fmt.Errorf("derived artifact security record crosses the resource boundary")
+	}
+	return nil
+}
+
+func derivedArtifactResourceIdentity(metadata ResourceMetadata) protocol.DerivedArtifactResourceIdentity {
+	return protocol.DerivedArtifactResourceIdentity{
+		ResourceID: metadata.ResourceID, Type: metadata.Type,
+		AuthorizationID:         metadata.AuthorizationObject,
+		AuthorizationResourceID: metadata.AuthorizationResourceID,
+		ContentDigest:           metadata.ContentDigest, Versions: metadata.Versions,
+	}
 }
 
 // ServingHandle returns the exact body-free protocol identity for a published
@@ -700,11 +740,52 @@ func (a DerivedArtifact) Validate() error {
 	if err := validateToken("artifact kind", a.Kind); err != nil {
 		return err
 	}
-	provenance := a.EffectiveProvenance()
+	provenance := a.EffectiveProvenance().normalized()
 	if err := provenance.Validate(); err != nil {
 		return err
 	}
-	return validateProvenanceVersions(a.Metadata, provenance)
+	if err := validateProvenanceVersions(a.Metadata, provenance); err != nil {
+		return err
+	}
+	if a.Metadata.DerivedArtifactSecurity != nil {
+		if err := validateDerivedArtifactRecordProvenance(a, provenance, *a.Metadata.DerivedArtifactSecurity); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateDerivedArtifactRecordProvenance(
+	artifact DerivedArtifact,
+	provenance Provenance,
+	record protocol.DerivedArtifactSecurityRecord,
+) error {
+	if record.Kind != artifact.Kind || record.DerivationMode != provenance.DerivationMode ||
+		len(record.Supports) != len(provenance.Supports) {
+		return fmt.Errorf("derived artifact security record does not match artifact provenance")
+	}
+	for i, support := range provenance.Supports {
+		securitySupport := record.Supports[i]
+		if securitySupport.SupportID != support.SupportID || securitySupport.Complete != support.Complete ||
+			len(securitySupport.Resources) != len(support.Evidence) {
+			return fmt.Errorf("derived artifact security record does not match support %s", support.SupportID)
+		}
+		resourcesByID := make(map[protocol.ResourceID]protocol.DerivedArtifactResourceIdentity, len(securitySupport.Resources))
+		for _, identity := range securitySupport.Resources {
+			resourcesByID[identity.ResourceID] = identity
+		}
+		for _, evidence := range support.Evidence {
+			identity, ok := resourcesByID[evidence.ResourceID]
+			if !ok {
+				return fmt.Errorf("derived artifact security record does not match support %s", support.SupportID)
+			}
+			if identity.ResourceID != evidence.ResourceID || identity.Type != evidence.Type ||
+				identity.Versions != evidence.Versions {
+				return fmt.Errorf("derived artifact security record does not match support %s", support.SupportID)
+			}
+		}
+	}
+	return nil
 }
 
 func validateProvenanceVersions(metadata ResourceMetadata, provenance Provenance) error {
@@ -761,6 +842,13 @@ func (c Catalog) Canonical() (Catalog, error) {
 	}
 	for i := range out.DerivedArtifacts {
 		out.DerivedArtifacts[i].Provenance = out.DerivedArtifacts[i].EffectiveProvenance().normalized()
+		if out.DerivedArtifacts[i].Metadata.DerivedArtifactSecurity != nil {
+			record, err := out.DerivedArtifacts[i].Metadata.DerivedArtifactSecurity.Canonical()
+			if err != nil {
+				return Catalog{}, fmt.Errorf("derived artifact %s: %w", out.DerivedArtifacts[i].Metadata.ResourceID, err)
+			}
+			out.DerivedArtifacts[i].Metadata.DerivedArtifactSecurity = &record
+		}
 	}
 	sort.Slice(out.Documents, func(i, j int) bool {
 		return out.Documents[i].Metadata.ResourceID < out.Documents[j].Metadata.ResourceID
@@ -960,8 +1048,32 @@ func (c Catalog) validateReferences(resources []ResourceMetadata) error {
 		if err := resolveProvenanceReferences(artifact.Metadata, artifact.EffectiveProvenance(), resourcesByID, documentsByID, claimDocumentsByID); err != nil {
 			return fmt.Errorf("derived artifact %s provenance: %w", artifact.Metadata.ResourceID, err)
 		}
+		if artifact.Metadata.DerivedArtifactSecurity != nil {
+			if err := validateResolvedDerivedArtifactSecurity(artifact, resourcesByID); err != nil {
+				return fmt.Errorf("derived artifact %s security: %w", artifact.Metadata.ResourceID, err)
+			}
+		}
 	}
 	return c.validateProvenanceAcyclic()
+}
+
+func validateResolvedDerivedArtifactSecurity(
+	artifact DerivedArtifact,
+	resourcesByID map[protocol.ResourceID]ResourceMetadata,
+) error {
+	record := artifact.Metadata.DerivedArtifactSecurity
+	if record == nil {
+		return nil
+	}
+	for _, support := range record.Supports {
+		for _, identity := range support.Resources {
+			resource, ok := resourcesByID[identity.ResourceID]
+			if !ok || derivedArtifactResourceIdentity(resource) != identity {
+				return fmt.Errorf("support %s resource %s does not resolve exactly", support.SupportID, identity.ResourceID)
+			}
+		}
+	}
+	return nil
 }
 
 func resolveProvenanceReferences(

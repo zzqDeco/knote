@@ -25,7 +25,7 @@ import (
 const (
 	localTenantID       = "local"
 	localSecurityDomain = "local"
-	projectionSchema    = "artifact-bundle-v2"
+	projectionSchema    = "artifact-bundle-v3"
 
 	maxKAGResourceFiles     = 4_096
 	maxKAGResourceFileBytes = 8 << 20
@@ -165,7 +165,8 @@ func (s service) prepareArtifactProjection(ctx context.Context) (repository.Arti
 
 	var set repository.ArtifactSet
 	resources := make([]catalog.ResourceMetadata, 0)
-	allDocumentIDs := make([]protocol.ResourceID, 0, len(loaded))
+	artifactDependencyIDs := make([]protocol.ResourceID, 0, len(loaded))
+	artifactSupportResources := make([]protocol.DerivedArtifactResourceIdentity, 0, len(loaded))
 	for _, source := range loaded {
 		documentID := documentIDs[source.source.Path]
 		documentMetadata, err := catalog.NewResourceMetadata(
@@ -177,7 +178,8 @@ func (s service) prepareArtifactProjection(ctx context.Context) (repository.Arti
 			return repository.ArtifactSet{}, projectionBuild{}, err
 		}
 		resources = append(resources, documentMetadata)
-		allDocumentIDs = append(allDocumentIDs, documentID)
+		artifactDependencyIDs = append(artifactDependencyIDs, documentID)
+		artifactSupportResources = append(artifactSupportResources, derivedArtifactSecurityIdentity(documentMetadata))
 		doc := protocol.Document{
 			DocumentID: string(documentID), Path: source.source.Path,
 			ContentHash: strings.TrimPrefix(string(source.digest), "sha256:")[:16],
@@ -216,6 +218,8 @@ func (s service) prepareArtifactProjection(ctx context.Context) (repository.Arti
 			}
 			chunkMetadata.Dependencies = []protocol.ResourceID{documentID}
 			resources = append(resources, chunkMetadata)
+			artifactDependencyIDs = append(artifactDependencyIDs, chunkID)
+			artifactSupportResources = append(artifactSupportResources, derivedArtifactSecurityIdentity(chunkMetadata))
 			entityDependencies = append(entityDependencies, chunkID)
 			item := protocol.Chunk{
 				ChunkID: string(chunkID), DocumentID: string(documentID), Span: chunk.span,
@@ -309,7 +313,7 @@ func (s service) prepareArtifactProjection(ctx context.Context) (repository.Arti
 			Aliases: []string{doc.Path}, EvidenceChunkIDs: evidenceChunkIDs,
 		})
 	}
-	sort.Slice(allDocumentIDs, func(i, j int) bool { return allDocumentIDs[i] < allDocumentIDs[j] })
+	sort.Slice(artifactDependencyIDs, func(i, j int) bool { return artifactDependencyIDs[i] < artifactDependencyIDs[j] })
 	artifactID, err := protocol.NewStableResourceID(scope.TenantID, scope.KnowledgeBaseID, protocol.ResourceDerivedArtifact, "artifacts/bundle")
 	if err != nil {
 		return repository.ArtifactSet{}, projectionBuild{}, err
@@ -322,7 +326,25 @@ func (s service) prepareArtifactProjection(ctx context.Context) (repository.Arti
 	if err != nil {
 		return repository.ArtifactSet{}, projectionBuild{}, err
 	}
-	artifactMetadata.Dependencies = allDocumentIDs
+	artifactMetadata.Dependencies = artifactDependencyIDs
+	artifactSecurity, err := protocol.NewDerivedArtifactSecurityRecord(
+		string(protocol.DerivedArtifactSummary), "", derivedArtifactSecurityIdentity(artifactMetadata),
+		[]protocol.DerivedArtifactSupportGroup{{
+			SupportID: "support-all-documents", Resources: artifactSupportResources, Complete: true,
+		}},
+		localSecurityDomain,
+		protocol.AuthorizationContext{
+			Version:  protocol.SecurityContractVersion,
+			TenantID: scope.TenantID, KnowledgeBaseID: scope.KnowledgeBaseID,
+			PrincipalID: "local", SessionID: "materialize", RequestID: "artifacts-bundle",
+			AuthorizationModelID: "local-model-v1", IdentityWatermark: "local-identity-v1",
+			ACLWatermark: aclVersion, Consistency: protocol.ConsistencyHigherConsistency,
+		},
+	)
+	if err != nil {
+		return repository.ArtifactSet{}, projectionBuild{}, fmt.Errorf("materialize derived artifact security: %w", err)
+	}
+	artifactMetadata.DerivedArtifactSecurity = &artifactSecurity
 	resources = append(resources, artifactMetadata)
 	sort.Slice(resources, func(i, j int) bool { return resources[i].ResourceID < resources[j].ResourceID })
 
@@ -432,6 +454,14 @@ func (s service) prepareArtifactProjection(ctx context.Context) (repository.Arti
 	return set, build, nil
 }
 
+func derivedArtifactSecurityIdentity(metadata catalog.ResourceMetadata) protocol.DerivedArtifactResourceIdentity {
+	return protocol.DerivedArtifactResourceIdentity{
+		ResourceID: metadata.ResourceID, Type: metadata.Type,
+		AuthorizationID: metadata.AuthorizationObject, AuthorizationResourceID: metadata.AuthorizationResourceID,
+		ContentDigest: metadata.ContentDigest, Versions: metadata.Versions,
+	}
+}
+
 func projectionJournalRoot(root, baseVersion, projectionVersion string) string {
 	return filepath.Join(root, "by-base", baseVersion, "successors", projectionVersion)
 }
@@ -505,6 +535,19 @@ func canonicalProjectionVersion(
 	buildConfigVersion string,
 	graphBindingContractVersion int,
 ) (string, error) {
+	return canonicalProjectionVersionForSchema(
+		projectionSchema, scope, snapshot, aclVersion, buildConfigVersion, graphBindingContractVersion,
+	)
+}
+
+func canonicalProjectionVersionForSchema(
+	schema string,
+	scope catalog.Scope,
+	snapshot catalog.SourceSnapshotRef,
+	aclVersion string,
+	buildConfigVersion string,
+	graphBindingContractVersion int,
+) (string, error) {
 	payload := struct {
 		Schema                      string                    `json:"schema"`
 		Scope                       catalog.Scope             `json:"scope"`
@@ -515,7 +558,7 @@ func canonicalProjectionVersion(
 		Graph                       string                    `json:"graph_version"`
 		GraphBindingContractVersion int                       `json:"graph_binding_contract_version,omitempty"`
 	}{
-		Schema: projectionSchema, Scope: scope, Snapshot: snapshot, ACL: aclVersion,
+		Schema: schema, Scope: scope, Snapshot: snapshot, ACL: aclVersion,
 		BuildConfig: buildConfigVersion, Index: "index-v1", Graph: "graph-v1",
 		GraphBindingContractVersion: graphBindingContractVersion,
 	}

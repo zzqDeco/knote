@@ -202,6 +202,41 @@ func TestServiceBuildArtifactsAreStableAndClaimsAreSourceBacked(t *testing.T) {
 	if err := protocol.ValidateGraphResourceBindings(repo.artifacts.GraphBindings); err != nil {
 		t.Fatalf("graph bindings: %v", err)
 	}
+	var derivedMetadata *catalog.ResourceMetadata
+	var projection catalog.Projection
+	if err := json.Unmarshal(repo.artifacts.ProjectionJSON, &projection); err != nil {
+		t.Fatalf("projection JSON: %v", err)
+	}
+	for index := range projection.Resources {
+		if projection.Resources[index].Type == protocol.ResourceDerivedArtifact {
+			derivedMetadata = &projection.Resources[index]
+			break
+		}
+	}
+	var derivedSecurity *protocol.DerivedArtifactSecurityRecord
+	if derivedMetadata != nil {
+		derivedSecurity = derivedMetadata.DerivedArtifactSecurity
+	}
+	if derivedSecurity == nil || derivedSecurity.Kind != string(protocol.DerivedArtifactSummary) ||
+		derivedSecurity.DerivationMode != protocol.DerivationAllRequired || len(derivedSecurity.Supports) != 1 ||
+		len(derivedSecurity.Supports[0].Resources) != len(repo.artifacts.Documents)+len(repo.artifacts.Chunks) {
+		t.Fatalf("materialized summary security = %#v", derivedSecurity)
+	}
+	if len(derivedMetadata.Dependencies) != len(repo.artifacts.Documents)+len(repo.artifacts.Chunks) {
+		t.Fatalf("materialized summary dependencies = %v", derivedMetadata.Dependencies)
+	}
+	boundResources := make(map[protocol.ResourceID]struct{}, len(derivedSecurity.Supports[0].Resources))
+	for _, resource := range derivedSecurity.Supports[0].Resources {
+		boundResources[resource.ResourceID] = struct{}{}
+	}
+	for _, chunk := range repo.artifacts.Chunks {
+		if _, ok := boundResources[protocol.ResourceID(chunk.ChunkID)]; !ok {
+			t.Fatalf("summary security omitted chunk %s", chunk.ChunkID)
+		}
+	}
+	if err := derivedSecurity.Validate(); err != nil {
+		t.Fatalf("materialized summary security: %v", err)
+	}
 	if got, want := len(repo.artifacts.ClaimBindings), len(repo.artifacts.Claims); got != want {
 		t.Fatalf("source-backed Claim binding count = %d, want %d: %+v", got, want, repo.artifacts.ClaimBindings)
 	}
@@ -920,6 +955,29 @@ func TestCanonicalProjectionVersionIncludesGraphBindingContract(t *testing.T) {
 	}
 	if graphBound == legacy {
 		t.Fatalf("graph binding contract reused legacy projection version %s", graphBound)
+	}
+}
+
+func TestCanonicalProjectionVersionBumpsForDerivedSecurityPayload(t *testing.T) {
+	scope := catalog.Scope{TenantID: "tenant", KnowledgeBaseID: "knowledge-base"}
+	snapshot, err := catalog.NewSourceSnapshot(scope, "workspace", "source-v1", "domain", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := canonicalProjectionVersionForSchema(
+		"artifact-bundle-v2", scope, snapshot.Ref(), "acl-v1", "build-v1", protocol.GraphBindingContractVersion,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := canonicalProjectionVersion(
+		scope, snapshot.Ref(), "acl-v1", "build-v1", protocol.GraphBindingContractVersion,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if projectionSchema != "artifact-bundle-v3" || current == legacy {
+		t.Fatalf("derived security payload reused legacy projection identity %s", current)
 	}
 }
 

@@ -235,7 +235,8 @@ func (p Projection) Validate() error {
 		if i > 0 && p.Resources[i-1].ResourceID > resource.ResourceID {
 			return fmt.Errorf("projection resources are not in canonical order")
 		}
-		if p.State == StatePublished && !resource.ServingState.IsTerminal() && !resource.IsServing() {
+		if p.State == StatePublished && !resource.ServingState.IsTerminal() && !resource.IsServing() &&
+			!isQuarantinedLegacyDerivedArtifact(resource) {
 			return fmt.Errorf("published projection contains non-serving resource %s", resource.ResourceID)
 		}
 		if p.State != StatePublished && resource.IsServing() {
@@ -258,6 +259,11 @@ func (p Projection) Validate() error {
 				return err
 			}
 		}
+		if resource.Type == protocol.ResourceDerivedArtifact && resource.DerivedArtifactSecurity != nil {
+			if err := validateProjectionDerivedArtifactSecurity(resource, resourcesByID); err != nil {
+				return err
+			}
+		}
 	}
 	for _, resource := range p.Resources {
 		if resource.IsServing() && resource.Type != protocol.ResourceDocument &&
@@ -269,7 +275,7 @@ func (p Projection) Validate() error {
 			if !ok {
 				return fmt.Errorf("resource %s dependency %s is not in the projection", resource.ResourceID, dependency)
 			}
-			if resource.IsServing() && !dependencyResource.IsServing() {
+			if resource.IsServing() && resource.Type != protocol.ResourceDerivedArtifact && !dependencyResource.IsServing() {
 				return fmt.Errorf("serving resource %s depends on non-serving resource %s", resource.ResourceID, dependency)
 			}
 		}
@@ -294,6 +300,56 @@ func (p Projection) Validate() error {
 		if i > 0 && p.AppliedOperations[i-1].OperationID > receipt.OperationID {
 			return fmt.Errorf("operation receipts are not in canonical order")
 		}
+	}
+	return nil
+}
+
+func isQuarantinedLegacyDerivedArtifact(resource ResourceMetadata) bool {
+	return resource.Type == protocol.ResourceDerivedArtifact && resource.DerivedArtifactSecurity == nil &&
+		resource.ServingState == StatePublished && resource.ProjectionStatus.Ready()
+}
+
+func validateProjectionDerivedArtifactSecurity(
+	artifact ResourceMetadata,
+	resources map[protocol.ResourceID]ResourceMetadata,
+) error {
+	record := artifact.DerivedArtifactSecurity
+	if record == nil {
+		return nil
+	}
+	dependencies := make([]protocol.ResourceID, 0)
+	completeServingGroups := 0
+	for _, support := range record.Supports {
+		groupServing := record.DerivationMode == protocol.DerivationAllRequired || support.Complete
+		for _, identity := range support.Resources {
+			resource, ok := resources[identity.ResourceID]
+			if !ok || derivedArtifactResourceIdentity(resource) != identity {
+				return fmt.Errorf("derived artifact %s support %s does not resolve exactly", artifact.ResourceID, support.SupportID)
+			}
+			dependencies = append(dependencies, identity.ResourceID)
+			groupServing = groupServing && resource.IsServing()
+		}
+		if groupServing {
+			completeServingGroups++
+		}
+	}
+	if !resourceIDsEqual(artifact.Dependencies, canonicalResourceIDs(dependencies)) {
+		return fmt.Errorf("derived artifact %s dependencies do not match its support groups", artifact.ResourceID)
+	}
+	if !artifact.IsServing() {
+		return nil
+	}
+	switch record.DerivationMode {
+	case protocol.DerivationAllRequired:
+		if completeServingGroups != len(record.Supports) {
+			return fmt.Errorf("serving derived artifact %s has an unavailable required support group", artifact.ResourceID)
+		}
+	case protocol.DerivationAnySupport:
+		if completeServingGroups == 0 {
+			return fmt.Errorf("serving derived artifact %s has no complete serving support group", artifact.ResourceID)
+		}
+	default:
+		return fmt.Errorf("serving derived artifact %s has an invalid derivation mode", artifact.ResourceID)
 	}
 	return nil
 }
@@ -445,7 +501,9 @@ func PlanRevocations(
 		return ProjectionPlan{}, fmt.Errorf("revoked resources are not in the current projection: %v", missing)
 	}
 	dependents := make(map[protocol.ResourceID][]protocol.ResourceID)
+	resourcesByID := make(map[protocol.ResourceID]ResourceMetadata, len(current.Resources))
 	for _, resource := range current.Resources {
+		resourcesByID[resource.ResourceID] = resource
 		if resource.Type != protocol.ResourceChunk {
 			for _, dependency := range resource.Dependencies {
 				dependents[dependency] = append(dependents[dependency], resource.ResourceID)
@@ -474,6 +532,9 @@ func PlanRevocations(
 			if _, alreadySelected := selected[dependent]; alreadySelected {
 				continue
 			}
+			if !resourceInvalidatedBySelection(resourcesByID[dependent], selected, resourcesByID) {
+				continue
+			}
 			selected[dependent] = struct{}{}
 			queue = append(queue, dependent)
 		}
@@ -486,11 +547,75 @@ func PlanRevocations(
 		if resource.ServingState.IsTerminal() {
 			continue
 		}
+		if isQuarantinedLegacyDerivedArtifact(resource) {
+			continue
+		}
 		resource.Versions.Projection = run.ProjectionVersion
 		rebindClaimRecordProjection(&resource, run)
+		if err := rebindDerivedArtifactSecurityProjection(&resource, resourcesByID, selected); err != nil {
+			return ProjectionPlan{}, err
+		}
 		desired = append(desired, resource)
 	}
 	return planResources(run, current, desired, OperationRevoke)
+}
+
+func resourceInvalidatedBySelection(
+	resource ResourceMetadata,
+	selected map[protocol.ResourceID]struct{},
+	resourcesByID map[protocol.ResourceID]ResourceMetadata,
+) bool {
+	if resource.Type == protocol.ResourceChunk && len(resource.Dependencies) == 0 {
+		_, invalidated := selected[resource.AuthorizationResourceID]
+		return invalidated
+	}
+	if resource.Type != protocol.ResourceDerivedArtifact || resource.DerivedArtifactSecurity == nil {
+		for _, dependency := range resource.Dependencies {
+			if _, invalidated := selected[dependency]; invalidated {
+				return true
+			}
+		}
+		return false
+	}
+	record := resource.DerivedArtifactSecurity
+	switch record.DerivationMode {
+	case protocol.DerivationAnySupport:
+		for _, support := range record.Supports {
+			if anySupportGroupAvailable(support, selected, resourcesByID) {
+				return false
+			}
+		}
+		return true
+	case protocol.DerivationAllRequired:
+		for _, support := range record.Supports {
+			for _, identity := range support.Resources {
+				current, exists := resourcesByID[identity.ResourceID]
+				_, invalidated := selected[identity.ResourceID]
+				if !exists || !current.IsServing() || invalidated {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func anySupportGroupAvailable(
+	support protocol.DerivedArtifactSupportGroup,
+	selected map[protocol.ResourceID]struct{},
+	resourcesByID map[protocol.ResourceID]ResourceMetadata,
+) bool {
+	if !support.Complete {
+		return false
+	}
+	for _, identity := range support.Resources {
+		resource, exists := resourcesByID[identity.ResourceID]
+		_, invalidated := selected[identity.ResourceID]
+		if !exists || !resource.IsServing() || invalidated {
+			return false
+		}
+	}
+	return true
 }
 
 func planResources(
@@ -534,6 +659,14 @@ func planResources(
 			return ProjectionPlan{}, fmt.Errorf("desired resource %s has another projection version", resource.ResourceID)
 		}
 		resource.Versions.Projection = run.ProjectionVersion
+		if resource.Type == protocol.ResourceDerivedArtifact {
+			if len(resource.Dependencies) == 0 {
+				return ProjectionPlan{}, fmt.Errorf("desired derived artifact %s has no canonical dependencies", resource.ResourceID)
+			}
+			if resource.DerivedArtifactSecurity == nil {
+				return ProjectionPlan{}, fmt.Errorf("desired derived artifact %s has no security record", resource.ResourceID)
+			}
+		}
 		resource.ServingState = StateStaged
 		resource.ProjectionStatus = PendingProjectionStatus()
 		if err := resource.Validate(); err != nil {
@@ -565,6 +698,7 @@ func planResources(
 			superseded.Versions.Projection = run.ProjectionVersion
 			superseded.ServingState = StateSuperseded
 			superseded.ClaimRecord = nil
+			superseded.DerivedArtifactSecurity = nil
 			operations = append(operations, newProjectionOperation(run, OperationSupersede, superseded))
 		}
 		for _, kind := range []OperationKind{
@@ -582,6 +716,7 @@ func planResources(
 		terminal.Versions.Source = run.SourceSnapshot.Version
 		terminal.Versions.Projection = run.ProjectionVersion
 		terminal.ClaimRecord = nil
+		terminal.DerivedArtifactSecurity = nil
 		if staleKind == OperationRevoke {
 			terminal.ServingState = StateRevoked
 		} else {
@@ -621,6 +756,7 @@ func validateDesiredReplacement(
 		resource.Versions.Source = run.SourceSnapshot.Version
 		resource.Versions.Projection = run.ProjectionVersion
 		resource.ClaimRecord = nil
+		resource.DerivedArtifactSecurity = nil
 		if staleKind == OperationRevoke {
 			resource.ServingState = StateRevoked
 		} else {
@@ -659,6 +795,42 @@ func rebindClaimRecordProjection(resource *ResourceMetadata, run SyncRun) {
 	resource.ClaimRecord = &record
 }
 
+func rebindDerivedArtifactSecurityProjection(
+	resource *ResourceMetadata,
+	resourcesByID map[protocol.ResourceID]ResourceMetadata,
+	selected map[protocol.ResourceID]struct{},
+) error {
+	if resource == nil || resource.Type != protocol.ResourceDerivedArtifact || resource.DerivedArtifactSecurity == nil {
+		return nil
+	}
+	record := *resource.DerivedArtifactSecurity
+	supports := make([]protocol.DerivedArtifactSupportGroup, 0, len(record.Supports))
+	dependencies := make([]protocol.ResourceID, 0, len(resource.Dependencies))
+	for _, support := range record.Supports {
+		if record.DerivationMode == protocol.DerivationAnySupport &&
+			!anySupportGroupAvailable(support, selected, resourcesByID) {
+			continue
+		}
+		copied := support
+		copied.Resources = append([]protocol.DerivedArtifactResourceIdentity(nil), support.Resources...)
+		for resourceIndex := range copied.Resources {
+			copied.Resources[resourceIndex].Versions.Projection = resource.Versions.Projection
+			dependencies = append(dependencies, copied.Resources[resourceIndex].ResourceID)
+		}
+		supports = append(supports, copied)
+	}
+	if len(supports) == 0 {
+		return fmt.Errorf("rebind derived artifact %s security record: no serving support groups", resource.ResourceID)
+	}
+	resource.Dependencies = canonicalResourceIDs(dependencies)
+	rebound, err := record.RebindProjection(derivedArtifactResourceIdentity(*resource), supports)
+	if err != nil {
+		return fmt.Errorf("rebind derived artifact %s security record: %w", resource.ResourceID, err)
+	}
+	resource.DerivedArtifactSecurity = &rebound
+	return nil
+}
+
 func validateChunkBoundaries(resources []ResourceMetadata) error {
 	byID := make(map[protocol.ResourceID]ResourceMetadata, len(resources))
 	for _, resource := range resources {
@@ -690,6 +862,9 @@ func sameResourceDefinition(left, right ResourceMetadata) bool {
 	left.Versions.Projection, right.Versions.Projection = "", ""
 	left.ServingState, right.ServingState = StateStaged, StateStaged
 	left.ProjectionStatus, right.ProjectionStatus = PendingProjectionStatus(), PendingProjectionStatus()
+	// Security records are projection-bound materializations, not content
+	// definition changes. Their full contents remain part of operation IDs.
+	left.DerivedArtifactSecurity, right.DerivedArtifactSecurity = nil, nil
 	return resourceMetadataEqual(left, right)
 }
 

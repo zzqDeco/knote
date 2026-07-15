@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
-	"reflect"
 	"strings"
 	"time"
 	"unicode"
@@ -239,7 +238,7 @@ func (s *Service) Query(ctx context.Context, request protocol.QueryRequest) (res
 			budget.setCompletePaths(len(items))
 		}
 	} else {
-		checked, err = s.checkEvidence(queryContext, authorization, "f", items)
+		items, checked, err = s.checkEvidence(queryContext, authorization, "f", items)
 	}
 	if err != nil {
 		if errors.Is(err, errNoEvidence) {
@@ -464,7 +463,11 @@ func (s *Service) revalidateCached(
 		handles[index] = item.Resource
 	}
 	loaded, err := s.loadExact(ctx, request.Authorization, handles)
-	if err != nil || !reflect.DeepEqual(loaded, cached.Evidence.Items) {
+	if err != nil {
+		return QueryResult{}, ErrProtectedContentUnavailable
+	}
+	loaded, ok := reloadSelectedEvidenceItems(loaded, cached.Evidence.Items)
+	if !ok {
 		return QueryResult{}, ErrProtectedContentUnavailable
 	}
 	checked, err := s.checkCachedDecisionBindings(
@@ -572,23 +575,24 @@ func (s *Service) checkEvidence(
 	authorization protocol.AuthorizationContext,
 	stage string,
 	items []protocol.EvidenceItem,
-) (checkedEvidence, error) {
-	handles, boundaries, projection, err := collectEvidenceHandles(authorization, items)
+) ([]protocol.EvidenceItem, checkedEvidence, error) {
+	handles, _, _, err := collectEvidenceHandles(authorization, items)
 	if err != nil {
-		return checkedEvidence{}, err
+		return nil, checkedEvidence{}, err
 	}
 	objects, err := s.checkObjects(ctx, authorization, stage, handles)
 	if err != nil {
-		return checkedEvidence{}, err
+		return nil, checkedEvidence{}, err
 	}
-	for _, resource := range handles {
-		if !objects[resource.AuthorizationID].allowed {
-			return checkedEvidence{}, errNoEvidence
-		}
+	selected := selectAuthorizedEvidenceItems(items, objects)
+	if len(selected) == 0 {
+		return nil, checkedEvidence{}, errNoEvidence
 	}
-	return checkedEvidence{
-		handles: handles, boundaries: boundaries, projection: projection, objects: objects,
-	}, nil
+	checked, err := checkedEvidenceForItems(authorization, selected, objects)
+	if err != nil {
+		return nil, checkedEvidence{}, err
+	}
+	return selected, checked, nil
 }
 
 func buildEvidencePackage(
@@ -718,7 +722,8 @@ func (s *Service) OpenCitation(
 	if err != nil {
 		return protocol.EvidenceItem{}, ErrCitationUnavailable
 	}
-	if !reflect.DeepEqual(loaded[0], *cited) {
+	selected, ok := reloadSelectedEvidenceItem(loaded[0], *cited)
+	if !ok {
 		return protocol.EvidenceItem{}, ErrCitationUnavailable
 	}
 	if _, err := s.checkCachedDecisionBindings(ctx, current, "c-final", bindings, nil); err != nil {
@@ -727,7 +732,7 @@ func (s *Service) OpenCitation(
 	if s.cache != nil && s.cache.containsInvalidatedResource(resourceIDs) {
 		return protocol.EvidenceItem{}, ErrCitationUnavailable
 	}
-	return loaded[0], nil
+	return selected, nil
 }
 
 type objectCheck struct {
