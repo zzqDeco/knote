@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/zzqDeco/knote/internal/protocol"
 	"github.com/zzqDeco/knote/internal/repository"
 )
 
@@ -125,6 +126,77 @@ func TestPublishArtifactsSerializesCompatibilityExportsWithPointerPublication(t 
 	}
 	if !bytes.Equal(actualManifest, expectedManifest) {
 		t.Fatalf("flat compatibility manifest does not match current projection %s", current.ProjectionID)
+	}
+}
+
+func TestPublishArtifactsBlocksCommitPruningBeforeSelection(t *testing.T) {
+	ctx := context.Background()
+	workspace := initRepo(t)
+	store := New(workspace)
+	base := testBundleArtifactSet(t, "prj_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "base")
+	candidate := testBundleArtifactSet(t, "prj_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "candidate")
+	mustWrite(t, filepath.Join(workspace, ".knote", "config.yaml"), "workspace: test\n")
+	mustWrite(t, filepath.Join(workspace, "sources", "intro.md"), "initial\n")
+	if err := store.WriteArtifacts(ctx, base); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, workspace, "add", ".")
+	runGit(t, workspace, "commit", "-m", "initial")
+	if err := store.StageArtifacts(ctx, candidate); err != nil {
+		t.Fatal(err)
+	}
+
+	publisherAtPointer := make(chan struct{})
+	releasePublisher := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releasePublisher) }) }
+	t.Cleanup(release)
+	publishDone := make(chan error, 1)
+	publishing := Store{
+		workspace: workspace,
+		beforePointerWrite: func(protocol.ArtifactCurrentPointer) error {
+			close(publisherAtPointer)
+			<-releasePublisher
+			return nil
+		},
+	}
+	go func() {
+		publishDone <- publishing.PublishArtifacts(ctx, repository.ArtifactPublicationBase{
+			ProjectionVersion: base.BundleManifest.ProjectionVersion,
+		}, candidate.BundleManifest)
+	}()
+	awaitArtifactPublicationSignal(t, publisherAtPointer, "candidate pointer publication")
+
+	commitStarted := make(chan struct{})
+	commitDone := make(chan error, 1)
+	go func() {
+		close(commitStarted)
+		_, err := (gitClient{workspace: workspace}).Commit(ctx, "select candidate")
+		commitDone <- err
+	}()
+	<-commitStarted
+	select {
+	case err := <-commitDone:
+		t.Fatalf("commit completed before candidate selection: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	release()
+	if err := awaitArtifactPublicationResult(t, publishDone, "candidate publication"); err != nil {
+		t.Fatal(err)
+	}
+	if err := awaitArtifactPublicationResult(t, commitDone, "artifact commit"); err != nil {
+		t.Fatal(err)
+	}
+	current, err := store.ReadCurrentArtifactManifest(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.ProjectionID != candidate.BundleManifest.ProjectionID {
+		t.Fatalf("current projection = %s, want %s", current.ProjectionID, candidate.BundleManifest.ProjectionID)
+	}
+	if _, err := os.Stat(filepath.Join(workspace, "artifacts", "bundles", candidate.BundleManifest.ProjectionID)); err != nil {
+		t.Fatalf("selected candidate bundle missing after commit: %v", err)
 	}
 }
 

@@ -258,12 +258,10 @@ func TestRunnerAllowsSafeNonPermissionedToolAnswerInAuthorizationContext(t *test
 		t.Fatal(err)
 	}
 	runner := NewRunner(Options{Executor: &fakeExecutor{events: []*adk.AgentEvent{
-		adk.EventFromMessage(schema.AssistantMessage("", []schema.ToolCall{
-			{ID: "call_1", Function: schema.FunctionCall{Name: "knote_diff", Arguments: `{}`}},
-			{ID: "call_2", Function: schema.FunctionCall{Name: "knote_versions", Arguments: `{}`}},
-		}), nil, schema.Assistant, ""),
-		adk.EventFromMessage(schema.ToolMessage("SAFE_DIFF_CANARY", "call_1", schema.WithToolName("knote_diff")), nil, schema.Tool, "knote_diff"),
-		adk.EventFromMessage(schema.ToolMessage("SAFE_VERSIONS_CANARY", "call_2", schema.WithToolName("knote_versions")), nil, schema.Tool, "knote_versions"),
+		adk.EventFromMessage(schema.AssistantMessage("", []schema.ToolCall{{
+			ID: "call_versions", Function: schema.FunctionCall{Name: "knote_versions", Arguments: `{}`},
+		}}), nil, schema.Assistant, ""),
+		adk.EventFromMessage(schema.ToolMessage("SAFE_VERSIONS_CANARY", "call_versions", schema.WithToolName("knote_versions")), nil, schema.Tool, "knote_versions"),
 		adk.EventFromMessage(schema.AssistantMessage("SAFE_ASSISTANT_CANARY", nil), nil, schema.Assistant, ""),
 	}}})
 
@@ -274,8 +272,8 @@ func TestRunnerAllowsSafeNonPermissionedToolAnswerInAuthorizationContext(t *test
 	if got := lastMessage(events, protocol.EventAssistantDone); got != "SAFE_ASSISTANT_CANARY" {
 		t.Fatalf("safe assistant answer = %q, events=%+v", got, events)
 	}
-	if got := countEvents(events, protocol.EventToolComplete); got != 2 {
-		t.Fatalf("safe tool completion count = %d, want 2: %+v", got, events)
+	if got := countEvents(events, protocol.EventToolComplete); got != 1 {
+		t.Fatalf("safe tool completion count = %d, want 1: %+v", got, events)
 	}
 	for _, event := range events {
 		if event.Type == protocol.EventError || event.ProtectedContent != nil {
@@ -286,6 +284,33 @@ func TestRunnerAllowsSafeNonPermissionedToolAnswerInAuthorizationContext(t *test
 				t.Fatalf("safe replay class = %q, want safe-tool-assistant/v1: %+v", got, event)
 			}
 		}
+	}
+}
+
+func TestRunnerRejectsContentBearingNonPermissionedToolInAuthorizationContext(t *testing.T) {
+	authorization := testEinoAuthorization("sess_eino")
+	ctx, err := protocol.WithAuthorizationContext(context.Background(), authorization)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := NewRunner(Options{Executor: &fakeExecutor{events: []*adk.AgentEvent{
+		adk.EventFromMessage(schema.AssistantMessage("", []schema.ToolCall{{
+			ID: "call_diff", Function: schema.FunctionCall{Name: "knote_diff", Arguments: `{}`},
+		}}), nil, schema.Assistant, ""),
+		adk.EventFromMessage(schema.ToolMessage("UNTRUSTED_DIFF_CANARY", "call_diff", schema.WithToolName("knote_diff")), nil, schema.Tool, "knote_diff"),
+		adk.EventFromMessage(schema.AssistantMessage("UNTRUSTED_ASSISTANT_CANARY", nil), nil, schema.Assistant, ""),
+	}}})
+
+	events, err := runner.Run(ctx, runtime.EinoRunInput{SessionID: authorization.SessionID, Message: "show diff"})
+	if err == nil || err.Error() != protectedContentUnavailableMessage {
+		t.Fatalf("content-bearing tool error = %v, want %q: %+v", err, protectedContentUnavailableMessage, events)
+	}
+	projected := fmt.Sprintf("%+v", events)
+	if strings.Contains(projected, "UNTRUSTED_DIFF_CANARY") || strings.Contains(projected, "UNTRUSTED_ASSISTANT_CANARY") {
+		t.Fatalf("content-bearing tool leaked into permissioned events: %s", projected)
+	}
+	if got := countEvents(events, protocol.EventToolComplete); got != 0 {
+		t.Fatalf("content-bearing tool completion count = %d, want 0: %+v", got, events)
 	}
 }
 
@@ -301,9 +326,9 @@ func TestRunnerPersistsLoadsAndResumesSafeNonPermissionedToolAnswer(t *testing.T
 	newExecutor := func() *fakeExecutor {
 		return &fakeExecutor{events: []*adk.AgentEvent{
 			adk.EventFromMessage(schema.AssistantMessage("", []schema.ToolCall{{
-				ID: "call_diff", Function: schema.FunctionCall{Name: "knote_diff", Arguments: `{}`},
+				ID: "call_versions", Function: schema.FunctionCall{Name: "knote_versions", Arguments: `{}`},
 			}}), nil, schema.Assistant, ""),
-			adk.EventFromMessage(schema.ToolMessage("SAFE_PERSISTED_TOOL_CANARY", "call_diff", schema.WithToolName("knote_diff")), nil, schema.Tool, "knote_diff"),
+			adk.EventFromMessage(schema.ToolMessage("SAFE_PERSISTED_TOOL_CANARY", "call_versions", schema.WithToolName("knote_versions")), nil, schema.Tool, "knote_versions"),
 			adk.EventFromMessage(schema.AssistantMessage("SAFE_PERSISTED_ANSWER_CANARY", nil), nil, schema.Assistant, ""),
 		}}
 	}
@@ -590,7 +615,7 @@ func TestRunnerFailsPermissionedOutputClosedAndSanitizesErrors(t *testing.T) {
 		{
 			name: "safe tool cannot mask malformed permissioned evidence",
 			executor: &fakeExecutor{events: []*adk.AgentEvent{
-				adk.EventFromMessage(schema.ToolMessage("SAFE_TOOL_BEFORE_MALFORMED_CANARY", "call_1", schema.WithToolName("knote_diff")), nil, schema.Tool, "knote_diff"),
+				adk.EventFromMessage(schema.ToolMessage("SAFE_TOOL_BEFORE_MALFORMED_CANARY", "call_1", schema.WithToolName("knote_versions")), nil, schema.Tool, "knote_versions"),
 				adk.EventFromMessage(schema.ToolMessage(`{"answer":"MIXED_MALFORMED_OUTPUT_CANARY"}`, "call_2", schema.WithToolName("knote_query")), nil, schema.Tool, "knote_query"),
 				adk.EventFromMessage(schema.AssistantMessage("MIXED_UNBOUND_ANSWER_CANARY", nil), nil, schema.Assistant, ""),
 			}},
@@ -601,7 +626,7 @@ func TestRunnerFailsPermissionedOutputClosedAndSanitizesErrors(t *testing.T) {
 				adk.EventFromMessage(schema.AssistantMessage("", []schema.ToolCall{{
 					ID: "call_query", Function: schema.FunctionCall{Name: "knote_query", Arguments: `{}`},
 				}}), nil, schema.Assistant, ""),
-				adk.EventFromMessage(schema.ToolMessage("SAFE_TOOL_AFTER_QUERY_CANARY", "call_diff", schema.WithToolName("knote_diff")), nil, schema.Tool, "knote_diff"),
+				adk.EventFromMessage(schema.ToolMessage("SAFE_TOOL_AFTER_QUERY_CANARY", "call_versions", schema.WithToolName("knote_versions")), nil, schema.Tool, "knote_versions"),
 				adk.EventFromMessage(schema.AssistantMessage("ATTEMPTED_QUERY_UNBOUND_ANSWER_CANARY", nil), nil, schema.Assistant, ""),
 			}},
 		},

@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -187,14 +188,18 @@ type stagedIndexEntry struct {
 }
 
 func (c gitClient) shelveUnrelatedStagedChanges(ctx context.Context) ([]stagedIndexEntry, error) {
-	out, err := c.git(ctx, "diff", "--cached", "--name-only", "-z")
+	out, err := c.git(ctx, "diff", "--cached", "--name-status", "-z")
+	if err != nil {
+		return nil, err
+	}
+	stagedPaths, err := pathsFromStagedNameStatus(out)
 	if err != nil {
 		return nil, err
 	}
 	var entries []stagedIndexEntry
 	var paths []string
-	for _, path := range strings.Split(out, "\x00") {
-		if path == "" || knowledgePath(path) {
+	for _, path := range stagedPaths {
+		if knowledgePath(path) {
 			continue
 		}
 		entry := stagedIndexEntry{path: path}
@@ -216,6 +221,34 @@ func (c gitClient) shelveUnrelatedStagedChanges(ctx context.Context) ([]stagedIn
 		}
 	}
 	return entries, nil
+}
+
+func pathsFromStagedNameStatus(out string) ([]string, error) {
+	fields := strings.Split(out, "\x00")
+	paths := make([]string, 0, len(fields))
+	for index := 0; index < len(fields); {
+		status := fields[index]
+		index++
+		if status == "" {
+			break
+		}
+		pathCount := 1
+		if status[0] == 'R' || status[0] == 'C' {
+			pathCount = 2
+		}
+		if index+pathCount > len(fields) {
+			return nil, fmt.Errorf("parse staged Git status %q: missing path", status)
+		}
+		for _, path := range fields[index : index+pathCount] {
+			if path == "" {
+				return nil, fmt.Errorf("parse staged Git status %q: empty path", status)
+			}
+			paths = append(paths, path)
+		}
+		index += pathCount
+	}
+	sort.Strings(paths)
+	return slices.Compact(paths), nil
 }
 
 func (c gitClient) restoreStagedChanges(ctx context.Context, entries []stagedIndexEntry) error {

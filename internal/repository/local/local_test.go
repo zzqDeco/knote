@@ -1343,6 +1343,32 @@ func TestCommitOnlyIncludesKnowledgePaths(t *testing.T) {
 	}
 }
 
+func TestCommitPreservesBothSidesOfUnrelatedStagedRename(t *testing.T) {
+	ctx := context.Background()
+	workspace := initRepo(t)
+	store := New(workspace)
+	mustWrite(t, filepath.Join(workspace, ".knote", "config.yaml"), "workspace: test\n")
+	mustWrite(t, filepath.Join(workspace, "sources", "intro.md"), "intro\n")
+	mustWrite(t, filepath.Join(workspace, "unrelated-old.txt"), "keep staged\n")
+	runGit(t, workspace, "add", ".")
+	runGit(t, workspace, "commit", "-m", "initial")
+
+	runGit(t, workspace, "mv", "unrelated-old.txt", "unrelated-new.txt")
+	mustWrite(t, filepath.Join(workspace, "sources", "intro.md"), "updated\n")
+	if _, err := store.Commit(ctx, "knowledge update"); err != nil {
+		t.Fatal(err)
+	}
+
+	show := runGit(t, workspace, "show", "--name-only", "--format=", "HEAD")
+	if strings.Contains(show, "unrelated-old.txt") || strings.Contains(show, "unrelated-new.txt") {
+		t.Fatalf("knowledge commit included unrelated rename:\n%s", show)
+	}
+	cached := runGit(t, workspace, "diff", "--cached", "--name-status", "-M")
+	if !strings.Contains(cached, "R100\tunrelated-old.txt\tunrelated-new.txt") {
+		t.Fatalf("unrelated rename should remain fully staged, got %q", cached)
+	}
+}
+
 func TestCommitIncludesDeletedKnowledgePaths(t *testing.T) {
 	ctx := context.Background()
 	workspace := initRepo(t)

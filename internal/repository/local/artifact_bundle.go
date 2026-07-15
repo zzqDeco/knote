@@ -145,20 +145,20 @@ func (s Store) PublishArtifacts(
 		return err
 	}
 	defer os.Remove(pointerTemporary)
-	if s.beforePointerWrite != nil {
-		if err := s.beforePointerWrite(pointer); err != nil {
-			return err
-		}
-	}
-	if err := verifyStagedArtifactBundle(bundleDir, manifest, manifestData); err != nil {
-		return err
-	}
 	publicationLock, err := acquireArtifactPublicationLock(ctx, artifactsDir)
 	if err != nil {
 		return err
 	}
 	defer publicationLock.release()
 	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if s.beforePointerWrite != nil {
+		if err := s.beforePointerWrite(pointer); err != nil {
+			return err
+		}
+	}
+	if err := verifyStagedArtifactBundle(bundleDir, manifest, manifestData); err != nil {
 		return err
 	}
 	if err := compareArtifactPublicationBase(currentPath, base); err != nil {

@@ -180,6 +180,10 @@ func permissionedToolName(toolName string) bool {
 	return toolName == einotools.NameQuery || toolName == einotools.NameExplain
 }
 
+func safeUnboundAssistantToolName(toolName string) bool {
+	return toolName == einotools.NameVersions
+}
+
 func eventToolName(payload any) string {
 	switch value := payload.(type) {
 	case map[string]string:

@@ -135,7 +135,7 @@ func protectedBindingFromAgentEvents(
 ) (*protocol.ProtectedContentBinding, bool, bool, error) {
 	authorization, authorized := protocol.AuthorizationContextFrom(ctx)
 	var packages []protocol.EvidencePackage
-	hasNonPermissionedTool := false
+	hasSafeUnboundTool := false
 	permissionedToolAttempted := false
 	for _, event := range events {
 		if authorized {
@@ -156,7 +156,10 @@ func protectedBindingFromAgentEvents(
 			return nil, true, false, errors.New("permissioned run received unnamed tool output")
 		}
 		if !permissionedToolName(toolName) {
-			hasNonPermissionedTool = true
+			if authorized && !safeUnboundAssistantToolName(toolName) {
+				return nil, false, false, fmt.Errorf("permissioned run received untrusted tool output %q", toolName)
+			}
+			hasSafeUnboundTool = true
 			continue
 		}
 		if !authorized {
@@ -169,7 +172,7 @@ func protectedBindingFromAgentEvents(
 		packages = append(packages, evidencePackage)
 	}
 	if len(packages) == 0 {
-		return nil, false, hasNonPermissionedTool && !permissionedToolAttempted, nil
+		return nil, false, hasSafeUnboundTool && !permissionedToolAttempted, nil
 	}
 	binding, err := protocol.NewProtectedContentBinding(authorization, packages...)
 	if err != nil {
@@ -244,7 +247,7 @@ func classifySafeToolAssistantEvents(events []protocol.Event) {
 		switch event.Type {
 		case protocol.EventToolComplete:
 			toolName := eventToolName(event.Payload)
-			if toolName == "" || permissionedToolName(toolName) {
+			if !safeUnboundAssistantToolName(toolName) {
 				continue
 			}
 		case protocol.EventAssistantDone:
