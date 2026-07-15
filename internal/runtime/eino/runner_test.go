@@ -253,7 +253,7 @@ func TestRunnerPendingSideEffectWaitsForManagerConfirmationWithoutError(t *testi
 	}
 }
 
-func TestRunnerAllowsSafeNonPermissionedToolAnswerInAuthorizationContext(t *testing.T) {
+func TestRunnerRejectsVersionsToolInAuthorizationContext(t *testing.T) {
 	authorization := testEinoAuthorization("sess_eino")
 	ctx, err := protocol.WithAuthorizationContext(context.Background(), authorization)
 	if err != nil {
@@ -268,24 +268,17 @@ func TestRunnerAllowsSafeNonPermissionedToolAnswerInAuthorizationContext(t *test
 	}}})
 
 	events, err := runner.Run(ctx, runtime.EinoRunInput{SessionID: authorization.SessionID, Message: "compare versions"})
-	if err != nil {
-		t.Fatalf("safe non-permissioned turn failed: %v, events=%+v", err, events)
+	if err == nil || err.Error() != protectedContentUnavailableMessage {
+		t.Fatalf("permissioned versions error = %v, events=%+v", err, events)
 	}
-	if got := lastMessage(events, protocol.EventAssistantDone); got != "SAFE_ASSISTANT_CANARY" {
-		t.Fatalf("safe assistant answer = %q, events=%+v", got, events)
-	}
-	if got := countEvents(events, protocol.EventToolComplete); got != 1 {
-		t.Fatalf("safe tool completion count = %d, want 1: %+v", got, events)
-	}
-	for _, event := range events {
-		if event.Type == protocol.EventError || event.ProtectedContent != nil {
-			t.Fatalf("safe non-permissioned turn was rejected or protected: %+v", events)
+	projected := fmt.Sprint(events)
+	for _, canary := range []string{"SAFE_VERSIONS_CANARY", "SAFE_ASSISTANT_CANARY", "safe-tool-assistant/v1"} {
+		if strings.Contains(projected, canary) {
+			t.Fatalf("permissioned versions turn leaked %q: %s", canary, projected)
 		}
-		if event.Type == protocol.EventToolComplete || event.Type == protocol.EventAssistantDone {
-			if got := eventPayloadString(event.Payload, "replay_class"); got != "safe-tool-assistant/v1" {
-				t.Fatalf("safe replay class = %q, want safe-tool-assistant/v1: %+v", got, event)
-			}
-		}
+	}
+	if hasEvent(events, protocol.EventToolComplete) || hasEvent(events, protocol.EventAssistantDone) {
+		t.Fatalf("permissioned versions output was projected: %+v", events)
 	}
 }
 
@@ -322,7 +315,7 @@ func TestRunnerRejectsSafeToolAssistantAnswerDerivedFromProtectedHistory(t *test
 		t.Fatalf("protected-history safe-tool error = %v, want %q: %+v", err, protectedContentUnavailableMessage, events)
 	}
 	encoded := fmt.Sprintf("%+v", events)
-	for _, canary := range []string{"SAFE_HISTORY_TOOL_CANARY", "SAFE_HISTORY_SUMMARY_CANARY", runtime.SafeToolAssistantReplayClassV1} {
+	for _, canary := range []string{"SAFE_HISTORY_TOOL_CANARY", "SAFE_HISTORY_SUMMARY_CANARY", "safe-tool-assistant/v1"} {
 		if strings.Contains(encoded, canary) {
 			t.Fatalf("protected-history safe-tool turn leaked %q: %s", canary, encoded)
 		}
@@ -359,15 +352,10 @@ func TestRunnerRejectsContentBearingNonPermissionedToolInAuthorizationContext(t 
 	}
 }
 
-func TestRunnerPersistsLoadsAndResumesSafeNonPermissionedToolAnswer(t *testing.T) {
+func TestRunnerPersistsLoadsAndResumesVersionsOutputWithoutAuthorization(t *testing.T) {
 	workspace := t.TempDir()
 	authorization := testEinoAuthorization("sess_safe_replay")
 	store := local.New(workspace)
-	provider := func(_ context.Context, sessionID string) (protocol.AuthorizationContext, error) {
-		current := authorization
-		current.SessionID = sessionID
-		return current, nil
-	}
 	newExecutor := func() *fakeExecutor {
 		return &fakeExecutor{events: []*adk.AgentEvent{
 			adk.EventFromMessage(schema.AssistantMessage("", []schema.ToolCall{{
@@ -380,11 +368,10 @@ func TestRunnerPersistsLoadsAndResumesSafeNonPermissionedToolAnswer(t *testing.T
 
 	firstExecutor := newExecutor()
 	manager := runtime.New(runtime.Dependencies{
-		Workspace:                    workspace,
-		Sessions:                     store,
-		EinoRunner:                   NewRunner(Options{Executor: firstExecutor}),
-		AuthorizationContextProvider: provider,
-		NewSessionID:                 func() string { return authorization.SessionID },
+		Workspace:    workspace,
+		Sessions:     store,
+		EinoRunner:   NewRunner(Options{Executor: firstExecutor}),
+		NewSessionID: func() string { return authorization.SessionID },
 	})
 	if _, err := manager.Start(context.Background(), runtime.StartOptions{}); err != nil {
 		t.Fatal(err)
@@ -401,8 +388,8 @@ func TestRunnerPersistsLoadsAndResumesSafeNonPermissionedToolAnswer(t *testing.T
 	for _, event := range raw {
 		if event.Message == "SAFE_PERSISTED_ANSWER_CANARY" {
 			persisted = true
-			if eventPayloadString(event.Payload, "replay_class") != "safe-tool-assistant/v1" {
-				t.Fatalf("safe replay class did not survive persistence: %+v", event)
+			if eventPayloadString(event.Payload, "replay_class") != "" {
+				t.Fatalf("non-permissioned answer unexpectedly received a replay class: %+v", event)
 			}
 		}
 	}
@@ -412,11 +399,10 @@ func TestRunnerPersistsLoadsAndResumesSafeNonPermissionedToolAnswer(t *testing.T
 
 	resumeExecutor := newExecutor()
 	resumed := runtime.New(runtime.Dependencies{
-		Workspace:                    workspace,
-		Sessions:                     store,
-		EinoRunner:                   NewRunner(Options{Executor: resumeExecutor}),
-		AuthorizationContextProvider: provider,
-		NewSessionID:                 func() string { return "sess_other" },
+		Workspace:    workspace,
+		Sessions:     store,
+		EinoRunner:   NewRunner(Options{Executor: resumeExecutor}),
+		NewSessionID: func() string { return "sess_other" },
 	})
 	replayed, err := resumed.Start(context.Background(), runtime.StartOptions{ResumeID: authorization.SessionID})
 	if err != nil {

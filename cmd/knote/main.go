@@ -100,9 +100,8 @@ func newRuntime(ctx context.Context, workspacePath string, resumeID string) (run
 	var protectedContentAuthorizer runtime.ProtectedContentAuthorizer
 	if permissionedApplication != nil {
 		authorizationProvider = permissionedApplication.AuthorizationContextProvider()
-		permissionedService := permissionedApplication.service
 		permissionedQuery = func(ctx context.Context, request protocol.QueryRequest) (einotools.PermissionedQueryResult, error) {
-			result, err := permissionedService.Query(ctx, request)
+			result, err := permissionedApplication.Query(ctx, request)
 			if err != nil {
 				return einotools.PermissionedQueryResult{}, err
 			}
@@ -120,17 +119,22 @@ func newRuntime(ctx context.Context, workspacePath string, resumeID string) (run
 		PermissionedQuery: permissionedQuery,
 		SideEffectGate:    func(context.Context, einotools.SideEffectRequest) error { return nil },
 	})
-	approvedEinoTools = permissionedToolMap(approvedEinoTools, permissionedConfig.Enabled)
-	einoTools := einotools.NewWithOptions(einotools.Options{
+	approvedEinoTools = permissionedSideEffectToolMap(approvedEinoTools, permissionedConfig.Enabled)
+	allEinoTools := einotools.NewWithOptions(einotools.Options{
 		Service:           knowledgeService,
 		PermissionedQuery: permissionedQuery,
 		SideEffectGate:    newEinoSideEffectGate(sideEffects, approvedEinoTools),
 	})
-	einoTools = permissionedTools(einoTools, permissionedConfig.Enabled)
-	toolExecutor := runtimeeino.NewToolExecutor(einoTools)
-	einoRunner, err := newEinoRunner(ctx, repoCfg, einoTools)
+	slashTools := permissionedSlashTools(allEinoTools, permissionedConfig.Enabled)
+	modelTools := permissionedModelTools(allEinoTools, permissionedConfig.Enabled)
+	toolExecutor := runtimeeino.NewToolExecutor(slashTools)
+	einoRunner, err := newEinoRunner(ctx, repoCfg, modelTools)
 	if err != nil {
 		return nil, nil, err
+	}
+	capabilities := runtime.DefaultSessionCapabilityProfile()
+	if permissionedConfig.Enabled {
+		capabilities = runtime.PermissionedSessionCapabilityProfile()
 	}
 	rt := runtime.New(runtime.Dependencies{
 		Workspace:                    workspace,
@@ -139,6 +143,7 @@ func newRuntime(ctx context.Context, workspacePath string, resumeID string) (run
 		Versions:                     repo,
 		WorkspaceRepo:                repo,
 		Knowledge:                    knowledgeService,
+		Capabilities:                 capabilities,
 		RunnerMode:                   runtime.RunnerModeEino,
 		EinoRunner:                   einoRunner,
 		AuthorizationContextProvider: authorizationProvider,

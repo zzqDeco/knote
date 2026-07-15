@@ -30,6 +30,7 @@ type Runtime interface {
 
 type Dependencies struct {
 	Workspace                    string
+	Capabilities                 SessionCapabilityProfile
 	Config                       repository.Config
 	SettingsYAML                 string
 	Sessions                     repository.Sessions
@@ -129,6 +130,10 @@ func (m *Manager) Start(ctx context.Context, opts StartOptions) ([]protocol.Even
 	}
 	resumeID := strings.TrimSpace(opts.ResumeID)
 	var resumeAuthorization *protocol.AuthorizationContext
+	if resumeID != "" && m.deps.Capabilities.IsPermissioned() && m.deps.AuthorizationContextProvider == nil {
+		m.mu.Unlock()
+		return nil, permissionedResumeError()
+	}
 	if resumeID != "" && m.deps.AuthorizationContextProvider != nil {
 		authorization, err := m.authorizeSessionResume(ctx, resumeID)
 		if err != nil {
@@ -191,6 +196,9 @@ func (m *Manager) SendMessage(ctx context.Context, input string) []protocol.Even
 	events := []protocol.Event{protocol.NewEvent(protocol.EventUserMessage, einoSession.ID, input, nil)}
 	if strings.HasPrefix(input, "/") {
 		command, _ := parseSlash(input)
+		if !m.deps.Capabilities.AllowsSlashCommand(command) {
+			return m.handleSlash(ctx, einoSession.ID, input)
+		}
 		if command == "new" {
 			return m.handleSlash(ctx, einoSession.ID, input)
 		}
@@ -199,16 +207,16 @@ func (m *Manager) SendMessage(ctx context.Context, input string) []protocol.Even
 	if authorizationProvider != nil {
 		authorization, err := authorizationProvider.authorizationContext(ctx, einoSession.ID)
 		if err != nil {
-			events = append(events, protocol.NewEvent(protocol.EventError, einoSession.ID, err.Error(), nil))
+			events = append(events, protocol.NewEvent(protocol.EventError, einoSession.ID, m.authorizationFailureMessage(err), nil))
 			return m.emitAndReturn(events)
 		}
 		runCtx, err = protocol.WithAuthorizationContext(ctx, authorization)
 		if err != nil {
-			events = append(events, protocol.NewEvent(protocol.EventError, einoSession.ID, err.Error(), nil))
+			events = append(events, protocol.NewEvent(protocol.EventError, einoSession.ID, m.authorizationFailureMessage(err), nil))
 			return m.emitAndReturn(events)
 		}
 		if err := m.bindSessionAuthorization(ctx, einoSession.ID, authorization); err != nil {
-			events = append(events, protocol.NewEvent(protocol.EventError, einoSession.ID, err.Error(), nil))
+			events = append(events, protocol.NewEvent(protocol.EventError, einoSession.ID, m.authorizationFailureMessage(err), nil))
 			return m.emitAndReturn(events)
 		}
 	}
@@ -234,10 +242,18 @@ func (m *Manager) SendMessage(ctx context.Context, input string) []protocol.Even
 	return m.persistEmitAndReturn(events)
 }
 
+func (m *Manager) authorizationFailureMessage(err error) string {
+	if m.deps.Capabilities.IsPermissioned() {
+		return sessionAuthorizationErrorMessage
+	}
+	return err.Error()
+}
+
 func (m *Manager) Confirm(ctx context.Context, req protocol.ConfirmRequest, approved bool) []protocol.Event {
 	m.mu.Lock()
 	einoSessionID := m.einoSession.ID
 	authorizationProvider := m.deps.AuthorizationContextProvider
+	permissionedCapabilities := m.deps.Capabilities.IsPermissioned()
 	m.mu.Unlock()
 	if einoSessionID == "" {
 		return m.emitAndReturn(m.runtimeError("runtime has not started"))
@@ -256,6 +272,12 @@ func (m *Manager) Confirm(ctx context.Context, req protocol.ConfirmRequest, appr
 			if err := m.bindSessionAuthorization(ctx, einoSessionID, authorization); err != nil {
 				return m.confirmBeforeConsumptionError(einoSessionID, req, err)
 			}
+		} else if approved && permissionedCapabilities {
+			var err error
+			confirmCtx, err = m.permissionedToolContext(ctx, einoSessionID)
+			if err != nil {
+				return m.confirmBeforeConsumptionError(einoSessionID, req, err)
+			}
 		}
 		return m.persistEmitAndReturn(m.deps.SideEffects.Confirm(confirmCtx, einoSessionID, req, approved))
 	}
@@ -263,7 +285,11 @@ func (m *Manager) Confirm(ctx context.Context, req protocol.ConfirmRequest, appr
 }
 
 func (m *Manager) confirmBeforeConsumptionError(sessionID string, req protocol.ConfirmRequest, err error) []protocol.Event {
-	events := []protocol.Event{protocol.NewEvent(protocol.EventError, sessionID, err.Error(), nil)}
+	message := err.Error()
+	if m.deps.Capabilities.IsPermissioned() {
+		message = sessionAuthorizationErrorMessage
+	}
+	events := []protocol.Event{protocol.NewEvent(protocol.EventError, sessionID, message, nil)}
 	events = append(events, m.deps.SideEffects.retryEvents(sessionID, req)...)
 	return m.persistEmitAndReturn(events)
 }
@@ -292,6 +318,9 @@ func (m *Manager) StopTask(_ context.Context, taskID string) []protocol.Event {
 }
 
 func (m *Manager) WorkspaceStatus(ctx context.Context) (repository.Status, error) {
+	if m.deps.Capabilities.IsPermissioned() {
+		return repository.Status{}, nil
+	}
 	if m.deps.Versions == nil {
 		return repository.Status{}, fmt.Errorf("runtime versions repository is not configured")
 	}
@@ -307,6 +336,9 @@ func (m *Manager) RunnerInfo(ctx context.Context) (RunnerInfo, error) {
 		ConfiguredMode: RunnerModeEino,
 		ActiveMode:     RunnerModeEino,
 		EinoAvailable:  einoRunner != nil,
+	}
+	if m.deps.Capabilities.IsPermissioned() {
+		return info, nil
 	}
 	if einoRunner == nil {
 		return info, nil
@@ -330,6 +362,14 @@ func (m *Manager) newEinoSessionLocked(ctx context.Context, resumeID string) pro
 		}
 		resumed = false
 	}
+	info := protocol.SessionInfo{
+		ID:        sessionID,
+		CreatedAt: time.Now().UTC(),
+		Resumed:   resumed,
+	}
+	if m.deps.Capabilities.IsPermissioned() {
+		return info
+	}
 	status := repository.Status{}
 	if m.deps.Versions != nil {
 		status, _ = m.deps.Versions.Status(ctx)
@@ -338,15 +378,11 @@ func (m *Manager) newEinoSessionLocked(ctx context.Context, resumeID string) pro
 	if m.deps.Knowledge != nil {
 		kagMode = string(m.deps.Knowledge.Mode())
 	}
-	return protocol.SessionInfo{
-		ID:        sessionID,
-		Workspace: m.deps.Workspace,
-		Branch:    status.Branch,
-		Dirty:     status.Dirty,
-		KAGMode:   kagMode,
-		CreatedAt: time.Now().UTC(),
-		Resumed:   resumed,
-	}
+	info.Workspace = m.deps.Workspace
+	info.Branch = status.Branch
+	info.Dirty = status.Dirty
+	info.KAGMode = kagMode
+	return info
 }
 
 func (m *Manager) Subscribe(fn EventSubscriber) func() {
@@ -377,6 +413,9 @@ func (m *Manager) SessionID() string {
 func (m *Manager) Workspace() string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.deps.Capabilities.IsPermissioned() {
+		return ""
+	}
 	return m.deps.Workspace
 }
 
@@ -385,12 +424,21 @@ func (m *Manager) CurrentSessionInfo(ctx context.Context) protocol.SessionInfo {
 	einoSession := m.einoSession
 	m.mu.Unlock()
 	if einoSession.ID != "" {
+		if m.deps.Capabilities.IsPermissioned() {
+			return permissionedSessionInfo(einoSession)
+		}
 		return m.refreshEinoSessionInfo(ctx, einoSession)
+	}
+	if m.deps.Capabilities.IsPermissioned() {
+		return protocol.SessionInfo{}
 	}
 	return protocol.SessionInfo{Workspace: m.deps.Workspace}
 }
 
 func (m *Manager) refreshEinoSessionInfo(ctx context.Context, info protocol.SessionInfo) protocol.SessionInfo {
+	if m.deps.Capabilities.IsPermissioned() {
+		return permissionedSessionInfo(info)
+	}
 	if m.deps.Versions == nil {
 		return info
 	}
@@ -401,6 +449,14 @@ func (m *Manager) refreshEinoSessionInfo(ctx context.Context, info protocol.Sess
 	info.Branch = status.Branch
 	info.Dirty = status.Dirty
 	return info
+}
+
+func permissionedSessionInfo(info protocol.SessionInfo) protocol.SessionInfo {
+	return protocol.SessionInfo{
+		ID:        info.ID,
+		CreatedAt: info.CreatedAt,
+		Resumed:   info.Resumed,
+	}
 }
 
 func (m *Manager) persistEmitAndReturn(events []protocol.Event) []protocol.Event {

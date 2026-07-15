@@ -102,7 +102,7 @@ func TestFilterPersistedEventsKeepsLegacyBehaviorWithoutPermissionedSessions(t *
 	}
 }
 
-func TestFilterPersistedEventsPreservesOrdinaryUnprotectedSlashResponses(t *testing.T) {
+func TestFilterPersistedEventsPreservesOnlyPermissionedSafeSlashResponses(t *testing.T) {
 	authorization := testAuthorizationContext("sess_replay")
 	events := []protocol.Event{
 		protocol.NewEvent(protocol.EventUserMessage, authorization.SessionID, "/help", nil),
@@ -111,6 +111,7 @@ func TestFilterPersistedEventsPreservesOrdinaryUnprotectedSlashResponses(t *test
 		protocol.NewEvent(protocol.EventAssistantDone, authorization.SessionID, "details response", map[string]any{"source": "slash", "overlay": "details"}),
 		protocol.NewEvent(protocol.EventUserMessage, authorization.SessionID, "/settings", nil),
 		protocol.NewEvent(protocol.EventError, authorization.SessionID, "settings error", nil),
+		protocol.NewEvent(protocol.EventSessionInfo, authorization.SessionID, "STALE_SESSION_INFO_CANARY", protocol.SessionInfo{Workspace: "STALE_WORKSPACE_CANARY"}),
 		protocol.NewEvent(protocol.EventUserMessage, authorization.SessionID, "protected legacy prompt", nil),
 		protocol.NewEvent(protocol.EventAssistantDone, authorization.SessionID, "LEGACY_ANSWER_CANARY", nil),
 		protocol.NewEvent(protocol.EventError, authorization.SessionID, "LEGACY_ERROR_CANARY", nil),
@@ -125,11 +126,12 @@ func TestFilterPersistedEventsPreservesOrdinaryUnprotectedSlashResponses(t *test
 	filtered := manager.filterPersistedEvents(context.Background(), authorization, events)
 	want := []string{
 		"/help", "help response",
-		"/details", "details response",
-		"/settings", "settings error",
 		"protected legacy prompt",
 	}
 	assertEventMessages(t, filtered, want)
+	if encoded := eventsText(filtered); strings.Contains(encoded, "STALE_") {
+		t.Fatalf("permissioned replay retained stale session metadata: %s", encoded)
+	}
 }
 
 func TestFilterPersistedEventsDropsCompleteHistoricalDiffTurnsInPermissionedReplay(t *testing.T) {
@@ -157,7 +159,6 @@ func TestFilterPersistedEventsDropsCompleteHistoricalDiffTurnsInPermissionedRepl
 	filtered := manager.filterPersistedEvents(context.Background(), authorization, events)
 	assertEventMessages(t, filtered, []string{
 		"SAFE_BEFORE_DIFF_CANARY",
-		"/different", "SAFE_NEAR_MATCH_SLASH_CANARY",
 		"/help", "SAFE_HELP_AFTER_DIFF_CANARY",
 		"SAFE_AFTER_DIFF_CANARY",
 	})
@@ -230,7 +231,7 @@ func TestFilterPersistedEventsDropsOrphanedHistoricalDiffArtifactsBeforeSlashPre
 	}
 }
 
-func TestFilterPersistedEventsAcceptsOnlyCorroboratedSafeToolAssistantClass(t *testing.T) {
+func TestFilterPersistedEventsRejectsHistoricalSafeToolAssistantClass(t *testing.T) {
 	authorization := testAuthorizationContext("sess_safe_class")
 	binding := testProtectedBinding(t, authorization, "mixed-forgery")
 	classified := func(event protocol.Event) protocol.Event {
@@ -274,12 +275,13 @@ func TestFilterPersistedEventsAcceptsOnlyCorroboratedSafeToolAssistantClass(t *t
 	})
 
 	filtered := manager.filterPersistedEvents(context.Background(), authorization, events)
-	if !hasMessage(filtered, protocol.EventAssistantDone, "safe answer") ||
-		!hasMessage(filtered, protocol.EventToolComplete, "allowed protected tool") {
-		t.Fatalf("valid safe or protected content was dropped: %+v", filtered)
+	if !hasMessage(filtered, protocol.EventToolComplete, "allowed protected tool") {
+		t.Fatalf("authorized protected content was dropped: %+v", filtered)
 	}
 	encoded := eventsText(filtered)
 	for _, canary := range []string{
+		"safe tool",
+		"safe answer",
 		"FORGED_NAKED_ANSWER_CANARY",
 		"UNCLASSIFIED_TERMINAL_CANARY",
 		"FORGED_AFTER_TERMINAL_CANARY",
@@ -312,20 +314,25 @@ func TestFilterPersistedEventsDropsProtectedContentWhenAuthorizationUnavailable(
 	for _, test := range []struct {
 		name string
 		deps Dependencies
+		want []string
 	}{
-		{name: "provider missing", deps: Dependencies{}},
+		{name: "provider missing", deps: Dependencies{}, want: []string{"before", "/help", "safe slash response", "safe tool summary", "after"}},
 		{
 			name: "provider missing with authorizer configured",
 			deps: Dependencies{ProtectedContentAuthorizer: func(context.Context, protocol.AuthorizationContext, protocol.ProtectedContentBinding) error {
 				t.Fatal("authorizer called without an authorization context provider")
 				return nil
 			}},
+			want: []string{"before", "/help", "safe slash response", "safe tool summary", "after"},
 		},
-		{name: "authorizer missing", deps: Dependencies{AuthorizationContextProvider: testAuthorizationContextProvider}},
+		{
+			name: "authorizer missing", deps: Dependencies{AuthorizationContextProvider: testAuthorizationContextProvider},
+			want: []string{"before", "/help", "safe slash response", "after"},
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			filtered := New(test.deps).filterPersistedEvents(context.Background(), authorization, events)
-			assertEventMessages(t, filtered, []string{"before", "/help", "safe slash response", "safe tool summary", "after"})
+			assertEventMessages(t, filtered, test.want)
 			if encoded := eventsText(filtered); strings.Contains(encoded, "PROTECTED_") {
 				t.Fatalf("protected content replayed without complete authorization dependencies: %s", encoded)
 			}
@@ -358,7 +365,7 @@ func TestFilterPersistedEventsPreservesMixedHistoryOrder(t *testing.T) {
 	})
 
 	filtered := manager.filterPersistedEvents(context.Background(), authorization, events)
-	assertEventMessages(t, filtered, []string{"first", "allowed answer", "/help", "slash answer", "local tool", "allowed tool", "last"})
+	assertEventMessages(t, filtered, []string{"first", "allowed answer", "/help", "slash answer", "allowed tool", "last"})
 }
 
 func TestRuntimeStartAndSlashResumeReplayAuthorizedProtectedBlocks(t *testing.T) {
@@ -478,7 +485,7 @@ func TestRuntimeStartAndSlashResumeDropProtectedContentWhenAuthorizationUnavaila
 				if err != nil {
 					t.Fatal(err)
 				}
-				assertMixedReplayHistory(t, events)
+				assertMixedReplayHistory(t, events, dependencyCase.provider)
 			})
 		}
 	}
@@ -508,12 +515,12 @@ func TestLoadHistoryDropsProtectedContentWhenAuthorizationUnavailable(t *testing
 			}
 
 			events := New(deps).loadHistory(ctx, authorization.SessionID)
-			assertMixedReplayHistory(t, events)
+			assertMixedReplayHistory(t, events, test.provider)
 		})
 	}
 }
 
-func TestSafeToolAssistantSurvivesPersistedHistoryStartAndResume(t *testing.T) {
+func TestHistoricalSafeToolAssistantIsDroppedFromPermissionedReplay(t *testing.T) {
 	for _, test := range []struct {
 		name   string
 		replay func(*Manager, context.Context, string) ([]protocol.Event, error)
@@ -564,11 +571,11 @@ func TestSafeToolAssistantSurvivesPersistedHistoryStartAndResume(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if !hasMessage(events, protocol.EventAssistantDone, "SAFE_CLASSIFIED_ANSWER_CANARY") {
-				t.Fatalf("safe classified answer was dropped: %+v", events)
-			}
 			encoded := eventsText(events)
-			for _, canary := range []string{"LEGACY_PERMISSIONED_TOOL_CANARY", "LEGACY_PERMISSIONED_ANSWER_CANARY", "FORGED_STANDALONE_ANSWER_CANARY"} {
+			for _, canary := range []string{
+				"SAFE_CLASSIFIED_TOOL_CANARY", "SAFE_CLASSIFIED_ANSWER_CANARY",
+				"LEGACY_PERMISSIONED_TOOL_CANARY", "LEGACY_PERMISSIONED_ANSWER_CANARY", "FORGED_STANDALONE_ANSWER_CANARY",
+			} {
 				if strings.Contains(encoded, canary) {
 					t.Fatalf("persisted replay leaked %q: %s", canary, encoded)
 				}
@@ -618,12 +625,16 @@ func appendMixedReplayHistory(t *testing.T, stored local.Store, authorization pr
 	}
 }
 
-func assertMixedReplayHistory(t *testing.T, events []protocol.Event) {
+func assertMixedReplayHistory(t *testing.T, events []protocol.Event, permissioned bool) {
 	t.Helper()
-	want := []string{"SAFE_STATUS_BEFORE", "/help", "SAFE_SLASH_RESPONSE", "SAFE_TOOL_SUMMARY", "SAFE_USER_AFTER", "SAFE_STATUS_AFTER"}
+	want := []string{"SAFE_STATUS_BEFORE", "/help", "SAFE_SLASH_RESPONSE"}
+	if !permissioned {
+		want = append(want, "SAFE_TOOL_SUMMARY")
+	}
+	want = append(want, "SAFE_USER_AFTER", "SAFE_STATUS_AFTER")
 	next := 0
 	for _, event := range events {
-		if strings.HasPrefix(event.Message, "PROTECTED_") {
+		if strings.HasPrefix(event.Message, "PROTECTED_") || permissioned && event.Message == "SAFE_TOOL_SUMMARY" {
 			t.Fatalf("protected history replayed without complete authorization dependencies: %+v", events)
 		}
 		if event.Message == "SAFE_SLASH_RESPONSE" {

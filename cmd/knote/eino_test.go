@@ -179,7 +179,7 @@ func TestPermissionedApplicationWiresRealSelectedBundleScope(t *testing.T) {
 		t.Fatal(err)
 	}
 	provider := application.AuthorizationContextProvider()
-	if application.service == nil || provider == nil {
+	if application.service == nil || application.revisionState == nil || provider == nil {
 		t.Fatalf("real permissioned application was not fully wired: %#v", application)
 	}
 	authorization, err := provider(context.Background(), "sess_real")
@@ -196,52 +196,68 @@ func TestPermissionedApplicationWiresRealSelectedBundleScope(t *testing.T) {
 func TestPermissionedToolsUseExactModeToolSets(t *testing.T) {
 	service := versioned.New(versioned.Options{})
 	all := einotools.New(service)
+	nonPermissioned := []string{
+		einotools.NameBuild,
+		einotools.NameCheckout,
+		einotools.NameCommit,
+		einotools.NameDiff,
+		einotools.NameRelease,
+		einotools.NameVersions,
+	}
 	tests := []struct {
-		name    string
-		enabled bool
-		want    []string
+		name            string
+		enabled         bool
+		wantModel       []string
+		wantSlash       []string
+		wantSideEffects []string
 	}{
 		{
-			name:    "real mode",
-			enabled: false,
-			want: []string{
-				einotools.NameBuild,
-				einotools.NameCheckout,
-				einotools.NameCommit,
-				einotools.NameDiff,
-				einotools.NameRelease,
-				einotools.NameVersions,
-			},
+			name:            "nonpermissioned mode",
+			enabled:         false,
+			wantModel:       nonPermissioned,
+			wantSlash:       nonPermissioned,
+			wantSideEffects: nonPermissioned,
 		},
 		{
-			name:    "permissioned fake mode",
+			name:    "permissioned mode",
 			enabled: true,
-			want: []string{
+			wantModel: []string{
+				einotools.NameExplain,
+				einotools.NameQuery,
+			},
+			wantSlash: []string{
 				einotools.NameBuild,
 				einotools.NameCheckout,
 				einotools.NameCommit,
-				einotools.NameExplain,
-				einotools.NameQuery,
 				einotools.NameRelease,
-				einotools.NameVersions,
+			},
+			wantSideEffects: []string{
+				einotools.NameBuild,
+				einotools.NameCheckout,
+				einotools.NameCommit,
+				einotools.NameRelease,
 			},
 		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			gotTools := toolNames(t, permissionedTools(all, test.enabled))
-			if !slices.Equal(gotTools, test.want) {
-				t.Fatalf("registered tools = %v, want exact set %v", gotTools, test.want)
+			gotModel := toolNames(t, permissionedModelTools(all, test.enabled))
+			if !slices.Equal(gotModel, test.wantModel) {
+				t.Fatalf("model tools = %v, want exact set %v", gotModel, test.wantModel)
+			}
+			gotSlash := toolNames(t, permissionedSlashTools(all, test.enabled))
+			if !slices.Equal(gotSlash, test.wantSlash) {
+				t.Fatalf("slash tools = %v, want exact set %v", gotSlash, test.wantSlash)
 			}
 
-			registry := permissionedToolMap(einotools.ByName(service), test.enabled)
+			registry := permissionedSideEffectToolMap(einotools.ByName(service), test.enabled)
 			gotRegistry := make([]string, 0, len(registry))
 			for name := range registry {
 				gotRegistry = append(gotRegistry, name)
 			}
 			slices.Sort(gotRegistry)
-			if !slices.Equal(gotRegistry, test.want) {
-				t.Fatalf("approved tool registry = %v, want exact set %v", gotRegistry, test.want)
+			if !slices.Equal(gotRegistry, test.wantSideEffects) {
+				t.Fatalf("approved tool registry = %v, want exact set %v", gotRegistry, test.wantSideEffects)
 			}
 		})
 	}

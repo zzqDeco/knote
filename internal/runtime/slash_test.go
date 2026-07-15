@@ -10,7 +10,6 @@ import (
 
 	einotools "github.com/zzqDeco/knote/internal/eino/tools"
 	"github.com/zzqDeco/knote/internal/protocol"
-	"github.com/zzqDeco/knote/internal/repository"
 	"github.com/zzqDeco/knote/internal/repository/local"
 )
 
@@ -52,37 +51,50 @@ func TestCheckoutSlashPassesActualDirtyStateToTool(t *testing.T) {
 	}
 }
 
-func TestPermissionedSlashBlocksRawDiff(t *testing.T) {
+func TestPermissionedSlashRejectsProtectedAndUnknownCommandsUniformly(t *testing.T) {
 	workspace := t.TempDir()
 	store := local.New(workspace)
-	const canary = "restricted-diff-canary"
+	const canary = "restricted-command-canary"
 	executor := &fakeToolExecutor{events: []protocol.Event{
 		protocol.NewEvent(protocol.EventVersionDiff, "", canary, map[string]string{"diff": canary}),
 	}}
+	providerCalls := 0
 	rt := New(Dependencies{
-		Workspace:                    workspace,
-		Sessions:                     store,
-		Versions:                     store,
-		EinoRunner:                   &fakeEinoRunner{events: []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, "", "natural answer", nil)}},
-		AuthorizationContextProvider: testAuthorizationContextProvider,
-		ToolExecutor:                 executor,
-		NewSessionID:                 func() string { return "sess_permissioned_diff" },
+		Workspace:    workspace,
+		Capabilities: PermissionedSessionCapabilityProfile(),
+		Sessions:     store,
+		Versions:     store,
+		EinoRunner:   &fakeEinoRunner{events: []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, "", "natural answer", nil)}},
+		AuthorizationContextProvider: func(ctx context.Context, sessionID string) (protocol.AuthorizationContext, error) {
+			providerCalls++
+			return testAuthorizationContextProvider(ctx, sessionID)
+		},
+		ToolExecutor: executor,
+		NewSessionID: func() string { return "sess_permissioned_commands" },
 	})
 	if _, err := rt.Start(context.Background(), StartOptions{}); err != nil {
 		t.Fatal(err)
 	}
 
-	events := rt.SendMessage(context.Background(), "/diff")
+	commands := []string{"/details", "/versions", "/status", "/settings", "/model", "/diff", "/eval", "/unknown"}
+	for _, command := range commands {
+		events := rt.SendMessage(context.Background(), command)
+		assertEventsExcludeCanary(t, events, canary)
+		var rejection string
+		for _, event := range events {
+			if event.Type == protocol.EventError {
+				rejection = event.Message
+			}
+		}
+		if rejection != permissionedCommandUnavailableMessage {
+			t.Fatalf("permissioned %s rejection = %q, want %q", command, rejection, permissionedCommandUnavailableMessage)
+		}
+	}
 	if executor.calls != 0 {
-		t.Fatalf("permissioned /diff invoked raw tool %d time(s)", executor.calls)
+		t.Fatalf("permissioned rejected commands invoked raw tool %d time(s)", executor.calls)
 	}
-	assertEventsExcludeCanary(t, events, canary)
-	encoded, err := json.Marshal(events)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(encoded), "diff is unavailable in permissioned sessions") {
-		t.Fatalf("permissioned /diff response did not explain the block: %s", encoded)
+	if providerCalls != 0 {
+		t.Fatalf("permissioned rejected commands reached authorization provider %d time(s)", providerCalls)
 	}
 	persisted, err := store.Load(context.Background(), rt.SessionID())
 	if err != nil {
@@ -91,55 +103,37 @@ func TestPermissionedSlashBlocksRawDiff(t *testing.T) {
 	assertEventsExcludeCanary(t, persisted, canary)
 }
 
-func TestPermissionedSlashStatusOmitsRawPaths(t *testing.T) {
+func TestPermissionedSlashHelpListsOnlyAvailableCommands(t *testing.T) {
 	workspace := t.TempDir()
-	mustRun(t, workspace, "git", "init")
-	mustRun(t, workspace, "git", "config", "user.email", "knote@example.com")
-	mustRun(t, workspace, "git", "config", "user.name", "knote")
-	must(t, os.MkdirAll(filepath.Join(workspace, "sources"), 0o755))
-	must(t, os.WriteFile(filepath.Join(workspace, "sources", "intro.md"), []byte("initial\n"), 0o644))
-	mustRun(t, workspace, "git", "add", ".")
-	mustRun(t, workspace, "git", "commit", "-m", "initial")
-	const canary = "restricted-status-canary.md"
-	must(t, os.WriteFile(filepath.Join(workspace, "sources", canary), []byte("restricted\n"), 0o644))
-
 	store := local.New(workspace)
 	rt := New(Dependencies{
-		Workspace:                    workspace,
-		Sessions:                     store,
-		Versions:                     store,
-		EinoRunner:                   &fakeEinoRunner{events: []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, "", "natural answer", nil)}},
-		AuthorizationContextProvider: testAuthorizationContextProvider,
-		NewSessionID:                 func() string { return "sess_permissioned_status" },
+		Workspace:    workspace,
+		Capabilities: PermissionedSessionCapabilityProfile(),
+		Sessions:     store,
+		EinoRunner:   &fakeEinoRunner{events: []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, "", "unused", nil)}},
+		NewSessionID: func() string { return "sess_permissioned_help" },
 	})
 	if _, err := rt.Start(context.Background(), StartOptions{}); err != nil {
 		t.Fatal(err)
 	}
 
-	events := rt.SendMessage(context.Background(), "/status")
-	assertEventsExcludeCanary(t, events, canary)
-	foundStatus := false
+	events := rt.SendMessage(context.Background(), "/help")
+	var help string
 	for _, event := range events {
-		if event.Type != protocol.EventStatusUpdate {
-			continue
-		}
-		foundStatus = true
-		status, ok := event.Payload.(repository.Status)
-		if !ok {
-			t.Fatalf("status payload type = %T, want repository.Status", event.Payload)
-		}
-		if status.Raw != "" || !status.Dirty {
-			t.Fatalf("permissioned status payload = %+v, want dirty aggregate without raw paths", status)
+		if event.Type == protocol.EventAssistantDone {
+			help = event.Message
 		}
 	}
-	if !foundStatus {
-		t.Fatal("permissioned /status produced no status event")
+	for _, command := range []string{"build", "commit", "release", "checkout", "tasks", "clear", "new", "resume", "help", "exit"} {
+		if !strings.Contains(help, "/"+command) {
+			t.Fatalf("permissioned help omitted /%s: %q", command, help)
+		}
 	}
-	persisted, err := store.Load(context.Background(), rt.SessionID())
-	if err != nil {
-		t.Fatal(err)
+	for _, command := range []string{"details", "versions", "status", "settings", "model", "diff", "eval"} {
+		if strings.Contains(help, "/"+command) {
+			t.Fatalf("permissioned help exposed /%s: %q", command, help)
+		}
 	}
-	assertEventsExcludeCanary(t, persisted, canary)
 }
 
 func assertEventsExcludeCanary(t *testing.T, events []protocol.Event, canary string) {

@@ -14,7 +14,10 @@ import (
 	"github.com/zzqDeco/knote/internal/runtime"
 )
 
-const protectedContentUnavailableMessage = "protected content is unavailable"
+const (
+	protectedContentUnavailableMessage   = "protected content is unavailable"
+	permissionedSideEffectFailureMessage = "side effect failed"
+)
 
 type ToolExecutor struct {
 	tools map[string]einotool.InvokableTool
@@ -48,8 +51,13 @@ func (e ToolExecutor) Invoke(ctx context.Context, sessionID string, toolName str
 func invokeTool(ctx context.Context, tools map[string]einotool.InvokableTool, sessionID string, toolName string, argumentsInJSON string) ([]protocol.Event, error) {
 	sessionID = strings.TrimSpace(sessionID)
 	toolName = strings.TrimSpace(toolName)
+	_, authorized := protocol.AuthorizationContextFrom(ctx)
+	permissionedSideEffect := authorized && sideEffectToolName(toolName)
 	tool, ok := tools[toolName]
 	if !ok || tool == nil {
+		if permissionedSideEffect {
+			return permissionedSideEffectFailure(sessionID, toolName, nil)
+		}
 		err := fmt.Errorf("Eino tool %q is not registered", toolName)
 		return []protocol.Event{protocol.NewEvent(protocol.EventError, sessionID, err.Error(), map[string]string{"tool": toolName})}, err
 	}
@@ -63,6 +71,9 @@ func invokeTool(ctx context.Context, tools map[string]einotool.InvokableTool, se
 		return nil, err
 	}
 	if err != nil {
+		if permissionedSideEffect {
+			return permissionedSideEffectFailure(sessionID, toolName, events)
+		}
 		if isPermissionedToolCall(toolName) {
 			generic := errors.New(protectedContentUnavailableMessage)
 			events = append(events, protocol.NewEvent(protocol.EventToolError, sessionID, generic.Error(), map[string]string{"tool": toolName}))
@@ -83,6 +94,9 @@ func invokeTool(ctx context.Context, tools map[string]einotool.InvokableTool, se
 	decoded := decodeToolResult(out)
 	payload := map[string]any{"tool": toolName, "result": decoded}
 	if failure := adapterFailureMessage(toolName, decoded); failure != "" {
+		if permissionedSideEffect {
+			return permissionedSideEffectFailure(sessionID, toolName, events)
+		}
 		if permissioned {
 			generic := errors.New(protectedContentUnavailableMessage)
 			errorPayload := map[string]string{"tool": toolName}
@@ -96,6 +110,10 @@ func invokeTool(ctx context.Context, tools map[string]einotool.InvokableTool, se
 		events = append(events, protocol.NewEvent(protocol.EventToolError, sessionID, failure, payload))
 		events = append(events, protocol.NewEvent(protocol.EventError, sessionID, failure, payload))
 		return events, fmt.Errorf("%s", failure)
+	}
+	if permissionedSideEffect {
+		events = append(events, permissionedSideEffectSuccess(sessionID, toolName)...)
+		return events, nil
 	}
 	complete := protocol.NewEvent(protocol.EventToolComplete, sessionID, toolName+" complete", payload)
 	if permissioned {
@@ -180,8 +198,44 @@ func permissionedToolName(toolName string) bool {
 	return toolName == einotools.NameQuery || toolName == einotools.NameExplain
 }
 
-func safeUnboundAssistantToolName(toolName string) bool {
-	return toolName == einotools.NameVersions
+func sideEffectToolName(toolName string) bool {
+	switch toolName {
+	case einotools.NameBuild, einotools.NameEval, einotools.NameCommit,
+		einotools.NameRelease, einotools.NameCheckout:
+		return true
+	default:
+		return false
+	}
+}
+
+func permissionedSideEffectFailure(sessionID string, toolName string, events []protocol.Event) ([]protocol.Event, error) {
+	payload := map[string]string{"tool": toolName}
+	if len(events) == 0 {
+		events = append(events, protocol.NewEvent(protocol.EventToolStart, sessionID, toolName, payload))
+	}
+	events = append(events,
+		protocol.NewEvent(protocol.EventToolError, sessionID, permissionedSideEffectFailureMessage, payload),
+		protocol.NewEvent(protocol.EventError, sessionID, permissionedSideEffectFailureMessage, payload),
+	)
+	return events, errors.New(permissionedSideEffectFailureMessage)
+}
+
+func permissionedSideEffectSuccess(sessionID string, toolName string) []protocol.Event {
+	payload := map[string]string{"tool": toolName}
+	events := []protocol.Event{
+		protocol.NewEvent(protocol.EventToolComplete, sessionID, "side effect complete", payload),
+	}
+	switch toolName {
+	case einotools.NameBuild:
+		events = append(events, protocol.NewEvent(protocol.EventBuildComplete, sessionID, "Build complete", payload))
+	case einotools.NameCommit:
+		events = append(events, protocol.NewEvent(protocol.EventVersionChanged, sessionID, "Commit complete", payload))
+	case einotools.NameRelease:
+		events = append(events, protocol.NewEvent(protocol.EventVersionChanged, sessionID, "Release complete", payload))
+	case einotools.NameCheckout:
+		events = append(events, protocol.NewEvent(protocol.EventVersionChanged, sessionID, "Checkout complete", payload))
+	}
+	return events
 }
 
 func eventToolName(payload any) string {

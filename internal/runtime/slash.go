@@ -18,6 +18,13 @@ import (
 func (m *Manager) handleSlash(ctx context.Context, sessionID string, input string) []protocol.Event {
 	userEvent := protocol.NewEvent(protocol.EventUserMessage, sessionID, input, nil)
 	cmd, arg := parseSlash(input)
+	if !m.deps.Capabilities.AllowsSlashCommand(cmd) {
+		events := []protocol.Event{
+			userEvent,
+			protocol.NewEvent(protocol.EventError, sessionID, permissionedCommandUnavailableMessage, nil),
+		}
+		return m.persistEmitAndReturn(events)
+	}
 	switch cmd {
 	case "new":
 		events := append([]protocol.Event{userEvent}, m.newSession(ctx)...)
@@ -41,9 +48,6 @@ func (m *Manager) routeSlash(ctx context.Context, sessionID string, cmd string, 
 	case "eval":
 		return []protocol.Event{protocol.NewEvent(protocol.EventError, sessionID, "eval is unavailable until authorized explain is implemented", nil)}
 	case "diff":
-		if m.deps.AuthorizationContextProvider != nil {
-			return []protocol.Event{protocol.NewEvent(protocol.EventError, sessionID, "diff is unavailable in permissioned sessions", nil)}
-		}
 		return m.invokeTool(ctx, sessionID, tools.NameDiff, jsonArgs(map[string]any{"ref": strings.TrimSpace(arg)}))
 	case "versions":
 		return m.invokeTool(ctx, sessionID, tools.NameVersions, jsonArgs(map[string]any{"limit": 20}))
@@ -61,7 +65,7 @@ func (m *Manager) routeSlash(ctx context.Context, sessionID string, cmd string, 
 			return []protocol.Event{protocol.NewEvent(protocol.EventError, sessionID, "ref is required", nil)}
 		}
 		allowDirty := false
-		if m.deps.Versions != nil {
+		if !m.deps.Capabilities.IsPermissioned() && m.deps.Versions != nil {
 			if status, err := m.deps.Versions.Status(ctx); err == nil {
 				allowDirty = status.Dirty
 			}
@@ -80,7 +84,7 @@ func (m *Manager) routeSlash(ctx context.Context, sessionID string, cmd string, 
 	case "model":
 		return m.modelInfo(sessionID)
 	case "help":
-		return []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, sessionID, helpText, map[string]string{"overlay": "help"})}
+		return []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, sessionID, helpTextFor(m.deps.Capabilities), map[string]string{"overlay": "help"})}
 	case "exit":
 		return []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, sessionID, "Use Ctrl+C to exit.", nil)}
 	case "":
@@ -94,7 +98,15 @@ func (m *Manager) invokeTool(ctx context.Context, sessionID string, toolName str
 	if m.deps.ToolExecutor == nil {
 		return []protocol.Event{protocol.NewEvent(protocol.EventError, sessionID, "Eino tool executor is not configured", map[string]string{"tool": toolName})}
 	}
-	runCtx := withSideEffectSession(ctx, sessionID)
+	runCtx := ctx
+	if m.deps.Capabilities.IsPermissioned() {
+		var err error
+		runCtx, err = m.permissionedToolContext(ctx, sessionID)
+		if err != nil {
+			return []protocol.Event{protocol.NewEvent(protocol.EventError, sessionID, sessionAuthorizationErrorMessage, nil)}
+		}
+	}
+	runCtx = withSideEffectSession(runCtx, sessionID)
 	events, err := m.deps.ToolExecutor.Invoke(runCtx, sessionID, toolName, argumentsInJSON)
 	if m.deps.SideEffects != nil {
 		events = append(events, m.deps.SideEffects.PendingEvents(sessionID)...)
@@ -106,6 +118,30 @@ func (m *Manager) invokeTool(ctx context.Context, sessionID string, toolName str
 		events = append(events, protocol.NewEvent(protocol.EventError, sessionID, err.Error(), map[string]string{"tool": toolName}))
 	}
 	return events
+}
+
+func (m *Manager) permissionedToolContext(ctx context.Context, sessionID string) (context.Context, error) {
+	if authorization, ok := protocol.AuthorizationContextFrom(ctx); ok {
+		if authorization.SessionID != sessionID {
+			return nil, sessionAuthorizationError()
+		}
+		return ctx, nil
+	}
+	if m.deps.AuthorizationContextProvider == nil {
+		return nil, sessionAuthorizationError()
+	}
+	authorization, err := m.deps.AuthorizationContextProvider.authorizationContext(ctx, sessionID)
+	if err != nil {
+		return nil, sessionAuthorizationError()
+	}
+	runCtx, err := protocol.WithAuthorizationContext(ctx, authorization)
+	if err != nil {
+		return nil, sessionAuthorizationError()
+	}
+	if err := m.bindSessionAuthorization(ctx, sessionID, authorization); err != nil {
+		return nil, sessionAuthorizationError()
+	}
+	return runCtx, nil
 }
 
 func (m *Manager) newSession(ctx context.Context) []protocol.Event {
@@ -132,6 +168,9 @@ func (m *Manager) resumeSession(ctx context.Context, currentSessionID string, se
 		return []protocol.Event{protocol.NewEvent(protocol.EventError, currentSessionID, "session storage is not configured", nil)}
 	}
 	var resumeAuthorization *protocol.AuthorizationContext
+	if m.deps.Capabilities.IsPermissioned() && m.deps.AuthorizationContextProvider == nil {
+		return []protocol.Event{protocol.NewEvent(protocol.EventError, currentSessionID, permissionedResumeErrorMessage, nil)}
+	}
 	if m.deps.AuthorizationContextProvider != nil {
 		authorization, err := m.authorizeSessionResume(ctx, sessionID)
 		if err != nil {
@@ -151,23 +190,7 @@ func (m *Manager) resumeSession(ctx context.Context, currentSessionID string, se
 		authorization = *resumeAuthorization
 	}
 	loaded = m.filterPersistedEvents(ctx, authorization, loaded)
-	status := repository.Status{}
-	if m.deps.Versions != nil {
-		status, _ = m.deps.Versions.Status(ctx)
-	}
-	kagMode := ""
-	if m.deps.Knowledge != nil {
-		kagMode = string(m.deps.Knowledge.Mode())
-	}
-	info := protocol.SessionInfo{
-		ID:        sessionID,
-		Workspace: m.deps.Workspace,
-		Branch:    status.Branch,
-		Dirty:     status.Dirty,
-		KAGMode:   kagMode,
-		CreatedAt: time.Now().UTC(),
-		Resumed:   true,
-	}
+	info := m.newEinoSessionLocked(ctx, sessionID)
 	m.mu.Lock()
 	m.einoSession = info
 	if resumeAuthorization == nil {
@@ -191,13 +214,16 @@ func (m *Manager) sessionList(ctx context.Context, sessionID string) []protocol.
 		return []protocol.Event{protocol.NewEvent(protocol.EventError, sessionID, "session storage is not configured", nil)}
 	}
 	var summaries []repository.SessionSummary
-	if m.deps.AuthorizationContextProvider == nil {
+	if !m.deps.Capabilities.IsPermissioned() && m.deps.AuthorizationContextProvider == nil {
 		var err error
 		summaries, err = m.deps.Sessions.List(ctx, 10)
 		if err != nil {
 			return []protocol.Event{protocol.NewEvent(protocol.EventError, sessionID, "list sessions failed: "+err.Error(), nil)}
 		}
 	} else {
+		if m.deps.AuthorizationContextProvider == nil {
+			return []protocol.Event{protocol.NewEvent(protocol.EventError, sessionID, sessionAuthorizationErrorMessage, nil)}
+		}
 		if _, ok := protocol.AuthorizationContextFrom(ctx); !ok {
 			return []protocol.Event{protocol.NewEvent(protocol.EventError, sessionID, sessionAuthorizationErrorMessage, nil)}
 		}
@@ -259,9 +285,6 @@ func (m *Manager) status(sessionID string, ctx context.Context) []protocol.Event
 	status, err := m.deps.Versions.Status(ctx)
 	if err != nil {
 		return []protocol.Event{protocol.NewEvent(protocol.EventError, sessionID, err.Error(), nil)}
-	}
-	if m.deps.AuthorizationContextProvider != nil {
-		status.Raw = ""
 	}
 	message := strings.TrimSpace(status.Raw)
 	if message == "" {
@@ -501,21 +524,40 @@ func redactYAMLSecrets(text string) string {
 	return strings.Join(lines, "\n")
 }
 
-const helpText = `Commands:
-/build      build knowledge artifacts
-/diff       show artifact/git diff
-/versions   show git versions
-/commit     commit current knowledge version
-/release    tag a release version
-/checkout   checkout a version or branch
-/tasks      show runtime tasks
-/status     show git status
-/clear      clear the current TUI transcript view
-/new        start a new session
-/resume     list recent sessions, or /resume <session-id>
-/details    show workspace/session/KAG details
-/settings   show effective read-only settings
-/model      show read-only model profile details
-/exit       exit from the TUI with Ctrl+C
-/help       show this help
-`
+const permissionedCommandUnavailableMessage = "command is unavailable in this session"
+
+type slashHelpEntry struct {
+	command     string
+	description string
+}
+
+var slashHelpEntries = []slashHelpEntry{
+	{command: "build", description: "build knowledge artifacts"},
+	{command: "diff", description: "show artifact/git diff"},
+	{command: "versions", description: "show git versions"},
+	{command: "commit", description: "commit current knowledge version"},
+	{command: "release", description: "tag a release version"},
+	{command: "checkout", description: "checkout a version or branch"},
+	{command: "tasks", description: "show runtime tasks"},
+	{command: "status", description: "show git status"},
+	{command: "clear", description: "clear the current TUI transcript view"},
+	{command: "new", description: "start a new session"},
+	{command: "resume", description: "list recent sessions, or /resume <session-id>"},
+	{command: "details", description: "show workspace/session/KAG details"},
+	{command: "settings", description: "show effective read-only settings"},
+	{command: "model", description: "show read-only model profile details"},
+	{command: "exit", description: "exit from the TUI with Ctrl+C"},
+	{command: "help", description: "show this help"},
+}
+
+func helpTextFor(profile SessionCapabilityProfile) string {
+	var b strings.Builder
+	b.WriteString("Commands:\n")
+	for _, entry := range slashHelpEntries {
+		if !profile.AllowsSlashCommand(entry.command) {
+			continue
+		}
+		fmt.Fprintf(&b, "/%-11s%s\n", entry.command, entry.description)
+	}
+	return b.String()
+}
