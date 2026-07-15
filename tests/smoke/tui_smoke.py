@@ -169,6 +169,35 @@ def wait_session_tool(workspace: Path, tool_name: str, timeout: float = 30) -> N
     )
 
 
+def wait_session_message(workspace: Path, message: str, timeout: float = 30) -> None:
+    session_dir = workspace / ".knote" / "sessions"
+    deadline = time.monotonic() + timeout
+    observed: set[str] = set()
+    while time.monotonic() < deadline:
+        for path in session_dir.glob("*.jsonl"):
+            try:
+                lines = path.read_text(encoding="utf-8").splitlines()
+            except (FileNotFoundError, OSError):
+                continue
+            for line in lines:
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if event.get("type") != "message.complete":
+                    continue
+                observed_message = event.get("message")
+                if isinstance(observed_message, str):
+                    observed.add(observed_message)
+                if observed_message == message and isinstance(event.get("protected_content"), dict):
+                    return
+        time.sleep(0.1)
+    raise AssertionError(
+        f"timed out waiting for protected assistant message {message!r} in {session_dir}; "
+        f"observed messages: {sorted(observed)}"
+    )
+
+
 def wait_git_clean(workspace: Path, timeout: float = 30) -> None:
     deadline = time.monotonic() + timeout
     pathspec = [".knote/config.yaml", "sources", "artifacts", "evals"]
@@ -184,6 +213,12 @@ def wait_git_clean(workspace: Path, timeout: float = 30) -> None:
             return
         time.sleep(0.1)
     raise AssertionError(f"timed out waiting for clean knote git paths in {workspace}")
+
+
+def assert_paths_absent(workspace: Path, *relative_paths: str) -> None:
+    unexpected = [path for path in relative_paths if (workspace / path).exists()]
+    if unexpected:
+        raise AssertionError(f"unexpected generated paths after fail-closed command: {unexpected}")
 
 
 def run_startup(driver: PTYDriver) -> None:
@@ -221,13 +256,14 @@ def run_fake_mvp(driver: PTYDriver, workspace: Path) -> None:
 
     driver.send("/eval\r")
     driver.expect("eval is unavail", timeout=10)
+    assert_paths_absent(workspace, "evals/report.md", "evals/results.jsonl")
 
 
 def run_eino_local_proxy(driver: PTYDriver, workspace: Path) -> None:
     run_startup(driver)
-    driver.send('Use knote_query to answer the current workspace knowledge-base question "What is knote?". After the tool succeeds, reply only with knote-authorized-ok.\r')
-    driver.expect("knote-authorized-ok", timeout=60)
-    wait_session_tool(workspace, "knote_query")
+    driver.send('Use knote_query to answer the current workspace knowledge-base question "What is knote?". After the tool succeeds, reply only with the three lowercase words knote, authorized, and ok joined by hyphens.\r')
+    wait_session_tool(workspace, "knote_query", timeout=60)
+    wait_session_message(workspace, "knote-authorized-ok", timeout=60)
 
 
 def main() -> int:

@@ -17,6 +17,8 @@ permissions:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    outputs:
+      commit: ${{ steps.verified_commit.outputs.commit }}
     env:
       RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
       CGO_ENABLED: "0"
@@ -26,6 +28,11 @@ jobs:
         with:
           fetch-depth: 0
           ref: ${{ env.RELEASE_TAG }}
+
+      - name: Record verified commit
+        id: verified_commit
+        shell: bash
+        run: echo "commit=$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
 
       - name: Setup Go
         uses: actions/setup-go@v6
@@ -71,13 +78,14 @@ jobs:
       contents: write
     env:
       RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+      VERIFIED_COMMIT: ${{ needs.verify.outputs.commit }}
       CGO_ENABLED: "0"
     steps:
       - name: Checkout
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ env.VERIFIED_COMMIT }}
 
       - name: Setup Go
         uses: actions/setup-go@v6
@@ -113,6 +121,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
+          git fetch --force origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+          tag_commit="$(git rev-list -n 1 "refs/tags/${RELEASE_TAG}")"
+          [[ "${tag_commit}" == "${VERIFIED_COMMIT}" ]] || {
+            printf 'release tag moved after verification\nexpected: %s\nactual:   %s\n' "${VERIFIED_COMMIT}" "${tag_commit}" >&2
+            exit 1
+          }
           if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
             gh release upload "${RELEASE_TAG}" dist/* --clobber
           else
