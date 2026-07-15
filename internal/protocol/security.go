@@ -229,6 +229,9 @@ func (h ResourceHandle) ValidateFor(auth AuthorizationContext) error {
 	if h.TenantID != auth.TenantID || h.KnowledgeBaseID != auth.KnowledgeBaseID {
 		return fmt.Errorf("resource %s crosses the authorization scope", h.ResourceID)
 	}
+	if h.Versions.ACL != auth.ACLWatermark {
+		return fmt.Errorf("resource %s ACL version does not match the authorization watermark", h.ResourceID)
+	}
 	return nil
 }
 
