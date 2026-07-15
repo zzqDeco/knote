@@ -4,10 +4,11 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
-	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/zzqDeco/knote/internal/knowledge/kag"
@@ -26,6 +27,10 @@ type Backend interface {
 	Build(ctx context.Context) (kag.Response, error)
 	Query(ctx context.Context, query string) (kag.Response, error)
 	Explain(ctx context.Context, query string) (kag.Response, error)
+	BuildInNamespace(ctx context.Context, namespace, idempotencyKey string) (kag.Response, error)
+	BuildInNamespaceWithCorpus(ctx context.Context, namespace, idempotencyKey string, corpus []kag.CorpusRecord) (kag.Response, error)
+	QueryInNamespace(ctx context.Context, namespace, query string) (kag.Response, error)
+	ExplainInNamespace(ctx context.Context, namespace, query string) (kag.Response, error)
 }
 
 type Service interface {
@@ -44,33 +49,38 @@ type Service interface {
 
 type Options struct {
 	Workspace string
-	Repo      repository.Workspace
+	Repo      repository.ProjectionWorkspace
 	Versions  repository.Versions
 	Backend   Backend
 	Mode      Mode
 }
 
 type BuildResult struct {
-	Manifest     protocol.ArtifactManifest
-	Report       string
-	KAGData      map[string]any
-	AdapterError string
+	Manifest       protocol.ArtifactManifest       `json:"manifest"`
+	BundleManifest protocol.ArtifactBundleManifest `json:"bundle_manifest"`
+	Report         string                          `json:"report"`
+	KAGData        map[string]any                  `json:"kag_data,omitempty"`
+	AdapterError   string                          `json:"adapter_error,omitempty"`
 }
 
 type Answer struct {
-	Answer       string
-	Evidence     []string
-	Uncertainty  string
-	Mode         string
-	Data         map[string]any
-	AdapterError string
+	Answer               string
+	Evidence             []string
+	Uncertainty          string
+	Mode                 string
+	Data                 map[string]any
+	ProjectionVersion    string
+	Namespace            string
+	AuthorizationObject  string
+	AuthorizationVersion string
+	AdapterError         string
 }
 
 type Explanation = Answer
 
 type service struct {
 	workspace string
-	repo      repository.Workspace
+	repo      repository.ProjectionWorkspace
 	versions  repository.Versions
 	backend   Backend
 	mode      Mode
@@ -96,33 +106,33 @@ func (s service) Mode() Mode {
 
 func (s service) Build(ctx context.Context) (BuildResult, error) {
 	var out BuildResult
-	if s.backend != nil {
-		resp, err := s.backend.Build(ctx)
-		if err != nil {
-			out.AdapterError = err.Error()
-			return out, fmt.Errorf("KAG build failed: %w", err)
-		} else {
-			out.KAGData = cloneMap(resp.Data)
-		}
-	}
-
-	artifacts, err := s.buildArtifacts(ctx)
+	artifacts, projection, err := s.buildArtifacts(ctx)
 	if err != nil {
 		return out, err
 	}
-	if err := s.repo.WriteArtifacts(ctx, artifacts); err != nil {
+	out.Manifest = artifacts.Manifest
+	out.BundleManifest = artifacts.BundleManifest
+	out.Report = artifacts.BuildReport
+	out.KAGData, err = s.executeProjectionBuild(ctx, artifacts, projection)
+	if err != nil {
+		if strings.Contains(err.Error(), "KAG build failed") {
+			out.AdapterError = err.Error()
+		}
 		return out, err
 	}
-	out.Manifest = artifacts.Manifest
-	out.Report = artifacts.BuildReport
 	return out, nil
 }
 
 func (s service) Query(ctx context.Context, question string) (Answer, error) {
+	manifest, hasManifest, err := s.currentBundleManifest(ctx)
+	if err != nil {
+		return Answer{}, err
+	}
 	if s.backend != nil {
-		resp, err := s.backend.Query(ctx, question)
+		resp, err := s.queryBackend(ctx, manifest, hasManifest, question)
 		if err == nil {
 			answer := answerFromResponse(resp)
+			applyProjectionMetadata(&answer, manifest, hasManifest)
 			if strings.TrimSpace(answer.Answer) != "" {
 				return answer, nil
 			}
@@ -142,7 +152,11 @@ func (s service) Explain(ctx context.Context, question string) (Explanation, err
 	if s.backend == nil {
 		return s.fallbackAnswer(ctx)
 	}
-	resp, err := s.backend.Explain(ctx, question)
+	manifest, hasManifest, manifestErr := s.currentBundleManifest(ctx)
+	if manifestErr != nil {
+		return Answer{}, manifestErr
+	}
+	resp, err := s.explainBackend(ctx, manifest, hasManifest, question)
 	if err != nil {
 		answer, fallbackErr := s.fallbackAnswer(ctx)
 		answer.AdapterError = err.Error()
@@ -152,6 +166,7 @@ func (s service) Explain(ctx context.Context, question string) (Explanation, err
 		return answer, nil
 	}
 	answer := answerFromResponse(resp)
+	applyProjectionMetadata(&answer, manifest, hasManifest)
 	if strings.TrimSpace(answer.Answer) == "" {
 		return s.fallbackAnswer(ctx)
 	}
@@ -164,6 +179,10 @@ func (s service) Eval(ctx context.Context) (repository.EvalReport, error) {
 		return repository.EvalReport{}, err
 	}
 	results := make([]repository.EvalResult, 0, len(questions))
+	manifest, hasManifest, err := s.currentBundleManifest(ctx)
+	if err != nil {
+		return repository.EvalReport{}, err
+	}
 	for _, question := range questions {
 		result := repository.EvalResult{
 			ID:       question.ID,
@@ -174,7 +193,7 @@ func (s service) Eval(ctx context.Context) (repository.EvalReport, error) {
 			results = append(results, result)
 			continue
 		}
-		resp, err := s.backend.Explain(ctx, question.Question)
+		resp, err := s.explainBackend(ctx, manifest, hasManifest, question.Question)
 		if err != nil {
 			result.AdapterError = err.Error()
 			results = append(results, result)
@@ -278,91 +297,23 @@ func (s service) requireVersions() (repository.Versions, error) {
 	return s.versions, nil
 }
 
-func (s service) buildArtifacts(ctx context.Context) (repository.ArtifactSet, error) {
-	sources, err := s.repo.ListSources(ctx)
-	if err != nil {
-		return repository.ArtifactSet{}, err
-	}
-	if len(sources) == 0 {
-		return repository.ArtifactSet{}, fmt.Errorf("sources directory not found or contains no .md/.txt files")
-	}
-	sort.Slice(sources, func(i, j int) bool { return sources[i].Path < sources[j].Path })
-
-	var set repository.ArtifactSet
-	generatedAt := stableGeneratedAt(sources)
-	for _, source := range sources {
-		data, err := s.repo.ReadSource(ctx, source.Path)
-		if err != nil {
-			return repository.ArtifactSet{}, err
-		}
-		contentHash := hashString(string(data))
-		doc := protocol.Document{
-			DocumentID:  hashString(source.Path + ":" + contentHash),
-			Path:        source.Path,
-			ContentHash: contentHash,
-			Title:       titleFromContent(string(data)),
-			Mtime:       source.ModTime.UTC(),
-		}
-		set.Documents = append(set.Documents, doc)
-		var evidenceChunkIDs []string
-		for _, chunk := range splitChunks(string(data), 1000) {
-			chunkHash := hashString(chunk.text)
-			item := protocol.Chunk{
-				ChunkID:    hashString(doc.DocumentID + fmt.Sprint(chunk.span) + chunkHash),
-				DocumentID: doc.DocumentID,
-				Span:       chunk.span,
-				Text:       chunk.text,
-				Hash:       chunkHash,
-			}
-			set.Chunks = append(set.Chunks, item)
-			evidenceChunkIDs = append(evidenceChunkIDs, item.ChunkID)
-			set.Claims = append(set.Claims, protocol.Claim{
-				ClaimID:          hashString("claim:" + item.ChunkID),
-				Text:             compactClaim(item.Text),
-				Confidence:       "medium",
-				EvidenceChunkIDs: []string{item.ChunkID},
-			})
-		}
-		sort.Strings(evidenceChunkIDs)
-		set.Entities = append(set.Entities, protocol.Entity{
-			EntityID:         hashString("document:" + doc.DocumentID),
-			Name:             firstNonEmpty(doc.Title, doc.Path),
-			Type:             "Document",
-			Aliases:          []string{doc.Path},
-			EvidenceChunkIDs: evidenceChunkIDs,
-		})
-	}
-	sort.Slice(set.Entities, func(i, j int) bool { return set.Entities[i].EntityID < set.Entities[j].EntityID })
-	sort.Slice(set.Claims, func(i, j int) bool { return set.Claims[i].ClaimID < set.Claims[j].ClaimID })
-	set.Summaries = []protocol.Summary{{
-		SummaryID:        hashString("summary:" + s.workspace),
-		Text:             fmt.Sprintf("Built %d documents and %d chunks.", len(set.Documents), len(set.Chunks)),
-		EvidenceChunkIDs: chunkIDs(set.Chunks),
-	}}
-	set.Manifest = protocol.ArtifactManifest{
-		Version:       1,
-		Workspace:     s.workspace,
-		GeneratedAt:   generatedAt,
-		SourceCount:   len(sources),
-		DocumentCount: len(set.Documents),
-		ChunkCount:    len(set.Chunks),
-		EntityCount:   len(set.Entities),
-		RelationCount: len(set.Relations),
-		ClaimCount:    len(set.Claims),
-		SummaryCount:  len(set.Summaries),
-	}
-	set.SchemaYAML = defaultSchemaYAML
-	set.BuildReport = renderBuildReport(set.Manifest)
-	return set, nil
+func (s service) buildArtifacts(ctx context.Context) (repository.ArtifactSet, projectionBuild, error) {
+	return s.prepareArtifactProjection(ctx)
 }
 
 func (s service) fallbackAnswer(ctx context.Context) (Answer, error) {
+	manifest, hasManifest, manifestErr := s.currentBundleManifest(ctx)
+	if manifestErr != nil {
+		return Answer{}, manifestErr
+	}
 	summaries, err := s.repo.ReadSummaries(ctx)
 	if err != nil || len(summaries) == 0 {
-		return Answer{
+		answer := Answer{
 			Answer:      "当前知识版本中没有足够证据回答这个问题。请先运行 /build。",
 			Uncertainty: "KAG unavailable; no local artifact summaries were available",
-		}, nil
+		}
+		applyProjectionMetadata(&answer, manifest, hasManifest)
+		return answer, nil
 	}
 	var b strings.Builder
 	b.WriteString("结论\n")
@@ -372,11 +323,48 @@ func (s service) fallbackAnswer(ctx context.Context) (Answer, error) {
 		b.WriteByte('\n')
 	}
 	b.WriteString("\n依据\n本回答来自 knote artifacts fallback。\n\n不确定性\n真实 KAG 查询未返回可用结果。")
-	return Answer{
+	answer := Answer{
 		Answer:      strings.TrimSpace(b.String()),
 		Uncertainty: "KAG unavailable; answered from local artifacts fallback",
 		Mode:        "fallback",
-	}, nil
+	}
+	applyProjectionMetadata(&answer, manifest, hasManifest)
+	return answer, nil
+}
+
+func (s service) queryBackend(ctx context.Context, manifest protocol.ArtifactBundleManifest, hasManifest bool, question string) (kag.Response, error) {
+	if hasManifest {
+		return s.backend.QueryInNamespace(ctx, manifest.Namespace, question)
+	}
+	return s.backend.Query(ctx, question)
+}
+
+func (s service) explainBackend(ctx context.Context, manifest protocol.ArtifactBundleManifest, hasManifest bool, question string) (kag.Response, error) {
+	if hasManifest {
+		return s.backend.ExplainInNamespace(ctx, manifest.Namespace, question)
+	}
+	return s.backend.Explain(ctx, question)
+}
+
+func (s service) currentBundleManifest(ctx context.Context) (protocol.ArtifactBundleManifest, bool, error) {
+	manifest, err := s.repo.ReadCurrentArtifactManifest(ctx)
+	if errors.Is(err, repository.ErrArtifactCurrentNotFound) {
+		return protocol.ArtifactBundleManifest{}, false, nil
+	}
+	if err != nil {
+		return protocol.ArtifactBundleManifest{}, false, err
+	}
+	return manifest, true, nil
+}
+
+func applyProjectionMetadata(answer *Answer, manifest protocol.ArtifactBundleManifest, ok bool) {
+	if !ok {
+		return
+	}
+	answer.ProjectionVersion = manifest.ProjectionVersion
+	answer.Namespace = manifest.Namespace
+	answer.AuthorizationObject = manifest.AuthorizationObject
+	answer.AuthorizationVersion = manifest.AuthorizationVersion
 }
 
 func answerFromResponse(resp kag.Response) Answer {
@@ -469,20 +457,29 @@ func splitChunks(text string, limit int) []chunk {
 	return chunks
 }
 
-func stableGeneratedAt(sources []repository.Source) time.Time {
-	generatedAt := time.Unix(0, 0).UTC()
-	for _, source := range sources {
-		modTime := source.ModTime.UTC()
-		if modTime.After(generatedAt) {
-			generatedAt = modTime
-		}
-	}
-	return generatedAt
-}
-
 func hashString(value string) string {
 	sum := sha256.Sum256([]byte(value))
 	return hex.EncodeToString(sum[:])[:16]
+}
+
+func fullHash(value []byte) string {
+	sum := sha256.Sum256(value)
+	return hex.EncodeToString(sum[:])
+}
+
+func canonicalNamespace(value string) string {
+	var b strings.Builder
+	for _, r := range strings.TrimSpace(value) {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '-' || r == '_' {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('_')
+		}
+	}
+	if b.Len() == 0 {
+		return "KnoteKB"
+	}
+	return b.String()
 }
 
 func titleFromContent(text string) string {
@@ -589,12 +586,18 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
-const defaultSchemaYAML = `version: 1
+const defaultSchemaYAML = `version: 2
 artifacts:
   documents: documents.jsonl
   chunks: chunks.jsonl
   entities: entities.jsonl
   relations: relations.jsonl
   claims: claims.jsonl
+  graph_bindings: graph_bindings.jsonl
+  claim_bindings: claim_bindings.jsonl
   summaries: summaries.jsonl
+graph_binding_contract:
+  version: 2
+  graph_object_type: KnoteResource
+  claim_edge_type: KnoteClaimEdge
 `

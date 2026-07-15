@@ -33,11 +33,41 @@ jobs:
       - name: Go tests
         run: KNOTE_KAG_FAKE=1 go test ./...
 
+      - name: OpenFGA authorization model tests
+        run: GOTOOLCHAIN=go1.25.12 go run github.com/openfga/cli/cmd/fga@v0.7.17 model test --tests internal/authz/model/authorization.fga.yaml
+
       - name: Python adapter smoke
         run: python -m unittest discover -s adapters/kag -p '*test*.py'
+
+      - name: Phase 2 permissioned graph deterministic smoke
+        run: python tests/smoke/permissioned_graph_real_smoke.py --self-test
 
       - name: Build CLI
         run: CGO_ENABLED=0 go build -o bin/knote ./cmd/knote
 
       - name: Fake MVP acceptance smoke
-        run: scripts/smoke_fake_mvp.sh
+        env:
+          KNOTE_EINO_API_KEY: ${{ secrets.KNOTE_EINO_API_KEY }}
+          KNOTE_EINO_BASE_URL: ${{ vars.KNOTE_EINO_BASE_URL }}
+          KNOTE_EINO_MODEL: ${{ vars.KNOTE_EINO_MODEL }}
+          KNOTE_EINO_REASONING_EFFORT: ${{ vars.KNOTE_EINO_REASONING_EFFORT }}
+        run: |
+          if [[ -z "${KNOTE_EINO_API_KEY:-}" || -z "${KNOTE_EINO_BASE_URL:-}" || -z "${KNOTE_EINO_MODEL:-}" ]]; then
+            echo "Skipping fake MVP acceptance smoke: Eino-only TUI smoke requires KNOTE_EINO_API_KEY, KNOTE_EINO_BASE_URL, and KNOTE_EINO_MODEL."
+            exit 0
+          fi
+          scripts/smoke_fake_mvp.sh
+
+  windows-catalog:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Projection store tests
+        run: go test ./internal/catalog/...

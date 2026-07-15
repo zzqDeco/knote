@@ -3,111 +3,66 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="${KNOTE_BIN:-${ROOT}/bin/knote}"
-PYTHON="${KNOTE_PYTHON:-${PYTHON:-python3}}"
+DEFAULT_PYTHON="python3"
+if [[ -x "/usr/bin/python3" ]]; then
+  DEFAULT_PYTHON="/usr/bin/python3"
+fi
+PYTHON="${KNOTE_PYTHON:-${PYTHON:-${DEFAULT_PYTHON}}}"
 TMPDIR_ROOT="${TMPDIR:-/tmp}"
 WORKSPACE="$(mktemp -d "${TMPDIR_ROOT%/}/knote-eino-proxy.XXXXXX")"
+SMOKE_BIN_DIR=""
+
+source "${ROOT}/scripts/lib/eino_local_proxy_env.sh"
 
 cleanup() {
   rm -rf "${WORKSPACE}"
+  if [[ -n "${SMOKE_BIN_DIR}" ]]; then
+    rm -rf "${SMOKE_BIN_DIR}"
+  fi
 }
 trap cleanup EXIT
 
 cd "${ROOT}"
 
-export KNOTE_EINO_PROVIDER="${KNOTE_EINO_PROVIDER:-openai-compatible}"
-export KNOTE_EINO_MODEL="${KNOTE_EINO_MODEL:-gpt-5.3-codex-spark}"
-export KNOTE_EINO_BASE_URL="${KNOTE_EINO_BASE_URL:-http://127.0.0.1:8317/v1}"
-export KNOTE_EINO_REASONING_EFFORT="${KNOTE_EINO_REASONING_EFFORT:-low}"
+knote_configure_eino_local_proxy_env
 export KNOTE_KAG_FAKE="${KNOTE_KAG_FAKE:-1}"
-
-if [[ -z "${KNOTE_EINO_API_KEY:-}" ]]; then
-  config_candidates=()
-  if [[ -n "${KNOTE_CLIPROXY_CONFIG:-}" ]]; then
-    config_candidates+=("${KNOTE_CLIPROXY_CONFIG}")
-  fi
-  if [[ -n "${HOME:-}" ]]; then
-    config_candidates+=("${HOME}/.cli-proxy-api/config.yaml")
-    config_candidates+=("${HOME}/CLIProxyAPI/config.yaml")
-  fi
-  if command -v brew >/dev/null 2>&1; then
-    brew_prefix="$(brew --prefix 2>/dev/null || true)"
-    if [[ -n "${brew_prefix}" ]]; then
-      config_candidates+=("${brew_prefix}/etc/cliproxyapi.conf")
-    fi
-  fi
-  config_candidates+=("/opt/homebrew/etc/cliproxyapi.conf")
-  config_candidates+=("/usr/local/etc/cliproxyapi.conf")
-
-  if command -v ruby >/dev/null 2>&1; then
-    for config_path in "${config_candidates[@]}"; do
-      if [[ ! -f "${config_path}" ]]; then
-        continue
-      fi
-      candidate_key="$(ruby -ryaml -e 'cfg=YAML.load_file(ARGV[0]) || {}; print Array(cfg["api-keys"] || cfg["api_keys"]).first.to_s' "${config_path}" 2>/dev/null || true)"
-      if [[ -n "${candidate_key}" ]]; then
-        KNOTE_EINO_API_KEY="${candidate_key}"
-        export KNOTE_EINO_API_KEY
-        break
-      fi
-    done
-  fi
-fi
-
-if [[ -z "${KNOTE_EINO_API_KEY:-}" ]]; then
-  echo "KNOTE_EINO_API_KEY is required. Set it explicitly or set KNOTE_CLIPROXY_CONFIG to a CLIProxyAPI config with api-keys." >&2
-  echo "Default config paths checked include ~/.cli-proxy-api/config.yaml, ~/CLIProxyAPI/config.yaml, and Homebrew etc/cliproxyapi.conf." >&2
-  exit 2
-fi
+knote_require_eino_api_key
 
 if [[ ! -x "${BIN}" ]]; then
   CGO_ENABLED=0 go build -o "${BIN}" ./cmd/knote
 fi
 
+prepare_smoke_bin() {
+  if [[ "$(uname -s)" != "Darwin" || "${KNOTE_SMOKE_FORCE_BIN:-}" != "1" ]]; then
+    printf '%s' "${BIN}"
+    return 0
+  fi
+  if [[ -z "${SMOKE_BIN_DIR}" ]]; then
+    SMOKE_BIN_DIR="$(mktemp -d "${TMPDIR_ROOT%/}/knote-smoke-bin.XXXXXX")"
+  fi
+  local target="${SMOKE_BIN_DIR}/eino-proxy-knote"
+  cp "${BIN}" "${target}"
+  chmod +x "${target}"
+  xattr -c "${target}" >/dev/null 2>&1 || true
+  codesign --force --sign - "${target}" >/dev/null 2>&1 || true
+  printf '%s' "${target}"
+}
+
 echo "==> Probing OpenAI-compatible model endpoint: ${KNOTE_EINO_BASE_URL}"
-"${PYTHON}" - <<'PY'
-import json
-import os
-import sys
-import urllib.error
-import urllib.request
-
-base = os.environ["KNOTE_EINO_BASE_URL"].rstrip("/")
-model = os.environ["KNOTE_EINO_MODEL"]
-key = os.environ["KNOTE_EINO_API_KEY"]
-req = urllib.request.Request(
-    base + "/models",
-    headers={"Authorization": "Bearer " + key},
-)
-try:
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
-except urllib.error.HTTPError as exc:
-    body = exc.read().decode("utf-8", errors="replace")
-    print(f"model endpoint failed: HTTP {exc.code} {body[:200]}", file=sys.stderr)
-    raise SystemExit(1)
-except Exception as exc:
-    print(f"model endpoint failed: {exc}", file=sys.stderr)
-    raise SystemExit(1)
-
-items = data.get("data", [])
-if not isinstance(items, list):
-    items = []
-ids = [item.get("id") for item in items if isinstance(item, dict) and item.get("id")]
-print(json.dumps({"model_count": len(ids), "target_model": model, "target_listed": model in ids}, ensure_ascii=False))
-if model not in ids:
-    if not ids:
-        print("model endpoint did not return any model ids", file=sys.stderr)
-        raise SystemExit(1)
-    print(f"target model {model!r} was not listed by /models", file=sys.stderr)
-    raise SystemExit(1)
-PY
+knote_probe_eino_local_proxy "${PYTHON}"
 
 mkdir -p "${WORKSPACE}/sources"
 cp -R "${ROOT}/tests/fixtures/basic-kb/sources/." "${WORKSPACE}/sources/"
 
 echo "==> Running Eino TUI smoke against local OpenAI-compatible proxy"
-KNOTE_RUNTIME_MODE=eino "${PYTHON}" tests/smoke/tui_smoke.py \
-  --bin "${BIN}" \
+TUI_TARGET=(--bin "${BIN}")
+if [[ "$(uname -s)" == "Darwin" && "${KNOTE_SMOKE_FORCE_BIN:-}" != "1" ]]; then
+  TUI_TARGET=(--go-run)
+elif [[ "$(uname -s)" == "Darwin" ]]; then
+  TUI_TARGET=(--bin "$(prepare_smoke_bin)")
+fi
+"${PYTHON}" tests/smoke/tui_smoke.py \
+  "${TUI_TARGET[@]}" \
   --workspace "${WORKSPACE}" \
   --scenario eino-local-proxy
 

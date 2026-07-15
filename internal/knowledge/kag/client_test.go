@@ -2,6 +2,7 @@ package kag
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,7 +14,9 @@ func TestClientReadsLargeNDJSONLine(t *testing.T) {
 	adapter := filepath.Join(workspace, "adapter.py")
 	largeAnswer := strings.Repeat("x", 128*1024)
 	script := `import json
-print(json.dumps({"id":"req","type":"result","data":{"answer":"` + largeAnswer + `"}}))
+import sys
+req = json.loads(sys.stdin.readline())
+print(json.dumps({"id":req["id"],"type":"result","data":{"answer":"` + largeAnswer + `"}}))
 `
 	if err := os.WriteFile(adapter, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
@@ -26,6 +29,105 @@ print(json.dumps({"id":"req","type":"result","data":{"answer":"` + largeAnswer +
 	}
 	if got := resp.Data["answer"]; got != largeAnswer {
 		t.Fatalf("large answer mismatch: %T", got)
+	}
+}
+
+func TestClientRejectsResponseForAnotherRequest(t *testing.T) {
+	workspace := t.TempDir()
+	adapter := filepath.Join(workspace, "adapter.py")
+	script := `import json
+print(json.dumps({"id":"wrong-request","type":"result","data":{"answer":"wrong"}}))
+`
+	if err := os.WriteFile(adapter, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("KNOTE_PYTHON", pythonForTest())
+
+	_, err := Client{AdapterPath: adapter, Workspace: workspace}.Query(context.Background(), "hello")
+	if err == nil || !strings.Contains(err.Error(), "does not match request") {
+		t.Fatalf("expected response id mismatch, got %v", err)
+	}
+}
+
+func TestClientProjectionNamespaceOverridesConfiguredNamespace(t *testing.T) {
+	workspace := t.TempDir()
+	adapter := filepath.Join(workspace, "adapter.py")
+	script := `import json
+import sys
+req = json.loads(sys.stdin.readline())
+print(json.dumps({"id":req["id"],"type":"result","data":{"namespace":req["params"]["namespace"],"runtime_dir":req["params"]["runtime_dir"],"idempotency_key":req["params"].get("idempotency_key", "")}}))
+`
+	if err := os.WriteFile(adapter, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("KNOTE_PYTHON", pythonForTest())
+	client := Client{AdapterPath: adapter, Workspace: workspace, Namespace: "legacy"}
+	for name, call := range map[string]func() (Response, error){
+		"build": func() (Response, error) {
+			return client.BuildInNamespace(context.Background(), "projection-one", "idem-build-one")
+		},
+		"query": func() (Response, error) {
+			return client.QueryInNamespace(context.Background(), "projection-two", "question")
+		},
+		"explain": func() (Response, error) {
+			return client.ExplainInNamespace(context.Background(), "projection-three", "question")
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			response, err := call()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := response.Data["namespace"]; got == "legacy" || got == "" {
+				t.Fatalf("projection namespace did not override configured namespace: %v", got)
+			}
+			if got := response.Data["runtime_dir"]; !strings.Contains(got.(string), filepath.Join("projections", response.Data["namespace"].(string))) {
+				t.Fatalf("projection runtime was not isolated: %v", got)
+			}
+			if got := response.Data["idempotency_key"]; name == "build" && got != "idem-build-one" {
+				t.Fatalf("build idempotency key = %v, want idem-build-one", got)
+			} else if name != "build" && got != "" {
+				t.Fatalf("%s unexpectedly sent build idempotency key %v", name, got)
+			}
+		})
+	}
+}
+
+func TestClientBuildInNamespaceSendsExplicitCorpus(t *testing.T) {
+	workspace := t.TempDir()
+	adapter := filepath.Join(workspace, "adapter.py")
+	script := `import json
+import sys
+req = json.loads(sys.stdin.readline())
+print(json.dumps({"id":req["id"],"type":"result","data":{"corpus":req["params"]["corpus"],"projection_isolated":req["params"]["projection_isolated"]}}))
+`
+	if err := os.WriteFile(adapter, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("KNOTE_PYTHON", pythonForTest())
+	corpus := []CorpusRecord{{
+		ID: "sources/one.md", Name: "One", Content: "# One\n\nprepared bytes", SourcePath: "sources/one.md",
+	}}
+
+	response, err := (Client{AdapterPath: adapter, Workspace: workspace}).BuildInNamespaceWithCorpus(
+		context.Background(), "projection-one", "idem-one", corpus,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(response.Data["corpus"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []CorpusRecord
+	if err := json.Unmarshal(encoded, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0] != corpus[0] {
+		t.Fatalf("explicit corpus = %+v, want %+v", got, corpus)
+	}
+	if isolated, ok := response.Data["projection_isolated"].(bool); !ok || !isolated {
+		t.Fatalf("projection isolation marker = %#v, want true", response.Data["projection_isolated"])
 	}
 }
 

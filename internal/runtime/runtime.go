@@ -8,7 +8,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/zzqDeco/knote/internal/agent"
 	"github.com/zzqDeco/knote/internal/knowledge/versioned"
 	"github.com/zzqDeco/knote/internal/protocol"
 	"github.com/zzqDeco/knote/internal/repository"
@@ -30,18 +29,23 @@ type Runtime interface {
 }
 
 type Dependencies struct {
-	Workspace     string
-	Config        repository.Config
-	SettingsYAML  string
-	Sessions      repository.Sessions
-	Versions      repository.Versions
-	WorkspaceRepo repository.Workspace
-	Knowledge     versioned.Service
-	RunnerMode    RunnerMode
-	EinoRunner    EinoRunner
-	SideEffects   *SideEffectBridge
-	NewSessionID  func() string
+	Workspace                    string
+	Config                       repository.Config
+	SettingsYAML                 string
+	Sessions                     repository.Sessions
+	Versions                     repository.Versions
+	WorkspaceRepo                repository.Workspace
+	Knowledge                    versioned.Service
+	RunnerMode                   RunnerMode
+	EinoRunner                   EinoRunner
+	AuthorizationContextProvider AuthorizationContextProvider
+	ProtectedContentAuthorizer   ProtectedContentAuthorizer
+	SideEffects                  *SideEffectBridge
+	ToolExecutor                 ToolExecutor
+	NewSessionID                 func() string
 }
+
+type AuthorizationContextProvider func(ctx context.Context, sessionID string) (protocol.AuthorizationContext, error)
 
 type StartOptions struct {
 	ResumeID string
@@ -50,8 +54,7 @@ type StartOptions struct {
 type RunnerMode string
 
 const (
-	RunnerModeDirect RunnerMode = "direct"
-	RunnerModeEino   RunnerMode = "eino"
+	RunnerModeEino RunnerMode = "eino"
 )
 
 type EinoRunner interface {
@@ -78,23 +81,25 @@ type RunnerToolInfo struct {
 	Description string `json:"description,omitempty"`
 }
 
+type ToolExecutor interface {
+	Invoke(ctx context.Context, sessionID string, toolName string, argumentsInJSON string) ([]protocol.Event, error)
+}
+
 type EventSubscriber func([]protocol.Event)
 
 type Manager struct {
-	mu          sync.Mutex
-	deps        Dependencies
-	agent       *agent.Agent
-	einoSession protocol.SessionInfo
-	subscribers map[int]EventSubscriber
-	nextSubID   int
+	mu                   sync.Mutex
+	deps                 Dependencies
+	einoSession          protocol.SessionInfo
+	authorizationBinding *authorizationBinding
+	subscribers          map[int]EventSubscriber
+	nextSubID            int
 }
 
 var _ Runtime = (*Manager)(nil)
 
 func New(deps Dependencies) *Manager {
-	if deps.RunnerMode == "" {
-		deps.RunnerMode = RunnerModeDirect
-	}
+	deps.RunnerMode = RunnerModeEino
 	return &Manager{
 		deps:        deps,
 		subscribers: map[int]EventSubscriber{},
@@ -103,13 +108,6 @@ func New(deps Dependencies) *Manager {
 
 func (m *Manager) Start(ctx context.Context, opts StartOptions) ([]protocol.Event, error) {
 	m.mu.Lock()
-	if m.agent != nil {
-		sessionID := m.agent.SessionID()
-		m.mu.Unlock()
-		events := []protocol.Event{protocol.NewEvent(protocol.EventStatusUpdate, sessionID, "runtime already started", nil)}
-		m.emit(events)
-		return events, nil
-	}
 	if m.einoSession.ID != "" {
 		sessionID := m.einoSession.ID
 		m.mu.Unlock()
@@ -117,51 +115,62 @@ func (m *Manager) Start(ctx context.Context, opts StartOptions) ([]protocol.Even
 		m.emit(events)
 		return events, nil
 	}
-	if m.deps.RunnerMode == RunnerModeEino {
-		if m.deps.EinoRunner == nil {
-			m.mu.Unlock()
-			return nil, fmt.Errorf("eino runner mode requires an Eino runner")
-		}
-		if m.deps.Sessions == nil {
-			m.mu.Unlock()
-			return nil, fmt.Errorf("eino runner mode requires session storage")
-		}
-		if err := m.deps.EinoRunner.Ready(ctx); err != nil {
-			m.mu.Unlock()
-			return nil, err
-		}
-		info, loaded := m.newEinoSessionLocked(ctx, opts.ResumeID)
-		m.einoSession = info
+	if m.deps.EinoRunner == nil {
 		m.mu.Unlock()
-		events := []protocol.Event{
-			protocol.NewEvent(protocol.EventGatewayReady, info.ID, "knote runtime ready", nil),
-			protocol.NewEvent(protocol.EventSessionInfo, info.ID, "session ready", info),
-		}
-		m.persist(events)
-		if info.Resumed {
-			events = append(loaded, events...)
-		}
-		m.emit(events)
-		return events, nil
+		return nil, fmt.Errorf("Eino-only runtime requires an Eino runner")
 	}
-	deps := agent.Dependencies{
-		Workspace:     m.deps.Workspace,
-		ResumeID:      opts.ResumeID,
-		Config:        m.deps.Config,
-		SettingsYAML:  m.deps.SettingsYAML,
-		Sessions:      m.deps.Sessions,
-		Versions:      m.deps.Versions,
-		WorkspaceRepo: m.deps.WorkspaceRepo,
-		Knowledge:     m.deps.Knowledge,
-		NewSessionID:  m.deps.NewSessionID,
+	if m.deps.Sessions == nil {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("Eino-only runtime requires session storage")
 	}
-	runner, events, err := agent.New(ctx, deps)
-	if err != nil {
+	if err := m.deps.EinoRunner.Ready(ctx); err != nil {
 		m.mu.Unlock()
 		return nil, err
 	}
-	m.agent = runner
+	resumeID := strings.TrimSpace(opts.ResumeID)
+	var resumeAuthorization *protocol.AuthorizationContext
+	if resumeID != "" && m.deps.AuthorizationContextProvider != nil {
+		authorization, err := m.authorizeSessionResume(ctx, resumeID)
+		if err != nil {
+			m.mu.Unlock()
+			return nil, err
+		}
+		resumeAuthorization = &authorization
+	}
+	var loaded []protocol.Event
+	if resumeID != "" {
+		var err error
+		loaded, err = m.deps.Sessions.Load(ctx, resumeID)
+		if err != nil {
+			m.mu.Unlock()
+			if resumeAuthorization != nil {
+				return nil, permissionedResumeError()
+			}
+			return nil, fmt.Errorf("resume failed: %w", err)
+		}
+		authorization := protocol.AuthorizationContext{}
+		if resumeAuthorization != nil {
+			authorization = *resumeAuthorization
+		}
+		loaded = m.filterPersistedEvents(ctx, authorization, loaded)
+	}
+	info := m.newEinoSessionLocked(ctx, resumeID)
+	m.einoSession = info
+	if resumeAuthorization == nil {
+		m.authorizationBinding = nil
+	} else {
+		binding := newAuthorizationBinding(*resumeAuthorization)
+		m.authorizationBinding = &binding
+	}
 	m.mu.Unlock()
+	events := []protocol.Event{
+		protocol.NewEvent(protocol.EventGatewayReady, info.ID, "knote runtime ready", nil),
+		protocol.NewEvent(protocol.EventSessionInfo, info.ID, "session ready", info),
+	}
+	m.persist(events)
+	if info.Resumed {
+		events = append(loaded, events...)
+	}
 	m.emit(events)
 	return events, nil
 }
@@ -172,56 +181,85 @@ func (m *Manager) SendMessage(ctx context.Context, input string) []protocol.Even
 		return nil
 	}
 	m.mu.Lock()
-	runner := m.agent
 	einoSession := m.einoSession
 	einoRunner := m.deps.EinoRunner
+	authorizationProvider := m.deps.AuthorizationContextProvider
 	m.mu.Unlock()
-	if runner == nil {
-		if einoSession.ID == "" {
-			return m.emitAndReturn(m.runtimeError("runtime has not started"))
+	if einoSession.ID == "" {
+		return m.emitAndReturn(m.runtimeError("runtime has not started"))
+	}
+	events := []protocol.Event{protocol.NewEvent(protocol.EventUserMessage, einoSession.ID, input, nil)}
+	if strings.HasPrefix(input, "/") {
+		command, _ := parseSlash(input)
+		if command == "new" {
+			return m.handleSlash(ctx, einoSession.ID, input)
 		}
-		events := []protocol.Event{protocol.NewEvent(protocol.EventUserMessage, einoSession.ID, input, nil)}
-		if strings.HasPrefix(input, "/") {
-			events = append(events, protocol.NewEvent(protocol.EventError, einoSession.ID, "slash commands are not available in Eino runner mode yet", nil))
-			return m.persistEmitAndReturn(events)
-		}
-		history := m.loadHistory(ctx, einoSession.ID)
-		runCtx := ctx
-		if m.deps.SideEffects != nil {
-			runCtx = withSideEffectSession(ctx, einoSession.ID)
-		}
-		runnerEvents, err := einoRunner.Run(runCtx, EinoRunInput{SessionID: einoSession.ID, Message: input, History: history})
-		events = append(events, runnerEvents...)
-		if m.deps.SideEffects != nil {
-			events = append(events, m.deps.SideEffects.PendingEvents(einoSession.ID)...)
-		}
+	}
+	runCtx := ctx
+	if authorizationProvider != nil {
+		authorization, err := authorizationProvider.authorizationContext(ctx, einoSession.ID)
 		if err != nil {
-			if errors.Is(err, ErrSideEffectPending) {
-				return m.persistEmitAndReturn(events)
-			}
 			events = append(events, protocol.NewEvent(protocol.EventError, einoSession.ID, err.Error(), nil))
+			return m.emitAndReturn(events)
+		}
+		runCtx, err = protocol.WithAuthorizationContext(ctx, authorization)
+		if err != nil {
+			events = append(events, protocol.NewEvent(protocol.EventError, einoSession.ID, err.Error(), nil))
+			return m.emitAndReturn(events)
+		}
+		if err := m.bindSessionAuthorization(ctx, einoSession.ID, authorization); err != nil {
+			events = append(events, protocol.NewEvent(protocol.EventError, einoSession.ID, err.Error(), nil))
+			return m.emitAndReturn(events)
+		}
+	}
+	if strings.HasPrefix(input, "/") {
+		return m.handleSlash(runCtx, einoSession.ID, input)
+	}
+	history := m.loadHistory(runCtx, einoSession.ID)
+	if m.deps.SideEffects != nil {
+		runCtx = withSideEffectSession(runCtx, einoSession.ID)
+	}
+	runnerEvents, err := einoRunner.Run(runCtx, EinoRunInput{SessionID: einoSession.ID, Message: input, History: history})
+	events = append(events, runnerEvents...)
+	if m.deps.SideEffects != nil {
+		events = append(events, m.deps.SideEffects.PendingEvents(einoSession.ID)...)
+	}
+	if err != nil {
+		if errors.Is(err, ErrSideEffectPending) {
 			return m.persistEmitAndReturn(events)
 		}
+		events = append(events, protocol.NewEvent(protocol.EventError, einoSession.ID, err.Error(), nil))
 		return m.persistEmitAndReturn(events)
 	}
-	return m.emitAndReturn(runner.Handle(ctx, input))
+	return m.persistEmitAndReturn(events)
 }
 
 func (m *Manager) Confirm(ctx context.Context, req protocol.ConfirmRequest, approved bool) []protocol.Event {
 	m.mu.Lock()
-	runner := m.agent
 	einoSessionID := m.einoSession.ID
+	authorizationProvider := m.deps.AuthorizationContextProvider
 	m.mu.Unlock()
-	if runner == nil {
-		if einoSessionID != "" {
-			if m.deps.SideEffects != nil {
-				return m.persistEmitAndReturn(m.deps.SideEffects.Confirm(ctx, einoSessionID, req, approved))
-			}
-			return m.persistEmitAndReturn([]protocol.Event{protocol.NewEvent(protocol.EventError, einoSessionID, "confirm is not available in Eino runner mode yet", nil)})
-		}
+	if einoSessionID == "" {
 		return m.emitAndReturn(m.runtimeError("runtime has not started"))
 	}
-	return m.emitAndReturn(runner.Confirm(ctx, req, approved))
+	if m.deps.SideEffects != nil {
+		confirmCtx := ctx
+		if approved && authorizationProvider != nil {
+			authorization, err := authorizationProvider.authorizationContext(ctx, einoSessionID)
+			if err != nil {
+				return m.persistEmitAndReturn([]protocol.Event{protocol.NewEvent(protocol.EventError, einoSessionID, err.Error(), nil)})
+			}
+			confirmCtx, err = protocol.WithAuthorizationContext(ctx, authorization)
+			if err != nil {
+				return m.persistEmitAndReturn([]protocol.Event{protocol.NewEvent(protocol.EventError, einoSessionID, err.Error(), nil)})
+			}
+			if err := m.bindSessionAuthorization(ctx, einoSessionID, authorization); err != nil {
+				return m.persistEmitAndReturn([]protocol.Event{protocol.NewEvent(protocol.EventError, einoSessionID, err.Error(), nil)})
+			}
+		}
+		return m.persistEmitAndReturn(m.deps.SideEffects.Confirm(confirmCtx, einoSessionID, req, approved))
+	}
+	return m.persistEmitAndReturn([]protocol.Event{protocol.NewEvent(protocol.EventError, einoSessionID, "confirm is not available without a side-effect bridge", nil)})
 }
 
 func (m *Manager) Interrupt(context.Context) []protocol.Event {
@@ -231,7 +269,7 @@ func (m *Manager) Interrupt(context.Context) []protocol.Event {
 	if einoSessionID != "" {
 		return m.persistEmitAndReturn([]protocol.Event{protocol.NewEvent(protocol.EventStatusUpdate, einoSessionID, "interrupt requested; Eino runner has no active streaming controller yet", nil)})
 	}
-	return m.emitAndReturn(m.currentStatus("interrupt requested; direct runner has no active streaming turn"))
+	return m.emitAndReturn(m.runtimeError("runtime has not started"))
 }
 
 func (m *Manager) StopTask(_ context.Context, taskID string) []protocol.Event {
@@ -244,7 +282,7 @@ func (m *Manager) StopTask(_ context.Context, taskID string) []protocol.Event {
 	if einoSessionID != "" {
 		return m.persistEmitAndReturn([]protocol.Event{protocol.NewEvent(protocol.EventStatusUpdate, einoSessionID, fmt.Sprintf("task stop requested for %s; Eino runner has no background task controller yet", taskID), nil)})
 	}
-	return m.emitAndReturn(m.currentStatus(fmt.Sprintf("task stop requested for %s; direct runner has no background task controller", taskID)))
+	return m.emitAndReturn(m.runtimeError("runtime has not started"))
 }
 
 func (m *Manager) WorkspaceStatus(ctx context.Context) (repository.Status, error) {
@@ -256,17 +294,12 @@ func (m *Manager) WorkspaceStatus(ctx context.Context) (repository.Status, error
 
 func (m *Manager) RunnerInfo(ctx context.Context) (RunnerInfo, error) {
 	m.mu.Lock()
-	configured := m.deps.RunnerMode
-	active := RunnerModeDirect
 	einoRunner := m.deps.EinoRunner
-	if m.agent == nil && (configured == RunnerModeEino || m.einoSession.ID != "") {
-		active = RunnerModeEino
-	}
 	m.mu.Unlock()
 
 	info := RunnerInfo{
-		ConfiguredMode: configured,
-		ActiveMode:     active,
+		ConfiguredMode: RunnerModeEino,
+		ActiveMode:     RunnerModeEino,
 		EinoAvailable:  einoRunner != nil,
 	}
 	if einoRunner == nil {
@@ -280,10 +313,9 @@ func (m *Manager) RunnerInfo(ctx context.Context) (RunnerInfo, error) {
 	return info, nil
 }
 
-func (m *Manager) newEinoSessionLocked(ctx context.Context, resumeID string) (protocol.SessionInfo, []protocol.Event) {
+func (m *Manager) newEinoSessionLocked(ctx context.Context, resumeID string) protocol.SessionInfo {
 	sessionID := strings.TrimSpace(resumeID)
 	resumed := true
-	var loaded []protocol.Event
 	if sessionID == "" {
 		if m.deps.NewSessionID != nil {
 			sessionID = m.deps.NewSessionID()
@@ -291,8 +323,6 @@ func (m *Manager) newEinoSessionLocked(ctx context.Context, resumeID string) (pr
 			sessionID = "sess_" + time.Now().UTC().Format("20060102T150405.000000000")
 		}
 		resumed = false
-	} else if m.deps.Sessions != nil {
-		loaded, _ = m.deps.Sessions.Load(ctx, sessionID)
 	}
 	status := repository.Status{}
 	if m.deps.Versions != nil {
@@ -310,7 +340,7 @@ func (m *Manager) newEinoSessionLocked(ctx context.Context, resumeID string) (pr
 		KAGMode:   kagMode,
 		CreatedAt: time.Now().UTC(),
 		Resumed:   resumed,
-	}, loaded
+	}
 }
 
 func (m *Manager) Subscribe(fn EventSubscriber) func() {
@@ -332,36 +362,26 @@ func (m *Manager) Subscribe(fn EventSubscriber) func() {
 func (m *Manager) SessionID() string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.agent == nil {
-		if m.einoSession.ID != "" {
-			return m.einoSession.ID
-		}
-		return ""
+	if m.einoSession.ID != "" {
+		return m.einoSession.ID
 	}
-	return m.agent.SessionID()
+	return ""
 }
 
 func (m *Manager) Workspace() string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.agent == nil {
-		return m.deps.Workspace
-	}
-	return m.agent.Workspace()
+	return m.deps.Workspace
 }
 
 func (m *Manager) CurrentSessionInfo(ctx context.Context) protocol.SessionInfo {
 	m.mu.Lock()
-	runner := m.agent
 	einoSession := m.einoSession
 	m.mu.Unlock()
-	if runner == nil {
-		if einoSession.ID != "" {
-			return m.refreshEinoSessionInfo(ctx, einoSession)
-		}
-		return protocol.SessionInfo{Workspace: m.deps.Workspace}
+	if einoSession.ID != "" {
+		return m.refreshEinoSessionInfo(ctx, einoSession)
 	}
-	return runner.CurrentSessionInfo(ctx)
+	return protocol.SessionInfo{Workspace: m.deps.Workspace}
 }
 
 func (m *Manager) refreshEinoSessionInfo(ctx context.Context, info protocol.SessionInfo) protocol.SessionInfo {
@@ -400,7 +420,11 @@ func (m *Manager) loadHistory(ctx context.Context, sessionID string) []protocol.
 	if err != nil {
 		return nil
 	}
-	return events
+	authorization, ok := protocol.AuthorizationContextFrom(ctx)
+	if !ok || authorization.SessionID != sessionID {
+		authorization = protocol.AuthorizationContext{}
+	}
+	return m.filterPersistedEvents(ctx, authorization, events)
 }
 
 func (m *Manager) emitAndReturn(events []protocol.Event) []protocol.Event {

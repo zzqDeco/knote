@@ -1,0 +1,43 @@
+{
+  "acl_version": "acl_permissioned_graph_smoke_v1",
+  "classification": "public-synthetic",
+  "content_version": "content_permissioned_graph_smoke_v1",
+  "derivation": "all_required",
+  "knowledge_base_id": "kb_permissioned_graph_smoke",
+  "organization_id": "knote_permissioned_graph_smoke",
+  "predicate_key": "pred_a3b0b7f1948c58d586d3af99fee4704e",
+  "principal_id": "alice",
+  "projection_id": "prj_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "query": "Find the public synthetic service that owns the release checklist.",
+  "question": "Which public synthetic checklist is connected to the service?",
+  "resources": [
+    {
+      "content": "Public synthetic source: Service Alpha owns Checklist Beta. This fixture contains no production or customer data.",
+      "name": "source",
+      "resource_id": "res_11111111111111111111111111111111",
+      "type": "document"
+    },
+    {
+      "content": "Service Alpha is the public synthetic start entity.",
+      "name": "subject",
+      "resource_id": "res_22222222222222222222222222222222",
+      "type": "entity"
+    },
+    {
+      "content": "Checklist Beta is the public synthetic terminal evidence.",
+      "name": "target",
+      "resource_id": "res_33333333333333333333333333333333",
+      "type": "entity"
+    },
+    {
+      "content": "Public synthetic structural claim from Service Alpha to Checklist Beta.",
+      "name": "claim",
+      "resource_id": "res_44444444444444444444444444444444",
+      "type": "claim"
+    }
+  ],
+  "source_version": "source_permissioned_graph_smoke_v1",
+  "support_key": "sup_66666666666666666666666666666666",
+  "tenant_id": "local",
+  "version": 1
+}

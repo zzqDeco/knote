@@ -32,11 +32,12 @@ const (
 )
 
 type Event struct {
-	Type      EventType `json:"type"`
-	SessionID string    `json:"session_id,omitempty"`
-	Message   string    `json:"message,omitempty"`
-	Payload   any       `json:"payload,omitempty"`
-	CreatedAt time.Time `json:"created_at"`
+	Type             EventType                `json:"type"`
+	SessionID        string                   `json:"session_id,omitempty"`
+	Message          string                   `json:"message,omitempty"`
+	Payload          any                      `json:"payload,omitempty"`
+	ProtectedContent *ProtectedContentBinding `json:"protected_content,omitempty"`
+	CreatedAt        time.Time                `json:"created_at"`
 }
 
 func NewEvent(eventType EventType, sessionID, message string, payload any) Event {
@@ -96,6 +97,14 @@ type PermissionRequest struct {
 	CreatedAt time.Time          `json:"created_at"`
 }
 
+// ActionApprovalOption is the canonical name for an option presented before a
+// local side effect. PermissionOption remains available for API compatibility.
+type ActionApprovalOption = PermissionOption
+
+// ActionApprovalRequest is the canonical name for a local side-effect
+// approval. It is separate from resource authorization decisions.
+type ActionApprovalRequest = PermissionRequest
+
 type ConfirmRequest struct {
 	RequestID   string    `json:"request_id"`
 	Action      string    `json:"action"`
@@ -106,6 +115,10 @@ type ConfirmRequest struct {
 	RejectText  string    `json:"reject_text"`
 	CreatedAt   time.Time `json:"created_at"`
 }
+
+// ActionConfirmationRequest is the canonical name for confirming a local
+// side effect. ConfirmRequest remains available for API compatibility.
+type ActionConfirmationRequest = ConfirmRequest
 
 type ArtifactManifest struct {
 	Version       int       `json:"version"`
@@ -166,8 +179,9 @@ type Summary struct {
 }
 
 type BuildResult struct {
-	Manifest protocolManifestAlias `json:"manifest"`
-	Report   string                `json:"report"`
+	Manifest       protocolManifestAlias  `json:"manifest"`
+	BundleManifest ArtifactBundleManifest `json:"bundle_manifest,omitempty"`
+	Report         string                 `json:"report"`
 }
 
 type protocolManifestAlias = ArtifactManifest

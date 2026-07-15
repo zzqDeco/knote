@@ -1,0 +1,407 @@
+name: knote authorization model
+model_file: ./authorization.fga
+
+tests:
+  - name: cross-tenant-direct-share
+    tuples:
+      - user: user:mallory
+        relation: member
+        object: organization:other
+      - user: organization:acme
+        relation: organization
+        object: document:shared
+      - user: user:mallory
+        relation: viewer
+        object: document:shared
+    check:
+      - user: user:mallory
+        object: document:shared
+        assertions:
+          can_view: false
+
+  - name: group-membership-add
+    tuples:
+      - user: user:alice
+        relation: member
+        object: group:engineering
+      - user: group:engineering#member
+        relation: member
+        object: organization:acme
+      - user: organization:acme
+        relation: organization
+        object: knowledge_base:handbook
+      - user: group:engineering#member
+        relation: viewer
+        object: knowledge_base:handbook
+      - user: organization:acme
+        relation: organization
+        object: document:welcome
+      - user: knowledge_base:handbook
+        relation: parent
+        object: document:welcome
+    check:
+      - user: user:alice
+        object: document:welcome
+        assertions:
+          can_view: true
+          can_edit: false
+
+  - name: group-membership-remove
+    tuples:
+      - user: group:engineering#member
+        relation: member
+        object: organization:acme
+      - user: organization:acme
+        relation: organization
+        object: knowledge_base:handbook
+      - user: group:engineering#member
+        relation: viewer
+        object: knowledge_base:handbook
+      - user: organization:acme
+        relation: organization
+        object: document:welcome
+      - user: knowledge_base:handbook
+        relation: parent
+        object: document:welcome
+    check:
+      - user: user:alice
+        object: document:welcome
+        assertions:
+          can_view: false
+
+  - name: inherited-read-and-edit
+    tuples:
+      - user: user:erin
+        relation: member
+        object: organization:acme
+      - user: organization:acme
+        relation: organization
+        object: knowledge_base:handbook
+      - user: user:erin
+        relation: editor
+        object: knowledge_base:handbook
+      - user: organization:acme
+        relation: organization
+        object: document:welcome
+      - user: knowledge_base:handbook
+        relation: parent
+        object: document:welcome
+    check:
+      - user: user:erin
+        object: document:welcome
+        assertions:
+          can_view: true
+          can_edit: true
+
+  - name: restricted-child-blocks-only-inheritance
+    tuples:
+      - user: user:alice
+        relation: member
+        object: organization:acme
+      - user: user:bob
+        relation: member
+        object: organization:acme
+      - user: organization:acme
+        relation: organization
+        object: knowledge_base:handbook
+      - user: user:alice
+        relation: viewer
+        object: knowledge_base:handbook
+      - user: organization:acme
+        relation: organization
+        object: document:restricted
+      - user: knowledge_base:handbook
+        relation: parent
+        object: document:restricted
+      - user: user:*
+        relation: restricted
+        object: document:restricted
+      - user: user:bob
+        relation: viewer
+        object: document:restricted
+    check:
+      - user: user:alice
+        object: document:restricted
+        assertions:
+          can_view: false
+      - user: user:bob
+        object: document:restricted
+        assertions:
+          can_view: true
+
+  - name: direct-share
+    tuples:
+      - user: user:bob
+        relation: member
+        object: organization:acme
+      - user: organization:acme
+        relation: organization
+        object: document:direct
+      - user: user:bob
+        relation: viewer
+        object: document:direct
+    check:
+      - user: user:bob
+        object: document:direct
+        assertions:
+          can_view: true
+
+  - name: direct-share-revoke
+    tuples:
+      - user: user:bob
+        relation: member
+        object: organization:acme
+      - user: organization:acme
+        relation: organization
+        object: document:direct
+    check:
+      - user: user:bob
+        object: document:direct
+        assertions:
+          can_view: false
+
+  - name: entity-claim-policy-oracle
+    tuples:
+      - user: user:alice
+        relation: member
+        object: organization:acme
+      - user: user:bob
+        relation: member
+        object: organization:acme
+      - user: user:erin
+        relation: member
+        object: organization:acme
+      - user: user:mallory
+        relation: member
+        object: organization:other
+      - user: organization:acme
+        relation: organization
+        object: knowledge_base:graph
+      - user: user:alice
+        relation: viewer
+        object: knowledge_base:graph
+      - user: user:erin
+        relation: editor
+        object: knowledge_base:graph
+      - user: organization:acme
+        relation: organization
+        object: document:source
+      - user: knowledge_base:graph
+        relation: parent
+        object: document:source
+      - user: organization:acme
+        relation: organization
+        object: document:source-denied
+
+      - user: organization:acme
+        relation: organization
+        object: entity:visible-subject
+      - user: document:source
+        relation: source_document
+        object: entity:visible-subject
+      - user: organization:acme
+        relation: organization
+        object: entity:visible-object
+      - user: document:source
+        relation: source_document
+        object: entity:visible-object
+      - user: organization:acme
+        relation: organization
+        object: entity:hidden-subject
+      - user: document:source
+        relation: source_document
+        object: entity:hidden-subject
+      - user: user:*
+        relation: restricted
+        object: entity:hidden-subject
+      - user: user:bob
+        relation: viewer
+        object: entity:hidden-subject
+      - user: organization:acme
+        relation: organization
+        object: entity:hidden-object
+      - user: document:source
+        relation: source_document
+        object: entity:hidden-object
+      - user: user:*
+        relation: restricted
+        object: entity:hidden-object
+      - user: organization:acme
+        relation: organization
+        object: entity:direct-edit
+      - user: document:source-denied
+        relation: source_document
+        object: entity:direct-edit
+      - user: user:bob
+        relation: editor
+        object: entity:direct-edit
+      - user: organization:acme
+        relation: organization
+        object: entity:cross-tenant
+      - user: user:mallory
+        relation: viewer
+        object: entity:cross-tenant
+
+      - user: organization:acme
+        relation: organization
+        object: claim:visible
+      - user: document:source
+        relation: source_document
+        object: claim:visible
+      - user: entity:visible-subject
+        relation: subject
+        object: claim:visible
+      - user: entity:visible-object
+        relation: object
+        object: claim:visible
+      - user: organization:acme
+        relation: organization
+        object: claim:hidden
+      - user: document:source
+        relation: source_document
+        object: claim:hidden
+      - user: entity:visible-subject
+        relation: subject
+        object: claim:hidden
+      - user: entity:visible-object
+        relation: object
+        object: claim:hidden
+      - user: user:*
+        relation: restricted
+        object: claim:hidden
+      - user: user:bob
+        relation: viewer
+        object: claim:hidden
+      - user: organization:acme
+        relation: organization
+        object: claim:direct-edit
+      - user: document:source-denied
+        relation: source_document
+        object: claim:direct-edit
+      - user: entity:hidden-subject
+        relation: subject
+        object: claim:direct-edit
+      - user: entity:hidden-object
+        relation: object
+        object: claim:direct-edit
+      - user: user:bob
+        relation: editor
+        object: claim:direct-edit
+      - user: organization:acme
+        relation: organization
+        object: claim:source-denied
+      - user: document:source-denied
+        relation: source_document
+        object: claim:source-denied
+      - user: entity:visible-subject
+        relation: subject
+        object: claim:source-denied
+      - user: entity:visible-object
+        relation: object
+        object: claim:source-denied
+      - user: organization:acme
+        relation: organization
+        object: claim:subject-denied
+      - user: document:source
+        relation: source_document
+        object: claim:subject-denied
+      - user: entity:hidden-subject
+        relation: subject
+        object: claim:subject-denied
+      - user: entity:visible-object
+        relation: object
+        object: claim:subject-denied
+      - user: organization:acme
+        relation: organization
+        object: claim:object-denied
+      - user: document:source
+        relation: source_document
+        object: claim:object-denied
+      - user: entity:visible-subject
+        relation: subject
+        object: claim:object-denied
+      - user: entity:hidden-object
+        relation: object
+        object: claim:object-denied
+      - user: organization:acme
+        relation: organization
+        object: claim:cross-tenant
+      - user: document:source
+        relation: source_document
+        object: claim:cross-tenant
+      - user: entity:visible-subject
+        relation: subject
+        object: claim:cross-tenant
+      - user: entity:visible-object
+        relation: object
+        object: claim:cross-tenant
+      - user: user:mallory
+        relation: viewer
+        object: claim:cross-tenant
+    check:
+      - user: user:alice
+        object: entity:visible-subject
+        assertions:
+          can_view: true
+          can_edit: false
+      - user: user:erin
+        object: entity:visible-subject
+        assertions:
+          can_view: true
+          can_edit: true
+      - user: user:alice
+        object: entity:hidden-subject
+        assertions:
+          can_view: false
+      - user: user:bob
+        object: entity:hidden-subject
+        assertions:
+          can_view: true
+      - user: user:bob
+        object: entity:direct-edit
+        assertions:
+          can_view: true
+          can_edit: true
+      - user: user:alice
+        object: claim:visible
+        assertions:
+          can_view: true
+          can_edit: false
+      - user: user:erin
+        object: claim:visible
+        assertions:
+          can_view: true
+          can_edit: true
+      - user: user:alice
+        object: claim:hidden
+        assertions:
+          can_view: false
+      - user: user:bob
+        object: claim:hidden
+        assertions:
+          can_view: true
+      - user: user:bob
+        object: claim:direct-edit
+        assertions:
+          can_view: true
+          can_edit: true
+      - user: user:alice
+        object: claim:source-denied
+        assertions:
+          can_view: false
+      - user: user:alice
+        object: claim:subject-denied
+        assertions:
+          can_view: false
+      - user: user:alice
+        object: claim:object-denied
+        assertions:
+          can_view: false
+      - user: user:mallory
+        object: entity:cross-tenant
+        assertions:
+          can_view: false
+      - user: user:mallory
+        object: claim:cross-tenant
+        assertions:
+          can_view: false

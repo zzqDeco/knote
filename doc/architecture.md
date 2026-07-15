@@ -4,16 +4,17 @@
 
 1. `cmd/knote` parses CLI flags and wires concrete implementations.
 2. `internal/tui` owns Bubble Tea projection and keyboard interaction.
-3. `internal/runtime` owns session/thread lifecycle, event dispatch, task controls, confirm routing, and runner selection.
-4. `internal/agent` owns the current direct turn handler: natural-language turns, slash commands, confirmations, tasks, and event persistence.
-5. `internal/knowledge/versioned` owns versioned knowledge operations: build/query/explain/eval/diff/commit/release/checkout/status.
-6. `internal/eino/tools` exposes the versioned knowledge service as shallow Eino `InvokableTool` adapters.
-7. `internal/runtime/eino` is the Eino ADK runner bridge. It can construct an OpenAI-compatible `ChatModelAgent`, inventory knote tools, and project ADK events back to knote events.
-8. `internal/repository` defines workspace/session/version interfaces; `internal/repository/local` implements them with the local filesystem and Git CLI.
-9. `internal/knowledge/kag` owns the OpenSPG/KAG boundary and Python NDJSON adapter subprocess.
-10. `internal/repository/remote` is a future adapter skeleton for GitHub/Gitea/GitLab-style backends.
+3. `internal/runtime` owns Eino-only session/thread lifecycle, event dispatch, task controls, slash routing, confirm routing, and runner management.
+4. `internal/knowledge/versioned` owns versioned build/query/explain/eval/diff/commit/release/checkout/status operations and projection builds.
+5. `internal/knowledge/authorized` owns the authorization-aware query gateway, bounded Claim traversal, cache, citations, and revocation handling.
+6. `internal/authz` owns local/OpenFGA authorization checks and model contracts; `internal/catalog` owns deterministic projection planning, immutable serving snapshots, and graph bindings.
+7. `internal/eino/tools` exposes versioned and permissioned knowledge operations as shallow Eino `InvokableTool` adapters.
+8. `internal/runtime/eino` is the Eino ADK runner bridge. It constructs an OpenAI-compatible `ChatModelAgent`, inventories knote tools, and projects ADK events back to knote events.
+9. `internal/repository` defines workspace/session/version interfaces; `internal/repository/local` implements them with the local filesystem and Git CLI.
+10. `internal/knowledge/kag` owns the OpenSPG/KAG boundary and Python NDJSON adapter subprocess.
+11. `internal/repository/remote` is a future adapter skeleton for GitHub/Gitea/GitLab-style backends.
 
-The TUI and agent are in the same Go binary. The KAG adapter remains a subprocess because OpenSPG/KAG is Python-native and has heavier environment requirements. The stable artifact contract is owned by knote, not by KAG.
+The TUI and runtime are in the same Go binary. The KAG adapter remains a subprocess because OpenSPG/KAG is Python-native and has heavier environment requirements. The stable artifact contract is owned by knote, not by KAG.
 
 ## Dependency Flow
 
@@ -21,14 +22,19 @@ The TUI and agent are in the same Go binary. The KAG adapter remains a subproces
 flowchart LR
   User["User input"] --> TUI["internal/tui"]
   TUI --> Runtime["internal/runtime"]
-  Runtime --> Agent["internal/agent direct runner"]
   Runtime --> EinoRunner["internal/runtime/eino ADK runner"]
   Runtime --> EinoTools["internal/eino/tools"]
   Runtime --> RepoIf["internal/repository interfaces"]
-  Agent --> RepoIf
-  Agent --> Versioned["internal/knowledge/versioned"]
+  EinoRunner --> EinoTools
   EinoTools --> Versioned
+  EinoTools -. deterministic fake composition .-> Authorized["internal/knowledge/authorized"]
+  Runtime --> Versioned["internal/knowledge/versioned"]
+  Authorized --> Authz["internal/authz"]
+  Authorized --> Catalog["internal/catalog"]
+  Authorized --> Kag
+  Versioned --> Catalog
   Versioned --> RepoIf
+  Catalog --> RepoIf
   Versioned --> Kag["internal/knowledge/kag"]
   Kag --> Adapter["adapters/kag/knote_kag_adapter.py"]
   Adapter --> OpenSPG["OpenSPG/KAG"]
@@ -41,31 +47,33 @@ flowchart LR
   RepoIf -. future .-> Remote["internal/repository/remote"]
 ```
 
-`internal/agent` depends only on `internal/knowledge/versioned`, `internal/repository`, `internal/protocol`, and the standard library. It does not import the local repository, KAG backend, Git wrapper, Python adapter, Eino tools, or TUI. `cmd/knote` is the composition root that creates `local.Store`, `kag.Client`, `versioned.Service`, Eino tools, the Eino runner, and `runtime.Manager`.
+`cmd/knote` is the composition root that creates `local.Store`, `kag.Client`, `versioned.Service`, Eino tools, the Eino runner, and `runtime.Manager`. The permissioned query application is currently selected only for deterministic fake mode; real primitive-provider composition is exercised by the dedicated smoke harness rather than the normal CLI. `internal/runtime` does not import the local repository, KAG backend, Python adapter, or TUI.
 
 ## Runtime Layers
 
-`internal/runtime` is the interaction boundary for TUI now and Web later. It exposes start, message, confirm, interrupt, task stop, status, subscription, and runner info methods. Runtime owns the active session/thread state and fans emitted events to subscribers.
+`internal/runtime` is the interaction boundary for TUI now and Web later. It exposes start, message, confirm, interrupt, task stop, status, subscription, and runner info methods. Runtime owns the active session/thread state, deterministic slash routing, pending side-effect confirmations, and event fanout.
 
-The default runner mode is `direct`. In this mode runtime delegates turns to `internal/agent`, preserving the current TUI behavior. `KNOTE_RUNTIME_MODE=eino` switches runtime to the Eino ADK `ChatModelAgent` path. Eino mode requires an OpenAI-compatible profile and API key from `.knote/config.yaml` plus environment overrides such as `KNOTE_EINO_PROVIDER`, `KNOTE_EINO_MODEL`, `KNOTE_EINO_API_KEY`, `KNOTE_EINO_BASE_URL`, and `KNOTE_EINO_REASONING_EFFORT`.
+The runtime is Eino-only. Ordinary user messages go through the Eino ADK `ChatModelAgent`; slash commands are routed deterministically by runtime to either local session/status behavior or knote Eino tools. Startup requires an OpenAI-compatible profile and API key from `.knote/config.yaml` plus environment overrides such as `KNOTE_EINO_PROVIDER`, `KNOTE_EINO_MODEL`, `KNOTE_EINO_API_KEY`, `KNOTE_EINO_BASE_URL`, and `KNOTE_EINO_REASONING_EFFORT`. `OPENAI_MODEL`, `OPENAI_API_KEY`, and `OPENAI_BASE_URL` are also accepted. `KNOTE_RUNTIME_MODE=direct` is rejected.
 
 `internal/runtime/eino` holds the Eino-facing runner. It converts knote `InvokableTool` adapters into Eino base tools, constructs the OpenAI-compatible chat model, builds the ADK agent, executes turns through `adk.Runner`, and projects ADK tool/assistant/interrupt events into knote protocol events. It does not own knowledge semantics.
 
 `internal/eino/tools` is intentionally shallow. Each tool parses JSON arguments, calls `internal/knowledge/versioned`, and returns JSON. Mutating tools require a side-effect gate so they cannot bypass runtime confirmation.
 
-Eino side effects are bridged back through runtime confirmation instead of executing directly. In Eino mode, mutating tools call a `SideEffectGate`; runtime stores the pending request, emits one `confirm.request` at a time, and only executes the approved tool once after TUI approval. Queued confirmations are FIFO, request ids include a monotonic suffix, and adapter failures returned by approved build/eval tools are projected as `tool.error`/`error` rather than `tool.complete`.
+Eino side effects are bridged back through runtime confirmation instead of executing directly. In Eino mode, mutating tools call a `SideEffectGate`; runtime stores the pending request, emits one `confirm.request` at a time, and only executes the approved tool once after TUI approval. Queued confirmations are FIFO, request ids include a monotonic suffix, and adapter failures returned by approved tools are projected as `tool.error`/`error` rather than `tool.complete`.
 
-The local OpenAI-compatible path is validated manually with `scripts/smoke_eino_local_proxy.sh`. That script probes `/v1/models`, starts `KNOTE_RUNTIME_MODE=eino`, sends a PTY prompt, and waits for the model to return `knote-eino-ok`. The smoke is intentionally manual because it depends on a local proxy and API key.
+The local OpenAI-compatible path is validated manually with `scripts/smoke_eino_local_proxy.sh`. That script probes `/v1/models`, starts the Eino-only TUI, requires a permissioned `knote_query` tool call, and waits for the evidence-bound `knote-authorized-ok` response. The smoke is intentionally manual because it depends on a local proxy and API key.
 
-## Agent And TUI
+## Runtime And TUI
 
 `internal/tui` owns screen projection only. It keeps the transcript, composer history, overlay state, and status line, then calls runtime methods for every user intent. It does not execute Git, artifact, KAG, Eino, or repository side effects directly.
 
-`internal/agent` owns the direct-runner event stream. User messages become `message.user`; read-only commands return status, details, settings, versions, or diff events; side-effecting commands first emit `confirm.request`. Confirmed actions are validated against agent-owned pending confirmation state before they can run.
+`internal/runtime` owns the event stream. User messages become `message.user`; read-only slash commands return status, details, settings, versions, or diff events; side-effecting slash commands first emit `confirm.request`. Confirmed actions are validated against runtime-owned pending confirmation state before they can run.
 
 ## Session Data
 
-Each session is a JSONL event log under `.knote/sessions/<session-id>.jsonl`. `/clear` appends a `view.clear` event so the TUI projection resets without deleting history. `/new` creates a new session id and emits fresh `gateway.ready` and `session.info` events. `/resume <session-id>` loads the old event log, clears the projection boundary, and appends a new `session.info` event for the resumed session.
+Each session is a JSONL event log under `.knote/sessions/<session-id>.jsonl`. `/clear` appends a `view.clear` event so the TUI projection resets without deleting history. `/new` creates a new session id and emits fresh `gateway.ready` and `session.info` events.
+
+Permissioned sessions pair the event log with a versioned `.authorization.json` metadata envelope. Resume fails closed before loading history when the envelope is missing or its tenant, knowledge base, principal, authorization model, identity/ACL watermarks, task scope, or consistency preference differs. Protected blocks are then reauthorized against current policy before replay; legacy, malformed, or denied protected content is not restored.
 
 ## Knowledge And KAG
 
@@ -73,7 +81,7 @@ Each session is a JSONL event log under `.knote/sessions/<session-id>.jsonl`. `/
 
 - `/build` reads sources through `repository.Workspace`, calls `kag.Backend.Build`, normalizes results into knote artifact records, and writes an `ArtifactSet` through the repository.
 - Natural-language query and explain prefer KAG, then fall back to stable local summaries when KAG is unavailable or empty.
-- `/eval` reads questions through the repository, calls explain, writes stable eval results/report, and updates the knowledge hash used by the release gate.
+- The versioned service retains eval/report and knowledge-hash semantics, but runtime rejects `/eval` because the legacy explain dependency is not a permissioned-query boundary. Evaluation must not be re-exposed until it consumes only authorized evidence.
 - Version commands delegate to `repository.Versions`, so Git-backed local versions and future remote-backed versions share the same semantic facade.
 
 `internal/knowledge` remains a compatibility shim over `internal/knowledge/versioned` while old imports are being removed.
@@ -85,8 +93,28 @@ Each session is a JSONL event log under `.knote/sessions/<session-id>.jsonl`. `/
 - `kag.query`
 - `kag.explain`
 - `kag.cancel`
+- `kag.discover`
+- `kag.retrieve`
+- `kag.expand`
+- `kag.generate`
 
-Fake mode is selected with `KNOTE_KAG_FAKE=1` and returns deterministic responses for tests and local development. Real mode expects OpenSPG at `127.0.0.1:8887` by default and `openspg-kag` importable from `KNOTE_PYTHON`. KAG output is normalized into knote-owned artifacts before it becomes part of the public workspace contract.
+The first five methods are legacy/build compatibility contracts. The complete real `kag.query` and `kag.explain` solver path is not a permissioned-query boundary: retrieval summaries, graph selectors, task memory, and intermediate LLM calls can observe content before the final answer returns.
+
+The four permissioned primitives are the current authorized boundary. Discover returns a complete deterministic body-free resource catalog. Retrieve and expand return exact versioned resource handles without bodies, predicate labels, or relation text. Generate accepts only the already-authorized, digest-verified exact evidence set. `internal/knowledge/authorized.Service` owns `discover -> pre-ranking authorize -> retrieve -> per-hop authorize/expand -> exact load -> final authorize -> generate`; it never falls back to legacy `kag.query` or `kag.explain`.
+
+Fake mode implements the boundary deterministically. Real mode validates the immutable graph bundle before loading an operator-configured provider. The provider can return only allowlisted opaque graph IDs for retrieve; expand traverses verified `claim_bindings.jsonl` one structural hop at a time; generate receives only validated evidence. Provider output cannot define resource metadata, citations, or trace membership. ADR 0002 records the interception decision, ADR 0003 defines graph identity, and ADR 0004 defines the real provider contract. These real primitives and the OpenFGA/OpenSPG path are smoke-tested, but the normal CLI does not yet select the real permissioned composition.
+
+Each Go client call starts one adapter subprocess. Context cancellation or timeout terminates that subprocess through `exec.CommandContext` and returns the caller's context error after reaping it. Real provider calls run behind an isolated runner and guardian with process-group or descendant cleanup, Linux subreaping, and a Windows kill-on-close job so detached helpers cannot outlive cancellation. `kag.cancel` remains a compatibility acknowledgement for its own one-request process and cannot interrupt another call.
+
+Fake mode is selected with `KNOTE_KAG_FAKE=1` and returns deterministic responses for tests and local development. Legacy real build/query/explain expects OpenSPG at `127.0.0.1:8887` by default and `openspg-kag` importable from `KNOTE_PYTHON`. Real permissioned primitives additionally require `KNOTE_KAG_PERMISSIONED_PROVIDER=module:factory` and a current immutable graph bundle. KAG build output is normalized into knote-owned artifacts before it becomes part of the public workspace contract.
+
+## Authorization, Projection, And Revocation
+
+`internal/catalog` plans complete replacement projections and publishes only immutable snapshots whose content, ACL, index, and graph identities agree. The selected bundle is the sole serving identity authority; OpenSPG IDs, labels, snippets, solver traces, and caller-supplied DSL are not trusted as bindings.
+
+`internal/authz` batches authorization decisions through a strict fail-closed contract. `internal/knowledge/authorized` authorizes the body-free catalog before ranking, authorizes each traversal frontier and Claim/object hop, validates exact content digests before use, and authorizes the final path/evidence set before generation. Denied or cross-tenant resources cannot participate in relevance, traversal, exact load, generation, traces, or citations.
+
+Authorized cache keys bind visibility, execution, traversal, projection, identity, and ACL state; cache hits are live-revalidated. Revocation installs permanent tombstones before further authorization, blocks in-flight repopulation, and closes future cache, citation, and protected-session replay. This cannot retract content that a user already viewed or copied.
 
 ## Local Repository
 
@@ -106,7 +134,10 @@ The artifact files are:
 - `entities.jsonl`
 - `relations.jsonl`
 - `claims.jsonl`
+- `graph_bindings.jsonl`
+- `claim_bindings.jsonl`
 - `summaries.jsonl`
+- `projection.json`
 - `manifest.json`
 - `schema.yaml`
 - `build_report.md`
@@ -125,7 +156,7 @@ The remote model does not simulate a local dirty working tree. It uses explicit 
 - pull or merge request
 - tag or release
 
-This keeps `internal/agent` stable: future remote implementations can make `/commit` create a branch commit or PR without changing TUI or agent command handling.
+This keeps runtime stable: future remote implementations can make `/commit` create a branch commit or PR without changing TUI command handling.
 
 ## Git And Release Gate
 
@@ -137,3 +168,5 @@ The local version implementation scopes version operations to `.knote/config.yam
 4. eval results are tied to the current knowledge hash.
 
 The knowledge hash covers `.knote/config.yaml`, `sources/`, `artifacts/`, and `evals/questions.jsonl`, so post-eval knowledge changes make the release gate fail until `/eval` is rerun.
+
+The current permissioned runtime cannot refresh that report because `/eval` fails closed. Repository product releases therefore use the reviewed tag workflow; this service-level knowledge release gate remains available only to workspaces with an already valid report until a permissioned evaluation path is implemented.

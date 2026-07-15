@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -15,6 +16,7 @@ import (
 	"github.com/zzqDeco/knote/internal/protocol"
 	"github.com/zzqDeco/knote/internal/repository/local"
 	"github.com/zzqDeco/knote/internal/runtime"
+	runtimeeino "github.com/zzqDeco/knote/internal/runtime/eino"
 	"github.com/zzqDeco/knote/internal/tui"
 )
 
@@ -53,6 +55,9 @@ func newRuntime(ctx context.Context, workspacePath string, resumeID string) (run
 	if err != nil {
 		return nil, nil, err
 	}
+	if err := validateRuntimeMode(); err != nil {
+		return nil, nil, err
+	}
 	repo := local.New(workspace)
 	repoCfg, err := repo.Config(ctx)
 	if err != nil {
@@ -69,10 +74,6 @@ func newRuntime(ctx context.Context, workspacePath string, resumeID string) (run
 	if repoCfg.KAG.Fake {
 		knowledgeMode = versioned.ModeFake
 	}
-	runnerMode := runtime.RunnerModeDirect
-	if os.Getenv("KNOTE_RUNTIME_MODE") == string(runtime.RunnerModeEino) {
-		runnerMode = runtime.RunnerModeEino
-	}
 	kagClient := kag.Client{
 		AdapterPath: repoCfg.KAG.AdapterPath,
 		Workspace:   workspace,
@@ -85,31 +86,72 @@ func newRuntime(ctx context.Context, workspacePath string, resumeID string) (run
 		RuntimeDir:  repoCfg.KAG.RuntimeDir,
 	}
 	knowledgeService := versioned.New(versioned.Options{Workspace: workspace, Repo: repo, Versions: repo, Backend: kagClient, Mode: knowledgeMode})
+	authorizationProvider, err := permissionedAuthorizationProvider(repoCfg.KAG.Fake)
+	if err != nil {
+		return nil, nil, err
+	}
+	permissionedApplication, err := newPermissionedApplication(repoCfg.KAG.Fake, kagClient)
+	if err != nil {
+		return nil, nil, err
+	}
+	var permissionedQuery einotools.PermissionedQuery
+	var protectedContentAuthorizer runtime.ProtectedContentAuthorizer
+	if permissionedApplication != nil {
+		permissionedService := permissionedApplication.fixture.Service
+		permissionedQuery = func(ctx context.Context, request protocol.QueryRequest) (einotools.PermissionedQueryResult, error) {
+			result, err := permissionedService.Query(ctx, request)
+			if err != nil {
+				return einotools.PermissionedQueryResult{}, err
+			}
+			return einotools.PermissionedQueryResult{
+				Answer:          result.Generation.Answer,
+				Mode:            result.Generation.Mode,
+				EvidencePackage: result.Evidence,
+			}, nil
+		}
+		protectedContentAuthorizer = permissionedApplication.AuthorizeProtectedContent
+	}
 	sideEffects := runtime.NewSideEffectBridge()
 	approvedEinoTools := einotools.ByNameWithOptions(einotools.Options{
-		Service:        knowledgeService,
-		SideEffectGate: func(context.Context, einotools.SideEffectRequest) error { return nil },
+		Service:           knowledgeService,
+		PermissionedQuery: permissionedQuery,
+		SideEffectGate:    func(context.Context, einotools.SideEffectRequest) error { return nil },
 	})
+	approvedEinoTools = permissionedToolMap(approvedEinoTools, repoCfg.KAG.Fake)
 	einoTools := einotools.NewWithOptions(einotools.Options{
-		Service:        knowledgeService,
-		SideEffectGate: newEinoSideEffectGate(sideEffects, approvedEinoTools),
+		Service:           knowledgeService,
+		PermissionedQuery: permissionedQuery,
+		SideEffectGate:    newEinoSideEffectGate(sideEffects, approvedEinoTools),
 	})
-	einoRunner, err := newEinoRunner(ctx, runnerMode, repoCfg, einoTools)
+	einoTools = permissionedTools(einoTools, repoCfg.KAG.Fake)
+	toolExecutor := runtimeeino.NewToolExecutor(einoTools)
+	einoRunner, err := newEinoRunner(ctx, repoCfg, einoTools)
 	if err != nil {
 		return nil, nil, err
 	}
 	rt := runtime.New(runtime.Dependencies{
-		Workspace:     workspace,
-		Config:        repoCfg,
-		Sessions:      repo,
-		Versions:      repo,
-		WorkspaceRepo: repo,
-		Knowledge:     knowledgeService,
-		RunnerMode:    runnerMode,
-		EinoRunner:    einoRunner,
-		SideEffects:   sideEffects,
-		NewSessionID:  local.NewSessionID,
+		Workspace:                    workspace,
+		Config:                       repoCfg,
+		Sessions:                     repo,
+		Versions:                     repo,
+		WorkspaceRepo:                repo,
+		Knowledge:                    knowledgeService,
+		RunnerMode:                   runtime.RunnerModeEino,
+		EinoRunner:                   einoRunner,
+		AuthorizationContextProvider: authorizationProvider,
+		ProtectedContentAuthorizer:   protectedContentAuthorizer,
+		SideEffects:                  sideEffects,
+		ToolExecutor:                 toolExecutor,
+		NewSessionID:                 local.NewSessionID,
 	})
 	events, err := rt.Start(ctx, runtime.StartOptions{ResumeID: resumeID})
 	return rt, events, err
+}
+
+func validateRuntimeMode() error {
+	mode := strings.TrimSpace(os.Getenv("KNOTE_RUNTIME_MODE"))
+	if mode == "" || mode == string(runtime.RunnerModeEino) {
+		return nil
+	}
+	return fmt.Errorf("KNOTE_RUNTIME_MODE=%q is not supported; knote uses the Eino runtime only", mode)
 }

@@ -26,7 +26,13 @@ def ensure_real_kag(host: str) -> None:
         raise SystemExit(f"OpenSPG host is not reachable at {host}: {exc}") from exc
 
 
-def call_adapter(adapter: Path, workspace: Path, host: str, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+def call_adapter(
+    adapter: Path,
+    workspace: Path,
+    host: str,
+    method: str,
+    params: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     payload = {
         "id": method.replace(".", "_"),
         "method": method,

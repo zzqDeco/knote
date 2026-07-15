@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -17,15 +18,16 @@ import (
 const maxNDJSONLineBytes = 16 * 1024 * 1024
 
 type Client struct {
-	AdapterPath string
-	Workspace   string
-	Host        string
-	Fake        bool
-	ConfigPath  string
-	ProjectID   string
-	Namespace   string
-	Language    string
-	RuntimeDir  string
+	AdapterPath          string
+	Workspace            string
+	Host                 string
+	Fake                 bool
+	ConfigPath           string
+	ProjectID            string
+	Namespace            string
+	Language             string
+	RuntimeDir           string
+	PermissionedProvider string
 }
 
 type Request struct {
@@ -37,16 +39,88 @@ type Request struct {
 type Response struct {
 	ID      string         `json:"id"`
 	Type    string         `json:"type"`
+	Code    string         `json:"code,omitempty"`
 	Message string         `json:"message,omitempty"`
 	Data    map[string]any `json:"data,omitempty"`
 	Error   string         `json:"error,omitempty"`
+	raw     json.RawMessage
+}
+
+type CorpusRecord struct {
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	Content    string `json:"content"`
+	SourcePath string `json:"source_path"`
+}
+
+func (r *Response) UnmarshalJSON(data []byte) error {
+	type responseWire struct {
+		ID      string         `json:"id"`
+		Type    string         `json:"type"`
+		Code    string         `json:"code,omitempty"`
+		Message string         `json:"message,omitempty"`
+		Data    map[string]any `json:"data,omitempty"`
+		Error   string         `json:"error,omitempty"`
+	}
+	var wire responseWire
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	*r = Response{
+		ID: wire.ID, Type: wire.Type, Code: wire.Code, Message: wire.Message,
+		Data: wire.Data, Error: wire.Error, raw: append(json.RawMessage(nil), data...),
+	}
+	return nil
+}
+
+type AdapterError struct {
+	Code    string
+	Message string
+}
+
+func (e *AdapterError) Error() string {
+	return e.Message
+}
+
+func (e *AdapterError) Is(target error) bool {
+	switch target {
+	case ErrUnsupportedPrimitive:
+		return e.Code == ErrorCodeUnsupportedPrimitive
+	case ErrInvalidGraphBinding:
+		return e.Code == ErrorCodeInvalidGraphBinding
+	case ErrPrimitiveUnavailable:
+		return e.Code == ErrorCodePrimitiveUnavailable
+	case ErrInvalidPrimitiveResponse:
+		return e.Code == ErrorCodeInvalidPrimitiveResponse
+	default:
+		return false
+	}
+}
+
+func IsUnsupportedPrimitive(err error) bool {
+	return errors.Is(err, ErrUnsupportedPrimitive)
+}
+
+func IsInvalidGraphBinding(err error) bool {
+	return errors.Is(err, ErrInvalidGraphBinding)
+}
+
+func IsPrimitiveUnavailable(err error) bool {
+	return errors.Is(err, ErrPrimitiveUnavailable)
+}
+
+func IsInvalidPrimitiveResponse(err error) bool {
+	return errors.Is(err, ErrInvalidPrimitiveResponse)
 }
 
 type Backend interface {
 	Health(ctx context.Context) (Response, error)
 	Build(ctx context.Context) (Response, error)
+	BuildInNamespace(ctx context.Context, namespace, idempotencyKey string) (Response, error)
 	Query(ctx context.Context, query string) (Response, error)
+	QueryInNamespace(ctx context.Context, namespace, query string) (Response, error)
 	Explain(ctx context.Context, query string) (Response, error)
+	ExplainInNamespace(ctx context.Context, namespace, query string) (Response, error)
 }
 
 func (c Client) Health(ctx context.Context) (Response, error) {
@@ -57,12 +131,49 @@ func (c Client) Build(ctx context.Context) (Response, error) {
 	return c.call(ctx, "kag.build", c.params(nil))
 }
 
+// BuildInNamespace sends idempotency_key as a durable adapter request token.
+// The adapter must return the same logical result when that token is replayed.
+func (c Client) BuildInNamespace(ctx context.Context, namespace, idempotencyKey string) (Response, error) {
+	return c.call(ctx, "kag.build", c.projectionParams(namespace, map[string]any{
+		"idempotency_key": idempotencyKey,
+	}))
+}
+
+// BuildInNamespaceWithCorpus pins the build to caller-prepared source bytes.
+func (c Client) BuildInNamespaceWithCorpus(ctx context.Context, namespace, idempotencyKey string, corpus []CorpusRecord) (Response, error) {
+	return c.call(ctx, "kag.build", c.projectionParams(namespace, map[string]any{
+		"idempotency_key": idempotencyKey,
+		"corpus":          append([]CorpusRecord(nil), corpus...),
+	}))
+}
+
 func (c Client) Query(ctx context.Context, query string) (Response, error) {
 	return c.call(ctx, "kag.query", c.params(map[string]any{"query": query}))
 }
 
+func (c Client) QueryInNamespace(ctx context.Context, namespace, query string) (Response, error) {
+	return c.call(ctx, "kag.query", c.projectionParams(namespace, map[string]any{"query": query}))
+}
+
 func (c Client) Explain(ctx context.Context, query string) (Response, error) {
 	return c.call(ctx, "kag.explain", c.params(map[string]any{"query": query}))
+}
+
+func (c Client) ExplainInNamespace(ctx context.Context, namespace, query string) (Response, error) {
+	return c.call(ctx, "kag.explain", c.projectionParams(namespace, map[string]any{"query": query}))
+}
+
+func (c Client) projectionParams(namespace string, extra map[string]any) map[string]any {
+	namespace = strings.TrimSpace(namespace)
+	params := c.params(extra)
+	params["namespace"] = namespace
+	params["projection_isolated"] = true
+	runtimeDir := strings.TrimSpace(c.RuntimeDir)
+	if runtimeDir == "" {
+		runtimeDir = filepath.Join(".knote", "kag-runtime")
+	}
+	params["runtime_dir"] = filepath.Join(runtimeDir, "projections", namespace)
+	return params
 }
 
 func (c Client) params(extra map[string]any) map[string]any {
@@ -97,7 +208,10 @@ func (c Client) call(ctx context.Context, method string, params map[string]any) 
 	cmd.Dir = c.Workspace
 	cmd.Env = os.Environ()
 	if c.Fake {
-		cmd.Env = append(cmd.Env, "KNOTE_KAG_FAKE=1")
+		cmd.Env = replaceProcessEnv(cmd.Env, "KNOTE_KAG_FAKE", "1")
+	}
+	if provider := strings.TrimSpace(c.PermissionedProvider); provider != "" {
+		cmd.Env = replaceProcessEnv(cmd.Env, "KNOTE_KAG_PERMISSIONED_PROVIDER", provider)
 	}
 	cmd.Stdin = bytes.NewReader(append(payload, '\n'))
 	out, err := cmd.StdoutPipe()
@@ -117,8 +231,14 @@ func (c Client) call(ctx context.Context, method string, params map[string]any) 
 	for scanner.Scan() {
 		var resp Response
 		if err := json.Unmarshal(scanner.Bytes(), &resp); err != nil {
+			_ = cmd.Process.Kill()
 			_ = cmd.Wait()
 			return Response{}, err
+		}
+		if resp.ID != req.ID {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			return Response{}, fmt.Errorf("kag adapter response id %q does not match request %q", resp.ID, req.ID)
 		}
 		mu.Lock()
 		last = resp
@@ -129,17 +249,26 @@ func (c Client) call(ctx context.Context, method string, params map[string]any) 
 	}
 	if err := scanner.Err(); err != nil {
 		_ = cmd.Wait()
+		if ctx.Err() != nil {
+			return Response{}, ctx.Err()
+		}
 		return Response{}, err
 	}
 	waitErr := cmd.Wait()
+	if ctx.Err() != nil {
+		return last, ctx.Err()
+	}
 	if last.Type == "error" {
-		return last, errors.New(last.Error)
+		return last, &AdapterError{Code: last.Code, Message: last.Error}
 	}
 	if waitErr != nil {
 		return last, fmt.Errorf("kag adapter failed: %w: %s", waitErr, stderr.String())
 	}
 	if last.ID == "" {
 		return Response{}, fmt.Errorf("kag adapter returned no response: %s", stderr.String())
+	}
+	if last.Type != "result" {
+		return last, fmt.Errorf("kag adapter ended without a result frame")
 	}
 	return last, nil
 }
@@ -198,4 +327,15 @@ func findInParents(dir, rel string) (string, bool) {
 func fileExists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
+}
+
+func replaceProcessEnv(env []string, key, value string) []string {
+	prefix := key + "="
+	updated := make([]string, 0, len(env)+1)
+	for _, entry := range env {
+		if !strings.HasPrefix(entry, prefix) {
+			updated = append(updated, entry)
+		}
+	}
+	return append(updated, prefix+value)
 }

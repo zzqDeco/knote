@@ -1,9 +1,11 @@
 package local
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,7 +15,7 @@ import (
 	"github.com/zzqDeco/knote/internal/repository"
 )
 
-var knowledgeHashPaths = []string{".knote/config.yaml", "sources", "artifacts", "evals/questions.jsonl"}
+var knowledgeHashPaths = []string{".knote/config.yaml", "sources", "evals/questions.jsonl"}
 
 func loadEvalQuestions(workspace string) ([]repository.EvalQuestion, error) {
 	path := filepath.Join(workspace, "evals", "questions.jsonl")
@@ -133,6 +135,11 @@ func knowledgeHash(workspace string) (string, error) {
 			return "", err
 		}
 	}
+	artifactFiles, err := selectedArtifactHashFiles(workspace)
+	if err != nil {
+		return "", err
+	}
+	files = append(files, artifactFiles...)
 	sort.Strings(files)
 	hash := sha256.New()
 	for _, rel := range files {
@@ -150,6 +157,55 @@ func knowledgeHash(workspace string) (string, error) {
 		hash.Write([]byte{0})
 	}
 	return hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+func selectedArtifactHashFiles(workspace string) ([]string, error) {
+	artifactsDir := filepath.Join(workspace, "artifacts")
+	manifest, err := New(workspace).ReadCurrentArtifactManifest(context.Background())
+	if err == nil {
+		files := []string{"artifacts/current.json"}
+		bundleDir := filepath.Join(artifactsDir, "bundles", manifest.ProjectionID)
+		err := filepath.WalkDir(bundleDir, func(path string, entry os.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if entry.IsDir() {
+				return nil
+			}
+			rel, err := filepath.Rel(workspace, path)
+			if err != nil {
+				return err
+			}
+			files = append(files, filepath.ToSlash(rel))
+			return nil
+		})
+		return files, err
+	}
+	if !errors.Is(err, repository.ErrArtifactCurrentNotFound) {
+		return nil, err
+	}
+	var files []string
+	err = filepath.WalkDir(artifactsDir, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		if entry.IsDir() {
+			if path != artifactsDir && entry.Name() == "bundles" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		rel, err := filepath.Rel(workspace, path)
+		if err != nil {
+			return err
+		}
+		files = append(files, filepath.ToSlash(rel))
+		return nil
+	})
+	return files, err
 }
 
 func renderEvalReport(report repository.EvalReport) string {

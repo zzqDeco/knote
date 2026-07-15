@@ -36,9 +36,18 @@ type SideEffectRequest struct {
 
 type SideEffectGate func(ctx context.Context, req SideEffectRequest) error
 
+type PermissionedQueryResult struct {
+	Answer          string
+	Mode            string
+	EvidencePackage protocol.EvidencePackage
+}
+
+type PermissionedQuery func(ctx context.Context, req protocol.QueryRequest) (PermissionedQueryResult, error)
+
 type Options struct {
-	Service        versioned.Service
-	SideEffectGate SideEffectGate
+	Service           versioned.Service
+	PermissionedQuery PermissionedQuery
+	SideEffectGate    SideEffectGate
 }
 
 func New(svc versioned.Service) []einotool.InvokableTool {
@@ -48,8 +57,8 @@ func New(svc versioned.Service) []einotool.InvokableTool {
 func NewWithOptions(opts Options) []einotool.InvokableTool {
 	return []einotool.InvokableTool{
 		buildTool(opts),
-		queryTool(opts.Service),
-		explainTool(opts.Service),
+		queryTool(opts),
+		explainTool(opts),
 		evalTool(opts),
 		diffTool(opts.Service),
 		versionsTool(opts.Service),
@@ -115,16 +124,14 @@ func buildTool(opts Options) einotool.InvokableTool {
 				return nil, err
 			}
 			return buildResult{
-				Manifest:     result.Manifest,
-				Report:       result.Report,
-				KAGData:      result.KAGData,
-				AdapterError: result.AdapterError,
+				Manifest: result.Manifest, BundleManifest: result.BundleManifest,
+				Report: result.Report, KAGData: result.KAGData, AdapterError: result.AdapterError,
 			}, nil
 		},
 	}
 }
 
-func queryTool(svc versioned.Service) einotool.InvokableTool {
+func queryTool(opts Options) einotool.InvokableTool {
 	return &invokable{
 		info: toolInfo(NameQuery, "Ask the current knote knowledge base a question.", params(map[string]*schema.ParameterInfo{
 			"question": stringParam("Natural language question to answer.", true),
@@ -137,7 +144,10 @@ func queryTool(svc versioned.Service) einotool.InvokableTool {
 			if strings.TrimSpace(req.Question) == "" {
 				return nil, fmt.Errorf("question is required")
 			}
-			answer, err := svc.Query(ctx, req.Question)
+			if opts.PermissionedQuery != nil {
+				return runPermissionedQuery(ctx, opts.PermissionedQuery, req.Question)
+			}
+			answer, err := opts.Service.Query(ctx, req.Question)
 			if err != nil {
 				return nil, err
 			}
@@ -146,7 +156,7 @@ func queryTool(svc versioned.Service) einotool.InvokableTool {
 	}
 }
 
-func explainTool(svc versioned.Service) einotool.InvokableTool {
+func explainTool(opts Options) einotool.InvokableTool {
 	return &invokable{
 		info: toolInfo(NameExplain, "Explain an answer with KAG evidence for the current knote knowledge base.", params(map[string]*schema.ParameterInfo{
 			"question": stringParam("Natural language question to explain.", true),
@@ -159,13 +169,35 @@ func explainTool(svc versioned.Service) einotool.InvokableTool {
 			if strings.TrimSpace(req.Question) == "" {
 				return nil, fmt.Errorf("question is required")
 			}
-			answer, err := svc.Explain(ctx, req.Question)
+			if opts.PermissionedQuery != nil {
+				return runPermissionedQuery(ctx, opts.PermissionedQuery, req.Question)
+			}
+			answer, err := opts.Service.Explain(ctx, req.Question)
 			if err != nil {
 				return nil, err
 			}
 			return answerResult(answer), nil
 		},
 	}
+}
+
+func runPermissionedQuery(ctx context.Context, query PermissionedQuery, question string) (permissionedAnswerResult, error) {
+	authorization, ok := protocol.AuthorizationContextFrom(ctx)
+	if !ok {
+		return permissionedAnswerResult{}, fmt.Errorf("permissioned query requires trusted authorization context")
+	}
+	result, err := query(ctx, protocol.QueryRequest{
+		Question:      question,
+		Authorization: authorization,
+	})
+	if err != nil {
+		return permissionedAnswerResult{}, err
+	}
+	return permissionedAnswerResult{
+		Answer:          result.Answer,
+		Mode:            result.Mode,
+		EvidencePackage: result.EvidencePackage,
+	}, nil
 }
 
 func evalTool(opts Options) einotool.InvokableTool {
@@ -294,7 +326,11 @@ func checkoutTool(opts Options) einotool.InvokableTool {
 				return nil, fmt.Errorf("ref is required")
 			}
 			checkoutOpts := repository.CheckoutOptions{AllowDirty: req.AllowDirty}
-			if err := requireSideEffectGate(ctx, opts, NameCheckout, "checkout", args, "Checkout a knowledge version."); err != nil {
+			summary := "Checkout a knowledge version."
+			if checkoutOpts.AllowDirty {
+				summary = "Workspace is dirty. Confirm checkout only if these local changes should remain in the working tree."
+			}
+			if err := requireSideEffectGate(ctx, opts, NameCheckout, "checkout", args, summary); err != nil {
 				return nil, err
 			}
 			if err := opts.Service.Checkout(ctx, req.Ref, checkoutOpts); err != nil {
@@ -388,19 +424,30 @@ type checkoutArgs struct {
 }
 
 type buildResult struct {
-	Manifest     protocol.ArtifactManifest `json:"manifest"`
-	Report       string                    `json:"report,omitempty"`
-	KAGData      map[string]any            `json:"kag_data,omitempty"`
-	AdapterError string                    `json:"adapter_error,omitempty"`
+	Manifest       protocol.ArtifactManifest       `json:"manifest"`
+	BundleManifest protocol.ArtifactBundleManifest `json:"bundle_manifest"`
+	Report         string                          `json:"report,omitempty"`
+	KAGData        map[string]any                  `json:"kag_data,omitempty"`
+	AdapterError   string                          `json:"adapter_error,omitempty"`
 }
 
 type answerResult struct {
-	Answer       string         `json:"answer"`
-	Evidence     []string       `json:"evidence,omitempty"`
-	Uncertainty  string         `json:"uncertainty,omitempty"`
-	Mode         string         `json:"mode,omitempty"`
-	Data         map[string]any `json:"data,omitempty"`
-	AdapterError string         `json:"adapter_error,omitempty"`
+	Answer               string         `json:"answer"`
+	Evidence             []string       `json:"evidence,omitempty"`
+	Uncertainty          string         `json:"uncertainty,omitempty"`
+	Mode                 string         `json:"mode,omitempty"`
+	Data                 map[string]any `json:"data,omitempty"`
+	ProjectionVersion    string         `json:"projection_version,omitempty"`
+	Namespace            string         `json:"namespace,omitempty"`
+	AuthorizationObject  string         `json:"authz_object,omitempty"`
+	AuthorizationVersion string         `json:"authz_version,omitempty"`
+	AdapterError         string         `json:"adapter_error,omitempty"`
+}
+
+type permissionedAnswerResult struct {
+	Answer          string                   `json:"answer"`
+	Mode            string                   `json:"mode,omitempty"`
+	EvidencePackage protocol.EvidencePackage `json:"evidence_package"`
 }
 
 type evalReportResult struct {

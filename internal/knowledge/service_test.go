@@ -3,6 +3,8 @@ package knowledge
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"testing"
@@ -101,7 +103,7 @@ func TestServiceBuildFailsBeforeWritingArtifactsWhenBackendFails(t *testing.T) {
 	}
 }
 
-func TestServiceBuildArtifactsAreStableAndEntityIsPerDocument(t *testing.T) {
+func TestServiceBuildArtifactsAreStableAndClaimsAreSourceBacked(t *testing.T) {
 	ctx := context.Background()
 	repo := newMemoryRepo()
 	repo.sourceModTimes["sources/long.md"] = time.Unix(42, 0).UTC()
@@ -132,17 +134,33 @@ func TestServiceBuildArtifactsAreStableAndEntityIsPerDocument(t *testing.T) {
 	if string(firstManifest) != string(secondManifest) {
 		t.Fatalf("manifest changed on no-op rebuild:\nfirst=%s\nsecond=%s", firstManifest, secondManifest)
 	}
-	if !first.Manifest.GeneratedAt.Equal(time.Unix(42, 0).UTC()) {
-		t.Fatalf("generated_at should come from stable source mtime, got %s", first.Manifest.GeneratedAt)
+	if !first.Manifest.GeneratedAt.Equal(time.Unix(0, 0).UTC()) {
+		t.Fatalf("generated_at must exclude source mtimes, got %s", first.Manifest.GeneratedAt)
 	}
 	if len(repo.artifacts.Chunks) < 2 {
 		t.Fatalf("test source did not split into multiple chunks: %+v", repo.artifacts.Chunks)
 	}
-	if len(repo.artifacts.Entities) != 1 {
-		t.Fatalf("expected one document entity, got %d: %+v", len(repo.artifacts.Entities), repo.artifacts.Entities)
+	if got, want := len(repo.artifacts.Entities), len(repo.artifacts.Chunks)+1; got != want {
+		t.Fatalf("entity count = %d, want one statement per chunk plus one document entity (%d): %+v", got, want, repo.artifacts.Entities)
 	}
-	if got, want := len(repo.artifacts.Entities[0].EvidenceChunkIDs), len(repo.artifacts.Chunks); got != want {
+	var documentEntity protocol.Entity
+	for _, entity := range repo.artifacts.Entities {
+		if entity.Type == "Document" {
+			documentEntity = entity
+			break
+		}
+	}
+	if documentEntity.EntityID == "" {
+		t.Fatalf("document entity was not emitted: %+v", repo.artifacts.Entities)
+	}
+	if got, want := len(documentEntity.EvidenceChunkIDs), len(repo.artifacts.Chunks); got != want {
 		t.Fatalf("document entity evidence chunk count = %d, want %d", got, want)
+	}
+	if got, want := len(repo.artifacts.ClaimBindings), len(repo.artifacts.Claims); got != want {
+		t.Fatalf("source-backed Claim binding count = %d, want %d", got, want)
+	}
+	if err := protocol.ValidateClaimTripleBindings(repo.artifacts.GraphBindings, repo.artifacts.ClaimBindings); err != nil {
+		t.Fatalf("Claim bindings: %v", err)
 	}
 }
 
@@ -195,17 +213,24 @@ type memoryRepo struct {
 	sources             map[string]string
 	sourceModTimes      map[string]time.Time
 	artifacts           repository.ArtifactSet
+	stagedArtifacts     repository.ArtifactSet
 	writeArtifactsCalls int
 	eval                repository.EvalReport
 	hash                string
+	projectionRoot      string
 }
 
 func newMemoryRepo() *memoryRepo {
+	projectionRoot, err := os.MkdirTemp("", "knote-knowledge-projections-")
+	if err != nil {
+		panic(err)
+	}
 	return &memoryRepo{
 		config:         repository.Config{Workspace: "/memory"},
 		sources:        map[string]string{},
 		sourceModTimes: map[string]time.Time{},
 		hash:           "current-knowledge-hash",
+		projectionRoot: projectionRoot,
 	}
 }
 
@@ -243,6 +268,40 @@ func (r *memoryRepo) WriteArtifacts(_ context.Context, set repository.ArtifactSe
 	r.artifacts = set
 	return nil
 }
+
+func (r *memoryRepo) StageArtifacts(_ context.Context, set repository.ArtifactSet) error {
+	r.writeArtifactsCalls++
+	r.stagedArtifacts = set
+	return nil
+}
+
+func (r *memoryRepo) PublishArtifacts(
+	_ context.Context,
+	_ repository.ArtifactPublicationBase,
+	manifest protocol.ArtifactBundleManifest,
+) error {
+	if r.stagedArtifacts.BundleManifest.ProjectionVersion != manifest.ProjectionVersion {
+		return fmt.Errorf("staged projection does not match published manifest")
+	}
+	r.artifacts = r.stagedArtifacts
+	return nil
+}
+
+func (r *memoryRepo) ReadCurrentArtifactManifest(context.Context) (protocol.ArtifactBundleManifest, error) {
+	if r.artifacts.BundleManifest.Version == 0 {
+		return protocol.ArtifactBundleManifest{}, repository.ErrArtifactCurrentNotFound
+	}
+	return r.artifacts.BundleManifest, nil
+}
+
+func (r *memoryRepo) ReadCurrentProjection(context.Context) ([]byte, error) {
+	if len(r.artifacts.ProjectionJSON) == 0 {
+		return nil, repository.ErrArtifactCurrentNotFound
+	}
+	return append([]byte(nil), r.artifacts.ProjectionJSON...), nil
+}
+
+func (r *memoryRepo) ProjectionStoreRoot() string { return r.projectionRoot }
 
 func (r *memoryRepo) ReadManifest(context.Context) (protocol.ArtifactManifest, error) {
 	return r.artifacts.Manifest, nil
@@ -283,6 +342,19 @@ func (fakeBackend) Explain(context.Context, string) (kag.Response, error) {
 	return kag.Response{Data: map[string]any{"answer": "Fake KAG answer", "explanation": "because", "mode": "fake"}}, nil
 }
 
+func (b fakeBackend) BuildInNamespace(ctx context.Context, _, _ string) (kag.Response, error) {
+	return b.Build(ctx)
+}
+func (b fakeBackend) BuildInNamespaceWithCorpus(ctx context.Context, _, _ string, _ []kag.CorpusRecord) (kag.Response, error) {
+	return b.Build(ctx)
+}
+func (b fakeBackend) QueryInNamespace(ctx context.Context, _ string, query string) (kag.Response, error) {
+	return b.Query(ctx, query)
+}
+func (b fakeBackend) ExplainInNamespace(ctx context.Context, _ string, query string) (kag.Response, error) {
+	return b.Explain(ctx, query)
+}
+
 type failingBackend struct{}
 
 func (failingBackend) Build(context.Context) (kag.Response, error) {
@@ -295,6 +367,19 @@ func (failingBackend) Query(context.Context, string) (kag.Response, error) {
 
 func (failingBackend) Explain(context.Context, string) (kag.Response, error) {
 	return kag.Response{}, errFakeUnavailable
+}
+
+func (b failingBackend) BuildInNamespace(ctx context.Context, _, _ string) (kag.Response, error) {
+	return b.Build(ctx)
+}
+func (b failingBackend) BuildInNamespaceWithCorpus(ctx context.Context, _, _ string, _ []kag.CorpusRecord) (kag.Response, error) {
+	return b.Build(ctx)
+}
+func (b failingBackend) QueryInNamespace(ctx context.Context, _ string, query string) (kag.Response, error) {
+	return b.Query(ctx, query)
+}
+func (b failingBackend) ExplainInNamespace(ctx context.Context, _ string, query string) (kag.Response, error) {
+	return b.Explain(ctx, query)
 }
 
 var errFakeUnavailable = &fakeError{"fake unavailable"}
@@ -311,6 +396,19 @@ func (buildFailingBackend) Query(context.Context, string) (kag.Response, error) 
 
 func (buildFailingBackend) Explain(context.Context, string) (kag.Response, error) {
 	return kag.Response{}, errFakeUnavailable
+}
+
+func (b buildFailingBackend) BuildInNamespace(ctx context.Context, _, _ string) (kag.Response, error) {
+	return b.Build(ctx)
+}
+func (b buildFailingBackend) BuildInNamespaceWithCorpus(ctx context.Context, _, _ string, _ []kag.CorpusRecord) (kag.Response, error) {
+	return b.Build(ctx)
+}
+func (b buildFailingBackend) QueryInNamespace(ctx context.Context, _ string, query string) (kag.Response, error) {
+	return b.Query(ctx, query)
+}
+func (b buildFailingBackend) ExplainInNamespace(ctx context.Context, _ string, query string) (kag.Response, error) {
+	return b.Explain(ctx, query)
 }
 
 type fakeError struct {
