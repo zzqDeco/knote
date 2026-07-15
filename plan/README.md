@@ -27,4 +27,4 @@ This directory stores current actionable implementation plans.
 - `main`: releasable branch
 - `dev`: integration branch
 - feature branches: `feature/*`, `feat/*`, `fix/*`, `refactor/*`, `test/*`, `chore/*`
-- release branch: `release/v0.1.0`
+- release branches: `release/v*`

@@ -189,20 +189,13 @@ def run_fake_mvp(driver: PTYDriver, workspace: Path) -> None:
     driver.expect("session resumed", timeout=20)
 
     driver.send("/eval\r")
-    driver.expect("Confirm Eino tool", "Run evaluation and w", timeout=10)
-    driver.send("y")
-    wait_file(workspace / "evals" / "report.md", timeout=30)
-
-    driver.send("/commit acceptance eval\r")
-    driver.expect("Confirm Eino tool", "Commit the current k", timeout=10)
-    driver.send("y")
-    wait_git_clean(workspace, timeout=30)
+    driver.expect("eval is unavail", timeout=10)
 
 
 def run_eino_local_proxy(driver: PTYDriver) -> None:
     run_startup(driver)
-    driver.send("Do not use tools. Reply only with the phrase made from the words knote, eino, ok using hyphens.\r")
-    driver.expect("knote-eino-ok", timeout=60)
+    driver.send('Use knote_query to answer the current workspace knowledge-base question "What is knote?". After the tool succeeds, reply only with knote-authorized-ok.\r')
+    driver.expect("knote-authorized-ok", timeout=60)
 
 
 def main() -> int:

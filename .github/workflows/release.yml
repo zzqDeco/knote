@@ -12,11 +12,63 @@ on:
         description: Release tag
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  release:
+  verify:
     runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+      CGO_ENABLED: "0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Go tests
+        run: KNOTE_KAG_FAKE=1 go test ./...
+
+      - name: OpenFGA authorization model tests
+        run: GOTOOLCHAIN=go1.25.12 go run github.com/openfga/cli/cmd/fga@v0.7.17 model test --tests internal/authz/model/authorization.fga.yaml
+
+      - name: Python adapter tests
+        run: python -m unittest discover -s adapters/kag -p '*test*.py'
+
+      - name: Phase 2 permissioned graph deterministic smoke
+        run: python tests/smoke/permissioned_graph_real_smoke.py --self-test
+
+      - name: Verify release version stamping
+        shell: bash
+        run: |
+          set -euo pipefail
+          commit="$(git rev-parse --short HEAD)"
+          build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          ldflags="-X main.version=${RELEASE_TAG} -X main.commit=${commit} -X main.date=${build_date}"
+          go build -trimpath -ldflags "${ldflags}" -o bin/knote ./cmd/knote
+          expected="version=${RELEASE_TAG} commit=${commit} date=${build_date}"
+          actual="$(bin/knote --version)"
+          [[ "${actual}" == "${expected}" ]] || {
+            printf 'release version mismatch\nexpected: %s\nactual:   %s\n' "${expected}" "${actual}" >&2
+            exit 1
+          }
+
+  release:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
     env:
       RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
       CGO_ENABLED: "0"
