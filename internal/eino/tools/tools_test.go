@@ -111,6 +111,15 @@ func TestToolsCallVersionedServiceAndReturnJSON(t *testing.T) {
 			t.Fatalf("missing side-effect gate action %s in %+v", action, gated)
 		}
 	}
+	var checkoutSummary string
+	for _, req := range gated {
+		if req.Action == "checkout" {
+			checkoutSummary = req.Summary
+		}
+	}
+	if !strings.Contains(checkoutSummary, "Workspace is dirty") || !strings.Contains(checkoutSummary, "local changes should remain") {
+		t.Fatalf("dirty checkout confirmation did not explain preservation risk: %q", checkoutSummary)
+	}
 }
 
 func TestToolsRejectMalformedUnknownAndMissingArguments(t *testing.T) {

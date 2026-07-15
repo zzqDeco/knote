@@ -1246,6 +1246,16 @@ func TestEvalQuestionsFallbackAndSorting(t *testing.T) {
 	}
 }
 
+func TestVersionsReturnsEmptyForUnbornRepository(t *testing.T) {
+	versions, err := New(initRepo(t)).Versions(context.Background(), 20)
+	if err != nil {
+		t.Fatalf("list versions in unborn repository: %v", err)
+	}
+	if len(versions) != 0 {
+		t.Fatalf("unborn repository versions = %+v, want none", versions)
+	}
+}
+
 func TestVersionsContract(t *testing.T) {
 	ctx := context.Background()
 	workspace := initRepo(t)

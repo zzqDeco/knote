@@ -69,8 +69,11 @@ func (c gitClient) Versions(ctx context.Context, limit int) ([]repository.Versio
 	if limit <= 0 {
 		limit = 20
 	}
-	head, err := c.git(ctx, "rev-parse", "HEAD")
+	head, err := c.git(ctx, "rev-parse", "--verify", "HEAD")
 	if err != nil {
+		if c.unbornHead(ctx) {
+			return []repository.Version{}, nil
+		}
 		return nil, err
 	}
 	out, err := c.git(ctx, "log", fmt.Sprintf("-n%d", limit), "--format=%H%x1f%h%x1f%s%x1f%cr%x1f%D")
@@ -97,6 +100,19 @@ func (c gitClient) Versions(ctx context.Context, limit int) ([]repository.Versio
 		})
 	}
 	return versions, nil
+}
+
+func (c gitClient) unbornHead(ctx context.Context) bool {
+	ref, err := c.git(ctx, "symbolic-ref", "-q", "HEAD")
+	if err != nil || strings.TrimSpace(ref) == "" {
+		return false
+	}
+	_, err = c.git(ctx, "show-ref", "--verify", "--quiet", strings.TrimSpace(ref))
+	if err == nil {
+		return false
+	}
+	var exitErr *exec.ExitError
+	return errors.As(err, &exitErr) && exitErr.ExitCode() == 1
 }
 
 func (c gitClient) Commit(ctx context.Context, message string) (output string, resultErr error) {

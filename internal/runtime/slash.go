@@ -57,7 +57,13 @@ func (m *Manager) routeSlash(ctx context.Context, sessionID string, cmd string, 
 		if ref == "" {
 			return []protocol.Event{protocol.NewEvent(protocol.EventError, sessionID, "ref is required", nil)}
 		}
-		return m.invokeTool(ctx, sessionID, tools.NameCheckout, jsonArgs(map[string]any{"ref": ref, "allow_dirty": true}))
+		allowDirty := false
+		if m.deps.Versions != nil {
+			if status, err := m.deps.Versions.Status(ctx); err == nil {
+				allowDirty = status.Dirty
+			}
+		}
+		return m.invokeTool(ctx, sessionID, tools.NameCheckout, jsonArgs(map[string]any{"ref": ref, "allow_dirty": allowDirty}))
 	case "status":
 		return m.status(sessionID, ctx)
 	case "tasks":
