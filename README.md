@@ -4,7 +4,7 @@
 
 ## Version Status
 
-`v0.1.1` is the published runtime/Eino baseline. The `v0.2.0` release line adds the permissioned KAG serving foundation and real primitive-provider path: OpenFGA-backed authorization, deterministic projection and graph bindings, body-free retrieval primitives, bounded per-hop authorized Claim traversal, revocation-safe cache/citation/session replay, and deterministic plus live OpenFGA/OpenSPG acceptance gates. The CLI currently selects the authorization-aware query tools only in deterministic fake mode; real operator runtime composition is not enabled by default.
+Current `dev` includes the permissioned KAG serving foundation and opt-in real operator composition: OpenFGA-backed authorization, verified selected-bundle evidence loading, deterministic projection and graph bindings, body-free retrieval primitives, bounded per-hop authorized Claim traversal, revocation-safe cache/citation/session replay, and protected observable surfaces. Issue #78 adds acceptance and operational evidence for that composition; it does not publish a new GitHub Release.
 
 This MVP is Go-first:
 
@@ -62,7 +62,7 @@ KNOTE_KAG_FAKE=1 go test ./...
 scripts/smoke_fake_mvp.sh
 ```
 
-`scripts/smoke_fake_mvp.sh` reuses `bin/knote` when it already exists; set `KNOTE_BIN=/path/to/knote` to smoke a different binary. On macOS it drives `go run` by default to avoid local unsigned-binary PTY startup flakiness; set `KNOTE_SMOKE_FORCE_BIN=1` to force the built binary.
+`scripts/smoke_fake_mvp.sh` reuses `bin/knote` when it already exists; set `KNOTE_BIN=/path/to/knote` to smoke a different binary. On macOS it drives `go run` by default to avoid local unsigned-binary PTY startup flakiness; set `KNOTE_SMOKE_FORCE_BIN=1` to force the built binary. This legacy fake smoke is not the issue #78 built-binary permissioned acceptance gate.
 
 If your preferred Python is not the system interpreter, set `KNOTE_PYTHON=/path/to/python`.
 
@@ -73,10 +73,10 @@ For real KAG execution:
 3. Put Markdown or text sources under `sources/`.
 4. Run `scripts/smoke_real_kag.sh` against a disposable OpenSPG project or stack before a release candidate. The compatibility smoke does not remove server-side project data.
 
-The Phase 2 permissioned graph smoke is separate from that legacy compatibility
-check. It starts pinned disposable OpenFGA and OpenSPG containers, uses only the
-checked-in public synthetic fixture, and removes its containers and volumes on
-exit:
+The optional Phase 2 permissioned graph smoke is separate from that legacy
+compatibility check. It starts pinned disposable OpenFGA and OpenSPG containers,
+uses only the checked-in public synthetic fixture, and removes its containers
+and volumes on exit:
 
 ```bash
 KNOTE_PERMISSIONED_GRAPH_REAL_SMOKE=1 \
@@ -89,6 +89,15 @@ CI runs the credential-free deterministic half with
 `docs/permissioned-kag-real-smoke.md` for exact image digests and external-stack
 options.
 
+Real permissioned CLI composition is enabled explicitly with
+`KNOTE_PERMISSIONED=1`, `KNOTE_KAG_FAKE` disabled, a real
+`KNOTE_KAG_PERMISSIONED_PROVIDER=module:factory`, a current selected artifact
+bundle, and complete OpenFGA principal/identity/endpoint/store/model/token
+configuration. Partial or invalid configuration fails before the TUI starts;
+provider or network failures during a request fail closed without legacy
+fallback. See `docs/permissioned-kag-operations.md` for the exact variables,
+startup boundary, trust model, and no-disclosure troubleshooting procedure.
+
 The adapter writes a sorted JSON corpus and generated starter config under `.knote/kag-runtime/`; copy that config to `.knote/kag_config.yaml` when you need custom model, namespace, or project settings. Runtime KAG cache is ignored by Git.
 
 ## Sessions
@@ -96,6 +105,13 @@ The adapter writes a sorted JSON corpus and generated starter config under `.kno
 Sessions are JSONL event logs under `.knote/sessions/`. They are retained until the workspace owner removes them; `/clear` only clears the current TUI projection and does not delete history. knote creates the session directory with owner-only access (`0700`) and session data with owner-only access (`0600`) on filesystems that support POSIX permissions.
 
 Permissioned sessions also persist a metadata-only authorization envelope. Resume replays history only when the current tenant, knowledge base, principal, authorization model, identity and ACL watermarks, task scope, and consistency preference still match that envelope; missing or changed authorization fails closed before history is loaded. `/new` creates a fresh session, while `/resume` lists recent sessions with matching authorization envelopes and `/resume <session-id>` restores an authorized one. Revocation protects future access but cannot retract content that a user already viewed or copied.
+
+Issue #78 defines `KNOTE_PERMISSIONED_TELEMETRY_PATH` as the optional
+content-free operational JSONL sink. Its closed schema contains fixed event
+classifications, aggregate counts, booleans, durations, rates, and
+percentile/budget outcomes; it contains no content, identifiers, paths, prompts,
+errors, endpoints, or secrets. Sink failures never affect authorization and
+never enter the TUI or session history.
 
 ## Runtime Layers
 
@@ -150,6 +166,20 @@ CGO_ENABLED=0 go build -o bin/knote ./cmd/knote
 PYTHON=/usr/bin/python3 KNOTE_SMOKE_FORCE_BIN=1 scripts/smoke_fake_mvp.sh
 ```
 
+Phase 2 acceptance additionally requires the issue #78 deterministic built-binary
+entrypoint:
+
+```bash
+scripts/smoke_permissioned_binary.sh
+```
+
+It builds `cmd/knote` once and invokes that exact artifact through real
+permissioned composition for authorized query/resume, permission-bound and
+revoked resume, deny, provider failure, and OpenFGA backend failure. A
+compile-only check, `go run`, direct Go service test, or the fake MVP smoke does
+not satisfy this gate. The optional live OpenFGA/KAG smoke below supplements
+rather than replaces it; see `docs/permissioned-kag-acceptance.md`.
+
 Manual Eino/OpenAI-compatible validation:
 
 ```bash
@@ -165,7 +195,7 @@ Manual real KAG validation:
 KNOTE_PYTHON=/path/to/python KNOTE_KAG_HOST=http://127.0.0.1:8887 scripts/smoke_real_kag.sh
 ```
 
-Manual Phase 2 permissioned graph validation:
+Optional live Phase 2 permissioned graph validation:
 
 ```bash
 KNOTE_PERMISSIONED_GRAPH_REAL_SMOKE=1 \
@@ -193,6 +223,8 @@ MVP scope includes:
 - bounded multi-hop Claim traversal with authorization at every participating hop
 - revocation-safe authorized caches, citations, and permission-bound session replay
 - protected query surfaces and derived-output visibility enforcement
-- credential-free permissioned acceptance tests plus a pinned disposable OpenFGA/OpenSPG live smoke
+- opt-in real CLI composition with verified selected-bundle evidence loading
+- optional content-free permissioned telemetry isolated from authorization and session history
+- mandatory credential-free built-binary acceptance plus an optional pinned disposable OpenFGA/OpenSPG live smoke
 
-Out of scope for `v0.2.0`: web UI, desktop app, cloud sync, multi-user collaboration UI, an independent version database, OpenSPG as the serving authorization boundary, default real-CLI composition of the operator permissioned provider, permissioned `/eval`, or an MCP dependency. Main-branch promotion still requires a reviewed release PR, and release tags still require explicit confirmation.
+Out of scope for the current Phase 2 acceptance slice: web UI, desktop app, cloud sync, multi-user collaboration UI, an independent version database, OpenSPG as the serving authorization boundary, default-on permissioned mode, permissioned `/eval`, an MCP dependency, or publishing a GitHub Release. Main-branch promotion and any future tag remain separate reviewed actions.

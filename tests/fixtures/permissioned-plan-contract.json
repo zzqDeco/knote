@@ -1,0 +1,23 @@
+{
+  "predicate_allowlist_version": 1,
+  "predicate_keys": [
+    "pred_117dbb19db72ab17c98e4ef1274d5981",
+    "pred_2f262980c75e6161b9b4e515b2de1e39",
+    "pred_5b962d789a179c3b0fef884c6ce16d3c",
+    "pred_66312e5e57ebd0b4fff4ef544c5a4abd",
+    "pred_6671808c414ad4b875384b8fa3bfc59c",
+    "pred_70a81d065c4e01846e6f7ab070e14be4",
+    "pred_8f3dc3703e8d493b1c38906cd34a06cc",
+    "pred_a3b0b7f1948c58d586d3af99fee4704e",
+    "pred_c2a0b72a30d819c4cd2a9024a1a2cbf9",
+    "pred_f394e7077977ae111ead3df2693e7b22"
+  ],
+  "resource_kind_allowlist_version": 1,
+  "resource_kinds": [
+    "chunk",
+    "claim",
+    "derived_artifact",
+    "document",
+    "entity"
+  ]
+}

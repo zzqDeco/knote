@@ -1,185 +1,250 @@
 # Permissioned KAG Acceptance
 
-This document defines the deterministic Phase 1 and Phase 2 permissioned KAG
-release gates for issues #41 and #61. It tests the security contracts in
-`doc/adr/0001-permissioned-kag-security-contracts.md`, the interception boundary
-in `doc/adr/0002-kag-query-interception.md`, and the bounded per-hop graph path
-implemented in Phase 2. The legacy `kag.query`/`kag.explain` solver remains a
-separate compatibility surface and is not acceptance evidence.
+This document defines the Phase 2 acceptance contract for issue #78 on `dev`.
+It builds on the deterministic authorization, graph, reconciliation, and
+protected-surface suites from issues #41 and #61, plus the real operator
+composition and protected surfaces now on `dev`. The legacy
+`kag.query`/`kag.explain` solver and the fake MVP TUI smoke are compatibility
+surfaces, not Phase 2 production-composition evidence.
 
-## CI entry points
+Passing this contract is evidence for the reviewed development branch. It does
+not create a tag, publish artifacts, or claim a GitHub Release.
 
-The credential-free gate is the same command run by `.github/workflows/ci.yml`:
+## Gate levels
+
+| Gate | Required | Network or credentials | Purpose |
+|---|---|---|---|
+| Deterministic baseline | yes | none | Go/Python contracts, policy model, graph/revocation invariants, protected surfaces, and allowlist parity |
+| Deterministic built binary | yes | no external network or credentials; loopback deterministic doubles only | Prove the built `cmd/knote` artifact crosses the real permissioned startup and request boundaries |
+| Live OpenFGA + OpenSPG/KAG smoke | no | disposable local services | Check pinned external-service compatibility without replacing deterministic acceptance |
+
+The baseline commands are:
 
 ```sh
 KNOTE_KAG_FAKE=1 go test ./...
 /usr/bin/python3 -m unittest discover -s adapters/kag -p '*test*.py'
 /usr/bin/python3 tests/smoke/permissioned_graph_real_smoke.py --self-test
-GOTOOLCHAIN=go1.25.12 go run github.com/openfga/cli/cmd/fga@v0.7.17 model test --tests internal/authz/model/authorization.fga.yaml
-CGO_ENABLED=0 go build -o /tmp/knote-check ./cmd/knote
+GOTOOLCHAIN=go1.25.12 go run github.com/openfga/cli/cmd/fga@v0.7.17 model test \
+  --tests internal/authz/model/authorization.fga.yaml
 ```
 
-For a focused local pass:
+Use Python 3.11 for the Python gates to match CI. No production OpenFGA, KAG,
+model-provider, or workspace credential is permitted in deterministic
+acceptance.
+
+## Mandatory built-binary gate
+
+Run the issue #78 deterministic entrypoint from the repository root:
 
 ```sh
-KNOTE_KAG_FAKE=1 go test -count=1 ./internal/authz ./internal/catalog ./internal/knowledge/authorized/... ./internal/knowledge/kag ./internal/protocol ./internal/runtime ./tests/eino_tools
-python3 -m unittest discover -s adapters/kag -p '*test*.py'
-python3 tests/smoke/permissioned_graph_real_smoke.py --self-test
+scripts/smoke_permissioned_binary.sh
 ```
 
-No OpenFGA, OpenSPG, KAG, or model-provider credential is permitted in this
-gate. Fixtures, clocks, candidate order, authorization decisions, and expected
-paths must be fixed. Failure output may contain opaque resource IDs and version
-metadata, but not protected bodies, titles, paths, prompts, or relation labels.
+This entrypoint is mandatory locally and in CI. After building `bin/knote`, CI
+invokes `scripts/smoke_permissioned_binary.sh --bin bin/knote` so the gate
+exercises the exact artifact produced by the preceding build step.
+
+The entrypoint rejects `KNOTE_KAG_FAKE` even when it is set to an empty value,
+builds `cmd/knote` once with `go build -trimpath`, verifies that artifact with
+`--version`, and invokes the exact artifact for every scenario. To exercise an
+already-built artifact, pass `--bin /absolute/path/to/knote`; the harness does
+not rebuild it.
+
+The deterministic harness:
+
+1. invokes the exact built artifact, with no `go run` and no direct construction
+   of the Go service under test;
+2. sets `KNOTE_PERMISSIONED=1`, keeps `KNOTE_KAG_FAKE` absent, and supplies the
+   complete real-mode operator configuration;
+3. uses only checked-in synthetic data, a local deterministic
+   OpenFGA-compatible endpoint, an allowlisted local provider, and a
+   deterministic model endpoint;
+4. exercises `authorized_query`, `authorized_resume`,
+   `permission_bound_resume`, `denied_query`, `revoked_resume`,
+   `provider_failure`, and `backend_failure`;
+5. proves authorization and replay rechecks, provider non-invocation after deny
+   or backend failure, and no generation after provider retrieval failure;
+6. asserts that denied/secret canaries and provider diagnostics never reach
+   public errors, TUI events, or session history;
+7. emits one sorted metadata-only JSON result. Running
+   `scripts/smoke_permissioned_binary.sh --self-test` materializes the fixture
+   twice and requires byte-identical artifact files and manifest digests.
+
+The shell entrypoint delegates to
+`tests/smoke/permissioned_binary_acceptance.py` and uses
+`tests/fixtures/permissioned-binary/permissioned_binary_provider.py`. A
+build-only step, `scripts/smoke_fake_mvp.sh`, the Python adapter self-test, or
+the optional live smoke cannot stand in for this gate.
 
 ## Fixture oracle
 
-Use `K = 3` for the Phase 1 positive-query cohort. The shared candidate list is
-the three deterministic resources in
-`internal/knowledge/authorized/fixture/fixture.go`:
+Quality metrics use `K = 4`. Compute every rate per principal/fixture first;
+aggregate reporting must not hide a principal-specific failure. Each positive
+fixture has at least one authorized relevant oracle result, and each negative
+control has none.
 
-| Principal | Authorized relevant resources | Expected denied candidates | Expected empty result |
-|---|---:|---:|---:|
-| Alice | 2 | 1 | no |
-| Bob | 1 | 2 | no |
-| Unknown principal | 0 | 3 | yes |
+| Principal | Authorized relevant results | Expected result |
+|---|---:|---|
+| Alice | `2` | both relevant results returned |
+| Bob | `1` | the relevant result returned |
+| Unknown principal | `0` | empty negative control |
 
-Discovery and result order is significant. The trusted adapter must return a
-complete, deterministic, body-free resource catalog. Authorization filters that
-catalog before a relevance provider runs, and `Retrieve` accepts only the exact
-sorted authorized handles. A test must compare those handles, exact projection
-and authorization versions, and the full set of generator, citation, trace,
+| Metric | Definition | Required result |
+|---|---|---:|
+| Positive Recall@4 | authorized oracle-relevant results returned in the first four / all authorized oracle-relevant results | `1.00` for Alice and Bob |
+| Positive Precision@4 | authorized oracle-relevant results returned in the first four / all results returned in the first four | `1.00` for Alice and Bob |
+| Positive empty-result rate | positive fixtures returning no evidence / all positive fixtures | `0` |
+| Negative-control empty-result rate | negative controls returning no evidence / all negative controls | `1` |
+| Policy-oracle false allows | denied oracle resources observed as allowed or returned | `0` |
+| Unauthorized path participation | unauthorized resources participating in any completed or partial graph path | `0` |
+| Unauthorized generator participation | unauthorized evidence or path resources passed to generation | `0` |
+
+A positive fixture with a missing sample, zero denominator, empty result, or
+extra non-relevant result in the first four fails instead of being omitted.
+Negative-control emptiness is reported separately and is never averaged into
+positive emptiness.
+
+Discovery and result order is significant. Trusted discovery returns a complete,
+deterministic, body-free catalog. Authorization filters it before relevance
+ranking, and retrieve accepts only exact authorized handles. Tests compare those
+handles, projection and authorization revisions, and generator, citation, trace,
 cache, and session references. A body-free candidate with the wrong tenant,
-knowledge base, authorization boundary, content digest, projection, ACL version,
-or serving state is a contract failure, not an ordinary retrieval miss.
+knowledge base, authorization boundary, digest, projection, ACL revision, or
+serving state is a contract failure, not an ordinary retrieval miss.
 
-## Hard invariants
+## Drop accounting
 
-The following are release blockers and are not percentile metrics:
+Per-hop authorization drops are a deterministic fixture diagnostic, not a
+relevance-quality metric. For each hop, report candidate, allowed, and dropped
+counts and require `candidates = allowed + dropped`. Across one Alice/Bob/unknown
+round, the fixture requires `40` candidates, `24` allows, and `16` drops, so
+`hop_authorization_drop_rate = 0.40`; over the four deterministic rounds those
+counts are `160`, `96`, and `64`. These values detect fixture or authorization
+stage drift and must not be generalized as a production quality threshold.
+
+Track the final post-filter independently through
+`final_filter_candidate_count`, `final_filter_allowed_count`, and
+`final_filter_dropped_count`; aggregate acceptance may also report
+`post_filter_drop_rate = dropped / candidates`. The policy-oracle fixture
+requires `3` candidates, `3` allows, and `0` drops per round (`12/12/0` across
+four rounds), with `post_filter_drop_rate = 0`. Do not fold these values into
+per-hop drops, Recall@4, Precision@4, or empty-result rates. A final drop can
+demonstrate the last revocation/authorization barrier; regardless of its count,
+no dropped resource may reach evidence, citations, generation, cache, replay, or
+protected output.
+
+## Latency and revocation budgets
+
+Percentiles use nearest rank: sort the complete sample set and select
+`ceil(percentile * sample_count) - 1`. Missing samples fail the cohort. Report
+sample count with every percentile.
+
+| Metric | Sample boundary | Required result |
+|---|---|---:|
+| Local hard latency | every local deterministic authorization, retrieval, graph, and authorized-query sample | each sample `<= 1s` |
+| Synthetic P99 | deterministic synthetic end-to-end query samples with fixed injected stage durations | `P99 <= 100ms` |
+| Revocation propagation P95 | declared revocation through observed cache/replay protection | `P95 <= 25ms` |
+| Revocation propagation P99 | same sample set | `P99 <= 100ms` |
+
+The 1-second ceiling catches hangs and accidental external I/O; it does not
+replace the 100-millisecond synthetic P99. Synthetic latency uses fixed clocks or
+durations so scheduler noise cannot make it nondeterministic. Revocation uses at
+least the existing 128 no-sleep samples and includes every attempt. Retries,
+timeouts, malformed responses, and failures are not hidden from counts.
+
+Physical OpenFGA `BatchCheck` requests remain bounded to
+`authz.MaxBatchChecks` (`50`). Batch size, RPC count, and latency are reported as
+diagnostics and must match the exact authorization stages exercised by the
+fixture. A batch timeout, missing decision, duplicate correlation, wrong model,
+or partial response fails closed.
+
+## Hard security invariants
+
+These are acceptance blockers for the code change and are never percentile
+allowances:
 
 | Invariant | Required result |
 |---|---:|
-| Policy-oracle false allows | 0 |
-| Unauthorized resources presented to the relevance provider | 0 |
-| Unauthorized evidence items or citations | 0 |
-| Unauthorized generator or solver inputs | 0 |
-| Unauthorized trace/debug resource participation | 0 |
-| Unauthorized graph-path participation | 0 |
-| Serving projections with incomplete or failed ACL state | 0 |
-| Stale cache, citation, or session reads after revocation observation | 0 |
-| Cross-tenant candidates reaching authorization, load, expand, or generate | 0 |
+| False allows | `0` |
+| Unauthorized resources presented to relevance | `0` |
+| Unauthorized evidence items or citations | `0` |
+| Unauthorized generator/solver inputs | `0` |
+| Unauthorized graph-path participation | `0` |
+| Unauthorized trace/debug/audit/session participation | `0` |
+| Cross-tenant candidates reaching authorization, load, expand, or generate | `0` |
+| Serving projections with incomplete or failed ACL state | `0` |
+| Stale cache, citation, derived-artifact, or session reads after revocation observation | `0` |
 
-Every negative fixture must also assert that the protected canary body is absent
-from errors, traces, debug values, metrics labels, generated output, persisted
-events, and adapter stdout/stderr captured by the test.
+Every negative fixture includes protected body, title, path, prompt, identifier,
+and secret canaries. All canaries must be absent from public errors, traces,
+debug values, telemetry fields, generated output, persisted events, and captured
+adapter output.
 
-## Metric definitions and budgets
+## Telemetry acceptance
 
-All rates are computed per principal first; aggregate reporting must not hide a
-principal-specific failure. Percentiles use nearest rank: sort the complete
-sample set and select `ceil(percentile * sample_count) - 1`. A missing sample or
-zero denominator fails the positive cohort instead of being omitted. The strict
-revocation test uses 128 no-sleep samples; BatchCheck and retrieval tests report
-P99 over their deterministic scenario samples and enforce the hard ceiling on
-every sample.
+`KNOTE_PERMISSIONED_TELEMETRY_PATH` is optional. Its tests must prove:
 
-| Metric | Definition | CI budget |
-|---|---|---:|
-| Authorized Recall@3 | returned authorized relevant / oracle authorized relevant | 1.00 for Alice and Bob |
-| Authorized Precision@3 | returned authorized relevant / all returned evidence | 1.00 for every non-empty result |
-| Authorization drop rate | denied handles / valid handles returned by trusted discovery or graph expansion | exactly 1/3 for Alice and 2/3 for Bob; aggregate exactly 0.50 |
-| Authorized empty-result rate | positive queries with no authorized evidence / positive queries | 0/2; the unknown-principal negative control is exactly 1/1 |
-| Authorized Path Completeness | complete authorized oracle paths returned / complete authorized oracle paths | 1.00 for controlled provenance fixtures |
-| BatchCheck size | checks in one `BatchCheckRequest` | 1 to `authz.MaxBatchChecks` (50) |
-| BatchCheck RPC count | sum of authorization batches for one query | exactly 2 for the no-expansion Alice/Bob fixture; exactly 5 for a complete one-hop fixture when each stage has at most 50 unique objects |
-| BatchCheck latency | elapsed time for one deterministic local batch | every sample <= 1 s; report P99 |
-| Retrieval latency | fake `Retrieve` call elapsed time | every sample <= 1 s; report P99 |
-| Total authorized query latency | `Service.Query` entry through validated generation result, including authorization and exact load | every sample <= 1 s; report P99 |
-| Revocation propagation | `RevocationRequest.RevokedAt` through cache tombstone `ObservedAt` | P95 <= 25 ms and P99 <= 100 ms across 128 no-sleep samples |
-| Content/ACL terminal skew | content projector terminal time to ACL projector terminal time for the same projection | maximum <= 25 ms in the controlled-clock fixture |
-| Unauthorized serving skew | time an incomplete or ACL-failed projection is serving | exactly 0 ms |
+- unset means no sink and no telemetry file;
+- each non-empty line is exactly one valid JSON object in the closed telemetry
+  schema;
+- only fixed metric-scope/event/stage/outcome/budget enums, aggregate integer
+  counts, durations, rates, and percentiles are accepted;
+- unknown fields, free-form diagnostics or errors, content, paths, identifiers,
+  endpoints, provider output, and secrets are absent;
+- `metric_scope=operational` records contain only per-operation observations;
+  cohort-only Recall@4, Precision@4, positive/negative empty-result rates,
+  unauthorized path/generator participation, and latency/revocation percentiles
+  remain zero and must not be interpreted as measurements;
+- the deterministic acceptance cohort computes those quality and percentile
+  metrics independently without joining telemetry to session or evidence data;
+- open, append, encode, flush, and close failures do not change an allow, deny,
+  revocation, evidence, or generated result;
+- neither telemetry records nor sink failures appear as TUI/model events or in
+  `.knote/sessions/*.jsonl`.
 
-The BatchCheck count formula for larger fixtures is:
-
-```text
-ceil(unique_discovered_objects / 50)      # pre-ranking authorization
-+ ceil(unique_start_objects / 50)         # zero when traversal is disabled
-+ ceil(unique_claim_objects / 50)         # zero when traversal is disabled
-+ ceil(unique_object_objects / 50)        # zero when traversal is disabled
-+ ceil(unique_final_path_and_evidence_objects / 50)
-```
-
-Cache-hit revalidation permits two live authorization passes; each pass uses as
-many 50-item physical batches as its exact resource set requires. Citation open
-and protected-session replay use the same physical batch ceiling. Revocation
-application permits one live pass after synchronous tombstoning. Count every
-attempt, including a timeout or malformed response; retries are not hidden from
-the metric.
-
-Latency tests run only against in-process deterministic doubles or the fake
-adapter and use monotonic elapsed time. They must not contact a network service.
-`TestPermissionedAcceptanceRevocationSLO` also applies a secondary 1-second
-P95/P99 ceiling over 16 complete query/cache/citation samples. The content/ACL
-test uses a controlled clock in its harness; public artifact formats do not gain
-test-only timestamps. An ACL failure ends the skew sample at the failure
-observation and must leave the projection non-serving.
+Telemetry is best-effort operational evidence. It is not an authorization input,
+an audit record for content access, or a reason to retry a protected operation.
+Issue #78 implements this contract in `internal/telemetry` and verifies the
+runtime file sink through both writable and blocked/failing paths. The built
+binary harness validates allowed and denied operational records without treating
+cohort-only zero placeholders as measured values.
 
 ## Invariant-to-test map
 
-The issue #41 acceptance files are credential-free and run under `go test ./...`.
-The older component tests remain defense in depth, but these are the direct
-scenario gates:
+| Scenario | Status | Direct anchor |
+|---|---|---|
+| Real opt-in configuration, selected-bundle loader, exact mode tools, startup context | existing | `cmd/knote/eino_test.go`; `cmd/knote/permissioned_revision_test.go`; `internal/knowledge/authorized/bundle_loader_test.go` |
+| Recall@4/Precision@4, positive/negative empty controls, path participation, hop/final drops, synthetic query P99 | implemented by #78 | `internal/knowledge/authorized/phase2_permissioned_graph_acceptance_test.go: TestPhase2PermissionedGraphPolicyOracleAcceptanceMetrics`; `internal/knowledge/authorized/traversal.go: TraversalReport` |
+| Hidden Claim, denied intermediate, alternate support, derivation and traversal limits | existing | `internal/knowledge/authorized/phase2_permissioned_graph_acceptance_test.go: TestPhase2PermissionedGraphDerivationBudgetsAndFailures` |
+| Revocation closes traversal, cache, citation, and replay within P95/P99 | existing | `internal/knowledge/authorized/phase2_permissioned_graph_acceptance_test.go: TestPhase2PermissionedGraphCacheCitationRevocationAndSessionReplay`, `TestPhase2PermissionedGraphRevocationLatencyBudget`; `internal/runtime/phase2_graph_replay_acceptance_test.go` |
+| Mixed-visibility count/exists/autocomplete/pagination/error/trace/debug/audit surfaces | existing | `internal/runtime/permissioned_acceptance_test.go: TestPermissionedAcceptanceSideChannelSurfacesHideCanaries`; `internal/runtime/phase2_protected_surfaces_acceptance_test.go` |
+| Cross-tenant input stops before search, graph, or generation | existing | `internal/runtime/phase2_protected_surfaces_acceptance_test.go: TestPhase2ProtectedSurfacesAcceptanceCrossTenantStopsBeforeSearchGraphAndGenerate` |
+| Full replacement removes stale content, bindings, Claims, and tuples | existing | `internal/catalog/phase2_full_reconciliation_acceptance_test.go`; `internal/authz/phase2_full_reconciliation_acceptance_test.go` |
+| Go/Python predicate and resource-kind allowlists stay identical | added by #78 | `tests/fixtures/permissioned-plan-contract.json`; `internal/protocol/permissioned_plan_contract_parity_test.go`; `adapters/kag/test_permissioned_plan_contract_parity.py` |
+| Content-free telemetry schema and sink-failure isolation | implemented by #78 | `internal/telemetry`; `cmd/knote/permissioned_telemetry.go`; `internal/knowledge/authorized/phase2_permissioned_graph_telemetry_test.go`; `internal/authz/reconciliation_telemetry_test.go`; built-binary coverage |
+| Real composition through allow, explain, deny, empty result, revocation-aware replay, telemetry sink failure, provider failure, and backend failure | implemented by #78 and invoked by CI | `.github/workflows/ci.yml`; `scripts/smoke_permissioned_binary.sh`; `tests/smoke/permissioned_binary_acceptance.py`; `tests/fixtures/permissioned-binary/permissioned_binary_provider.py` |
 
-| Issue #41 scenario | Current deterministic anchors |
-|---|---|
-| Alice and Bob receive different evidence; pre-ranking authorization, quality, and drop/empty budgets | `internal/knowledge/authorized/service_test.go: TestQueryScopesEvidencePerPrincipal`; `internal/runtime/permissioned_acceptance_test.go: TestPermissionedAcceptanceSideChannelSurfacesHideCanaries`; `internal/knowledge/authorized/permissioned_acceptance_test.go: TestPermissionedAcceptancePolicyOracleAndRetrievalMetrics` |
-| Entity support and Claim visibility remain independent | `internal/knowledge/authorized/permissioned_acceptance_test.go: TestPermissionedAcceptanceVisibleEntityHiddenClaim`; `internal/authz/permissioned_acceptance_test.go: TestPermissionedAcceptanceEntityVisibleProtectedClaimHidden` |
-| A denied intermediate blocks later participation; `any_support` and `all_required` stay closed | `internal/knowledge/authorized/permissioned_acceptance_test.go: TestPermissionedAcceptanceProvenancePathSemantics`; `internal/authz/permissioned_acceptance_test.go: TestPermissionedAcceptanceDeniedIntermediateClaimBlocksPathParticipation`; `internal/catalog/permissioned_acceptance_test.go: TestPermissionedAcceptanceProvenanceModesAndIntermediateRevocation` |
-| Revocation denies cache, in-flight result, citation, and replay within SLO | `internal/knowledge/authorized/permissioned_acceptance_test.go: TestPermissionedAcceptanceRevocationSLO`; `internal/runtime/permissioned_acceptance_test.go: TestPermissionedAcceptanceRevocationDeniesCacheCitationAndSessionReplay`, `TestPermissionedAcceptanceRevocationPropagationPercentiles` |
-| Content success plus ACL failure is non-serving and skew-bounded | `internal/catalog/permissioned_acceptance_test.go: TestPermissionedAcceptanceContentSuccessACLFailureNeverServes` |
-| Timeout or partial authorization fails closed | `internal/knowledge/authorized/permissioned_acceptance_test.go: TestPermissionedAcceptanceAuthorizationFailuresFailClosed`; malformed/extra/wrong-model cases remain anchored in `internal/authz/openfga_test.go` |
-| Count, exists, autocomplete, pagination, errors, traces, debug, and status hide canaries | `internal/runtime/permissioned_acceptance_test.go: TestPermissionedAcceptanceSideChannelSurfacesHideCanaries`, `TestPermissionedAcceptanceProtectedReplayFailsClosed` |
-| Cross-tenant candidates stop before authorization, content, or generation | `internal/knowledge/authorized/permissioned_acceptance_test.go: TestPermissionedAcceptanceCrossTenantStopsBeforeContentBoundaries` |
-| Reconciliation removes stale content and tuples | `internal/catalog/permissioned_acceptance_test.go: TestPermissionedAcceptanceReconciliationRemovesStaleContent`; `internal/authz/permissioned_acceptance_test.go: TestPermissionedAcceptanceReconciliationRemovesStaleTuples` |
-
-`count`, `exists`, `autocomplete`, and pagination are not exposed by the current
-permissioned primitive or CLI surface. Their Phase 1 assertion is therefore
-surface closure: unknown methods and unknown response fields fail, and denied
-resource existence is indistinguishable from absence. Any future endpoint must
-add a policy-oracle and canary test before it is exposed.
+Component tests remain defense in depth; all implemented rows name concrete
+paths and the built-binary gate remains authoritative over its runtime scenarios.
 
 ## Failure diagnostics
 
-Acceptance failures identify the invariant and version boundary without
-including content. Knowledge/runtime tests use `projection` and `authz_model`
-(`authz` is an accepted short form); catalog tests use `projection_version` and
-`authz_version`:
+Acceptance output identifies only a fixed invariant slug, scenario/stage class,
+sample number, aggregate expected/actual value, and duration/budget class. Lists
+and records are deterministic and sorted. Public authorization timeout,
+unavailable, malformed, stale-revision, and provider failures remain generic.
 
-```text
-invariant=<slug> projection=<version> authz_model=<id>:
-sample=<n> expected=<metadata-only value> actual=<metadata-only value>
-```
+Do not use `set -x`, print environment variables, dump OpenFGA requests or
+responses, expose provider stdout/stderr, or include source/artifact/session
+bodies in a failure report. A telemetry sink problem is diagnosed through file
+existence, ownership, permissions, and free space outside the TUI; it never
+changes the protected test oracle.
 
-Lists are sorted by resource ID. Authorization timeouts and malformed responses
-must report the generic fail-closed class at the public boundary; detailed
-transport errors remain test-local.
+## Optional live counterpart
 
-## Phase 2 deterministic gate
-
-Issue #61 extends the original Phase 1 oracle with a multi-hop fixture and the
-production authorization-aware service. These tests run with synthetic clocks
-and fixed local policy decisions; no network endpoint or credential is used.
-
-| Phase 2 invariant | Direct deterministic anchor |
-|---|---|
-| Alice/Bob/unknown cohorts, recall/precision/path completeness, per-hop drops, BatchCheck RPCs, P95/P99 | `internal/knowledge/authorized/phase2_permissioned_graph_acceptance_test.go: TestPhase2PermissionedGraphPolicyOracleAcceptanceMetrics` |
-| Hidden Claim, denied intermediate, alternate support, any/all derivation, cycles, fanout/depth/time budgets, cancellation, partial authorization | `internal/knowledge/authorized/phase2_permissioned_graph_acceptance_test.go: TestPhase2PermissionedGraphDerivationBudgetsAndFailures` |
-| Traversal/cache/citation/session replay closes after revocation; graph revocation P95/P99 stays bounded | `internal/knowledge/authorized/phase2_permissioned_graph_acceptance_test.go: TestPhase2PermissionedGraphCacheCitationRevocationAndSessionReplay`; `TestPhase2PermissionedGraphRevocationLatencyBudget`; `internal/runtime/phase2_graph_replay_acceptance_test.go` |
-| Mixed-visibility count/exists/autocomplete/pagination/error/trace/debug/audit surfaces are canary-free and not-found timing cohorts stay within budget | `internal/runtime/permissioned_acceptance_test.go: TestPermissionedAcceptanceSideChannelSurfacesHideCanaries`; `internal/runtime/phase2_protected_surfaces_acceptance_test.go: TestPhase2ProtectedSurfacesAcceptanceAreTypedAndCanaryFree` |
-| Cross-tenant input stops before search, graph, or generation | `internal/runtime/phase2_protected_surfaces_acceptance_test.go: TestPhase2ProtectedSurfacesAcceptanceCrossTenantStopsBeforeSearchGraphAndGenerate` |
-| Full replacement removes stale content, bindings, Claims, and tuple snapshots; content/ACL/index/graph projection skew stays bounded | `internal/catalog/phase2_full_reconciliation_acceptance_test.go`; `internal/authz/phase2_full_reconciliation_acceptance_test.go` |
-
-The live counterpart is intentionally separate from CI. Run the exact pinned,
+After both mandatory deterministic gates pass, an operator may run the pinned
 public-synthetic OpenFGA + OpenSPG/KAG procedure in
-`docs/permissioned-kag-real-smoke.md`. A release claim requires both the
-deterministic gate and that live smoke to pass.
+`docs/permissioned-kag-real-smoke.md`. Its service compatibility evidence is
+useful, but a skip or unavailable Docker environment does not weaken the
+deterministic security gate, and a live pass does not compensate for a missing
+built-binary pass.

@@ -104,6 +104,7 @@ func TestPermissionedRuntimeConfigIsExplicitAndComplete(t *testing.T) {
 		permissionedEnabledEnv, permissionedPrincipalEnv, permissionedIdentityWatermarkEnv,
 		permissionedProviderEnv, openFGAEndpointEnv, openFGAStoreIDEnv, openFGAModelIDEnv,
 		openFGATimeoutEnv, openFGAConsistencyEnv, "KNOTE_OPENFGA_API_TOKEN",
+		permissionedTelemetryPathEnv,
 	} {
 		t.Setenv(name, "")
 	}
@@ -124,10 +125,20 @@ func TestPermissionedRuntimeConfigIsExplicitAndComplete(t *testing.T) {
 	t.Setenv(openFGAStoreIDEnv, "01ARZ3NDEKTSV4RRFFQ69G5FAV")
 	t.Setenv(openFGAModelIDEnv, "01ARZ3NDEKTSV4RRFFQ69G5FAW")
 	t.Setenv("KNOTE_OPENFGA_API_TOKEN", "test-token")
+	telemetryPath := filepath.Join(t.TempDir(), "telemetry.jsonl")
+	t.Setenv(permissionedTelemetryPathEnv, telemetryPath)
 	config, err = loadPermissionedRuntimeConfig(false)
 	if err != nil || !config.Enabled || config.Fake || config.Provider != "permissioned_provider:create" {
 		t.Fatalf("real config = %+v, %v", config, err)
 	}
+	if config.TelemetryPath != telemetryPath {
+		t.Fatalf("telemetry path = %q", config.TelemetryPath)
+	}
+	t.Setenv(permissionedTelemetryPathEnv, "relative/telemetry.jsonl")
+	if _, err := loadPermissionedRuntimeConfig(false); err == nil || !strings.Contains(err.Error(), permissionedTelemetryPathEnv) {
+		t.Fatalf("relative telemetry path should fail closed, got %v", err)
+	}
+	t.Setenv(permissionedTelemetryPathEnv, telemetryPath)
 	if _, err := loadPermissionedRuntimeConfig(true); err == nil {
 		t.Fatal("real and fake permissioned modes were both accepted")
 	}
@@ -296,6 +307,7 @@ func clearEinoEnv(t *testing.T) {
 		openFGAModelIDEnv,
 		openFGATimeoutEnv,
 		openFGAConsistencyEnv,
+		permissionedTelemetryPathEnv,
 		authz.APITokenEnv,
 		"OPENAI_MODEL",
 		"OPENAI_API_KEY",

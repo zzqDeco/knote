@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -30,6 +31,7 @@ const (
 	openFGAModelIDEnv                = "KNOTE_OPENFGA_MODEL_ID"
 	openFGATimeoutEnv                = "KNOTE_OPENFGA_TIMEOUT"
 	openFGAConsistencyEnv            = "KNOTE_OPENFGA_CONSISTENCY"
+	permissionedTelemetryPathEnv     = "KNOTE_PERMISSIONED_TELEMETRY_PATH"
 
 	permissionedQueryCacheSize   = 64
 	permissionedRetrieverVersion = "permissioned-retriever-v1"
@@ -45,6 +47,7 @@ type permissionedRuntimeConfig struct {
 	Principal         string
 	IdentityWatermark string
 	Provider          string
+	TelemetryPath     string
 	OpenFGA           authz.OpenFGAConfig
 	Consistency       protocol.ConsistencyPreference
 }
@@ -69,10 +72,20 @@ func loadPermissionedRuntimeConfig(fake bool) (permissionedRuntimeConfig, error)
 		if err != nil {
 			return permissionedRuntimeConfig{}, err
 		}
-		return permissionedRuntimeConfig{Enabled: true, Fake: true, Principal: principal}, nil
+		telemetryPath, err := optionalPermissionedTelemetryPath()
+		if err != nil {
+			return permissionedRuntimeConfig{}, err
+		}
+		return permissionedRuntimeConfig{
+			Enabled: true, Fake: true, Principal: principal, TelemetryPath: telemetryPath,
+		}, nil
 	}
 	if requested != "1" {
 		return permissionedRuntimeConfig{}, nil
+	}
+	telemetryPath, err := optionalPermissionedTelemetryPath()
+	if err != nil {
+		return permissionedRuntimeConfig{}, err
 	}
 
 	principal, err := requiredPermissionedEnv(permissionedPrincipalEnv)
@@ -124,12 +137,21 @@ func loadPermissionedRuntimeConfig(fake bool) (permissionedRuntimeConfig, error)
 	}
 	return permissionedRuntimeConfig{
 		Enabled: true, Principal: principal, IdentityWatermark: identityWatermark, Provider: provider,
+		TelemetryPath: telemetryPath,
 		OpenFGA: authz.OpenFGAConfig{
 			Endpoint: endpoint, StoreID: storeID, AuthorizationModelID: modelID,
 			Timeout: timeout, Consistency: consistency,
 		},
 		Consistency: protocolConsistency,
 	}, nil
+}
+
+func optionalPermissionedTelemetryPath() (string, error) {
+	path := strings.TrimSpace(os.Getenv(permissionedTelemetryPathEnv))
+	if path != "" && !filepath.IsAbs(path) {
+		return "", fmt.Errorf("%s must be an absolute path", permissionedTelemetryPathEnv)
+	}
+	return path, nil
 }
 
 func requiredPermissionedEnv(name string) (string, error) {
@@ -153,9 +175,11 @@ func newPermissionedApplication(
 	if err != nil {
 		return nil, err
 	}
+	telemetrySink := newPermissionedTelemetrySink(config.TelemetryPath)
 	if config.Fake {
 		application, err := fixture.NewApplication(backend, fixture.ApplicationOptions{
 			Cache: cache, RetrieverVersion: permissionedRetrieverVersion, PromptVersion: permissionedPromptVersion,
+			Telemetry: telemetrySink,
 		})
 		if err != nil {
 			return nil, err
@@ -191,6 +215,7 @@ func newPermissionedApplication(
 		KAG: backend, Authorizer: authorizer, Loader: loader, Cache: cache,
 		RetrieverVersion: permissionedRetrieverVersion, PromptVersion: permissionedPromptVersion,
 		RetrieveLimit: 20, EvidenceLimit: 8, Traversal: productionTraversalConfig(),
+		Telemetry: telemetrySink,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("initialize permissioned query service: %w", err)
