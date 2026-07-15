@@ -71,15 +71,25 @@ func (m *Manager) filterPersistedEvents(
 	filtered := make([]protocol.Event, 0, len(events))
 	permissionedReplay := m.deps.AuthorizationContextProvider != nil
 	slashTurn := false
+	diffTurn := false
 	turnSessionID := ""
 	classifiedSafeTool := false
 	permissionedTurn := false
 	for _, event := range events {
 		if event.Type == protocol.EventUserMessage {
 			slashTurn = strings.HasPrefix(strings.TrimSpace(event.Message), "/")
+			diffTurn = permissionedReplay && diffSlashReplayTurn(event)
 			turnSessionID = event.SessionID
 			classifiedSafeTool = false
 			permissionedTurn = false
+		}
+		if permissionedReplay && (diffTurn || historicalDiffReplayEvent(event)) {
+			if event.Type == protocol.EventAssistantDone || event.Type == protocol.EventError {
+				slashTurn = false
+				diffTurn = false
+				classifiedSafeTool = false
+			}
+			continue
 		}
 		if event.ProtectedContent != nil {
 			slashTurn = false
@@ -116,6 +126,18 @@ func (m *Manager) filterPersistedEvents(
 		filtered = append(filtered, event)
 	}
 	return filtered
+}
+
+func diffSlashReplayTurn(event protocol.Event) bool {
+	if event.Type != protocol.EventUserMessage {
+		return false
+	}
+	command, _ := parseSlash(event.Message)
+	return command == "diff"
+}
+
+func historicalDiffReplayEvent(event protocol.Event) bool {
+	return event.Type == protocol.EventVersionDiff || eventToolName(event.Payload) == einotools.NameDiff
 }
 
 func classifiedSafeToolReplayEvent(event protocol.Event, turnSessionID, currentSessionID string) bool {

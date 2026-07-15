@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -88,16 +89,20 @@ func TestFilterPersistedEventsRejectsMalformedBlocksWithoutAuthorization(t *test
 
 func TestFilterPersistedEventsKeepsLegacyBehaviorWithoutPermissionedSessions(t *testing.T) {
 	events := []protocol.Event{
-		protocol.NewEvent(protocol.EventAssistantDone, "sess_legacy", "legacy answer", nil),
+		protocol.NewEvent(protocol.EventUserMessage, "sess_legacy", "/diff UNPERMISSIONED_DIFF_USER_CANARY", nil),
+		protocol.NewEvent(protocol.EventToolStart, "sess_legacy", "UNPERMISSIONED_DIFF_START_CANARY", map[string]string{"tool": einotools.NameDiff}),
+		protocol.NewEvent(protocol.EventToolComplete, "sess_legacy", "UNPERMISSIONED_DIFF_COMPLETE_CANARY", map[string]string{"tool": einotools.NameDiff}),
+		protocol.NewEvent(protocol.EventVersionDiff, "sess_legacy", "UNPERMISSIONED_VERSION_DIFF_CANARY", map[string]string{"diff": "UNPERMISSIONED_VERSION_DIFF_CANARY"}),
+		protocol.NewEvent(protocol.EventAssistantDone, "sess_legacy", "UNPERMISSIONED_DIFF_ANSWER_CANARY", map[string]string{"source": "slash", "tool": einotools.NameDiff}),
 		protocol.NewEvent(protocol.EventError, "sess_legacy", "legacy error", nil),
 	}
 	filtered := New(Dependencies{}).filterPersistedEvents(context.Background(), protocol.AuthorizationContext{}, events)
-	if len(filtered) != len(events) || !hasMessage(filtered, protocol.EventAssistantDone, "legacy answer") {
+	if !reflect.DeepEqual(filtered, events) {
 		t.Fatalf("non-permissioned replay changed: %+v", filtered)
 	}
 }
 
-func TestFilterPersistedEventsPreservesUnprotectedSlashResponsesAndToolSummaries(t *testing.T) {
+func TestFilterPersistedEventsPreservesOrdinaryUnprotectedSlashResponses(t *testing.T) {
 	authorization := testAuthorizationContext("sess_replay")
 	events := []protocol.Event{
 		protocol.NewEvent(protocol.EventUserMessage, authorization.SessionID, "/help", nil),
@@ -106,9 +111,6 @@ func TestFilterPersistedEventsPreservesUnprotectedSlashResponsesAndToolSummaries
 		protocol.NewEvent(protocol.EventAssistantDone, authorization.SessionID, "details response", map[string]any{"source": "slash", "overlay": "details"}),
 		protocol.NewEvent(protocol.EventUserMessage, authorization.SessionID, "/settings", nil),
 		protocol.NewEvent(protocol.EventError, authorization.SessionID, "settings error", nil),
-		protocol.NewEvent(protocol.EventUserMessage, authorization.SessionID, "/diff", nil),
-		protocol.NewEvent(protocol.EventToolComplete, authorization.SessionID, "diff summary", map[string]string{"tool": einotools.NameDiff}),
-		protocol.NewEvent(protocol.EventAssistantDone, authorization.SessionID, "direct tool summary", map[string]string{"source": "slash"}),
 		protocol.NewEvent(protocol.EventUserMessage, authorization.SessionID, "protected legacy prompt", nil),
 		protocol.NewEvent(protocol.EventAssistantDone, authorization.SessionID, "LEGACY_ANSWER_CANARY", nil),
 		protocol.NewEvent(protocol.EventError, authorization.SessionID, "LEGACY_ERROR_CANARY", nil),
@@ -125,10 +127,107 @@ func TestFilterPersistedEventsPreservesUnprotectedSlashResponsesAndToolSummaries
 		"/help", "help response",
 		"/details", "details response",
 		"/settings", "settings error",
-		"/diff", "diff summary", "direct tool summary",
 		"protected legacy prompt",
 	}
 	assertEventMessages(t, filtered, want)
+}
+
+func TestFilterPersistedEventsDropsCompleteHistoricalDiffTurnsInPermissionedReplay(t *testing.T) {
+	authorization := testAuthorizationContext("sess_diff_turn")
+	events := []protocol.Event{
+		protocol.NewEvent(protocol.EventStatusUpdate, authorization.SessionID, "SAFE_BEFORE_DIFF_CANARY", nil),
+		protocol.NewEvent(protocol.EventUserMessage, authorization.SessionID, "/diff FULL_DIFF_USER_CANARY", nil),
+		protocol.NewEvent(protocol.EventToolStart, authorization.SessionID, "FULL_DIFF_TOOL_START_CANARY", map[string]string{"tool": einotools.NameDiff}),
+		protocol.NewEvent(protocol.EventToolProgress, authorization.SessionID, "FULL_DIFF_TOOL_PROGRESS_CANARY", map[string]string{"tool": einotools.NameDiff}),
+		protocol.NewEvent(protocol.EventToolComplete, authorization.SessionID, "FULL_DIFF_TOOL_COMPLETE_CANARY", map[string]any{"tool": einotools.NameDiff, "result": "FULL_DIFF_RESULT_CANARY"}),
+		protocol.NewEvent(protocol.EventVersionDiff, authorization.SessionID, "FULL_VERSION_DIFF_CANARY", map[string]string{"diff": "FULL_VERSION_DIFF_PAYLOAD_CANARY"}),
+		protocol.NewEvent(protocol.EventAssistantDone, authorization.SessionID, "FULL_DIFF_SLASH_COMPLETION_CANARY", map[string]string{"source": "slash", "tool": einotools.NameDiff}),
+		protocol.NewEvent(protocol.EventUserMessage, authorization.SessionID, "/diff FULL_DIFF_ERROR_USER_CANARY", nil),
+		protocol.NewEvent(protocol.EventToolStart, authorization.SessionID, "FULL_DIFF_ERROR_START_CANARY", map[string]string{"tool": einotools.NameDiff}),
+		protocol.NewEvent(protocol.EventToolError, authorization.SessionID, "FULL_DIFF_TOOL_ERROR_CANARY", map[string]string{"tool": einotools.NameDiff}),
+		protocol.NewEvent(protocol.EventError, authorization.SessionID, "FULL_DIFF_SLASH_ERROR_CANARY", map[string]string{"source": "slash"}),
+		protocol.NewEvent(protocol.EventUserMessage, authorization.SessionID, "/different", nil),
+		protocol.NewEvent(protocol.EventError, authorization.SessionID, "SAFE_NEAR_MATCH_SLASH_CANARY", nil),
+		protocol.NewEvent(protocol.EventUserMessage, authorization.SessionID, "/help", nil),
+		protocol.NewEvent(protocol.EventAssistantDone, authorization.SessionID, "SAFE_HELP_AFTER_DIFF_CANARY", map[string]string{"source": "slash"}),
+		protocol.NewEvent(protocol.EventStatusUpdate, authorization.SessionID, "SAFE_AFTER_DIFF_CANARY", nil),
+	}
+	manager := New(Dependencies{AuthorizationContextProvider: testAuthorizationContextProvider})
+
+	filtered := manager.filterPersistedEvents(context.Background(), authorization, events)
+	assertEventMessages(t, filtered, []string{
+		"SAFE_BEFORE_DIFF_CANARY",
+		"/different", "SAFE_NEAR_MATCH_SLASH_CANARY",
+		"/help", "SAFE_HELP_AFTER_DIFF_CANARY",
+		"SAFE_AFTER_DIFF_CANARY",
+	})
+	encoded := eventsText(filtered)
+	for _, canary := range []string{
+		"FULL_DIFF_USER_CANARY",
+		"FULL_DIFF_TOOL_START_CANARY",
+		"FULL_DIFF_TOOL_PROGRESS_CANARY",
+		"FULL_DIFF_TOOL_COMPLETE_CANARY",
+		"FULL_DIFF_RESULT_CANARY",
+		"FULL_VERSION_DIFF_CANARY",
+		"FULL_VERSION_DIFF_PAYLOAD_CANARY",
+		"FULL_DIFF_SLASH_COMPLETION_CANARY",
+		"FULL_DIFF_ERROR_USER_CANARY",
+		"FULL_DIFF_ERROR_START_CANARY",
+		"FULL_DIFF_TOOL_ERROR_CANARY",
+		"FULL_DIFF_SLASH_ERROR_CANARY",
+	} {
+		if strings.Contains(encoded, canary) {
+			t.Fatalf("permissioned replay retained complete /diff canary %q: %s", canary, encoded)
+		}
+	}
+}
+
+func TestFilterPersistedEventsDropsOrphanedHistoricalDiffArtifactsBeforeSlashPreservation(t *testing.T) {
+	authorization := testAuthorizationContext("sess_orphaned_diff")
+	events := []protocol.Event{
+		protocol.NewEvent(protocol.EventStatusUpdate, authorization.SessionID, "SAFE_BEFORE_ORPHANS_CANARY", nil),
+		protocol.NewEvent(protocol.EventToolStart, authorization.SessionID, "ORPHAN_DIFF_START_CANARY", map[string]string{"source": "slash", "tool": einotools.NameDiff}),
+		protocol.NewEvent(protocol.EventToolProgress, authorization.SessionID, "ORPHAN_DIFF_PROGRESS_CANARY", map[string]string{"source": "slash", "tool": einotools.NameDiff}),
+		protocol.NewEvent(protocol.EventToolComplete, authorization.SessionID, "ORPHAN_DIFF_COMPLETE_CANARY", map[string]string{
+			"source":       "slash",
+			"tool":         einotools.NameDiff,
+			"replay_class": SafeToolAssistantReplayClassV1,
+		}),
+		protocol.NewEvent(protocol.EventVersionDiff, authorization.SessionID, "ORPHAN_VERSION_DIFF_CANARY", map[string]string{"source": "slash", "diff": "ORPHAN_VERSION_PAYLOAD_CANARY"}),
+		protocol.NewEvent(protocol.EventAssistantDone, authorization.SessionID, "ORPHAN_DIFF_COMPLETION_CANARY", map[string]string{
+			"source":       "slash",
+			"tool":         einotools.NameDiff,
+			"replay_class": SafeToolAssistantReplayClassV1,
+		}),
+		protocol.NewEvent(protocol.EventToolError, authorization.SessionID, "ORPHAN_DIFF_TOOL_ERROR_CANARY", map[string]string{"source": "slash", "tool": einotools.NameDiff}),
+		protocol.NewEvent(protocol.EventError, authorization.SessionID, "ORPHAN_DIFF_SLASH_ERROR_CANARY", map[string]string{"source": "slash", "tool": einotools.NameDiff}),
+		protocol.NewEvent(protocol.EventUserMessage, authorization.SessionID, "/help", nil),
+		protocol.NewEvent(protocol.EventAssistantDone, authorization.SessionID, "SAFE_HELP_AFTER_ORPHANS_CANARY", map[string]string{"source": "slash"}),
+		protocol.NewEvent(protocol.EventStatusUpdate, authorization.SessionID, "SAFE_AFTER_ORPHANS_CANARY", nil),
+	}
+	manager := New(Dependencies{AuthorizationContextProvider: testAuthorizationContextProvider})
+
+	filtered := manager.filterPersistedEvents(context.Background(), authorization, events)
+	assertEventMessages(t, filtered, []string{
+		"SAFE_BEFORE_ORPHANS_CANARY",
+		"/help", "SAFE_HELP_AFTER_ORPHANS_CANARY",
+		"SAFE_AFTER_ORPHANS_CANARY",
+	})
+	encoded := eventsText(filtered)
+	for _, canary := range []string{
+		"ORPHAN_DIFF_START_CANARY",
+		"ORPHAN_DIFF_PROGRESS_CANARY",
+		"ORPHAN_DIFF_COMPLETE_CANARY",
+		"ORPHAN_VERSION_DIFF_CANARY",
+		"ORPHAN_VERSION_PAYLOAD_CANARY",
+		"ORPHAN_DIFF_COMPLETION_CANARY",
+		"ORPHAN_DIFF_TOOL_ERROR_CANARY",
+		"ORPHAN_DIFF_SLASH_ERROR_CANARY",
+	} {
+		if strings.Contains(encoded, canary) {
+			t.Fatalf("permissioned replay retained orphaned /diff canary %q: %s", canary, encoded)
+		}
+	}
 }
 
 func TestFilterPersistedEventsAcceptsOnlyCorroboratedSafeToolAssistantClass(t *testing.T) {
@@ -145,23 +244,23 @@ func TestFilterPersistedEventsAcceptsOnlyCorroboratedSafeToolAssistantClass(t *t
 	}
 	events := []protocol.Event{
 		protocol.NewEvent(protocol.EventUserMessage, authorization.SessionID, "safe prompt", nil),
-		classified(protocol.NewEvent(protocol.EventToolComplete, authorization.SessionID, "safe tool", map[string]string{"tool": einotools.NameDiff})),
+		classified(protocol.NewEvent(protocol.EventToolComplete, authorization.SessionID, "safe tool", map[string]string{"tool": einotools.NameVersions})),
 		classified(protocol.NewEvent(protocol.EventAssistantDone, authorization.SessionID, "safe answer", nil)),
 		protocol.NewEvent(protocol.EventUserMessage, authorization.SessionID, "naked forgery", nil),
 		classified(protocol.NewEvent(protocol.EventAssistantDone, authorization.SessionID, "FORGED_NAKED_ANSWER_CANARY", nil)),
 		protocol.NewEvent(protocol.EventUserMessage, authorization.SessionID, "terminal forgery", nil),
-		classified(protocol.NewEvent(protocol.EventToolComplete, authorization.SessionID, "terminal safe tool", map[string]string{"tool": einotools.NameDiff})),
+		classified(protocol.NewEvent(protocol.EventToolComplete, authorization.SessionID, "terminal safe tool", map[string]string{"tool": einotools.NameVersions})),
 		protocol.NewEvent(protocol.EventAssistantDone, authorization.SessionID, "UNCLASSIFIED_TERMINAL_CANARY", nil),
 		classified(protocol.NewEvent(protocol.EventAssistantDone, authorization.SessionID, "FORGED_AFTER_TERMINAL_CANARY", nil)),
 		protocol.NewEvent(protocol.EventUserMessage, authorization.SessionID, "permissioned forgery", nil),
 		classified(protocol.NewEvent(protocol.EventToolComplete, authorization.SessionID, "FORGED_QUERY_TOOL_CANARY", map[string]string{"tool": einotools.NameQuery})),
 		classified(protocol.NewEvent(protocol.EventAssistantDone, authorization.SessionID, "FORGED_QUERY_ANSWER_CANARY", nil)),
 		protocol.NewEvent(protocol.EventUserMessage, authorization.SessionID, "mixed forgery", nil),
-		classified(protocol.NewEvent(protocol.EventToolComplete, authorization.SessionID, "mixed safe tool", map[string]string{"tool": einotools.NameDiff})),
+		classified(protocol.NewEvent(protocol.EventToolComplete, authorization.SessionID, "mixed safe tool", map[string]string{"tool": einotools.NameVersions})),
 		protectedTestEvent(protocol.EventToolComplete, authorization.SessionID, "allowed protected tool", map[string]string{"tool": einotools.NameQuery}, binding),
 		classified(protocol.NewEvent(protocol.EventAssistantDone, authorization.SessionID, "FORGED_MIXED_ANSWER_CANARY", nil)),
 		protocol.NewEvent(protocol.EventUserMessage, authorization.SessionID, "malformed class", nil),
-		classified(protocol.NewEvent(protocol.EventToolComplete, authorization.SessionID, "malformed safe tool", map[string]string{"tool": einotools.NameDiff})),
+		classified(protocol.NewEvent(protocol.EventToolComplete, authorization.SessionID, "malformed safe tool", map[string]string{"tool": einotools.NameVersions})),
 		protocol.NewEvent(protocol.EventAssistantDone, authorization.SessionID, "MALFORMED_CLASS_ANSWER_CANARY", map[string]string{"replay_class": "safe-tool-assistant/v2"}),
 		protocol.NewEvent(protocol.EventUserMessage, authorization.SessionID, "legacy permissioned prompt", nil),
 		protocol.NewEvent(protocol.EventToolComplete, authorization.SessionID, "LEGACY_QUERY_TOOL_CANARY", map[string]string{"tool": einotools.NameQuery}),
@@ -206,7 +305,7 @@ func TestFilterPersistedEventsDropsProtectedContentWhenAuthorizationUnavailable(
 		protocol.NewEvent(protocol.EventUserMessage, authorization.SessionID, "/help", nil),
 		protocol.NewEvent(protocol.EventAssistantDone, authorization.SessionID, "safe slash response", map[string]string{"source": "slash"}),
 		protectedTestEvent(protocol.EventAssistantDone, authorization.SessionID, "PROTECTED_ANSWER_CANARY", nil, binding),
-		protocol.NewEvent(protocol.EventToolComplete, authorization.SessionID, "safe tool summary", map[string]string{"tool": einotools.NameDiff}),
+		protocol.NewEvent(protocol.EventToolComplete, authorization.SessionID, "safe tool summary", map[string]string{"tool": einotools.NameVersions}),
 		protocol.NewEvent(protocol.EventStatusUpdate, authorization.SessionID, "after", nil),
 	}
 
@@ -244,7 +343,7 @@ func TestFilterPersistedEventsPreservesMixedHistoryOrder(t *testing.T) {
 		protocol.NewEvent(protocol.EventUserMessage, authorization.SessionID, "/help", nil),
 		protocol.NewEvent(protocol.EventAssistantDone, authorization.SessionID, "slash answer", map[string]string{"source": "slash"}),
 		protectedTestEvent(protocol.EventToolComplete, authorization.SessionID, "denied tool", map[string]string{"tool": einotools.NameExplain}, denied),
-		protocol.NewEvent(protocol.EventToolComplete, authorization.SessionID, "local tool", map[string]string{"tool": einotools.NameDiff}),
+		protocol.NewEvent(protocol.EventToolComplete, authorization.SessionID, "local tool", map[string]string{"tool": einotools.NameVersions}),
 		protectedTestEvent(protocol.EventToolComplete, authorization.SessionID, "allowed tool", map[string]string{"tool": einotools.NameQuery}, allowed),
 		protocol.NewEvent(protocol.EventStatusUpdate, authorization.SessionID, "last", nil),
 	}
@@ -484,7 +583,7 @@ func appendSafeToolAndLegacyHistory(t *testing.T, stored local.Store, authorizat
 		protocol.NewEvent(protocol.EventUserMessage, authorization.SessionID, "safe prompt", nil),
 		protocol.NewEvent(protocol.EventAssistantStart, authorization.SessionID, "eino runner started", nil),
 		protocol.NewEvent(protocol.EventToolComplete, authorization.SessionID, "SAFE_CLASSIFIED_TOOL_CANARY", map[string]string{
-			"tool":         einotools.NameDiff,
+			"tool":         einotools.NameVersions,
 			"replay_class": "safe-tool-assistant/v1",
 		}),
 		protocol.NewEvent(protocol.EventAssistantDone, authorization.SessionID, "SAFE_CLASSIFIED_ANSWER_CANARY", map[string]string{
@@ -510,7 +609,7 @@ func appendMixedReplayHistory(t *testing.T, stored local.Store, authorization pr
 		protocol.NewEvent(protocol.EventUserMessage, authorization.SessionID, "/help", nil),
 		protocol.NewEvent(protocol.EventAssistantDone, authorization.SessionID, "SAFE_SLASH_RESPONSE", map[string]string{"source": "slash", "overlay": "help"}),
 		protectedTestEvent(protocol.EventToolComplete, authorization.SessionID, "PROTECTED_TOOL_CANARY", map[string]string{"tool": einotools.NameQuery}, binding),
-		protocol.NewEvent(protocol.EventToolComplete, authorization.SessionID, "SAFE_TOOL_SUMMARY", map[string]string{"tool": einotools.NameDiff}),
+		protocol.NewEvent(protocol.EventToolComplete, authorization.SessionID, "SAFE_TOOL_SUMMARY", map[string]string{"tool": einotools.NameVersions}),
 		protocol.NewEvent(protocol.EventUserMessage, authorization.SessionID, "SAFE_USER_AFTER", nil),
 		protocol.NewEvent(protocol.EventStatusUpdate, authorization.SessionID, "SAFE_STATUS_AFTER", nil),
 		protectedTestEvent(protocol.EventAssistantDone, authorization.SessionID, "PROTECTED_ANSWER_CANARY", nil, binding),

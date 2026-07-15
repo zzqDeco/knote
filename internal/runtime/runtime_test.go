@@ -897,20 +897,72 @@ func TestRuntimeEinoModeRevalidatesAuthorizationBeforeApprovedSideEffect(t *test
 			if !hasMessage(events, protocol.EventError, test.wantError) {
 				t.Fatalf("authorization change was not rejected: %+v", events)
 			}
+			if len(events) != 2 || events[0].Type != protocol.EventError || events[1].Type != protocol.EventConfirmRequest {
+				t.Fatalf("authorization rejection events = %+v, want error then confirm request", events)
+			}
+			retry := firstConfirm(t, events)
+			if retry != confirm {
+				t.Fatalf("retry confirmation = %+v, want canonical request %+v", retry, confirm)
+			}
 			if einoRunner.executions != 0 {
 				t.Fatalf("stale side-effect executed %d times", einoRunner.executions)
 			}
 
 			current = original
 			providerErr = nil
-			events = rt.Confirm(context.Background(), confirm, true)
-			if hasEvent(events, protocol.EventError) || !hasEvent(events, protocol.EventToolComplete) {
+			events = rt.Confirm(context.Background(), retry, true)
+			if hasEvent(events, protocol.EventError) || hasEvent(events, protocol.EventConfirmRequest) || !hasEvent(events, protocol.EventToolComplete) {
 				t.Fatalf("pending confirmation was consumed by authorization rejection: %+v", events)
 			}
 			if einoRunner.executions != 1 || !einoRunner.executionAuthorizationBound || einoRunner.executionAuthorization != original {
 				t.Fatalf("revalidated execution = count:%d bound:%t context:%+v", einoRunner.executions, einoRunner.executionAuthorizationBound, einoRunner.executionAuthorization)
 			}
+
+			providerErr = fmt.Errorf("identity provider unavailable again")
+			events = rt.Confirm(context.Background(), retry, true)
+			if len(events) != 1 || events[0].Type != protocol.EventError || hasEvent(events, protocol.EventConfirmRequest) {
+				t.Fatalf("stale confirmation was re-emitted after consumption: %+v", events)
+			}
+			if einoRunner.executions != 1 {
+				t.Fatalf("stale confirmation executed side-effect %d times, want 1", einoRunner.executions)
+			}
 		})
+	}
+}
+
+func TestRuntimeEinoModeDoesNotRetryPostConsumptionExecutionFailure(t *testing.T) {
+	workspace := t.TempDir()
+	bridge := NewSideEffectBridge()
+	einoRunner := &sideEffectEinoRunner{
+		bridge:       bridge,
+		executionErr: fmt.Errorf("workspace write failed"),
+	}
+	rt := New(Dependencies{
+		Workspace:    workspace,
+		Sessions:     local.New(workspace),
+		EinoRunner:   einoRunner,
+		SideEffects:  bridge,
+		NewSessionID: func() string { return "sess_eino" },
+	})
+	if _, err := rt.Start(context.Background(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	confirm := firstConfirm(t, rt.SendMessage(context.Background(), "build knowledge"))
+
+	events := rt.Confirm(context.Background(), confirm, true)
+	if !hasMessage(events, protocol.EventError, "workspace write failed") || hasEvent(events, protocol.EventConfirmRequest) {
+		t.Fatalf("post-consumption execution failure became retryable: %+v", events)
+	}
+	if einoRunner.executions != 1 {
+		t.Fatalf("failed side-effect executions = %d, want 1", einoRunner.executions)
+	}
+
+	events = rt.Confirm(context.Background(), confirm, true)
+	if !hasMessage(events, protocol.EventError, "confirmation is not pending or has already been used") || hasEvent(events, protocol.EventConfirmRequest) {
+		t.Fatalf("consumed confirmation was not cleared: %+v", events)
+	}
+	if einoRunner.executions != 1 {
+		t.Fatalf("consumed confirmation executed side-effect %d times, want 1", einoRunner.executions)
 	}
 }
 
@@ -1278,6 +1330,7 @@ func (e *fakeToolExecutor) Invoke(ctx context.Context, sessionID string, toolNam
 type sideEffectEinoRunner struct {
 	bridge                      *SideEffectBridge
 	executions                  int
+	executionErr                error
 	executionAuthorization      protocol.AuthorizationContext
 	executionAuthorizationBound bool
 }
@@ -1299,6 +1352,9 @@ func (r *sideEffectEinoRunner) Run(ctx context.Context, input EinoRunInput) ([]p
 		Execute: func(ctx context.Context, _ SideEffectRequest) ([]protocol.Event, error) {
 			r.executions++
 			r.executionAuthorization, r.executionAuthorizationBound = protocol.AuthorizationContextFrom(ctx)
+			if r.executionErr != nil {
+				return nil, r.executionErr
+			}
 			return []protocol.Event{
 				protocol.NewEvent(protocol.EventToolComplete, input.SessionID, "knote_build complete", map[string]string{"tool": "knote_build"}),
 			}, nil

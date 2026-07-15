@@ -4,8 +4,11 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+
+	einotool "github.com/cloudwego/eino/components/tool"
 
 	einotools "github.com/zzqDeco/knote/internal/eino/tools"
 	"github.com/zzqDeco/knote/internal/knowledge/kag"
@@ -128,46 +131,72 @@ func TestPermissionedApplicationOnlyWiresCachedRevocationPathInFakeMode(t *testi
 	}
 }
 
-func TestPermissionedToolsAreNotSelectedWithoutImplementedPrimitives(t *testing.T) {
+func TestPermissionedToolsUseExactModeToolSets(t *testing.T) {
 	service := versioned.New(versioned.Options{})
 	all := einotools.New(service)
-	realMode := permissionedTools(all, false)
-	for _, candidate := range realMode {
-		info, err := candidate.Info(context.Background())
-		if err != nil {
-			t.Fatal(err)
-		}
-		if info.Name == einotools.NameQuery || info.Name == einotools.NameExplain || info.Name == einotools.NameEval {
-			t.Fatalf("real mode selected unsupported permissioned tool %s", info.Name)
-		}
+	tests := []struct {
+		name    string
+		enabled bool
+		want    []string
+	}{
+		{
+			name:    "real mode",
+			enabled: false,
+			want: []string{
+				einotools.NameBuild,
+				einotools.NameCheckout,
+				einotools.NameCommit,
+				einotools.NameDiff,
+				einotools.NameRelease,
+				einotools.NameVersions,
+			},
+		},
+		{
+			name:    "permissioned fake mode",
+			enabled: true,
+			want: []string{
+				einotools.NameBuild,
+				einotools.NameCheckout,
+				einotools.NameCommit,
+				einotools.NameExplain,
+				einotools.NameQuery,
+				einotools.NameRelease,
+				einotools.NameVersions,
+			},
+		},
 	}
-	if got, want := len(realMode), len(all)-3; got != want {
-		t.Fatalf("real-mode tool count = %d, want %d", got, want)
-	}
-	fakeMode := permissionedTools(all, true)
-	if got, want := len(fakeMode), len(all)-1; got != want {
-		t.Fatalf("fake mode tool count = %d, want %d", got, want)
-	}
-	for _, candidate := range fakeMode {
-		info, err := candidate.Info(context.Background())
-		if err != nil {
-			t.Fatal(err)
-		}
-		if info.Name == einotools.NameEval {
-			t.Fatal("fake mode retained eval before authorized explain is implemented")
-		}
-	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			gotTools := toolNames(t, permissionedTools(all, test.enabled))
+			if !slices.Equal(gotTools, test.want) {
+				t.Fatalf("registered tools = %v, want exact set %v", gotTools, test.want)
+			}
 
-	registry := einotools.ByName(service)
-	permissionedToolMap(registry, false)
-	if registry[einotools.NameQuery] != nil || registry[einotools.NameExplain] != nil || registry[einotools.NameEval] != nil {
-		t.Fatal("real-mode approved registry retained query, explain, or eval")
+			registry := permissionedToolMap(einotools.ByName(service), test.enabled)
+			gotRegistry := make([]string, 0, len(registry))
+			for name := range registry {
+				gotRegistry = append(gotRegistry, name)
+			}
+			slices.Sort(gotRegistry)
+			if !slices.Equal(gotRegistry, test.want) {
+				t.Fatalf("approved tool registry = %v, want exact set %v", gotRegistry, test.want)
+			}
+		})
 	}
-	registry = einotools.ByName(service)
-	permissionedToolMap(registry, true)
-	if registry[einotools.NameEval] != nil || registry[einotools.NameQuery] == nil || registry[einotools.NameExplain] == nil {
-		t.Fatal("fake-mode approved registry did not retain only authorized knowledge tools")
+}
+
+func toolNames(t *testing.T, tools []einotool.InvokableTool) []string {
+	t.Helper()
+	names := make([]string, 0, len(tools))
+	for _, candidate := range tools {
+		info, err := candidate.Info(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		names = append(names, info.Name)
 	}
+	slices.Sort(names)
+	return names
 }
 
 func clearEinoEnv(t *testing.T) {

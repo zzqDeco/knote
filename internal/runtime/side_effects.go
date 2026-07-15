@@ -110,6 +110,21 @@ func (b *SideEffectBridge) PendingEvents(sessionID string) []protocol.Event {
 	return nil
 }
 
+func (b *SideEffectBridge) retryEvents(sessionID string, req protocol.ConfirmRequest) []protocol.Event {
+	if b == nil {
+		return nil
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	pending, ok := b.pendingForRequestLocked(sessionID, req)
+	if !ok || !pending.emitted {
+		return nil
+	}
+	return []protocol.Event{
+		protocol.NewEvent(protocol.EventConfirmRequest, pending.request.SessionID, pending.confirm.Title, pending.confirm),
+	}
+}
+
 func (b *SideEffectBridge) Confirm(ctx context.Context, sessionID string, req protocol.ConfirmRequest, approved bool) []protocol.Event {
 	if b == nil {
 		return []protocol.Event{protocol.NewEvent(protocol.EventError, sessionID, "side-effect bridge is not configured", nil)}
@@ -145,6 +160,16 @@ func (b *SideEffectBridge) Confirm(ctx context.Context, sessionID string, req pr
 func (b *SideEffectBridge) consume(sessionID string, req protocol.ConfirmRequest) (pendingSideEffect, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	pending, ok := b.pendingForRequestLocked(sessionID, req)
+	if !ok {
+		return pendingSideEffect{}, false
+	}
+	delete(b.pending, req.RequestID)
+	b.removeQueuedLocked(req.RequestID)
+	return pending, true
+}
+
+func (b *SideEffectBridge) pendingForRequestLocked(sessionID string, req protocol.ConfirmRequest) (pendingSideEffect, bool) {
 	pending, ok := b.pending[req.RequestID]
 	if !ok || pending.request.SessionID != strings.TrimSpace(sessionID) {
 		return pendingSideEffect{}, false
@@ -152,8 +177,6 @@ func (b *SideEffectBridge) consume(sessionID string, req protocol.ConfirmRequest
 	if pending.confirm.Action != req.Action || pending.confirm.Command != req.Command {
 		return pendingSideEffect{}, false
 	}
-	delete(b.pending, req.RequestID)
-	b.removeQueuedLocked(req.RequestID)
 	return pending, true
 }
 
