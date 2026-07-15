@@ -123,6 +123,14 @@ func (s Store) PublishArtifacts(
 	if err := validateArtifactBundleDirectory(bundlesDir); err != nil {
 		return err
 	}
+	publicationLock, err := acquireArtifactPublicationLock(ctx, artifactsDir)
+	if err != nil {
+		return err
+	}
+	defer publicationLock.release()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	bundleDir := filepath.Join(bundlesDir, manifest.ProjectionID)
 	if err := validateArtifactBundleDirectory(bundleDir); err != nil {
 		return err
@@ -145,14 +153,6 @@ func (s Store) PublishArtifacts(
 		return err
 	}
 	defer os.Remove(pointerTemporary)
-	publicationLock, err := acquireArtifactPublicationLock(ctx, artifactsDir)
-	if err != nil {
-		return err
-	}
-	defer publicationLock.release()
-	if err := ctx.Err(); err != nil {
-		return err
-	}
 	if s.beforePointerWrite != nil {
 		if err := s.beforePointerWrite(pointer); err != nil {
 			return err
