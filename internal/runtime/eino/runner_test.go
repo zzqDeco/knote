@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -470,6 +472,61 @@ func TestRunnerBindsAllPermissionedToolOutputsAndAnswerToOneBlock(t *testing.T) 
 	}
 	if bound != 3 {
 		t.Fatalf("permissioned ADK bound events = %d in %+v", bound, events)
+	}
+}
+
+func TestRunnerRedactsPermissionedToolOutputBeforeSessionPersistence(t *testing.T) {
+	workspace := t.TempDir()
+	authorization := testEinoAuthorization("sess_redacted_tool_output")
+	evidencePackage := testEinoEvidencePackage(t, authorization, "sources/private.md", "PRIVATE_EVIDENCE_CONTENT_CANARY")
+	runner := NewRunner(Options{Executor: &fakeExecutor{events: []*adk.AgentEvent{
+		adk.EventFromMessage(schema.ToolMessage(testPermissionedToolOutput(t, evidencePackage, "PRIVATE_TOOL_ANSWER_CANARY"), "call_1", schema.WithToolName("knote_query")), nil, schema.Tool, "knote_query"),
+		adk.EventFromMessage(schema.AssistantMessage("AUTHORIZED_FINAL_ANSWER_CANARY", nil), nil, schema.Assistant, ""),
+	}}})
+	store := local.New(workspace)
+	manager := runtime.New(runtime.Dependencies{
+		Workspace:  workspace,
+		Sessions:   store,
+		EinoRunner: runner,
+		AuthorizationContextProvider: func(context.Context, string) (protocol.AuthorizationContext, error) {
+			return authorization, nil
+		},
+		NewSessionID: func() string { return authorization.SessionID },
+	})
+	if _, err := manager.Start(context.Background(), runtime.StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	produced := manager.SendMessage(context.Background(), "private question")
+	if !hasEventMessage(produced, protocol.EventAssistantDone, "AUTHORIZED_FINAL_ANSWER_CANARY") {
+		t.Fatalf("authorized answer was not produced: %+v", produced)
+	}
+	var redactedToolEvent *protocol.Event
+	for index := range produced {
+		if produced[index].Type == protocol.EventToolComplete {
+			redactedToolEvent = &produced[index]
+			break
+		}
+	}
+	if redactedToolEvent == nil || redactedToolEvent.Message != "knote_query complete" ||
+		eventPayloadString(redactedToolEvent.Payload, "tool") != "knote_query" ||
+		redactedToolEvent.ProtectedContent == nil {
+		t.Fatalf("permissioned tool completion was not reduced to protected metadata: %+v", produced)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(workspace, ".knote", "sessions", authorization.SessionID+".jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	persisted := string(raw)
+	for _, secret := range []string{"PRIVATE_EVIDENCE_CONTENT_CANARY", "PRIVATE_TOOL_ANSWER_CANARY"} {
+		if strings.Contains(persisted, secret) {
+			t.Fatalf("permissioned tool output persisted %q: %s", secret, persisted)
+		}
+	}
+	for _, retained := range []string{"AUTHORIZED_FINAL_ANSWER_CANARY", string(evidencePackage.Items[0].Resource.ResourceID), `"block_id"`} {
+		if !strings.Contains(persisted, retained) {
+			t.Fatalf("permissioned session omitted protected metadata %q: %s", retained, persisted)
+		}
 	}
 }
 

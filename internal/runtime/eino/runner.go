@@ -307,6 +307,7 @@ func bindProjectedEvents(events []protocol.Event, binding *protocol.ProtectedCon
 	for index := range events {
 		event := &events[index]
 		sanitizePermissionedErrors(events[index : index+1])
+		redactPermissionedToolEvent(event)
 		if event.Type == protocol.EventAssistantDone ||
 			event.Type == protocol.EventError ||
 			event.Type == protocol.EventApprovalRequest ||
@@ -316,6 +317,22 @@ func bindProjectedEvents(events []protocol.Event, binding *protocol.ProtectedCon
 			event.ProtectedContent = &copy
 		}
 	}
+}
+
+func redactPermissionedToolEvent(event *protocol.Event) {
+	if event == nil || (event.Type != protocol.EventToolComplete && event.Type != protocol.EventToolError) {
+		return
+	}
+	toolName := eventToolName(event.Payload)
+	if !permissionedToolName(toolName) {
+		return
+	}
+	event.Payload = map[string]string{"tool": toolName}
+	if event.Type == protocol.EventToolError {
+		event.Message = protectedContentUnavailableMessage
+		return
+	}
+	event.Message = toolName + " complete"
 }
 
 func (r *Runner) RunnerConfig(agent adk.Agent) adk.RunnerConfig {
