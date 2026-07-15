@@ -287,6 +287,49 @@ func TestRunnerAllowsSafeNonPermissionedToolAnswerInAuthorizationContext(t *test
 	}
 }
 
+func TestRunnerRejectsSafeToolAssistantAnswerDerivedFromProtectedHistory(t *testing.T) {
+	authorization := testEinoAuthorization("sess_eino")
+	ctx, err := protocol.WithAuthorizationContext(context.Background(), authorization)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidencePackage := testEinoEvidencePackage(t, authorization, "sources/protected.md", "PROTECTED_HISTORY_EVIDENCE_CANARY")
+	binding, err := protocol.NewProtectedContentBinding(authorization, evidencePackage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	protectedAnswer := protocol.NewEvent(protocol.EventAssistantDone, authorization.SessionID, "PROTECTED_HISTORY_ANSWER_CANARY", nil)
+	protectedAnswer.ProtectedContent = &binding
+	runner := NewRunner(Options{Executor: &fakeExecutor{events: []*adk.AgentEvent{
+		adk.EventFromMessage(schema.AssistantMessage("", []schema.ToolCall{{
+			ID: "call_versions", Function: schema.FunctionCall{Name: "knote_versions", Arguments: `{}`},
+		}}), nil, schema.Assistant, ""),
+		adk.EventFromMessage(schema.ToolMessage("SAFE_HISTORY_TOOL_CANARY", "call_versions", schema.WithToolName("knote_versions")), nil, schema.Tool, "knote_versions"),
+		adk.EventFromMessage(schema.AssistantMessage("SAFE_HISTORY_SUMMARY_CANARY", nil), nil, schema.Assistant, ""),
+	}}})
+
+	events, err := runner.Run(ctx, runtime.EinoRunInput{
+		SessionID: authorization.SessionID,
+		Message:   "compare versions",
+		History: []protocol.Event{
+			protocol.NewEvent(protocol.EventUserMessage, authorization.SessionID, "protected question", nil),
+			protectedAnswer,
+		},
+	})
+	if err == nil || err.Error() != protectedContentUnavailableMessage {
+		t.Fatalf("protected-history safe-tool error = %v, want %q: %+v", err, protectedContentUnavailableMessage, events)
+	}
+	encoded := fmt.Sprintf("%+v", events)
+	for _, canary := range []string{"SAFE_HISTORY_TOOL_CANARY", "SAFE_HISTORY_SUMMARY_CANARY", runtime.SafeToolAssistantReplayClassV1} {
+		if strings.Contains(encoded, canary) {
+			t.Fatalf("protected-history safe-tool turn leaked %q: %s", canary, encoded)
+		}
+	}
+	if hasEvent(events, protocol.EventToolComplete) || hasEvent(events, protocol.EventAssistantDone) {
+		t.Fatalf("protected-history safe-tool turn projected content: %+v", events)
+	}
+}
+
 func TestRunnerRejectsContentBearingNonPermissionedToolInAuthorizationContext(t *testing.T) {
 	authorization := testEinoAuthorization("sess_eino")
 	ctx, err := protocol.WithAuthorizationContext(context.Background(), authorization)

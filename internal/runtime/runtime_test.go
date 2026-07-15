@@ -832,12 +832,85 @@ func TestRuntimeEinoModeConfirmsSideEffectTool(t *testing.T) {
 	if einoRunner.executions != 1 {
 		t.Fatalf("approved side-effect executions = %d, want 1", einoRunner.executions)
 	}
+	if !einoRunner.executionAuthorizationBound || einoRunner.executionAuthorization != testAuthorizationContext("sess_eino") {
+		t.Fatalf("approved side-effect authorization = bound:%t context:%+v", einoRunner.executionAuthorizationBound, einoRunner.executionAuthorization)
+	}
 	loaded, err := store.Load(context.Background(), "sess_eino")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !hasEvent(loaded, protocol.EventConfirmRequest) || !hasEvent(loaded, protocol.EventToolComplete) {
 		t.Fatalf("side-effect confirm/execution events were not persisted: %+v", loaded)
+	}
+}
+
+func TestRuntimeEinoModeRevalidatesAuthorizationBeforeApprovedSideEffect(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		invalidate func(*protocol.AuthorizationContext, *error)
+		wantError  string
+	}{
+		{
+			name: "provider failure",
+			invalidate: func(_ *protocol.AuthorizationContext, providerErr *error) {
+				*providerErr = fmt.Errorf("identity provider unavailable")
+			},
+			wantError: "authorization context provider: identity provider unavailable",
+		},
+		{
+			name: "binding change",
+			invalidate: func(authorization *protocol.AuthorizationContext, _ *error) {
+				authorization.ACLWatermark = "acl-v2"
+			},
+			wantError: `authorization context changed for live session "sess_eino"`,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			workspace := t.TempDir()
+			bridge := NewSideEffectBridge()
+			einoRunner := &sideEffectEinoRunner{bridge: bridge}
+			original := testAuthorizationContext("sess_eino")
+			current := original
+			var providerErr error
+			rt := New(Dependencies{
+				Workspace:  workspace,
+				Sessions:   local.New(workspace),
+				EinoRunner: einoRunner,
+				AuthorizationContextProvider: func(_ context.Context, sessionID string) (protocol.AuthorizationContext, error) {
+					if providerErr != nil {
+						return protocol.AuthorizationContext{}, providerErr
+					}
+					authorization := current
+					authorization.SessionID = sessionID
+					return authorization, nil
+				},
+				SideEffects:  bridge,
+				NewSessionID: func() string { return "sess_eino" },
+			})
+			if _, err := rt.Start(context.Background(), StartOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			confirm := firstConfirm(t, rt.SendMessage(context.Background(), "build knowledge"))
+			test.invalidate(&current, &providerErr)
+
+			events := rt.Confirm(context.Background(), confirm, true)
+			if !hasMessage(events, protocol.EventError, test.wantError) {
+				t.Fatalf("authorization change was not rejected: %+v", events)
+			}
+			if einoRunner.executions != 0 {
+				t.Fatalf("stale side-effect executed %d times", einoRunner.executions)
+			}
+
+			current = original
+			providerErr = nil
+			events = rt.Confirm(context.Background(), confirm, true)
+			if hasEvent(events, protocol.EventError) || !hasEvent(events, protocol.EventToolComplete) {
+				t.Fatalf("pending confirmation was consumed by authorization rejection: %+v", events)
+			}
+			if einoRunner.executions != 1 || !einoRunner.executionAuthorizationBound || einoRunner.executionAuthorization != original {
+				t.Fatalf("revalidated execution = count:%d bound:%t context:%+v", einoRunner.executions, einoRunner.executionAuthorizationBound, einoRunner.executionAuthorization)
+			}
+		})
 	}
 }
 
@@ -1203,8 +1276,10 @@ func (e *fakeToolExecutor) Invoke(ctx context.Context, sessionID string, toolNam
 }
 
 type sideEffectEinoRunner struct {
-	bridge     *SideEffectBridge
-	executions int
+	bridge                      *SideEffectBridge
+	executions                  int
+	executionAuthorization      protocol.AuthorizationContext
+	executionAuthorizationBound bool
 }
 
 func (r *sideEffectEinoRunner) Ready(context.Context) error {
@@ -1221,8 +1296,9 @@ func (r *sideEffectEinoRunner) Run(ctx context.Context, input EinoRunInput) ([]p
 		Action:          "build",
 		ArgumentsInJSON: "{}",
 		Summary:         "Build knowledge artifacts.",
-		Execute: func(context.Context, SideEffectRequest) ([]protocol.Event, error) {
+		Execute: func(ctx context.Context, _ SideEffectRequest) ([]protocol.Event, error) {
 			r.executions++
+			r.executionAuthorization, r.executionAuthorizationBound = protocol.AuthorizationContextFrom(ctx)
 			return []protocol.Event{
 				protocol.NewEvent(protocol.EventToolComplete, input.SessionID, "knote_build complete", map[string]string{"tool": "knote_build"}),
 			}, nil

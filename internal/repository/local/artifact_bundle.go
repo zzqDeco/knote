@@ -399,21 +399,27 @@ func (s Store) pruneUnselectedArtifactBundles(ctx context.Context) error {
 	}
 	artifactsDir := filepath.Join(s.workspace, "artifacts")
 	bundlesDir := filepath.Join(artifactsDir, "bundles")
-	if _, err := os.Lstat(bundlesDir); errors.Is(err, os.ErrNotExist) {
+	if err := validateArtifactBundleDirectory(bundlesDir); errors.Is(err, os.ErrNotExist) {
 		return nil
 	} else if err != nil {
-		return err
+		return fmt.Errorf("validate artifact bundles before pruning: %w", err)
 	}
 	manifest, err := s.ReadCurrentArtifactManifest(ctx)
-	if err != nil {
+	selectedProjectionID := ""
+	if errors.Is(err, repository.ErrArtifactCurrentNotFound) {
+		// A staged first build may be interrupted before current.json is
+		// published. With no selected bundle, every candidate is disposable.
+	} else if err != nil {
 		return fmt.Errorf("validate selected artifacts before pruning: %w", err)
+	} else {
+		selectedProjectionID = manifest.ProjectionID
 	}
 	entries, err := os.ReadDir(bundlesDir)
 	if err != nil {
 		return err
 	}
 	for _, entry := range entries {
-		if entry.Name() == manifest.ProjectionID {
+		if entry.Name() == selectedProjectionID {
 			continue
 		}
 		if err := os.RemoveAll(filepath.Join(bundlesDir, entry.Name())); err != nil {

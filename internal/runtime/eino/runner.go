@@ -100,22 +100,29 @@ func (r *Runner) Run(ctx context.Context, input runtime.EinoRunInput) ([]protoco
 		events = append(events, protocol.NewEvent(protocol.EventError, input.SessionID, generic.Error(), nil))
 		return events, generic
 	}
-	for _, event := range agentEvents {
-		projected := projectEvent(input.SessionID, event)
-		if permissioned {
-			bindProjectedEvents(projected, binding)
-		} else if permissionedContext {
-			sanitizePermissionedErrors(projected)
-			if hasAssistantOutput(projected) && !allowUnboundAssistant {
-				generic := fmt.Errorf("%s", protectedContentUnavailableMessage)
-				events = append(events, protocol.NewEvent(protocol.EventError, input.SessionID, generic.Error(), nil))
-				return events, generic
-			}
-			if allowUnboundAssistant {
-				classifySafeToolAssistantEvents(projected)
-			}
+	if permissionedContext && !permissioned {
+		projectedEvents := make([]protocol.Event, 0, len(agentEvents))
+		for _, event := range agentEvents {
+			projectedEvents = append(projectedEvents, projectEvent(input.SessionID, event)...)
 		}
-		events = append(events, projected...)
+		sanitizePermissionedErrors(projectedEvents)
+		if hasAssistantOutput(projectedEvents) && (!allowUnboundAssistant || hasProtectedHistory(input.History)) {
+			generic := fmt.Errorf("%s", protectedContentUnavailableMessage)
+			events = append(events, protocol.NewEvent(protocol.EventError, input.SessionID, generic.Error(), nil))
+			return events, generic
+		}
+		if allowUnboundAssistant {
+			classifySafeToolAssistantEvents(projectedEvents)
+		}
+		events = append(events, projectedEvents...)
+	} else {
+		for _, event := range agentEvents {
+			projected := projectEvent(input.SessionID, event)
+			if permissioned {
+				bindProjectedEvents(projected, binding)
+			}
+			events = append(events, projected...)
+		}
 	}
 	if err != nil {
 		if permissionedContext {
@@ -235,6 +242,15 @@ func sanitizePermissionedErrors(events []protocol.Event) {
 func hasAssistantOutput(events []protocol.Event) bool {
 	for _, event := range events {
 		if event.Type == protocol.EventAssistantDelta || event.Type == protocol.EventAssistantDone {
+			return true
+		}
+	}
+	return false
+}
+
+func hasProtectedHistory(events []protocol.Event) bool {
+	for _, event := range events {
+		if event.ProtectedContent != nil {
 			return true
 		}
 	}
