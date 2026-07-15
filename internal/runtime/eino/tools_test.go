@@ -12,6 +12,7 @@ import (
 
 	einotools "github.com/zzqDeco/knote/internal/eino/tools"
 	"github.com/zzqDeco/knote/internal/protocol"
+	"github.com/zzqDeco/knote/internal/repository/local"
 	"github.com/zzqDeco/knote/internal/runtime"
 )
 
@@ -189,6 +190,186 @@ func TestToolExecutorRejectsPermissionedOutputWithoutAuthorizationContext(t *tes
 			t.Fatalf("missing authorization leaked permissioned output: %+v", events)
 		}
 	}
+}
+
+func TestPermissionedSideEffectOutputsHaveFixedShapes(t *testing.T) {
+	authorization := testEinoAuthorization("sess_side_effect_shapes")
+	ctx, err := protocol.WithAuthorizationContext(context.Background(), authorization)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const resultCanary = "MANIFEST_BUNDLE_COUNT_PATH_HASH_NAMESPACE_AUTHZ_KAG_CANARY"
+	successes := []struct {
+		tool      string
+		output    string
+		eventType protocol.EventType
+	}{
+		{
+			tool: einotools.NameBuild,
+			output: `{"manifest":{"path":"` + resultCanary + `","document_count":97},` +
+				`"bundle_manifest":{"hash":"` + resultCanary + `","namespace":"` + resultCanary + `","authz_object":"` + resultCanary + `","authz_version":"` + resultCanary + `"},` +
+				`"kag_data":{"mode":"` + resultCanary + `"}}`,
+			eventType: protocol.EventBuildComplete,
+		},
+		{tool: einotools.NameCommit, output: `{"hash":"` + resultCanary + `","path":"` + resultCanary + `"}`, eventType: protocol.EventVersionChanged},
+		{tool: einotools.NameRelease, output: `{"tag":"` + resultCanary + `"}`, eventType: protocol.EventVersionChanged},
+		{tool: einotools.NameCheckout, output: `{"ref":"` + resultCanary + `","allow_dirty":true}`, eventType: protocol.EventVersionChanged},
+	}
+	for _, test := range successes {
+		t.Run(test.tool, func(t *testing.T) {
+			executor := NewToolExecutor([]einotool.InvokableTool{staticTool{name: test.tool, out: test.output}})
+			events, err := executor.Invoke(ctx, authorization.SessionID, test.tool, `{}`)
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertFixedPermissionedSideEffectEvents(t, events, test.tool, []protocol.EventType{
+				protocol.EventToolStart, protocol.EventToolComplete, test.eventType,
+			})
+			if strings.Contains(fmt.Sprint(events), resultCanary) {
+				t.Fatalf("permissioned side-effect success leaked backend result: %+v", events)
+			}
+		})
+	}
+
+	for _, test := range []struct {
+		name string
+		tool staticTool
+	}{
+		{name: "backend error", tool: staticTool{name: einotools.NameBuild, err: errors.New("BACKEND_PATH_HASH_CANARY")}},
+		{name: "adapter error", tool: staticTool{name: einotools.NameBuild, out: `{"adapter_error":"ADAPTER_KAG_CANARY","manifest":{"path":"PRIVATE_PATH_CANARY"}}`}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			executor := NewToolExecutor([]einotool.InvokableTool{test.tool})
+			events, err := executor.Invoke(ctx, authorization.SessionID, test.tool.name, `{}`)
+			if err == nil || err.Error() != permissionedSideEffectFailureMessage {
+				t.Fatalf("permissioned side-effect failure = %v, events=%+v", err, events)
+			}
+			assertFixedPermissionedSideEffectEvents(t, events, test.tool.name, []protocol.EventType{
+				protocol.EventToolStart, protocol.EventToolError, protocol.EventError,
+			})
+			if strings.Contains(fmt.Sprint(events), "CANARY") {
+				t.Fatalf("permissioned side-effect failure leaked backend result: %+v", events)
+			}
+		})
+	}
+}
+
+func TestPermissionedSlashBuildConfirmationKeepsSideEffectResultsFixed(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		tool      staticTool
+		wantError bool
+	}{
+		{
+			name: "success",
+			tool: staticTool{name: einotools.NameBuild, out: `{
+				"manifest":{"path":"SUCCESS_PRIVATE_PATH_CANARY","count":97},
+				"bundle_manifest":{"hash":"SUCCESS_HASH_CANARY","namespace":"SUCCESS_NAMESPACE_CANARY","authz_object":"SUCCESS_AUTHZ_CANARY"},
+				"kag_data":{"mode":"SUCCESS_KAG_CANARY"}
+			}`},
+		},
+		{
+			name:      "failure",
+			tool:      staticTool{name: einotools.NameBuild, err: errors.New("FAILURE_ADAPTER_PATH_HASH_KAG_CANARY")},
+			wantError: true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			workspace := t.TempDir()
+			store := local.New(workspace)
+			bridge := runtime.NewSideEffectBridge()
+			executor := NewToolExecutor([]einotool.InvokableTool{test.tool})
+			providerCalls := 0
+			manager := runtime.New(runtime.Dependencies{
+				Workspace:    workspace,
+				Capabilities: runtime.PermissionedSessionCapabilityProfile(),
+				Sessions:     store,
+				EinoRunner:   NewRunner(Options{Executor: &fakeExecutor{}}),
+				SideEffects:  bridge,
+				ToolExecutor: gatedToolExecutor{bridge: bridge, executor: executor},
+				AuthorizationContextProvider: func(_ context.Context, sessionID string) (protocol.AuthorizationContext, error) {
+					providerCalls++
+					return testEinoAuthorization(sessionID), nil
+				},
+				NewSessionID: func() string { return "sess_permissioned_slash_build" },
+			})
+			if _, err := manager.Start(context.Background(), runtime.StartOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			pending := manager.SendMessage(context.Background(), "/build")
+			confirm := firstToolConfirm(t, pending)
+			for _, event := range pending {
+				if event.Type == protocol.EventToolComplete || event.Type == protocol.EventBuildComplete {
+					t.Fatalf("permissioned /build executed before confirmation: %+v", pending)
+				}
+			}
+			events := manager.Confirm(context.Background(), confirm, true)
+			if providerCalls < 2 {
+				t.Fatalf("permissioned /build authorization provider calls = %d, want send and confirm revalidation", providerCalls)
+			}
+			if strings.Contains(fmt.Sprint(events), "CANARY") {
+				t.Fatalf("permissioned /build leaked backend details after confirmation: %+v", events)
+			}
+			if !hasToolEvent(events, protocol.EventToolComplete) && !test.wantError {
+				t.Fatalf("permissioned /build success omitted fixed completion: %+v", events)
+			}
+			if got := hasToolEvent(events, protocol.EventError); got != test.wantError {
+				t.Fatalf("permissioned /build error=%t, want %t: %+v", got, test.wantError, events)
+			}
+		})
+	}
+}
+
+type gatedToolExecutor struct {
+	bridge   *runtime.SideEffectBridge
+	executor ToolExecutor
+}
+
+func (e gatedToolExecutor) Invoke(ctx context.Context, sessionID string, toolName string, argumentsInJSON string) ([]protocol.Event, error) {
+	err := e.bridge.Request(ctx, runtime.SideEffectRequest{
+		SessionID:       sessionID,
+		ToolName:        toolName,
+		Action:          "build",
+		ArgumentsInJSON: argumentsInJSON,
+		Summary:         "Build knowledge artifacts.",
+		Execute: func(execCtx context.Context, _ runtime.SideEffectRequest) ([]protocol.Event, error) {
+			return e.executor.Invoke(execCtx, sessionID, toolName, argumentsInJSON)
+		},
+	})
+	return nil, err
+}
+
+func assertFixedPermissionedSideEffectEvents(t *testing.T, events []protocol.Event, toolName string, eventTypes []protocol.EventType) {
+	t.Helper()
+	if len(events) != len(eventTypes) {
+		t.Fatalf("permissioned side-effect event count = %d, want %d: %+v", len(events), len(eventTypes), events)
+	}
+	for index, eventType := range eventTypes {
+		event := events[index]
+		if event.Type != eventType {
+			t.Fatalf("permissioned side-effect event[%d] = %s, want %s: %+v", index, event.Type, eventType, events)
+		}
+		payload, ok := event.Payload.(map[string]string)
+		if !ok || len(payload) != 1 || payload["tool"] != toolName {
+			t.Fatalf("permissioned side-effect payload[%d] = %#v", index, event.Payload)
+		}
+	}
+}
+
+func firstToolConfirm(t *testing.T, events []protocol.Event) protocol.ConfirmRequest {
+	t.Helper()
+	for _, event := range events {
+		if event.Type != protocol.EventConfirmRequest {
+			continue
+		}
+		confirm, ok := event.Payload.(protocol.ConfirmRequest)
+		if !ok {
+			t.Fatalf("confirm payload type = %T", event.Payload)
+		}
+		return confirm
+	}
+	t.Fatalf("no confirmation request in %+v", events)
+	return protocol.ConfirmRequest{}
 }
 
 type staticTool struct {

@@ -20,8 +20,9 @@ type ProtectedContentAuthorizer func(
 ) error
 
 const (
-	// SafeToolAssistantReplayClassKey and V1 are persisted wire values shared
-	// by the safe Eino producer and permissioned replay validator.
+	// SafeToolAssistantReplayClassKey and V1 remain wire constants so old
+	// sessions can be decoded. Permissioned replay no longer trusts this
+	// producer-supplied classification.
 	SafeToolAssistantReplayClassKey = "replay_class"
 	SafeToolAssistantReplayClassV1  = "safe-tool-assistant/v1"
 )
@@ -71,56 +72,36 @@ func (m *Manager) filterPersistedEvents(
 	filtered := make([]protocol.Event, 0, len(events))
 	permissionedReplay := m.deps.AuthorizationContextProvider != nil
 	slashTurn := false
-	diffTurn := false
-	turnSessionID := ""
-	classifiedSafeTool := false
-	permissionedTurn := false
+	restrictedSlashTurn := false
 	for _, event := range events {
 		if event.Type == protocol.EventUserMessage {
 			slashTurn = strings.HasPrefix(strings.TrimSpace(event.Message), "/")
-			diffTurn = permissionedReplay && diffSlashReplayTurn(event)
-			turnSessionID = event.SessionID
-			classifiedSafeTool = false
-			permissionedTurn = false
+			restrictedSlashTurn = permissionedReplay && slashTurn && restrictedPermissionedSlashReplayTurn(event)
 		}
-		if permissionedReplay && (diffTurn || historicalDiffReplayEvent(event)) {
+		if permissionedReplay && (restrictedSlashTurn || historicalDiffReplayEvent(event)) {
 			if event.Type == protocol.EventAssistantDone || event.Type == protocol.EventError {
 				slashTurn = false
-				diffTurn = false
-				classifiedSafeTool = false
+				restrictedSlashTurn = false
 			}
+			continue
+		}
+		if permissionedReplay && event.Type == protocol.EventSessionInfo {
 			continue
 		}
 		if event.ProtectedContent != nil {
 			slashTurn = false
-			permissionedTurn = true
 			if allowed[event.ProtectedContent.BlockID] {
 				filtered = append(filtered, event)
 			}
 			continue
 		}
-		if permissionedReplayToolEvent(event) {
-			permissionedTurn = true
-		}
-		if classifiedSafeToolReplayEvent(event, turnSessionID, current.SessionID) {
-			classifiedSafeTool = true
-		}
 		unprotectedSlash := slashReplayEvent(event, slashTurn)
-		safeToolAssistant := classifiedSafeToolAssistantReplayEvent(
-			event,
-			turnSessionID,
-			current.SessionID,
-			classifiedSafeTool,
-			permissionedTurn,
-			slashTurn,
-		)
 		if event.Type == protocol.EventAssistantDone || event.Type == protocol.EventError {
-			classifiedSafeTool = false
 			if unprotectedSlash {
 				slashTurn = false
 			}
 		}
-		if permissionedReplay && legacyProtectedEvent(event) && !unprotectedSlash && !safeToolAssistant {
+		if permissionedReplay && legacyProtectedEvent(event) && !unprotectedSlash {
 			continue
 		}
 		filtered = append(filtered, event)
@@ -128,55 +109,21 @@ func (m *Manager) filterPersistedEvents(
 	return filtered
 }
 
-func diffSlashReplayTurn(event protocol.Event) bool {
+func restrictedPermissionedSlashReplayTurn(event protocol.Event) bool {
 	if event.Type != protocol.EventUserMessage {
 		return false
 	}
 	command, _ := parseSlash(event.Message)
-	return command == "diff"
+	switch command {
+	case "new", "resume", "tasks", "clear", "help", "exit":
+		return false
+	default:
+		return true
+	}
 }
 
 func historicalDiffReplayEvent(event protocol.Event) bool {
 	return event.Type == protocol.EventVersionDiff || eventToolName(event.Payload) == einotools.NameDiff
-}
-
-func classifiedSafeToolReplayEvent(event protocol.Event, turnSessionID, currentSessionID string) bool {
-	if event.Type != protocol.EventToolComplete ||
-		turnSessionID == "" ||
-		turnSessionID != currentSessionID ||
-		event.SessionID != turnSessionID ||
-		eventPayloadValue(event.Payload, SafeToolAssistantReplayClassKey) != SafeToolAssistantReplayClassV1 {
-		return false
-	}
-	toolName := eventToolName(event.Payload)
-	return toolName != "" && !permissionedToolName(toolName)
-}
-
-func classifiedSafeToolAssistantReplayEvent(
-	event protocol.Event,
-	turnSessionID string,
-	currentSessionID string,
-	classifiedSafeTool bool,
-	permissionedTurn bool,
-	slashTurn bool,
-) bool {
-	return event.Type == protocol.EventAssistantDone &&
-		classifiedSafeTool &&
-		!permissionedTurn &&
-		!slashTurn &&
-		turnSessionID != "" &&
-		turnSessionID == currentSessionID &&
-		event.SessionID == turnSessionID &&
-		eventPayloadValue(event.Payload, SafeToolAssistantReplayClassKey) == SafeToolAssistantReplayClassV1
-}
-
-func permissionedReplayToolEvent(event protocol.Event) bool {
-	switch event.Type {
-	case protocol.EventToolStart, protocol.EventToolProgress, protocol.EventToolComplete, protocol.EventToolError:
-		return permissionedToolName(eventToolName(event.Payload))
-	default:
-		return false
-	}
 }
 
 func permissionedToolName(toolName string) bool {
@@ -200,10 +147,10 @@ func slashReplayEvent(event protocol.Event, slashTurn bool) bool {
 
 func legacyProtectedEvent(event protocol.Event) bool {
 	switch event.Type {
-	case protocol.EventAssistantDelta, protocol.EventAssistantDone, protocol.EventError:
+	case protocol.EventAssistantStart, protocol.EventAssistantDelta, protocol.EventAssistantDone, protocol.EventError:
 		return true
 	case protocol.EventToolStart, protocol.EventToolProgress, protocol.EventToolComplete, protocol.EventToolError:
-		return permissionedToolName(eventToolName(event.Payload))
+		return eventToolName(event.Payload) != ""
 	default:
 		return false
 	}

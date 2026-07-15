@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -100,6 +101,102 @@ func TestRuntimeRunnerInfoIncludesEinoInventory(t *testing.T) {
 	}
 	if len(info.Tools) != 1 || info.Tools[0].Name != "knote_query" {
 		t.Fatalf("unexpected tool inventory: %+v", info.Tools)
+	}
+}
+
+func TestPermissionedRuntimeRedactsObservableSurfaces(t *testing.T) {
+	const (
+		workspaceCanary = "/private/workspaces/permissioned-canary"
+		branchCanary    = "private-branch-canary"
+		toolCanary      = "private-tool-canary"
+	)
+	store := local.New(t.TempDir())
+	versions := &observableVersionsProbe{status: repository.Status{
+		Branch: branchCanary,
+		Dirty:  true,
+		Raw:    workspaceCanary,
+	}}
+	runner := &fakeEinoRunner{
+		tools:  []RunnerToolInfo{{Name: toolCanary, Description: workspaceCanary}},
+		events: []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, "", "unused", nil)},
+	}
+	rt := New(Dependencies{
+		Workspace:    workspaceCanary,
+		Capabilities: PermissionedSessionCapabilityProfile(),
+		Sessions:     store,
+		Versions:     versions,
+		EinoRunner:   runner,
+		NewSessionID: func() string { return "sess_permissioned_observables" },
+	})
+	initial, err := rt.Start(context.Background(), StartOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if versions.statusCalls != 0 {
+		t.Fatalf("permissioned start queried workspace status %d time(s)", versions.statusCalls)
+	}
+	for _, event := range initial {
+		if event.Type != protocol.EventSessionInfo {
+			continue
+		}
+		info, ok := event.Payload.(protocol.SessionInfo)
+		if !ok || info.Workspace != "" || info.Branch != "" || info.Dirty || info.KAGMode != "" {
+			t.Fatalf("permissioned session event leaked observables: %+v", event.Payload)
+		}
+	}
+
+	status, err := rt.WorkspaceStatus(context.Background())
+	if err != nil || status != (repository.Status{}) || versions.statusCalls != 0 {
+		t.Fatalf("permissioned workspace status = %+v, err=%v, calls=%d", status, err, versions.statusCalls)
+	}
+	info := rt.CurrentSessionInfo(context.Background())
+	if info.ID != "sess_permissioned_observables" || info.Workspace != "" || info.Branch != "" || info.Dirty || info.KAGMode != "" {
+		t.Fatalf("permissioned current session info = %+v", info)
+	}
+	if got := rt.Workspace(); got != "" {
+		t.Fatalf("permissioned workspace accessor = %q", got)
+	}
+	runnerInfo, err := rt.RunnerInfo(context.Background())
+	if err != nil || len(runnerInfo.Tools) != 0 || runner.inventoryCalls != 0 {
+		t.Fatalf("permissioned runner info = %+v, err=%v, inventory calls=%d", runnerInfo, err, runner.inventoryCalls)
+	}
+	if !runnerInfo.EinoAvailable || runnerInfo.ConfiguredMode != RunnerModeEino || runnerInfo.ActiveMode != RunnerModeEino {
+		t.Fatalf("permissioned runner info lost fixed availability shape: %+v", runnerInfo)
+	}
+	encoded := fmt.Sprint(initial, status, info, runnerInfo)
+	for _, canary := range []string{workspaceCanary, branchCanary, toolCanary} {
+		if strings.Contains(encoded, canary) {
+			t.Fatalf("permissioned observable surfaces leaked %q: %s", canary, encoded)
+		}
+	}
+}
+
+func TestPermissionedRuntimeHidesAuthorizationProviderFailures(t *testing.T) {
+	const providerCanary = "PRIVATE_AUTH_PROVIDER_PATH_CANARY"
+	runner := &fakeEinoRunner{events: []protocol.Event{
+		protocol.NewEvent(protocol.EventAssistantDone, "", "unused", nil),
+	}}
+	rt := New(Dependencies{
+		Capabilities: PermissionedSessionCapabilityProfile(),
+		Sessions:     local.New(t.TempDir()),
+		EinoRunner:   runner,
+		AuthorizationContextProvider: func(context.Context, string) (protocol.AuthorizationContext, error) {
+			return protocol.AuthorizationContext{}, errors.New(providerCanary)
+		},
+		NewSessionID: func() string { return "sess_permissioned_provider_failure" },
+	})
+	if _, err := rt.Start(context.Background(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	events := rt.SendMessage(context.Background(), "protected request")
+	if !hasMessage(events, protocol.EventError, sessionAuthorizationErrorMessage) {
+		t.Fatalf("permissioned provider failure shape = %+v", events)
+	}
+	if strings.Contains(fmt.Sprint(events), providerCanary) {
+		t.Fatalf("permissioned provider failure leaked backend details: %+v", events)
+	}
+	if runner.runCalls != 0 {
+		t.Fatalf("permissioned provider failure reached runner %d time(s)", runner.runCalls)
 	}
 }
 
@@ -1247,6 +1344,7 @@ func hasMessage(events []protocol.Event, eventType protocol.EventType, message s
 
 type fakeEinoRunner struct {
 	tools              []RunnerToolInfo
+	inventoryCalls     int
 	events             []protocol.Event
 	lastHistory        []protocol.Event
 	authorization      protocol.AuthorizationContext
@@ -1370,7 +1468,38 @@ func (r *fakeEinoRunner) Ready(context.Context) error {
 }
 
 func (r *fakeEinoRunner) ToolInventory(context.Context) ([]RunnerToolInfo, error) {
+	r.inventoryCalls++
 	return append([]RunnerToolInfo(nil), r.tools...), nil
+}
+
+type observableVersionsProbe struct {
+	status      repository.Status
+	statusCalls int
+}
+
+func (p *observableVersionsProbe) Status(context.Context) (repository.Status, error) {
+	p.statusCalls++
+	return p.status, nil
+}
+
+func (*observableVersionsProbe) Diff(context.Context, string) (string, error) {
+	return "", fmt.Errorf("unexpected diff call")
+}
+
+func (*observableVersionsProbe) Versions(context.Context, int) ([]repository.Version, error) {
+	return nil, fmt.Errorf("unexpected versions call")
+}
+
+func (*observableVersionsProbe) Commit(context.Context, string) (repository.CommitResult, error) {
+	return repository.CommitResult{}, fmt.Errorf("unexpected commit call")
+}
+
+func (*observableVersionsProbe) Tag(context.Context, string) error {
+	return fmt.Errorf("unexpected tag call")
+}
+
+func (*observableVersionsProbe) Checkout(context.Context, string, repository.CheckoutOptions) error {
+	return fmt.Errorf("unexpected checkout call")
 }
 
 func (r *fakeEinoRunner) Run(ctx context.Context, input EinoRunInput) ([]protocol.Event, error) {

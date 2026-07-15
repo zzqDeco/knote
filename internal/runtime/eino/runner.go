@@ -94,7 +94,7 @@ func (r *Runner) Run(ctx context.Context, input runtime.EinoRunInput) ([]protoco
 		}
 		return events, fmt.Errorf("%s", protectedContentUnavailableMessage)
 	}
-	binding, permissioned, allowUnboundAssistant, bindingErr := protectedBindingFromAgentEvents(ctx, agentEvents)
+	binding, permissioned, bindingErr := protectedBindingFromAgentEvents(ctx, agentEvents)
 	if bindingErr != nil {
 		generic := fmt.Errorf("%s", protectedContentUnavailableMessage)
 		events = append(events, protocol.NewEvent(protocol.EventError, input.SessionID, generic.Error(), nil))
@@ -106,13 +106,10 @@ func (r *Runner) Run(ctx context.Context, input runtime.EinoRunInput) ([]protoco
 			projectedEvents = append(projectedEvents, projectEvent(input.SessionID, event)...)
 		}
 		sanitizePermissionedErrors(projectedEvents)
-		if hasAssistantOutput(projectedEvents) && (!allowUnboundAssistant || hasProtectedHistory(input.History)) {
+		if hasAssistantOutput(projectedEvents) {
 			generic := fmt.Errorf("%s", protectedContentUnavailableMessage)
 			events = append(events, protocol.NewEvent(protocol.EventError, input.SessionID, generic.Error(), nil))
 			return events, generic
-		}
-		if allowUnboundAssistant {
-			classifySafeToolAssistantEvents(projectedEvents)
 		}
 		events = append(events, projectedEvents...)
 	} else {
@@ -139,53 +136,54 @@ func (r *Runner) Run(ctx context.Context, input runtime.EinoRunInput) ([]protoco
 func protectedBindingFromAgentEvents(
 	ctx context.Context,
 	events []*adk.AgentEvent,
-) (*protocol.ProtectedContentBinding, bool, bool, error) {
+) (*protocol.ProtectedContentBinding, bool, error) {
 	authorization, authorized := protocol.AuthorizationContextFrom(ctx)
 	var packages []protocol.EvidencePackage
-	hasSafeUnboundTool := false
 	permissionedToolAttempted := false
 	for _, event := range events {
 		if authorized {
 			attempted, err := permissionedAgentToolAttempt(event)
 			if err != nil {
-				return nil, true, false, err
+				return nil, true, err
 			}
 			permissionedToolAttempted = permissionedToolAttempted || attempted
 		}
 		toolName, content, ok, err := permissionedAgentToolOutput(event)
 		if err != nil {
-			return nil, true, false, err
+			return nil, true, err
 		}
 		if !ok {
 			continue
 		}
 		if authorized && toolName == "" {
-			return nil, true, false, errors.New("permissioned run received unnamed tool output")
+			return nil, true, errors.New("permissioned run received unnamed tool output")
 		}
 		if !permissionedToolName(toolName) {
-			if authorized && !safeUnboundAssistantToolName(toolName) {
-				return nil, false, false, fmt.Errorf("permissioned run received untrusted tool output %q", toolName)
+			if authorized {
+				return nil, false, fmt.Errorf("permissioned run received untrusted tool output %q", toolName)
 			}
-			hasSafeUnboundTool = true
 			continue
 		}
 		if !authorized {
-			return nil, true, false, errors.New("permissioned tool output requires authorization")
+			return nil, true, errors.New("permissioned tool output requires authorization")
 		}
 		evidencePackage, err := decodeEvidencePackage(content)
 		if err != nil {
-			return nil, true, false, err
+			return nil, true, err
 		}
 		packages = append(packages, evidencePackage)
 	}
 	if len(packages) == 0 {
-		return nil, false, hasSafeUnboundTool && !permissionedToolAttempted, nil
+		if permissionedToolAttempted {
+			return nil, true, errors.New("permissioned tool call produced no protected output")
+		}
+		return nil, false, nil
 	}
 	binding, err := protocol.NewProtectedContentBinding(authorization, packages...)
 	if err != nil {
-		return nil, true, false, err
+		return nil, true, err
 	}
-	return &binding, true, false, nil
+	return &binding, true, nil
 }
 
 func permissionedAgentToolAttempt(event *adk.AgentEvent) (bool, error) {
@@ -199,16 +197,18 @@ func permissionedAgentToolAttempt(event *adk.AgentEvent) (bool, error) {
 	if message == nil {
 		return false, nil
 	}
+	attempted := false
 	for _, call := range message.ToolCalls {
 		toolName := strings.TrimSpace(call.Function.Name)
 		if toolName == "" {
 			return false, errors.New("permissioned run received unnamed tool call")
 		}
-		if permissionedToolName(toolName) {
-			return true, nil
+		if !permissionedToolName(toolName) {
+			return false, fmt.Errorf("permissioned run received untrusted tool call %q", toolName)
 		}
+		attempted = true
 	}
-	return false, nil
+	return attempted, nil
 }
 
 func permissionedAgentToolOutput(event *adk.AgentEvent) (string, string, bool, error) {
@@ -246,58 +246,6 @@ func hasAssistantOutput(events []protocol.Event) bool {
 		}
 	}
 	return false
-}
-
-func hasProtectedHistory(events []protocol.Event) bool {
-	for _, event := range events {
-		if event.ProtectedContent != nil {
-			return true
-		}
-	}
-	return false
-}
-
-func classifySafeToolAssistantEvents(events []protocol.Event) {
-	for index := range events {
-		event := &events[index]
-		switch event.Type {
-		case protocol.EventToolComplete:
-			toolName := eventToolName(event.Payload)
-			if !safeUnboundAssistantToolName(toolName) {
-				continue
-			}
-		case protocol.EventAssistantDone:
-		default:
-			continue
-		}
-		event.Payload = payloadWithReplayClass(event.Payload)
-	}
-}
-
-func payloadWithReplayClass(payload any) any {
-	switch value := payload.(type) {
-	case nil:
-		return map[string]string{runtime.SafeToolAssistantReplayClassKey: runtime.SafeToolAssistantReplayClassV1}
-	case map[string]string:
-		out := make(map[string]string, len(value)+1)
-		for key, item := range value {
-			out[key] = item
-		}
-		out[runtime.SafeToolAssistantReplayClassKey] = runtime.SafeToolAssistantReplayClassV1
-		return out
-	case map[string]any:
-		out := make(map[string]any, len(value)+1)
-		for key, item := range value {
-			out[key] = item
-		}
-		out[runtime.SafeToolAssistantReplayClassKey] = runtime.SafeToolAssistantReplayClassV1
-		return out
-	default:
-		return map[string]any{
-			runtime.SafeToolAssistantReplayClassKey: runtime.SafeToolAssistantReplayClassV1,
-			"value":                                 payload,
-		}
-	}
 }
 
 func bindProjectedEvents(events []protocol.Event, binding *protocol.ProtectedContentBinding) {

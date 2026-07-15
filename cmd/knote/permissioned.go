@@ -53,6 +53,7 @@ type permissionedApplication struct {
 	service               *authorized.Service
 	fixture               *fixture.Application
 	authorizationProvider runtime.AuthorizationContextProvider
+	revisionState         *permissionedRevisionState
 }
 
 func loadPermissionedRuntimeConfig(fake bool) (permissionedRuntimeConfig, error) {
@@ -174,8 +175,13 @@ func newPermissionedApplication(
 	if err != nil {
 		return nil, err
 	}
-	if _, err := loader.CurrentAuthorizationScope(ctx); err != nil {
+	scope, err := loader.CurrentAuthorizationScope(ctx)
+	if err != nil {
 		return nil, fmt.Errorf("initialize permissioned artifact scope: %w", err)
+	}
+	revisionState, err := newPermissionedRevisionState(config, scope, cache)
+	if err != nil {
+		return nil, fmt.Errorf("initialize permissioned authorization revision: %w", err)
 	}
 	authorizer, err := authz.NewOpenFGA(config.OpenFGA)
 	if err != nil {
@@ -200,13 +206,17 @@ func newPermissionedApplication(
 		if err != nil {
 			return protocol.AuthorizationContext{}, err
 		}
+		revision, err := revisionState.currentForScope(ctx, config, scope)
+		if err != nil {
+			return protocol.AuthorizationContext{}, authorized.ErrProtectedContentUnavailable
+		}
 		authorization := protocol.AuthorizationContext{
 			Version:  protocol.SecurityContractVersion,
 			TenantID: scope.TenantID, KnowledgeBaseID: scope.KnowledgeBaseID,
 			PrincipalID: config.Principal, SessionID: sessionID,
 			RequestID:            fmt.Sprintf("request_permissioned_%020d", permissionedRequestSequence.Add(1)),
-			AuthorizationModelID: config.OpenFGA.AuthorizationModelID,
-			IdentityWatermark:    config.IdentityWatermark, ACLWatermark: scope.ACLWatermark,
+			AuthorizationModelID: revision.AuthorizationModelID,
+			IdentityWatermark:    revision.IdentityWatermark, ACLWatermark: revision.ACLWatermark,
 			Consistency: config.Consistency,
 		}
 		if err := authorization.Validate(); err != nil {
@@ -217,7 +227,9 @@ func newPermissionedApplication(
 	if _, err := provider(ctx, "session_permissioned_startup"); err != nil {
 		return nil, fmt.Errorf("validate permissioned authorization context: %w", err)
 	}
-	return &permissionedApplication{service: service, authorizationProvider: provider}, nil
+	return &permissionedApplication{
+		service: service, authorizationProvider: provider, revisionState: revisionState,
+	}, nil
 }
 
 func productionTraversalConfig() authorized.TraversalConfig {
@@ -243,6 +255,55 @@ func (a *permissionedApplication) AuthorizationContextProvider() runtime.Authori
 	return a.authorizationProvider
 }
 
+func (a *permissionedApplication) Query(
+	ctx context.Context,
+	request protocol.QueryRequest,
+) (authorized.QueryResult, error) {
+	if a == nil || a.service == nil {
+		return authorized.QueryResult{}, authorized.ErrProtectedContentUnavailable
+	}
+	if a.revisionState == nil {
+		return a.service.Query(ctx, request)
+	}
+	revision, err := a.revisionState.begin(ctx, request.Authorization)
+	if err != nil {
+		return authorized.QueryResult{}, authorized.ErrProtectedContentUnavailable
+	}
+	result, err := a.service.Query(ctx, request)
+	if err != nil {
+		return authorized.QueryResult{}, err
+	}
+	if err := a.revisionState.finish(ctx, revision, permissionedEvidenceResourceIDs(result.Evidence)); err != nil {
+		return authorized.QueryResult{}, authorized.ErrProtectedContentUnavailable
+	}
+	return result, nil
+}
+
+func (a *permissionedApplication) ReadDerivedArtifact(
+	ctx context.Context,
+	authorization protocol.AuthorizationContext,
+	resource protocol.ResourceHandle,
+) (protocol.EvidenceItem, error) {
+	if a == nil || a.service == nil {
+		return protocol.EvidenceItem{}, authorized.ErrProtectedContentUnavailable
+	}
+	if a.revisionState == nil {
+		return a.service.ReadDerivedArtifact(ctx, authorization, resource)
+	}
+	revision, err := a.revisionState.begin(ctx, authorization)
+	if err != nil {
+		return protocol.EvidenceItem{}, authorized.ErrProtectedContentUnavailable
+	}
+	item, err := a.service.ReadDerivedArtifact(ctx, authorization, resource)
+	if err != nil {
+		return protocol.EvidenceItem{}, err
+	}
+	if err := a.revisionState.finish(ctx, revision, permissionedDerivedArtifactResourceIDs(item)); err != nil {
+		return protocol.EvidenceItem{}, authorized.ErrProtectedContentUnavailable
+	}
+	return item, nil
+}
+
 func (a *permissionedApplication) AuthorizeProtectedContent(
 	ctx context.Context,
 	current protocol.AuthorizationContext,
@@ -251,8 +312,21 @@ func (a *permissionedApplication) AuthorizeProtectedContent(
 	if a == nil || a.service == nil {
 		return authorized.ErrProtectedContentUnavailable
 	}
-	_, err := a.service.AuthorizeProtectedContent(ctx, current, binding)
-	return err
+	if a.revisionState == nil {
+		_, err := a.service.AuthorizeProtectedContent(ctx, current, binding)
+		return err
+	}
+	revision, err := a.revisionState.begin(ctx, current)
+	if err != nil {
+		return authorized.ErrProtectedContentUnavailable
+	}
+	if _, err := a.service.AuthorizeProtectedContent(ctx, current, binding); err != nil {
+		return err
+	}
+	if err := a.revisionState.finish(ctx, revision, permissionedBindingResourceIDs(binding)); err != nil {
+		return authorized.ErrProtectedContentUnavailable
+	}
+	return nil
 }
 
 func (a *permissionedApplication) ApplyRevocation(
@@ -278,14 +352,18 @@ func permissionedFixturePrincipal() (string, error) {
 	}
 }
 
-func permissionedTools(tools []einotool.InvokableTool, enabled bool) []einotool.InvokableTool {
+func filterPermissionedTools(
+	tools []einotool.InvokableTool,
+	enabled bool,
+	allowed func(string, bool) bool,
+) []einotool.InvokableTool {
 	out := make([]einotool.InvokableTool, 0, len(tools))
 	for _, candidate := range tools {
 		if candidate == nil {
 			continue
 		}
 		info, err := candidate.Info(context.Background())
-		if err != nil || info == nil || !permissionedToolAllowed(info.Name, enabled) {
+		if err != nil || info == nil || !allowed(info.Name, enabled) {
 			continue
 		}
 		out = append(out, candidate)
@@ -293,26 +371,59 @@ func permissionedTools(tools []einotool.InvokableTool, enabled bool) []einotool.
 	return out
 }
 
-func permissionedToolMap(tools map[string]einotool.InvokableTool, enabled bool) map[string]einotool.InvokableTool {
+func filterPermissionedToolMap(
+	tools map[string]einotool.InvokableTool,
+	enabled bool,
+	allowed func(string, bool) bool,
+) map[string]einotool.InvokableTool {
 	for name := range tools {
-		if !permissionedToolAllowed(name, enabled) {
+		if !allowed(name, enabled) {
 			delete(tools, name)
 		}
 	}
 	return tools
 }
 
-func permissionedToolAllowed(name string, enabled bool) bool {
+func permissionedModelTools(tools []einotool.InvokableTool, enabled bool) []einotool.InvokableTool {
+	return filterPermissionedTools(tools, enabled, permissionedModelToolAllowed)
+}
+
+func permissionedSlashTools(tools []einotool.InvokableTool, enabled bool) []einotool.InvokableTool {
+	return filterPermissionedTools(tools, enabled, permissionedSlashToolAllowed)
+}
+
+func permissionedSideEffectToolMap(
+	tools map[string]einotool.InvokableTool,
+	enabled bool,
+) map[string]einotool.InvokableTool {
+	return filterPermissionedToolMap(tools, enabled, permissionedSideEffectToolAllowed)
+}
+
+func permissionedModelToolAllowed(name string, enabled bool) bool {
 	if !enabled {
 		return name != einotools.NameEval && name != einotools.NameQuery && name != einotools.NameExplain
 	}
+	return name == einotools.NameQuery || name == einotools.NameExplain
+}
 
-	// Permissioned ADK registration is fail-closed. These are the authorized
-	// query, safe metadata, and confirmation-gated side-effect tools.
+func permissionedSlashToolAllowed(name string, enabled bool) bool {
+	if !enabled {
+		return permissionedModelToolAllowed(name, false)
+	}
 	switch name {
-	case einotools.NameQuery, einotools.NameExplain,
-		einotools.NameVersions,
-		einotools.NameBuild, einotools.NameCommit, einotools.NameRelease, einotools.NameCheckout:
+	case einotools.NameBuild, einotools.NameCommit, einotools.NameRelease, einotools.NameCheckout:
+		return true
+	default:
+		return false
+	}
+}
+
+func permissionedSideEffectToolAllowed(name string, enabled bool) bool {
+	if !enabled {
+		return permissionedModelToolAllowed(name, false)
+	}
+	switch name {
+	case einotools.NameBuild, einotools.NameCommit, einotools.NameRelease, einotools.NameCheckout:
 		return true
 	default:
 		return false

@@ -123,6 +123,17 @@ func (s service) prepareArtifactProjection(ctx context.Context) (repository.Arti
 	if err != nil {
 		return repository.ArtifactSet{}, projectionBuild{}, err
 	}
+	materializationAuthorization, permissionedMaterialization, err := derivedArtifactMaterializationAuthorization(
+		ctx, scope, aclVersion,
+	)
+	if err != nil {
+		return repository.ArtifactSet{}, projectionBuild{}, err
+	}
+	if permissionedMaterialization {
+		buildConfigVersion = permissionedDerivedBuildConfigVersion(
+			buildConfigVersion, materializationAuthorization,
+		)
+	}
 	snapshotDocuments := make([]catalog.SourceDocumentSnapshot, 0, len(loaded))
 	documentIDs := make(map[string]protocol.ResourceID, len(loaded))
 	for _, item := range loaded {
@@ -318,9 +329,11 @@ func (s service) prepareArtifactProjection(ctx context.Context) (repository.Arti
 	if err != nil {
 		return repository.ArtifactSet{}, projectionBuild{}, err
 	}
+	summaryText := fmt.Sprintf("Built %d documents and %d chunks.", len(set.Documents), len(set.Chunks))
+	summaryDigest := protocol.NewContentDigest(summaryText)
 	artifactMetadata, err := catalog.NewResourceMetadata(
 		scope, protocol.ResourceDerivedArtifact, "artifacts/bundle", "artifact:"+string(artifactID), artifactID,
-		protocol.NewContentDigest(projectionVersion), versions("content_"+projectionVersion),
+		summaryDigest, versions("content_"+strings.TrimPrefix(string(summaryDigest), "sha256:")[:24]),
 		catalog.SensitivityInternal, localSecurityDomain,
 	)
 	if err != nil {
@@ -333,13 +346,7 @@ func (s service) prepareArtifactProjection(ctx context.Context) (repository.Arti
 			SupportID: "support-all-documents", Resources: artifactSupportResources, Complete: true,
 		}},
 		localSecurityDomain,
-		protocol.AuthorizationContext{
-			Version:  protocol.SecurityContractVersion,
-			TenantID: scope.TenantID, KnowledgeBaseID: scope.KnowledgeBaseID,
-			PrincipalID: "local", SessionID: "materialize", RequestID: "artifacts-bundle",
-			AuthorizationModelID: "local-model-v1", IdentityWatermark: "local-identity-v1",
-			ACLWatermark: aclVersion, Consistency: protocol.ConsistencyHigherConsistency,
-		},
+		materializationAuthorization,
 	)
 	if err != nil {
 		return repository.ArtifactSet{}, projectionBuild{}, fmt.Errorf("materialize derived artifact security: %w", err)
@@ -350,7 +357,7 @@ func (s service) prepareArtifactProjection(ctx context.Context) (repository.Arti
 
 	set.Summaries = []protocol.Summary{{
 		SummaryID:        string(artifactID),
-		Text:             fmt.Sprintf("Built %d documents and %d chunks.", len(set.Documents), len(set.Chunks)),
+		Text:             summaryText,
 		EvidenceChunkIDs: chunkIDs(set.Chunks),
 	}}
 	generatedAt := time.Unix(0, 0).UTC()
@@ -460,6 +467,53 @@ func derivedArtifactSecurityIdentity(metadata catalog.ResourceMetadata) protocol
 		AuthorizationID: metadata.AuthorizationObject, AuthorizationResourceID: metadata.AuthorizationResourceID,
 		ContentDigest: metadata.ContentDigest, Versions: metadata.Versions,
 	}
+}
+
+func derivedArtifactMaterializationAuthorization(
+	ctx context.Context,
+	scope catalog.Scope,
+	aclVersion string,
+) (protocol.AuthorizationContext, bool, error) {
+	if authorization, ok := protocol.AuthorizationContextFrom(ctx); ok {
+		if err := authorization.Validate(); err != nil {
+			return protocol.AuthorizationContext{}, false, fmt.Errorf("materialize derived artifact security: %w", err)
+		}
+		if authorization.TenantID != scope.TenantID ||
+			authorization.KnowledgeBaseID != scope.KnowledgeBaseID ||
+			authorization.ACLWatermark != aclVersion {
+			return protocol.AuthorizationContext{}, false, fmt.Errorf(
+				"materialize derived artifact security: authorization context does not match projection scope",
+			)
+		}
+		return authorization, true, nil
+	}
+	return protocol.AuthorizationContext{
+		Version:  protocol.SecurityContractVersion,
+		TenantID: scope.TenantID, KnowledgeBaseID: scope.KnowledgeBaseID,
+		PrincipalID: "local", SessionID: "materialize", RequestID: "artifacts-bundle",
+		AuthorizationModelID: "local-model-v1", IdentityWatermark: "local-identity-v1",
+		ACLWatermark: aclVersion, Consistency: protocol.ConsistencyHigherConsistency,
+	}, false, nil
+}
+
+func permissionedDerivedBuildConfigVersion(
+	buildConfigVersion string,
+	authorization protocol.AuthorizationContext,
+) string {
+	bindings := []string{
+		buildConfigVersion,
+		authorization.Version,
+		authorization.TenantID,
+		authorization.KnowledgeBaseID,
+		authorization.PrincipalID,
+		authorization.AgentID,
+		authorization.TaskID,
+		string(authorization.Consistency),
+		authorization.AuthorizationModelID,
+		authorization.IdentityWatermark,
+		authorization.ACLWatermark,
+	}
+	return "build_" + fullHash([]byte(strings.Join(bindings, "\x00")))[:24]
 }
 
 func projectionJournalRoot(root, baseVersion, projectionVersion string) string {
