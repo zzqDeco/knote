@@ -1,9 +1,11 @@
 # Permissioned KAG Acceptance
 
-This document defines the deterministic Phase 1 release gate for issue #41. It
-tests the security contracts in `doc/adr/0001-permissioned-kag-security-contracts.md`
-and the interception boundary in `doc/adr/0002-kag-query-interception.md`. It does
-not turn the legacy real KAG solver into a permissioned query path.
+This document defines the deterministic Phase 1 and Phase 2 permissioned KAG
+release gates for issues #41 and #61. It tests the security contracts in
+`doc/adr/0001-permissioned-kag-security-contracts.md`, the interception boundary
+in `doc/adr/0002-kag-query-interception.md`, and the bounded per-hop graph path
+implemented in Phase 2. The legacy `kag.query`/`kag.explain` solver remains a
+separate compatibility surface and is not acceptance evidence.
 
 ## CI entry points
 
@@ -12,7 +14,9 @@ The credential-free gate is the same command run by `.github/workflows/ci.yml`:
 ```sh
 KNOTE_KAG_FAKE=1 go test ./...
 /usr/bin/python3 -m unittest discover -s adapters/kag -p '*test*.py'
+/usr/bin/python3 tests/smoke/permissioned_graph_real_smoke.py --self-test
 GOTOOLCHAIN=go1.25.12 go run github.com/openfga/cli/cmd/fga@v0.7.17 model test --tests internal/authz/model/authorization.fga.yaml
+CGO_ENABLED=0 go build -o /tmp/knote-check ./cmd/knote
 ```
 
 For a focused local pass:
@@ -20,6 +24,7 @@ For a focused local pass:
 ```sh
 KNOTE_KAG_FAKE=1 go test -count=1 ./internal/authz ./internal/catalog ./internal/knowledge/authorized/... ./internal/knowledge/kag ./internal/protocol ./internal/runtime ./tests/eino_tools
 python3 -m unittest discover -s adapters/kag -p '*test*.py'
+python3 tests/smoke/permissioned_graph_real_smoke.py --self-test
 ```
 
 No OpenFGA, OpenSPG, KAG, or model-provider credential is permitted in this
@@ -159,22 +164,22 @@ Lists are sorted by resource ID. Authorization timeouts and malformed responses
 must report the generic fail-closed class at the public boundary; detailed
 transport errors remain test-local.
 
-## Phase 2-only gaps
+## Phase 2 deterministic gate
 
-Passing this Phase 1 suite does **not** prove authorization-aware production
-graph reasoning:
+Issue #61 extends the original Phase 1 oracle with a multi-hop fixture and the
+production authorization-aware service. These tests run with synthetic clocks
+and fixed local policy decisions; no network endpoint or credential is used.
 
-- `internal/knowledge/authorized/fixture/fixture.go` sets `ExpandLimit: 0` and
-  uses a document-only authorization boundary.
-- Real `kag.retrieve`, `kag.expand`, and `kag.generate` return
-  `unsupported_primitive` before KAG setup. The legacy real `kag.query` and
-  `kag.explain` paths are not permissioned acceptance evidence.
-- Controlled one-hop handle tests prove authorization ordering, not arbitrary
-  Claim traversal, multi-hop path completeness, a restricted graph DSL, or
-  graph-query time/width/depth limits.
-- Timing-resistant count/exists/autocomplete/pagination behavior, dynamic
-  all-required graph derivations, and production graph path metrics remain
-  Phase 2 work from issue #34.
+| Phase 2 invariant | Direct deterministic anchor |
+|---|---|
+| Alice/Bob/unknown cohorts, recall/precision/path completeness, per-hop drops, BatchCheck RPCs, P95/P99 | `internal/knowledge/authorized/phase2_permissioned_graph_acceptance_test.go: TestPhase2PermissionedGraphPolicyOracleAcceptanceMetrics` |
+| Hidden Claim, denied intermediate, alternate support, any/all derivation, cycles, fanout/depth/time budgets, cancellation, partial authorization | `internal/knowledge/authorized/phase2_permissioned_graph_acceptance_test.go: TestPhase2PermissionedGraphDerivationBudgetsAndFailures` |
+| Traversal/cache/citation/session replay closes after revocation; graph revocation P95/P99 stays bounded | `internal/knowledge/authorized/phase2_permissioned_graph_acceptance_test.go: TestPhase2PermissionedGraphCacheCitationRevocationAndSessionReplay`; `TestPhase2PermissionedGraphRevocationLatencyBudget`; `internal/runtime/phase2_graph_replay_acceptance_test.go` |
+| Mixed-visibility count/exists/autocomplete/pagination/error/trace/debug/audit surfaces are canary-free and not-found timing cohorts stay within budget | `internal/runtime/permissioned_acceptance_test.go: TestPermissionedAcceptanceSideChannelSurfacesHideCanaries`; `internal/runtime/phase2_protected_surfaces_acceptance_test.go: TestPhase2ProtectedSurfacesAcceptanceAreTypedAndCanaryFree` |
+| Cross-tenant input stops before search, graph, or generation | `internal/runtime/phase2_protected_surfaces_acceptance_test.go: TestPhase2ProtectedSurfacesAcceptanceCrossTenantStopsBeforeSearchGraphAndGenerate` |
+| Full replacement removes stale content, bindings, Claims, and tuple snapshots; content/ACL/index/graph projection skew stays bounded | `internal/catalog/phase2_full_reconciliation_acceptance_test.go`; `internal/authz/phase2_full_reconciliation_acceptance_test.go` |
 
-Issue #41 is a gate for creating that work. Its report must label these metrics
-`not_applicable_phase_1`, never zero or passing.
+The live counterpart is intentionally separate from CI. Run the exact pinned,
+public-synthetic OpenFGA + OpenSPG/KAG procedure in
+`docs/permissioned-kag-real-smoke.md`. A release claim requires both the
+deterministic gate and that live smoke to pass.

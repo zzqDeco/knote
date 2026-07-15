@@ -74,6 +74,22 @@ For real KAG execution:
 3. Put Markdown or text sources under `sources/`.
 4. Run `scripts/smoke_real_kag.sh` before a release candidate.
 
+The Phase 2 permissioned graph smoke is separate from that legacy compatibility
+check. It starts pinned disposable OpenFGA and OpenSPG containers, uses only the
+checked-in public synthetic fixture, and removes its containers and volumes on
+exit:
+
+```bash
+KNOTE_PERMISSIONED_GRAPH_REAL_SMOKE=1 \
+KNOTE_PYTHON=/path/to/openspg-kag-0.8-python \
+scripts/smoke_permissioned_graph_real.sh
+```
+
+CI runs the credential-free deterministic half with
+`python3 tests/smoke/permissioned_graph_real_smoke.py --self-test`. See
+`docs/permissioned-kag-real-smoke.md` for exact image digests and external-stack
+options.
+
 The adapter writes a sorted JSON corpus and generated starter config under `.knote/kag-runtime/`; copy that config to `.knote/kag_config.yaml` when you need custom model, namespace, or project settings. Runtime KAG cache is ignored by Git.
 
 ## Sessions
@@ -144,6 +160,14 @@ Manual real KAG validation:
 
 ```bash
 KNOTE_PYTHON=/path/to/python KNOTE_KAG_HOST=http://127.0.0.1:8887 scripts/smoke_real_kag.sh
+```
+
+Manual Phase 2 permissioned graph validation:
+
+```bash
+KNOTE_PERMISSIONED_GRAPH_REAL_SMOKE=1 \
+KNOTE_PYTHON=/path/to/openspg-kag-0.8-python \
+scripts/smoke_permissioned_graph_real.sh
 ```
 
 ## Current Scope

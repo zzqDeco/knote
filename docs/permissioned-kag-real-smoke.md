@@ -1,129 +1,123 @@
-# Optional Real OpenFGA and KAG Smoke
+# Phase 2 Permissioned Graph Smoke
 
-These procedures are manual compatibility checks. They are deliberately
-separate from the deterministic issue #41 gate and must not be added to CI.
-They do not prove an end-to-end real permissioned query: the current runtime
-wires permissioned retrieval only in fake KAG mode, and the real adapter rejects
-the three permissioned primitives with `unsupported_primitive`.
+This is the live compatibility gate for issue #61. It uses only the checked-in
+`public-synthetic` fixture and starts a disposable OpenFGA + OpenSPG/KAG stack.
+It is separate from CI because it pulls several service images and requires an
+`openspg-kag` Python environment. CI runs the deterministic offline half.
 
-## Credential rules
+## Credential and data rules
 
-- Use local or disposable stores and workspaces.
-- Keep API tokens and model-provider credentials only in the invoking shell or
-  an ignored local configuration. Never add them to Git, command output, test
-  fixtures, GitHub Actions secrets for this smoke, or generated artifacts.
-- Do not enable `KNOTE_KAG_FAKE` for the KAG procedure.
-- Sanitized evidence may include versions, opaque IDs, counts, durations, and
-  allow/deny outcomes. Do not retain protected bodies, prompts, traces, paths,
-  or relation labels.
+- Do not set `KNOTE_KAG_FAKE` for the live command.
+- Do not use production endpoints, stores, projects, workspaces, content, or
+  model-provider credentials.
+- The default Compose stack publishes only its random loopback OpenSPG port.
+  Its fixed internal service passwords are public fixture values and disappear
+  with the disposable volumes.
+- The script emits one sorted JSON result. It suppresses provider stdout/stderr
+  and never emits content, prompts, relation labels, API tokens, or model IDs.
+- `KEEP_KNOTE_PERMISSIONED_GRAPH_REAL_WORKSPACE=1` may retain the synthetic
+  workspace for debugging. Never use that option with non-synthetic input.
 
-## OpenFGA model test
+## Exact versions
 
-This repository-pinned command is credential-free and already runs in CI:
+The repository pins the following compatibility set:
+
+| Component | Version or image digest |
+|---|---|
+| OpenFGA CLI | `github.com/openfga/cli/cmd/fga@v0.7.17` |
+| OpenFGA server | `openfga/openfga:v1.15.1@sha256:8543200bf85878c968d73da46c4f0e31ba1f63ed3675b71122f1133b0e9d97eb` |
+| OpenSPG/KAG Python | `0.8.0` |
+| knext Python | `0.8.0` |
+| OpenSPG server | `sha256:fe6708deef9ebb8da8da7b1cb643e83b827769a5be8811961311639aa1f2cb88` |
+| OpenSPG MySQL | `sha256:71eb546d5fc5faf70b3d8a358c022f601591b54a029b79298f2fa0302e46de9a` |
+| OpenSPG Neo4j | `sha256:4bc5b7f6b83d333b1d2c8f60ac145c068d77d50bca65b3a07c927f9e2a541eb9` |
+| OpenSPG MinIO | `sha256:9493c8e8f77edb10d556255d49ba8b5761b0fe57889235dfd10619c0513da007` |
+| Python | `>= 3.11` |
+
+## Deterministic CI half
+
+This command is credential-free and runs in `.github/workflows/ci.yml`:
 
 ```sh
-GOTOOLCHAIN=go1.25.12 go run github.com/openfga/cli/cmd/fga@v0.7.17 model test --tests internal/authz/model/authorization.fga.yaml
+python3 tests/smoke/permissioned_graph_real_smoke.py --self-test
 ```
 
-It validates `internal/authz/model/authorization.fga` against the direct-share,
-cross-tenant, group-membership, restricted-child, and revoke truth tables in
-`internal/authz/model/authorization.fga.yaml`.
+It materializes the same deterministic projection twice and requires identical
+manifest digests. It then exercises real adapter mode for discover, retrieve,
+two per-hop expands, exact evidence load, generate, and replay denial with a
+local allowlisted provider. It does not claim live OpenSPG coverage.
 
-## Live local OpenFGA
+## Disposable live command
 
 Prerequisites:
 
-- Docker with ports 8080 and 3000 available.
-- Go toolchain download access for the pinned OpenFGA CLI.
-- No API token; this procedure binds only to loopback and uses an ephemeral
-  in-memory OpenFGA server.
+- Docker Desktop or Docker Engine with Compose v2;
+- Go, used to install the pinned CLI when needed and to verify a supplied
+  `KNOTE_FGA_BIN` against its embedded module version;
+- Python 3.11 or newer with `openspg-kag==0.8.0` and `knext==0.8.0` importable.
 
-Start OpenFGA in one terminal:
-
-```sh
-docker run --rm --name knote-openfga -p 127.0.0.1:8080:8080 -p 127.0.0.1:3000:3000 openfga/openfga run
-```
-
-Create a disposable store and write the checked-in model:
+From the repository root:
 
 ```sh
-GOTOOLCHAIN=go1.25.12 go run github.com/openfga/cli/cmd/fga@v0.7.17 store create --api-url http://127.0.0.1:8080 --name knote-permissioned-kag-smoke --model internal/authz/model/authorization.fga --format fga
+KNOTE_PERMISSIONED_GRAPH_REAL_SMOKE=1 \
+KNOTE_PYTHON=/absolute/path/to/openspg-kag-0.8-python \
+scripts/smoke_permissioned_graph_real.sh
 ```
 
-Record `.store.id` from the JSON response as `<store-id>`, then write a minimal
-same-organization direct-share fixture:
+The command starts all pinned containers on random loopback ports, creates a
+temporary OpenFGA store/model and OpenSPG project, and then validates:
+
+1. unknown-principal denial before retrieval;
+2. a real KAG/knext project create and schema sync;
+3. separate typed vertex upserts plus one `owns` edge;
+4. live `ReasonerClient.query_node` and bounded `syn_execute` graph probes;
+5. real adapter retrieve restricted to the exact allowed graph object ID;
+6. entity-to-Claim and Claim-to-object expansion using the checked-in binding;
+7. exact digest-checked evidence load and allowlisted generation;
+8. higher-consistency OpenFGA revoke and replay denial before load/generate.
+
+The exit trap removes the OpenFGA container and runs
+`docker compose down -v --remove-orphans` for OpenSPG. A cleanup failure changes
+an otherwise successful run to failure and is also reported after a failed run.
+The pass record contains only versions, version-verification sources, stage
+names, counts, and durations.
+
+The live `replay_denial` stage rechecks the stale capsule through the real
+OpenFGA store and proves that content load and generation are not called after
+denial. The production runtime session-replay path is exercised separately by
+`internal/runtime/phase2_graph_replay_acceptance_test.go`.
+
+## Existing disposable OpenSPG stack
+
+An externally managed endpoint is accepted only when the caller explicitly
+declares that the whole stack is disposable. The script leaves the temporary
+project in that stack because OpenSPG 0.8 protects project deletion with its
+login session; the caller must destroy the stack and its volumes after the run.
+External endpoint versions are marked `caller-declared` in the pass record and
+cannot satisfy the issue #61 release gate; that gate requires the repository's
+default digest-pinned stack and `repository-pinned-image-digest` markers.
 
 ```sh
-GOTOOLCHAIN=go1.25.12 go run github.com/openfga/cli/cmd/fga@v0.7.17 tuple write --api-url http://127.0.0.1:8080 --store-id <store-id> user:alice member organization:acme
-GOTOOLCHAIN=go1.25.12 go run github.com/openfga/cli/cmd/fga@v0.7.17 tuple write --api-url http://127.0.0.1:8080 --store-id <store-id> organization:acme organization document:smoke
-GOTOOLCHAIN=go1.25.12 go run github.com/openfga/cli/cmd/fga@v0.7.17 tuple write --api-url http://127.0.0.1:8080 --store-id <store-id> user:alice viewer document:smoke
+KNOTE_PERMISSIONED_GRAPH_REAL_SMOKE=1 \
+KNOTE_PYTHON=/absolute/path/to/openspg-kag-0.8-python \
+KNOTE_KAG_HOST=http://127.0.0.1:8887 \
+KNOTE_OPENSPG_DISPOSABLE=1 \
+KNOTE_OPENSPG_SERVER_VERSION='v0.8.0@sha256:fe6708deef9ebb8da8da7b1cb643e83b827769a5be8811961311639aa1f2cb88' \
+scripts/smoke_permissioned_graph_real.sh
 ```
 
-Alice must be allowed and Bob must be denied with higher consistency:
+For an external OpenFGA endpoint, also set `KNOTE_OPENFGA_API_URL` and the exact
+`KNOTE_OPENFGA_SERVER_VERSION`. Keep any `KNOTE_OPENFGA_API_TOKEN` only in the
+invoking environment. Do not retain shell traces or service logs containing it.
+
+## Other validation
+
+The authorization model remains a separate credential-free gate:
 
 ```sh
-GOTOOLCHAIN=go1.25.12 go run github.com/openfga/cli/cmd/fga@v0.7.17 query check --api-url http://127.0.0.1:8080 --store-id <store-id> --consistency HIGHER_CONSISTENCY user:alice can_view document:smoke
-GOTOOLCHAIN=go1.25.12 go run github.com/openfga/cli/cmd/fga@v0.7.17 query check --api-url http://127.0.0.1:8080 --store-id <store-id> --consistency HIGHER_CONSISTENCY user:bob can_view document:smoke
+GOTOOLCHAIN=go1.25.12 go run github.com/openfga/cli/cmd/fga@v0.7.17 model test \
+  --tests internal/authz/model/authorization.fga.yaml
 ```
 
-Delete Alice's direct share and repeat her check. The result must change to
-deny; record the elapsed delete-to-deny time as an observational revocation
-sample, not as CI evidence:
-
-```sh
-GOTOOLCHAIN=go1.25.12 go run github.com/openfga/cli/cmd/fga@v0.7.17 tuple delete --api-url http://127.0.0.1:8080 --store-id <store-id> user:alice viewer document:smoke
-GOTOOLCHAIN=go1.25.12 go run github.com/openfga/cli/cmd/fga@v0.7.17 query check --api-url http://127.0.0.1:8080 --store-id <store-id> --consistency HIGHER_CONSISTENCY user:alice can_view document:smoke
-```
-
-Stop the container with `Ctrl-C`. `internal/authz/openfga_test.go` separately
-proves the Go SDK request, model pinning, response validation, timeout, and
-fail-closed behavior against local HTTP test servers. There is currently no
-supported `knote` CLI flag that wires this disposable store into the runtime;
-do not invent one. `internal/authz.NewOpenFGA` also requires
-`KNOTE_OPENFGA_API_TOKEN`, so this unauthenticated service check does not claim
-to exercise that constructor.
-
-## Real OpenSPG/KAG
-
-Prerequisites:
-
-- A Python interpreter that can import the repository's supported
-  `openspg-kag` 0.8.0 environment.
-- A reachable OpenSPG/KAG service, defaulting to
-  `http://127.0.0.1:8887`.
-- Any model-provider configuration required by the local KAG configuration,
-  supplied only through the local environment.
-- Git, because the smoke creates an ephemeral repository when no workspace is
-  supplied.
-
-Run the existing smoke script from the repository root:
-
-```sh
-KNOTE_PYTHON=/path/to/python KNOTE_KAG_HOST=http://127.0.0.1:8887 scripts/smoke_real_kag.sh
-```
-
-To inspect a prepared local workspace instead of the ephemeral fixture:
-
-```sh
-KNOTE_PYTHON=/path/to/python KNOTE_KAG_HOST=http://127.0.0.1:8887 KNOTE_REAL_KAG_WORKSPACE=/absolute/path/to/workspace scripts/smoke_real_kag.sh
-```
-
-`scripts/smoke_real_kag.sh` invokes `tests/smoke/kag_real_smoke.py`. Success
-means:
-
-1. `kag.health`, `kag.build`, legacy `kag.query`, and legacy `kag.explain`
-   complete against the local service.
-2. `kag.retrieve`, `kag.expand`, and `kag.generate` each return the typed
-   `unsupported_primitive` error.
-
-The second condition is a security assertion: real permissioned primitives
-must remain closed until a pre-generation, per-hop implementation is proven.
-Legacy query/explain output is compatibility evidence only and must not be used
-to satisfy issue #41 recall, precision, path-completeness, or no-leak gates.
-
-## Smoke record
-
-Keep a short local record with the Git commit, OpenFGA/OpenSPG/KAG versions,
-sanitized endpoint host, model ID, projection version, pass/fail per step, and
-observed durations. A failure does not weaken the deterministic CI gate; it
-blocks any claim that the corresponding real integration is operational.
+`scripts/smoke_real_kag.sh` remains the legacy build/query/explain compatibility
+check. Its output is not permissioned retrieval, graph-path, or no-leak evidence.

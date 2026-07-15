@@ -39,6 +39,9 @@ jobs:
       - name: Python adapter smoke
         run: python -m unittest discover -s adapters/kag -p '*test*.py'
 
+      - name: Phase 2 permissioned graph deterministic smoke
+        run: python tests/smoke/permissioned_graph_real_smoke.py --self-test
+
       - name: Build CLI
         run: CGO_ENABLED=0 go build -o bin/knote ./cmd/knote
 
