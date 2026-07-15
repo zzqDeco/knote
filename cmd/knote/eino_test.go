@@ -10,10 +10,13 @@ import (
 
 	einotool "github.com/cloudwego/eino/components/tool"
 
+	"github.com/zzqDeco/knote/internal/authz"
 	einotools "github.com/zzqDeco/knote/internal/eino/tools"
 	"github.com/zzqDeco/knote/internal/knowledge/kag"
 	"github.com/zzqDeco/knote/internal/knowledge/versioned"
+	"github.com/zzqDeco/knote/internal/protocol"
 	"github.com/zzqDeco/knote/internal/repository"
+	"github.com/zzqDeco/knote/internal/repository/local"
 )
 
 func TestValidateRuntimeModeRejectsDirect(t *testing.T) {
@@ -77,57 +80,116 @@ func TestNewEinoRunnerUsesOpenAIEnvironmentOverrides(t *testing.T) {
 	}
 }
 
-func TestPermissionedPrincipalUsesTrustedRuntimeEnvironment(t *testing.T) {
+func TestPermissionedFixturePrincipalUsesTrustedRuntimeEnvironment(t *testing.T) {
 	t.Setenv(permissionedPrincipalEnv, "")
-	principal, err := permissionedPrincipal()
+	principal, err := permissionedFixturePrincipal()
 	if err != nil || principal != "alice" {
 		t.Fatalf("default principal = %q, %v; want alice", principal, err)
 	}
 
 	t.Setenv(permissionedPrincipalEnv, "bob")
-	principal, err = permissionedPrincipal()
+	principal, err = permissionedFixturePrincipal()
 	if err != nil || principal != "bob" {
 		t.Fatalf("configured principal = %q, %v; want bob", principal, err)
 	}
 
 	t.Setenv(permissionedPrincipalEnv, "mallory")
-	if _, err := permissionedPrincipal(); err == nil || !strings.Contains(err.Error(), permissionedPrincipalEnv) {
+	if _, err := permissionedFixturePrincipal(); err == nil || !strings.Contains(err.Error(), permissionedPrincipalEnv) {
 		t.Fatalf("unknown principal should fail closed, got %v", err)
 	}
 }
 
-func TestPermissionedAuthorizationProviderOnlyEnablesFakeMode(t *testing.T) {
-	t.Setenv(permissionedPrincipalEnv, "mallory")
-	provider, err := permissionedAuthorizationProvider(false)
-	if err != nil || provider != nil {
-		t.Fatalf("real-mode provider = %v, %v; want nil", provider, err)
+func TestPermissionedRuntimeConfigIsExplicitAndComplete(t *testing.T) {
+	for _, name := range []string{
+		permissionedEnabledEnv, permissionedPrincipalEnv, permissionedIdentityWatermarkEnv,
+		permissionedProviderEnv, openFGAEndpointEnv, openFGAStoreIDEnv, openFGAModelIDEnv,
+		openFGATimeoutEnv, openFGAConsistencyEnv, "KNOTE_OPENFGA_API_TOKEN",
+	} {
+		t.Setenv(name, "")
 	}
-	if _, err := permissionedAuthorizationProvider(true); err == nil {
-		t.Fatal("fake mode accepted an unknown fixture principal")
+	config, err := loadPermissionedRuntimeConfig(false)
+	if err != nil || config.Enabled {
+		t.Fatalf("disabled config = %+v, %v", config, err)
 	}
 
-	t.Setenv(permissionedPrincipalEnv, "bob")
-	provider, err = permissionedAuthorizationProvider(true)
-	if err != nil || provider == nil {
-		t.Fatalf("fake-mode provider = %v, %v; want configured provider", provider, err)
+	t.Setenv(permissionedEnabledEnv, "1")
+	if _, err := loadPermissionedRuntimeConfig(false); err == nil || !strings.Contains(err.Error(), permissionedPrincipalEnv) {
+		t.Fatalf("partial real config should fail closed, got %v", err)
 	}
-	authorization, err := provider(context.Background(), "sess_fake")
-	if err != nil || authorization.PrincipalID != "bob" || authorization.SessionID != "sess_fake" {
-		t.Fatalf("fake-mode authorization = %+v, %v", authorization, err)
+
+	t.Setenv(permissionedPrincipalEnv, "alice")
+	t.Setenv(permissionedIdentityWatermarkEnv, "identity_v1")
+	t.Setenv(permissionedProviderEnv, "permissioned_provider:create")
+	t.Setenv(openFGAEndpointEnv, "http://127.0.0.1:8080")
+	t.Setenv(openFGAStoreIDEnv, "01ARZ3NDEKTSV4RRFFQ69G5FAV")
+	t.Setenv(openFGAModelIDEnv, "01ARZ3NDEKTSV4RRFFQ69G5FAW")
+	t.Setenv("KNOTE_OPENFGA_API_TOKEN", "test-token")
+	config, err = loadPermissionedRuntimeConfig(false)
+	if err != nil || !config.Enabled || config.Fake || config.Provider != "permissioned_provider:create" {
+		t.Fatalf("real config = %+v, %v", config, err)
+	}
+	if _, err := loadPermissionedRuntimeConfig(true); err == nil {
+		t.Fatal("real and fake permissioned modes were both accepted")
 	}
 }
 
 func TestPermissionedApplicationOnlyWiresCachedRevocationPathInFakeMode(t *testing.T) {
-	application, err := newPermissionedApplication(false, nil)
+	application, err := newPermissionedApplication(context.Background(), permissionedRuntimeConfig{}, nil, nil)
 	if err != nil || application != nil {
 		t.Fatalf("real-mode permissioned application = %#v, %v", application, err)
 	}
-	application, err = newPermissionedApplication(true, kag.Client{Fake: true})
+	application, err = newPermissionedApplication(context.Background(), permissionedRuntimeConfig{
+		Enabled: true, Fake: true, Principal: "alice",
+	}, kag.Client{Fake: true}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if application == nil || application.fixture == nil || application.fixture.Service == nil {
+	if application == nil || application.fixture == nil || application.service == nil || application.AuthorizationContextProvider() == nil {
 		t.Fatalf("fake-mode permissioned application was not fully wired: %#v", application)
+	}
+}
+
+func TestPermissionedApplicationWiresRealSelectedBundleScope(t *testing.T) {
+	workspace := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(workspace, "sources"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "sources", "intro.md"), []byte("# Intro\n\nreal permissioned content\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store := local.New(workspace)
+	service := versioned.New(versioned.Options{
+		Workspace: workspace, Repo: store, Backend: permissionedBuildBackend{}, Mode: versioned.ModeFake,
+	})
+	if _, err := service.Build(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(authz.APITokenEnv, "test-token")
+	config := permissionedRuntimeConfig{
+		Enabled: true, Principal: "alice", IdentityWatermark: "identity_v1",
+		OpenFGA: authz.OpenFGAConfig{
+			Endpoint: "http://127.0.0.1:8080", StoreID: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+			AuthorizationModelID: "01ARZ3NDEKTSV4RRFFQ69G5FAW", Timeout: defaultOpenFGATimeout,
+			Consistency: authz.ConsistencyHigherConsistency,
+		},
+		Consistency: protocol.ConsistencyHigherConsistency,
+	}
+	application, err := newPermissionedApplication(context.Background(), config, kag.Client{Fake: true}, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := application.AuthorizationContextProvider()
+	if application.service == nil || provider == nil {
+		t.Fatalf("real permissioned application was not fully wired: %#v", application)
+	}
+	authorization, err := provider(context.Background(), "sess_real")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if authorization.PrincipalID != "alice" || authorization.SessionID != "sess_real" ||
+		authorization.AuthorizationModelID != config.OpenFGA.AuthorizationModelID ||
+		authorization.TenantID != "local" || authorization.KnowledgeBaseID == "" || authorization.ACLWatermark == "" {
+		t.Fatalf("unexpected real authorization context: %+v", authorization)
 	}
 }
 
@@ -209,7 +271,16 @@ func clearEinoEnv(t *testing.T) {
 		"KNOTE_EINO_REASONING_EFFORT",
 		"KNOTE_EINO_MODEL_PROFILE",
 		"KNOTE_RUNTIME_MODE",
+		permissionedEnabledEnv,
 		permissionedPrincipalEnv,
+		permissionedIdentityWatermarkEnv,
+		permissionedProviderEnv,
+		openFGAEndpointEnv,
+		openFGAStoreIDEnv,
+		openFGAModelIDEnv,
+		openFGATimeoutEnv,
+		openFGAConsistencyEnv,
+		authz.APITokenEnv,
 		"OPENAI_MODEL",
 		"OPENAI_API_KEY",
 		"OPENAI_BASE_URL",
@@ -217,4 +288,34 @@ func clearEinoEnv(t *testing.T) {
 	} {
 		t.Setenv(name, "")
 	}
+}
+
+type permissionedBuildBackend struct{}
+
+func (permissionedBuildBackend) Build(context.Context) (kag.Response, error) {
+	return kag.Response{Data: map[string]any{"mode": "fake"}}, nil
+}
+
+func (permissionedBuildBackend) Query(context.Context, string) (kag.Response, error) {
+	return kag.Response{Data: map[string]any{"answer": "fake", "mode": "fake"}}, nil
+}
+
+func (permissionedBuildBackend) Explain(context.Context, string) (kag.Response, error) {
+	return kag.Response{Data: map[string]any{"answer": "fake", "mode": "fake"}}, nil
+}
+
+func (b permissionedBuildBackend) BuildInNamespace(ctx context.Context, _, _ string) (kag.Response, error) {
+	return b.Build(ctx)
+}
+
+func (b permissionedBuildBackend) BuildInNamespaceWithCorpus(ctx context.Context, _, _ string, _ []kag.CorpusRecord) (kag.Response, error) {
+	return b.Build(ctx)
+}
+
+func (b permissionedBuildBackend) QueryInNamespace(ctx context.Context, _ string, query string) (kag.Response, error) {
+	return b.Query(ctx, query)
+}
+
+func (b permissionedBuildBackend) ExplainInNamespace(ctx context.Context, _ string, query string) (kag.Response, error) {
+	return b.Explain(ctx, query)
 }

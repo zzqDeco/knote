@@ -61,6 +61,27 @@ type ProjectionWorkspace interface {
 	ReadCurrentProjection(ctx context.Context) ([]byte, error)
 }
 
+// SelectedArtifactBundle is an immutable, fully verified serving snapshot.
+// Files contains exactly the descriptors declared by Manifest.
+type SelectedArtifactBundle struct {
+	Manifest protocol.ArtifactBundleManifest
+	Files    map[string][]byte
+}
+
+// SelectedArtifactMetadata contains only the verified authorization metadata
+// needed before an authorization decision. It must not contain evidence bytes.
+type SelectedArtifactMetadata struct {
+	Manifest       protocol.ArtifactBundleManifest
+	ProjectionJSON []byte
+}
+
+// SelectedArtifactReader separates pre-authorization metadata from the full
+// selected bundle while keeping both reads coherent and independently verified.
+type SelectedArtifactReader interface {
+	ReadCurrentArtifactMetadata(context.Context) (SelectedArtifactMetadata, error)
+	ReadCurrentArtifactBundle(context.Context) (SelectedArtifactBundle, error)
+}
+
 type Sessions interface {
 	Append(ctx context.Context, event protocol.Event) error
 	Load(ctx context.Context, sessionID string) ([]protocol.Event, error)

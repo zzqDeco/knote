@@ -245,58 +245,95 @@ func readArtifactCurrentPointer(path string) (protocol.ArtifactCurrentPointer, e
 	return pointer, nil
 }
 
-func (s Store) ReadCurrentArtifactManifest(ctx context.Context) (protocol.ArtifactBundleManifest, error) {
+type currentArtifactSelection struct {
+	pointer      protocol.ArtifactCurrentPointer
+	manifest     protocol.ArtifactBundleManifest
+	manifestData []byte
+	bundleDir    string
+}
+
+func (s Store) readCurrentArtifactSelection(ctx context.Context) (currentArtifactSelection, error) {
 	if err := ctx.Err(); err != nil {
-		return protocol.ArtifactBundleManifest{}, err
+		return currentArtifactSelection{}, err
 	}
 	artifactsDir := filepath.Join(s.workspace, "artifacts")
 	if err := validateArtifactBundleDirectory(artifactsDir); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return protocol.ArtifactBundleManifest{}, repository.ErrArtifactCurrentNotFound
+			return currentArtifactSelection{}, repository.ErrArtifactCurrentNotFound
 		}
-		return protocol.ArtifactBundleManifest{}, err
+		return currentArtifactSelection{}, err
 	}
-	pointerData, err := os.ReadFile(filepath.Join(artifactsDir, "current.json"))
+	pointerPath := filepath.Join(artifactsDir, "current.json")
+	pointerInfo, err := os.Lstat(pointerPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return protocol.ArtifactBundleManifest{}, repository.ErrArtifactCurrentNotFound
+			return currentArtifactSelection{}, repository.ErrArtifactCurrentNotFound
 		}
-		return protocol.ArtifactBundleManifest{}, err
+		return currentArtifactSelection{}, err
+	}
+	if pointerInfo.Mode()&os.ModeSymlink != 0 || !pointerInfo.Mode().IsRegular() {
+		return currentArtifactSelection{}, fmt.Errorf("artifact current pointer is not a regular file")
+	}
+	pointerData, err := os.ReadFile(pointerPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return currentArtifactSelection{}, repository.ErrArtifactCurrentNotFound
+		}
+		return currentArtifactSelection{}, err
 	}
 	var pointer protocol.ArtifactCurrentPointer
 	if err := json.Unmarshal(pointerData, &pointer); err != nil {
-		return protocol.ArtifactBundleManifest{}, fmt.Errorf("decode artifact current pointer: %w", err)
+		return currentArtifactSelection{}, fmt.Errorf("decode artifact current pointer: %w", err)
 	}
 	if err := pointer.Validate(); err != nil {
-		return protocol.ArtifactBundleManifest{}, fmt.Errorf("validate artifact current pointer: %w", err)
+		return currentArtifactSelection{}, fmt.Errorf("validate artifact current pointer: %w", err)
 	}
 	bundlesDir := filepath.Join(artifactsDir, "bundles")
 	if err := validateArtifactBundleDirectory(bundlesDir); err != nil {
-		return protocol.ArtifactBundleManifest{}, err
+		return currentArtifactSelection{}, err
 	}
 	manifestPath := filepath.Join(bundlesDir, pointer.ProjectionID, bundleManifestName)
 	if err := validateArtifactBundleDirectory(filepath.Dir(manifestPath)); err != nil {
-		return protocol.ArtifactBundleManifest{}, err
+		return currentArtifactSelection{}, err
+	}
+	manifestInfo, err := os.Lstat(manifestPath)
+	if err != nil {
+		return currentArtifactSelection{}, err
+	}
+	if manifestInfo.Mode()&os.ModeSymlink != 0 || !manifestInfo.Mode().IsRegular() {
+		return currentArtifactSelection{}, fmt.Errorf("immutable artifact bundle contains non-regular file %q", bundleManifestName)
 	}
 	manifestData, err := os.ReadFile(manifestPath)
 	if err != nil {
-		return protocol.ArtifactBundleManifest{}, err
+		return currentArtifactSelection{}, err
 	}
 	manifestSum := sha256.Sum256(manifestData)
 	if got := hex.EncodeToString(manifestSum[:]); got != pointer.ManifestSHA256 {
-		return protocol.ArtifactBundleManifest{}, fmt.Errorf("artifact bundle manifest digest does not match current pointer")
+		return currentArtifactSelection{}, fmt.Errorf("artifact bundle manifest digest does not match current pointer")
 	}
 	var manifest protocol.ArtifactBundleManifest
 	if err := json.Unmarshal(manifestData, &manifest); err != nil {
-		return protocol.ArtifactBundleManifest{}, fmt.Errorf("decode artifact bundle manifest: %w", err)
+		return currentArtifactSelection{}, fmt.Errorf("decode artifact bundle manifest: %w", err)
 	}
 	if err := manifest.Validate(); err != nil {
-		return protocol.ArtifactBundleManifest{}, fmt.Errorf("validate artifact bundle manifest: %w", err)
+		return currentArtifactSelection{}, fmt.Errorf("validate artifact bundle manifest: %w", err)
 	}
 	if manifest.ProjectionID != pointer.ProjectionID || manifest.ProjectionVersion != pointer.ProjectionVersion {
-		return protocol.ArtifactBundleManifest{}, fmt.Errorf("artifact bundle manifest does not match current pointer projection")
+		return currentArtifactSelection{}, fmt.Errorf("artifact bundle manifest does not match current pointer projection")
 	}
-	bundleDir := filepath.Dir(manifestPath)
+	return currentArtifactSelection{
+		pointer: pointer, manifest: manifest, manifestData: manifestData, bundleDir: filepath.Dir(manifestPath),
+	}, nil
+}
+
+func (s Store) ReadCurrentArtifactManifest(ctx context.Context) (protocol.ArtifactBundleManifest, error) {
+	selection, err := s.readCurrentArtifactSelection(ctx)
+	if err != nil {
+		return protocol.ArtifactBundleManifest{}, err
+	}
+	manifest := selection.manifest
+	manifestData := selection.manifestData
+	bundleDir := selection.bundleDir
 	if err := verifyStagedArtifactBundle(bundleDir, manifest, manifestData); err != nil {
 		return protocol.ArtifactBundleManifest{}, err
 	}
@@ -326,7 +363,60 @@ func (s Store) ReadCurrentArtifactManifest(ctx context.Context) (protocol.Artifa
 	if err := repository.ValidateGraphArtifactPayloads(manifest, files); err != nil {
 		return protocol.ArtifactBundleManifest{}, err
 	}
+	current, err := s.readCurrentArtifactSelection(ctx)
+	if err != nil {
+		return protocol.ArtifactBundleManifest{}, err
+	}
+	if current.pointer != selection.pointer {
+		return protocol.ArtifactBundleManifest{}, repository.ErrArtifactPublicationStaleBase
+	}
 	return manifest, nil
+}
+
+// ReadCurrentArtifactMetadata verifies only the selected manifest and
+// projection needed to construct an authorization context. Evidence payloads
+// remain unread until the post-authorization bundle load.
+func (s Store) ReadCurrentArtifactMetadata(ctx context.Context) (repository.SelectedArtifactMetadata, error) {
+	selection, err := s.readCurrentArtifactSelection(ctx)
+	if err != nil {
+		return repository.SelectedArtifactMetadata{}, err
+	}
+	var projectionDescriptor *protocol.ArtifactBundleFile
+	for index := range selection.manifest.Files {
+		if selection.manifest.Files[index].Path == "projection.json" {
+			projectionDescriptor = &selection.manifest.Files[index]
+			break
+		}
+	}
+	if projectionDescriptor == nil {
+		return repository.SelectedArtifactMetadata{}, fmt.Errorf("selected artifact projection descriptor is missing")
+	}
+	projectionPath := filepath.Join(selection.bundleDir, projectionDescriptor.Path)
+	projectionInfo, err := os.Lstat(projectionPath)
+	if err != nil {
+		return repository.SelectedArtifactMetadata{}, err
+	}
+	if projectionInfo.Mode()&os.ModeSymlink != 0 || !projectionInfo.Mode().IsRegular() {
+		return repository.SelectedArtifactMetadata{}, fmt.Errorf("immutable artifact bundle contains non-regular file %q", projectionDescriptor.Path)
+	}
+	projectionJSON, err := os.ReadFile(projectionPath)
+	if err != nil {
+		return repository.SelectedArtifactMetadata{}, err
+	}
+	metadata := repository.SelectedArtifactMetadata{
+		Manifest: selection.manifest, ProjectionJSON: projectionJSON,
+	}
+	if err := metadata.Validate(); err != nil {
+		return repository.SelectedArtifactMetadata{}, err
+	}
+	current, err := s.readCurrentArtifactSelection(ctx)
+	if err != nil {
+		return repository.SelectedArtifactMetadata{}, err
+	}
+	if current.pointer != selection.pointer {
+		return repository.SelectedArtifactMetadata{}, repository.ErrArtifactPublicationStaleBase
+	}
+	return metadata.Clone(), nil
 }
 
 func (s Store) ReadCurrentProjection(ctx context.Context) ([]byte, error) {
@@ -335,6 +425,54 @@ func (s Store) ReadCurrentProjection(ctx context.Context) ([]byte, error) {
 		return nil, err
 	}
 	return os.ReadFile(filepath.Join(s.workspace, "artifacts", "bundles", manifest.ProjectionID, "projection.json"))
+}
+
+// ReadCurrentArtifactBundle returns one coherent serving snapshot. The current
+// pointer and every file are validated before any bytes leave the store, and
+// each file is rechecked after the manifest validation to fail closed on a
+// concurrent mutation.
+func (s Store) ReadCurrentArtifactBundle(ctx context.Context) (repository.SelectedArtifactBundle, error) {
+	selection, err := s.readCurrentArtifactSelection(ctx)
+	if err != nil {
+		return repository.SelectedArtifactBundle{}, err
+	}
+	manifest := selection.manifest
+	bundleDir := selection.bundleDir
+	if err := verifyStagedArtifactBundle(bundleDir, manifest, selection.manifestData); err != nil {
+		return repository.SelectedArtifactBundle{}, err
+	}
+	files := make(map[string][]byte, len(manifest.Files))
+	for _, descriptor := range manifest.Files {
+		path := filepath.Join(bundleDir, descriptor.Path)
+		info, err := os.Lstat(path)
+		if err != nil {
+			return repository.SelectedArtifactBundle{}, err
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			return repository.SelectedArtifactBundle{}, fmt.Errorf("immutable artifact bundle contains non-regular file %q", descriptor.Path)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return repository.SelectedArtifactBundle{}, err
+		}
+		sum := sha256.Sum256(data)
+		if hex.EncodeToString(sum[:]) != descriptor.SHA256 || int64(len(data)) != descriptor.SizeBytes {
+			return repository.SelectedArtifactBundle{}, fmt.Errorf("immutable artifact bundle file %q differs from projection %s", descriptor.Path, manifest.ProjectionID)
+		}
+		files[descriptor.Path] = data
+	}
+	snapshot := repository.SelectedArtifactBundle{Manifest: manifest, Files: files}
+	if err := snapshot.Validate(); err != nil {
+		return repository.SelectedArtifactBundle{}, err
+	}
+	current, err := s.readCurrentArtifactSelection(ctx)
+	if err != nil {
+		return repository.SelectedArtifactBundle{}, err
+	}
+	if current.pointer != selection.pointer {
+		return repository.SelectedArtifactBundle{}, repository.ErrArtifactPublicationStaleBase
+	}
+	return snapshot.Clone(), nil
 }
 
 // committableArtifactPaths returns the exact selected serving snapshot. Other
