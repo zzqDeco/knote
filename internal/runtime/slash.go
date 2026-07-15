@@ -41,6 +41,9 @@ func (m *Manager) routeSlash(ctx context.Context, sessionID string, cmd string, 
 	case "eval":
 		return []protocol.Event{protocol.NewEvent(protocol.EventError, sessionID, "eval is unavailable until authorized explain is implemented", nil)}
 	case "diff":
+		if m.deps.AuthorizationContextProvider != nil {
+			return []protocol.Event{protocol.NewEvent(protocol.EventError, sessionID, "diff is unavailable in permissioned sessions", nil)}
+		}
 		return m.invokeTool(ctx, sessionID, tools.NameDiff, jsonArgs(map[string]any{"ref": strings.TrimSpace(arg)}))
 	case "versions":
 		return m.invokeTool(ctx, sessionID, tools.NameVersions, jsonArgs(map[string]any{"limit": 20}))
@@ -256,6 +259,9 @@ func (m *Manager) status(sessionID string, ctx context.Context) []protocol.Event
 	status, err := m.deps.Versions.Status(ctx)
 	if err != nil {
 		return []protocol.Event{protocol.NewEvent(protocol.EventError, sessionID, err.Error(), nil)}
+	}
+	if m.deps.AuthorizationContextProvider != nil {
+		status.Raw = ""
 	}
 	message := strings.TrimSpace(status.Raw)
 	if message == "" {

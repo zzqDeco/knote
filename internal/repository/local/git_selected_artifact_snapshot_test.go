@@ -2,6 +2,7 @@ package local
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
@@ -9,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/zzqDeco/knote/internal/protocol"
 	"github.com/zzqDeco/knote/internal/repository"
 )
 
@@ -104,6 +106,60 @@ func TestCommitPrunesUnpublishedFirstArtifactBundleWithoutCurrentPointer(t *test
 		t.Fatalf("source update was not committed:\n%s", show)
 	}
 	assertGitTreeOmits(t, workspace, candidate.BundleManifest.ProjectionID, "unpublished-secret-content")
+}
+
+func TestCommitPreservesLegacyArtifactsWhilePruningUnpublishedBundle(t *testing.T) {
+	ctx := context.Background()
+	workspace := initRepo(t)
+	mustWrite(t, filepath.Join(workspace, ".knote", "config.yaml"), "workspace: test\n")
+	mustWrite(t, filepath.Join(workspace, "sources", "intro.md"), "initial\n")
+
+	manifest := protocol.ArtifactManifest{Version: 1, Workspace: "legacy", SummaryCount: 1}
+	manifestData, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	summaryData, err := json.Marshal(protocol.Summary{
+		SummaryID:        "legacy-summary",
+		Text:             "legacy-visible-content",
+		EvidenceChunkIDs: []string{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(workspace, "artifacts", "manifest.json"), string(manifestData)+"\n")
+	mustWrite(t, filepath.Join(workspace, "artifacts", "summaries.jsonl"), string(summaryData)+"\n")
+	runGit(t, workspace, "add", ".")
+	runGit(t, workspace, "commit", "-m", "legacy artifacts")
+
+	store := New(workspace)
+	candidate := testBundleArtifactSet(t, "prj_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "unpublished-secret-content")
+	if err := store.StageArtifacts(ctx, candidate); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(workspace, "sources", "intro.md"), "updated\n")
+	if _, err := store.Commit(ctx, "source update"); err != nil {
+		t.Fatal(err)
+	}
+
+	tree := runGit(t, workspace, "ls-tree", "-r", "--name-only", "HEAD")
+	for _, path := range []string{"artifacts/manifest.json", "artifacts/summaries.jsonl"} {
+		if !strings.Contains(tree, path) {
+			t.Fatalf("Git tree dropped legacy artifact %q:\n%s", path, tree)
+		}
+	}
+	assertGitTreeOmits(t, workspace, candidate.BundleManifest.ProjectionID, "unpublished-secret-content")
+	if (gitClient{workspace: workspace}).Dirty(ctx) {
+		t.Fatal("preserved legacy artifacts left the committed workspace dirty")
+	}
+	readManifest, err := store.ReadManifest(ctx)
+	if err != nil || readManifest.Workspace != "legacy" {
+		t.Fatalf("legacy manifest unavailable after commit: manifest=%+v err=%v", readManifest, err)
+	}
+	summaries, err := store.ReadSummaries(ctx)
+	if err != nil || len(summaries) != 1 || summaries[0].Text != "legacy-visible-content" {
+		t.Fatalf("legacy summaries unavailable after commit: summaries=%+v err=%v", summaries, err)
+	}
 }
 
 func assertGitTreeContains(t *testing.T, workspace, projectionID string) {

@@ -355,7 +355,11 @@ func (s Store) committableArtifactPaths(ctx context.Context) ([]string, bool, er
 	}
 	manifest, err := s.ReadCurrentArtifactManifest(ctx)
 	if errors.Is(err, repository.ErrArtifactCurrentNotFound) {
-		return nil, true, nil
+		// Commit prunes unpublished bundles before adding paths. Keep only flat
+		// exports so a staged v2 build cannot delete active v1 data or stage the
+		// publication lock that protects this commit.
+		paths, legacyErr := committableLegacyArtifactPaths(artifactsDir)
+		return paths, true, legacyErr
 	}
 	if err != nil {
 		return nil, true, fmt.Errorf("validate selected artifacts for commit: %w", err)
@@ -391,6 +395,37 @@ func (s Store) committableArtifactPaths(ctx context.Context) ([]string, bool, er
 	}
 	sort.Strings(paths)
 	return paths, true, nil
+}
+
+func committableLegacyArtifactPaths(artifactsDir string) ([]string, error) {
+	entries, err := os.ReadDir(artifactsDir)
+	if err != nil {
+		return nil, err
+	}
+	var paths []string
+	for _, entry := range entries {
+		switch entry.Name() {
+		case "bundles", "current.json", artifactPublicationLockName:
+			continue
+		}
+		path := filepath.Join(artifactsDir, entry.Name())
+		info, err := os.Lstat(path)
+		if err != nil {
+			return nil, err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return nil, fmt.Errorf("legacy artifact is not a regular file: %s", path)
+		}
+		if info.IsDir() {
+			continue
+		}
+		if !info.Mode().IsRegular() {
+			return nil, fmt.Errorf("legacy artifact is not a regular file: %s", path)
+		}
+		paths = append(paths, filepath.ToSlash(filepath.Join("artifacts", entry.Name())))
+	}
+	sort.Strings(paths)
+	return paths, nil
 }
 
 func (s Store) pruneUnselectedArtifactBundles(ctx context.Context) error {

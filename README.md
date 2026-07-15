@@ -128,7 +128,7 @@ The script probes `/v1/models`, starts the Eino-only TUI, requires the model to 
 
 `knote` treats Git commits as knowledge versions, Git tags as release versions, and branches as candidate experiments.
 
-- `/diff` shows current knowledge changes in `.knote/config.yaml`, `sources/`, `artifacts/`, and `evals/`.
+- `/diff` shows current knowledge changes in `.knote/config.yaml`, `sources/`, `artifacts/`, and `evals/` when no authorization provider is configured. The permissioned runtime blocks raw diffs because their content is not authorization-bound.
 - `/commit [message]` stages only those knowledge paths and creates a commit after confirmation.
 - `/versions` lists recent commits, tags, and the current marker.
 - `/checkout <ref>` requires confirmation, with an extra dirty-workspace warning.

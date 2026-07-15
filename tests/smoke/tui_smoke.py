@@ -238,7 +238,7 @@ def run_fake_mvp(driver: PTYDriver, workspace: Path) -> None:
     wait_file(workspace / "artifacts" / "manifest.json", timeout=30)
 
     driver.send("/diff\r")
-    driver.expect("Untracked knote file", "artifacts/", timeout=20)
+    driver.expect("diff is unavail", timeout=20)
 
     driver.send("/commit acceptance build\r")
     driver.expect("Confirm Eino tool", "Commit the current k", timeout=10)
@@ -246,7 +246,7 @@ def run_fake_mvp(driver: PTYDriver, workspace: Path) -> None:
     wait_git_clean(workspace, timeout=30)
 
     driver.send("/diff\r")
-    driver.expect("No diff.", timeout=20)
+    driver.expect("diff is unavail", timeout=20)
 
     driver.send("/new\r")
     driver.expect("knote ready", timeout=15)
