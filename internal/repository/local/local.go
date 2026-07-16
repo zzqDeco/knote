@@ -254,6 +254,17 @@ func (s Store) BindAuthorization(ctx context.Context, envelope protocol.SessionA
 	return bindSessionAuthorization(ctx, s.workspace, envelope)
 }
 
+func (s Store) RebindAuthorization(
+	ctx context.Context,
+	expected protocol.SessionAuthorizationEnvelope,
+	replacement protocol.SessionAuthorizationEnvelope,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return rebindSessionAuthorization(ctx, s.workspace, expected, replacement)
+}
+
 func (s Store) LoadAuthorization(ctx context.Context, sessionID string) (protocol.SessionAuthorizationEnvelope, error) {
 	if err := ctx.Err(); err != nil {
 		return protocol.SessionAuthorizationEnvelope{}, err

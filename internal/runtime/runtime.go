@@ -272,6 +272,10 @@ func (m *Manager) Confirm(ctx context.Context, req protocol.ConfirmRequest, appr
 			if err := m.bindSessionAuthorization(ctx, einoSessionID, authorization); err != nil {
 				return m.confirmBeforeConsumptionError(einoSessionID, req, err)
 			}
+			confirmCtx, err = m.withSessionAuthorizationExpectation(confirmCtx, einoSessionID, authorization)
+			if err != nil {
+				return m.confirmBeforeConsumptionError(einoSessionID, req, err)
+			}
 		} else if approved && permissionedCapabilities {
 			var err error
 			confirmCtx, err = m.permissionedToolContext(ctx, einoSessionID)
