@@ -69,6 +69,14 @@ type projectionBuild struct {
 	noop            bool
 }
 
+// MaterializationAuthorizationScope is the trusted workspace boundary used
+// when a confirmed permissioned build writes derived artifact security records.
+type MaterializationAuthorizationScope struct {
+	TenantID        string
+	KnowledgeBaseID string
+	ACLWatermark    string
+}
+
 type projectionRootProvider interface {
 	ProjectionStoreRoot() string
 }
@@ -108,20 +116,33 @@ func (s service) prepareArtifactProjection(ctx context.Context) (repository.Arti
 		return repository.ArtifactSet{}, projectionBuild{}, fmt.Errorf("KAG corpus contains no non-blank sources")
 	}
 
-	namespace, err := effectiveKAGNamespace(s.workspace, cfg)
+	materializationScope, err := ResolveMaterializationAuthorizationScope(s.workspace, cfg)
 	if err != nil {
 		return repository.ArtifactSet{}, projectionBuild{}, err
 	}
-	namespaceBase := canonicalNamespace(namespace)
-	scope := catalog.Scope{TenantID: localTenantID, KnowledgeBaseID: namespaceBase}
+	namespaceBase := materializationScope.KnowledgeBaseID
+	scope := catalog.Scope{
+		TenantID: materializationScope.TenantID, KnowledgeBaseID: materializationScope.KnowledgeBaseID,
+	}
 	snapshotVersion, err := sourceSnapshotVersion(scope, loaded)
 	if err != nil {
 		return repository.ArtifactSet{}, projectionBuild{}, err
 	}
-	aclVersion := canonicalACLVersion(scope)
+	aclVersion := materializationScope.ACLWatermark
 	buildConfigVersion, err := kagBuildConfigVersion(s.workspace, cfg)
 	if err != nil {
 		return repository.ArtifactSet{}, projectionBuild{}, err
+	}
+	materializationAuthorization, permissionedMaterialization, err := derivedArtifactMaterializationAuthorization(
+		ctx, scope, aclVersion,
+	)
+	if err != nil {
+		return repository.ArtifactSet{}, projectionBuild{}, err
+	}
+	if permissionedMaterialization {
+		buildConfigVersion = permissionedDerivedBuildConfigVersion(
+			buildConfigVersion, materializationAuthorization,
+		)
 	}
 	snapshotDocuments := make([]catalog.SourceDocumentSnapshot, 0, len(loaded))
 	documentIDs := make(map[string]protocol.ResourceID, len(loaded))
@@ -318,9 +339,11 @@ func (s service) prepareArtifactProjection(ctx context.Context) (repository.Arti
 	if err != nil {
 		return repository.ArtifactSet{}, projectionBuild{}, err
 	}
+	summaryText := fmt.Sprintf("Built %d documents and %d chunks.", len(set.Documents), len(set.Chunks))
+	summaryDigest := protocol.NewContentDigest(summaryText)
 	artifactMetadata, err := catalog.NewResourceMetadata(
 		scope, protocol.ResourceDerivedArtifact, "artifacts/bundle", "artifact:"+string(artifactID), artifactID,
-		protocol.NewContentDigest(projectionVersion), versions("content_"+projectionVersion),
+		summaryDigest, versions("content_"+strings.TrimPrefix(string(summaryDigest), "sha256:")[:24]),
 		catalog.SensitivityInternal, localSecurityDomain,
 	)
 	if err != nil {
@@ -333,13 +356,7 @@ func (s service) prepareArtifactProjection(ctx context.Context) (repository.Arti
 			SupportID: "support-all-documents", Resources: artifactSupportResources, Complete: true,
 		}},
 		localSecurityDomain,
-		protocol.AuthorizationContext{
-			Version:  protocol.SecurityContractVersion,
-			TenantID: scope.TenantID, KnowledgeBaseID: scope.KnowledgeBaseID,
-			PrincipalID: "local", SessionID: "materialize", RequestID: "artifacts-bundle",
-			AuthorizationModelID: "local-model-v1", IdentityWatermark: "local-identity-v1",
-			ACLWatermark: aclVersion, Consistency: protocol.ConsistencyHigherConsistency,
-		},
+		materializationAuthorization,
 	)
 	if err != nil {
 		return repository.ArtifactSet{}, projectionBuild{}, fmt.Errorf("materialize derived artifact security: %w", err)
@@ -350,7 +367,7 @@ func (s service) prepareArtifactProjection(ctx context.Context) (repository.Arti
 
 	set.Summaries = []protocol.Summary{{
 		SummaryID:        string(artifactID),
-		Text:             fmt.Sprintf("Built %d documents and %d chunks.", len(set.Documents), len(set.Chunks)),
+		Text:             summaryText,
 		EvidenceChunkIDs: chunkIDs(set.Chunks),
 	}}
 	generatedAt := time.Unix(0, 0).UTC()
@@ -460,6 +477,53 @@ func derivedArtifactSecurityIdentity(metadata catalog.ResourceMetadata) protocol
 		AuthorizationID: metadata.AuthorizationObject, AuthorizationResourceID: metadata.AuthorizationResourceID,
 		ContentDigest: metadata.ContentDigest, Versions: metadata.Versions,
 	}
+}
+
+func derivedArtifactMaterializationAuthorization(
+	ctx context.Context,
+	scope catalog.Scope,
+	aclVersion string,
+) (protocol.AuthorizationContext, bool, error) {
+	if authorization, ok := protocol.AuthorizationContextFrom(ctx); ok {
+		if err := authorization.Validate(); err != nil {
+			return protocol.AuthorizationContext{}, false, fmt.Errorf("materialize derived artifact security: %w", err)
+		}
+		if authorization.TenantID != scope.TenantID ||
+			authorization.KnowledgeBaseID != scope.KnowledgeBaseID ||
+			authorization.ACLWatermark != aclVersion {
+			return protocol.AuthorizationContext{}, false, fmt.Errorf(
+				"materialize derived artifact security: authorization context does not match projection scope",
+			)
+		}
+		return authorization, true, nil
+	}
+	return protocol.AuthorizationContext{
+		Version:  protocol.SecurityContractVersion,
+		TenantID: scope.TenantID, KnowledgeBaseID: scope.KnowledgeBaseID,
+		PrincipalID: "local", SessionID: "materialize", RequestID: "artifacts-bundle",
+		AuthorizationModelID: "local-model-v1", IdentityWatermark: "local-identity-v1",
+		ACLWatermark: aclVersion, Consistency: protocol.ConsistencyHigherConsistency,
+	}, false, nil
+}
+
+func permissionedDerivedBuildConfigVersion(
+	buildConfigVersion string,
+	authorization protocol.AuthorizationContext,
+) string {
+	bindings := []string{
+		buildConfigVersion,
+		authorization.Version,
+		authorization.TenantID,
+		authorization.KnowledgeBaseID,
+		authorization.PrincipalID,
+		authorization.AgentID,
+		authorization.TaskID,
+		string(authorization.Consistency),
+		authorization.AuthorizationModelID,
+		authorization.IdentityWatermark,
+		authorization.ACLWatermark,
+	}
+	return "build_" + fullHash([]byte(strings.Join(bindings, "\x00")))[:24]
 }
 
 func projectionJournalRoot(root, baseVersion, projectionVersion string) string {
@@ -1177,6 +1241,24 @@ func canonicalACLVersion(scope catalog.Scope) string {
 		"document-boundary-v1",
 	}, "\x00")
 	return "acl_" + fullHash([]byte(payload))[:24]
+}
+
+// ResolveMaterializationAuthorizationScope returns the exact scope the build
+// planner derives from the effective workspace configuration. Permissioned
+// callers use this rather than reconstructing security identifiers separately.
+func ResolveMaterializationAuthorizationScope(
+	workspace string,
+	cfg repository.Config,
+) (MaterializationAuthorizationScope, error) {
+	namespace, err := effectiveKAGNamespace(workspace, cfg)
+	if err != nil {
+		return MaterializationAuthorizationScope{}, err
+	}
+	scope := catalog.Scope{TenantID: localTenantID, KnowledgeBaseID: canonicalNamespace(namespace)}
+	return MaterializationAuthorizationScope{
+		TenantID: scope.TenantID, KnowledgeBaseID: scope.KnowledgeBaseID,
+		ACLWatermark: canonicalACLVersion(scope),
+	}, nil
 }
 
 func projectionKAGBuildIdempotencyKey(projectionVersion string) string {

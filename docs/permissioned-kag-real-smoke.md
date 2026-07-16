@@ -1,9 +1,15 @@
 # Phase 2 Permissioned Graph Smoke
 
-This is the live compatibility gate for issue #61. It uses only the checked-in
-`public-synthetic` fixture and starts a disposable OpenFGA + OpenSPG/KAG stack.
-It is separate from CI because it pulls several service images and requires an
-`openspg-kag` Python environment. CI runs the deterministic offline half.
+This is the optional live compatibility path retained by issue #78. It uses only
+the checked-in `public-synthetic` fixture and starts a disposable OpenFGA +
+OpenSPG/KAG stack. It is separate from mandatory acceptance because it pulls
+several service images and requires an `openspg-kag` Python environment. CI runs
+the deterministic offline half and must separately run the issue #78 built Go
+binary through real permissioned composition.
+
+A live pass is external-service compatibility evidence. It does not replace the
+deterministic `scripts/smoke_permissioned_binary.sh` gate and does not publish or
+imply a GitHub Release.
 
 ## Credential and data rules
 
@@ -15,6 +21,8 @@ It is separate from CI because it pulls several service images and requires an
   with the disposable volumes.
 - The script emits one sorted JSON result. It suppresses provider stdout/stderr
   and never emits content, prompts, relation labels, API tokens, or model IDs.
+- Do not enable shell tracing, dump process environments, or attach raw service,
+  provider, workspace, or HTTP logs to a smoke result.
 - `KEEP_KNOTE_PERMISSIONED_GRAPH_REAL_WORKSPACE=1` may retain the synthetic
   workspace for debugging. Never use that option with non-synthetic input.
 
@@ -45,9 +53,10 @@ python3 tests/smoke/permissioned_graph_real_smoke.py --self-test
 It materializes the same deterministic projection twice and requires identical
 manifest digests. It then exercises real adapter mode for discover, retrieve,
 two per-hop expands, exact evidence load, generate, and replay denial with a
-local allowlisted provider. It does not claim live OpenSPG coverage.
+local allowlisted provider. It does not claim live OpenSPG coverage or execute
+the built `cmd/knote` production-composition boundary.
 
-## Disposable live command
+## Optional disposable live command
 
 Prerequisites:
 
@@ -79,8 +88,9 @@ temporary OpenFGA store/model and OpenSPG project, and then validates:
 The exit trap removes the OpenFGA container and runs
 `docker compose down -v --remove-orphans` for OpenSPG. A cleanup failure changes
 an otherwise successful run to failure and is also reported after a failed run.
-The pass record contains only versions, version-verification sources, stage
-names, counts, and durations.
+The pass record contains only fixed version-verification classes, stage names,
+counts, and durations. It contains no protected content, resource/principal
+identifiers, endpoint credentials, provider diagnostics, or service output.
 
 The live `replay_denial` stage rechecks the stale capsule through the real
 OpenFGA store and proves that content load and generation are not called after
@@ -94,8 +104,8 @@ declares that the whole stack is disposable. The script leaves the temporary
 project in that stack because OpenSPG 0.8 protects project deletion with its
 login session; the caller must destroy the stack and its volumes after the run.
 External endpoint versions are marked `caller-declared` in the pass record and
-cannot satisfy the issue #61 release gate; that gate requires the repository's
-default digest-pinned stack and `repository-pinned-image-digest` markers.
+cannot support a repository-pinned live compatibility claim; that claim requires
+the default digest-pinned stack and `repository-pinned-image-digest` markers.
 
 ```sh
 KNOTE_PERMISSIONED_GRAPH_REAL_SMOKE=1 \
@@ -109,6 +119,32 @@ scripts/smoke_permissioned_graph_real.sh
 For an external OpenFGA endpoint, also set `KNOTE_OPENFGA_API_URL` and the exact
 `KNOTE_OPENFGA_SERVER_VERSION`. Keep any `KNOTE_OPENFGA_API_TOKEN` only in the
 invoking environment. Do not retain shell traces or service logs containing it.
+
+`KNOTE_OPENFGA_API_URL` is a smoke-script orchestration variable. The real
+`cmd/knote` operator boundary uses `KNOTE_OPENFGA_ENDPOINT`; see
+`docs/permissioned-kag-operations.md` and do not silently substitute one for the
+other.
+
+## Troubleshooting without content or secrets
+
+- A preflight failure should be resolved from the named missing command,
+  declared version, or generic stage. Do not add environment values to the
+  preflight output.
+- If a container is unhealthy, inspect its health and exit status first. Do not
+  retain or share raw logs until they have been verified to contain only the
+  checked-in synthetic fixture and no token/header values.
+- If provider import or KAG probing fails, verify the selected Python and pinned
+  package versions with version-only commands. Provider stdout/stderr is
+  intentionally suppressed and must not be routed into the result JSON.
+- If OpenFGA fails, verify loopback reachability, declared server version, and
+  store/model setup without printing `KNOTE_OPENFGA_API_TOKEN` or raw check
+  requests/responses.
+- If cleanup fails, rerun `docker compose down -v --remove-orphans` against the
+  generated project name and remove the disposable OpenFGA container. Do not
+  preserve the stack as a debugging shortcut when any non-synthetic input may
+  have been used.
+- A live-smoke failure does not justify weakening authorization, expanding an
+  allowlist, enabling a legacy fallback, or copying content into diagnostics.
 
 ## Other validation
 

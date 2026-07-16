@@ -48,6 +48,8 @@ The MVP is a single Go CLI/TUI binary with a Python KAG subprocess adapter. Bubb
 - PR #31 `refactor/remove-direct-agent`: removes the legacy direct agent package and updates Eino-only docs.
 - PRs #42-#54: complete the Phase 1 permissioned KAG contracts, interception boundary, OpenFGA foundation, deterministic projection store, authorized retrieval/runtime wiring, revocation-safe state, and acceptance suite.
 - PRs #62-#67: complete the Phase 2 graph identity bindings, real permissioned primitives, restricted Claim traversal, bounded per-hop authorization, protected derived/query surfaces, and pinned live acceptance gate.
+- PRs #79-#82: complete opt-in real CLI composition, catalog Claim tuple reconciliation, protected observable surfaces, content-free telemetry, and built-binary acceptance.
+- Issue #83: tracks the `v0.3.0` readiness, promotion, and release evidence.
 
 ## Acceptance
 
@@ -83,20 +85,21 @@ Candidate validation must pass on `dev` and again on `release/v0.1.1`:
 
 The release was promoted through `release/v0.1.1 -> main`, reviewed, tagged, and published with the repository release workflow.
 
-## v0.2.0 Release Candidate
+## v0.3.0 Release
 
-`v0.2.0` is the permissioned KAG release candidate. Phase 1 adds the fail-closed authorization boundary and durable serving projection; Phase 2 adds permission-safe graph identity, real body-free primitives, restricted Claim traversal with per-hop authorization, protected derived/query surfaces, and live OpenFGA/OpenSPG evidence. Permissioned `/eval` remains fail closed because the legacy explain dependency is outside this boundary.
+`v0.3.0` follows the published `v0.2.1` release and packages the completed permissioned KAG runtime. It adds opt-in real operator composition, selected-bundle evidence loading, Claim tuple reconciliation, protected observable surfaces, content-free telemetry, and deterministic built-binary acceptance on top of the fail-closed authorization, projection, graph identity, body-free primitive, traversal, revocation, and live OpenFGA/OpenSPG foundations. Permissioned `/eval` remains fail closed because the legacy explain dependency is outside this boundary.
 
-Candidate validation must pass on `dev` and again on `release/v0.2.0`:
+Candidate validation must pass on `dev` and again on `release/v0.3.0`:
 
 - `KNOTE_KAG_FAKE=1 go test ./...`
 - `/usr/bin/python3 -m unittest discover -s adapters/kag -p '*test*.py'`
-- `CGO_ENABLED=0 go build -o /tmp/knote-v0.2.0 ./cmd/knote`
+- `CGO_ENABLED=0 go build -o /tmp/knote-v0.3.0 ./cmd/knote`
 - `GOTOOLCHAIN=go1.25.12 go run github.com/openfga/cli/cmd/fga@v0.7.17 model test --tests internal/authz/model/authorization.fga.yaml`
 - `python3 tests/smoke/permissioned_graph_real_smoke.py --self-test`
+- `scripts/smoke_permissioned_binary.sh --bin /tmp/knote-v0.3.0 --timeout 180`
 - `PYTHON=/usr/bin/python3 KNOTE_SMOKE_FORCE_BIN=1 bash scripts/smoke_fake_mvp.sh`
 - `KNOTE_EINO_BASE_URL=http://127.0.0.1:8317/v1 KNOTE_EINO_MODEL=gpt-5.3-codex-spark KNOTE_EINO_REASONING_EFFORT=low bash scripts/smoke_eino_local_proxy.sh`
 - `KNOTE_PYTHON=/path/to/kag-venv/python KNOTE_KAG_HOST=http://127.0.0.1:8887 bash scripts/smoke_real_kag.sh` against a disposable project or stack
 - `KNOTE_PERMISSIONED_GRAPH_REAL_SMOKE=1 KNOTE_PYTHON=/path/to/openspg-kag-0.8-python bash scripts/smoke_permissioned_graph_real.sh`
 
-After these pass, merge the release-readiness PR into `dev`, create `release/v0.2.0` from that exact head, open `release/v0.2.0 -> main`, and trigger a fresh current-head `@codex review`. The tag-triggered release workflow reruns the offline gates and checks version stamping before it can publish assets. Merging to `main`, creating `v0.2.0`, and publishing release assets still require explicit confirmation.
+After these pass, merge the release-readiness PR into `dev`, create `release/v0.3.0` from that exact head, open `release/v0.3.0 -> main`, and trigger a fresh current-head `@codex review`. The tag-triggered release workflow reruns the offline gates, built-binary acceptance, and version stamping before it can publish assets. Merging to `main`, creating `v0.3.0`, and publishing release assets remain separately reviewable actions.

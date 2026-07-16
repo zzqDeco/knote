@@ -25,6 +25,86 @@ type ArtifactFilePayload struct {
 	Data       []byte
 }
 
+// Validate proves that pre-authorization metadata is selected by a valid
+// manifest and contains the exact projection bytes committed by that manifest.
+func (m SelectedArtifactMetadata) Validate() error {
+	if err := m.Manifest.Validate(); err != nil {
+		return fmt.Errorf("validate selected artifact manifest: %w", err)
+	}
+	var projectionDescriptor *protocol.ArtifactBundleFile
+	for index := range m.Manifest.Files {
+		if m.Manifest.Files[index].Path == "projection.json" {
+			projectionDescriptor = &m.Manifest.Files[index]
+			break
+		}
+	}
+	if projectionDescriptor == nil {
+		return fmt.Errorf("selected artifact projection descriptor is missing")
+	}
+	sum := sha256.Sum256(m.ProjectionJSON)
+	if hex.EncodeToString(sum[:]) != projectionDescriptor.SHA256 || int64(len(m.ProjectionJSON)) != projectionDescriptor.SizeBytes {
+		return fmt.Errorf("selected artifact projection does not match manifest")
+	}
+	var projection catalog.Projection
+	if err := json.Unmarshal(m.ProjectionJSON, &projection); err != nil {
+		return fmt.Errorf("decode selected artifact projection: %w", err)
+	}
+	if err := projection.Validate(); err != nil {
+		return fmt.Errorf("validate selected artifact projection: %w", err)
+	}
+	if projection.Version != m.Manifest.ProjectionVersion || projection.State != catalog.StatePublished {
+		return fmt.Errorf("selected artifact projection does not match the serving manifest")
+	}
+	return nil
+}
+
+// Clone prevents callers from mutating store-owned authorization metadata.
+func (m SelectedArtifactMetadata) Clone() SelectedArtifactMetadata {
+	clone := SelectedArtifactMetadata{
+		Manifest:       m.Manifest,
+		ProjectionJSON: append([]byte(nil), m.ProjectionJSON...),
+	}
+	clone.Manifest.Files = append([]protocol.ArtifactBundleFile(nil), m.Manifest.Files...)
+	return clone
+}
+
+// Validate proves that a selected snapshot contains exactly the immutable
+// bytes committed by its manifest. Graph payloads receive the same semantic
+// cross-validation used by the local artifact store.
+func (b SelectedArtifactBundle) Validate() error {
+	if err := b.Manifest.Validate(); err != nil {
+		return fmt.Errorf("validate selected artifact manifest: %w", err)
+	}
+	if len(b.Files) != len(b.Manifest.Files) {
+		return fmt.Errorf("selected artifact file set does not match manifest")
+	}
+	for _, descriptor := range b.Manifest.Files {
+		data, ok := b.Files[descriptor.Path]
+		if !ok {
+			return fmt.Errorf("selected artifact file %q is missing", descriptor.Path)
+		}
+		sum := sha256.Sum256(data)
+		if hex.EncodeToString(sum[:]) != descriptor.SHA256 || int64(len(data)) != descriptor.SizeBytes {
+			return fmt.Errorf("selected artifact file %q does not match manifest", descriptor.Path)
+		}
+	}
+	if err := ValidateGraphArtifactPayloads(b.Manifest, b.Files); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Clone returns a deep copy suitable for crossing package boundaries without
+// allowing callers to mutate a store-owned serving snapshot.
+func (b SelectedArtifactBundle) Clone() SelectedArtifactBundle {
+	clone := SelectedArtifactBundle{Manifest: b.Manifest, Files: make(map[string][]byte, len(b.Files))}
+	clone.Manifest.Files = append([]protocol.ArtifactBundleFile(nil), b.Manifest.Files...)
+	for path, data := range b.Files {
+		clone.Files[path] = append([]byte(nil), data...)
+	}
+	return clone
+}
+
 // CanonicalArtifactFiles returns the exact bytes used by both immutable v2
 // bundles and flat v1 compatibility exports.
 func CanonicalArtifactFiles(set ArtifactSet) ([]ArtifactFilePayload, error) {

@@ -13,6 +13,7 @@ import (
 	"github.com/zzqDeco/knote/internal/knowledge/authorized/fixture"
 	"github.com/zzqDeco/knote/internal/knowledge/kag"
 	"github.com/zzqDeco/knote/internal/protocol"
+	"github.com/zzqDeco/knote/internal/telemetry"
 )
 
 const (
@@ -244,11 +245,22 @@ func (f *phase2PermissionedGraphFixture) newService(
 	cache *authorized.QueryCache,
 	config authorized.TraversalConfig,
 ) *authorized.Service {
+	return f.newServiceWithTelemetry(t, invariant, oracle, cache, config, nil)
+}
+
+func (f *phase2PermissionedGraphFixture) newServiceWithTelemetry(
+	t testing.TB,
+	invariant string,
+	oracle *phase2PolicyOracle,
+	cache *authorized.QueryCache,
+	config authorized.TraversalConfig,
+	sink telemetry.Sink,
+) *authorized.Service {
 	t.Helper()
 	options := authorized.Options{
 		KAG: f.backend, Authorizer: oracle, Loader: f.loader, Cache: cache,
 		RetrieverVersion: "phase2_retriever_v1", PromptVersion: "phase2_prompt_v1",
-		RetrieveLimit: 1, EvidenceLimit: 4, Traversal: config, Now: f.clock.Now,
+		RetrieveLimit: 1, EvidenceLimit: 4, Traversal: config, Now: f.clock.Now, Telemetry: sink,
 	}
 	service, err := authorized.New(options)
 	if err != nil {

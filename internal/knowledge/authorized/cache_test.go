@@ -110,6 +110,16 @@ func TestQueryCacheSeparatesVisibilityAndExecutionVersions(t *testing.T) {
 			current := base
 			current.RequestID = fmt.Sprintf("request-variation-%d", index)
 			variation.change(&current)
+			if variation.name == "acl watermark" {
+				currentDocument := document
+				currentDocument.Versions.ACL = current.ACLWatermark
+				backend.retrieveResult = queryTestRetrieve(currentDocument)
+				loader.items[document.ResourceID] = queryTestItem(currentDocument)
+				defer func() {
+					backend.retrieveResult = queryTestRetrieve(document)
+					loader.items[document.ResourceID] = queryTestItem(document)
+				}()
+			}
 			before := backend.retrieveCalls
 			query(current, service)
 			if backend.retrieveCalls != before+1 {

@@ -18,7 +18,7 @@ The production path uses four explicit adapter primitives:
 3. `kag.expand` accepts an already-authorized frontier and returns ID-only expansion handles.
 4. `kag.generate` accepts only an already-authorized evidence set.
 
-The fake adapter implements these contracts for deterministic contract and leak tests. Issue #39 subsequently implemented real mode through the operator-supplied provider contract recorded in ADR 0004. Real mode validates the immutable graph bundle before provider loading; provider output remains constrained to allowlisted opaque IDs, and generation receives only digest-verified authorized evidence. The normal CLI does not yet select this real permissioned composition.
+The fake adapter implements these contracts for deterministic contract and leak tests. Issue #39 subsequently implemented real mode through the operator-supplied provider contract recorded in ADR 0004. Real mode validates the immutable graph bundle before provider loading; provider output remains constrained to allowlisted opaque IDs, and generation receives only digest-verified authorized evidence. As of `v0.3.0`, the CLI selects this real permissioned composition only when the operator explicitly sets `KNOTE_PERMISSIONED=1`; the default CLI path remains unchanged.
 
 Legacy `kag.query` and `kag.explain` remain compatibility methods for existing non-permissioned smoke coverage. They are not a secure production query path and must not be selected by the future authorized gateway.
 
@@ -146,5 +146,5 @@ Authorization context is not part of these adapter JSON parameters. The trusted 
 - Issue #37 implemented authorization without importing KAG internals.
 - Issue #38 produced stable projection/index handles and a catalog that loads bodies only after authorization.
 - Issue #39 implemented the real provider-backed primitives, authorized gateway, and deterministic fake runtime wiring.
-- Phase 2 added immutable graph and Claim bindings plus bounded per-hop expansion; default real CLI composition remains out of scope for `v0.2.0`.
+- Phase 2 added immutable graph and Claim bindings plus bounded per-hop expansion. `v0.3.0` adds opt-in real CLI composition; default-on real composition remains out of scope.
 - Real KAG build smoke remains valid. Legacy real query/explain smoke is compatibility evidence only and is not a permissioned-query acceptance gate.

@@ -74,32 +74,34 @@ func newRuntime(ctx context.Context, workspacePath string, resumeID string) (run
 	if repoCfg.KAG.Fake {
 		knowledgeMode = versioned.ModeFake
 	}
+	permissionedConfig, err := loadPermissionedRuntimeConfig(repoCfg.KAG.Fake)
+	if err != nil {
+		return nil, nil, err
+	}
 	kagClient := kag.Client{
-		AdapterPath: repoCfg.KAG.AdapterPath,
-		Workspace:   workspace,
-		Host:        repoCfg.KAG.Host,
-		Fake:        repoCfg.KAG.Fake,
-		ConfigPath:  repoCfg.KAG.ConfigPath,
-		ProjectID:   repoCfg.KAG.ProjectID,
-		Namespace:   repoCfg.KAG.Namespace,
-		Language:    repoCfg.KAG.Language,
-		RuntimeDir:  repoCfg.KAG.RuntimeDir,
+		AdapterPath:          repoCfg.KAG.AdapterPath,
+		Workspace:            workspace,
+		Host:                 repoCfg.KAG.Host,
+		Fake:                 repoCfg.KAG.Fake,
+		ConfigPath:           repoCfg.KAG.ConfigPath,
+		ProjectID:            repoCfg.KAG.ProjectID,
+		Namespace:            repoCfg.KAG.Namespace,
+		Language:             repoCfg.KAG.Language,
+		RuntimeDir:           repoCfg.KAG.RuntimeDir,
+		PermissionedProvider: permissionedConfig.Provider,
 	}
 	knowledgeService := versioned.New(versioned.Options{Workspace: workspace, Repo: repo, Versions: repo, Backend: kagClient, Mode: knowledgeMode})
-	authorizationProvider, err := permissionedAuthorizationProvider(repoCfg.KAG.Fake)
+	permissionedApplication, err := newPermissionedApplication(ctx, permissionedConfig, kagClient, repo)
 	if err != nil {
 		return nil, nil, err
 	}
-	permissionedApplication, err := newPermissionedApplication(repoCfg.KAG.Fake, kagClient)
-	if err != nil {
-		return nil, nil, err
-	}
+	var authorizationProvider runtime.AuthorizationContextProvider
 	var permissionedQuery einotools.PermissionedQuery
 	var protectedContentAuthorizer runtime.ProtectedContentAuthorizer
 	if permissionedApplication != nil {
-		permissionedService := permissionedApplication.fixture.Service
+		authorizationProvider = permissionedApplication.AuthorizationContextProvider()
 		permissionedQuery = func(ctx context.Context, request protocol.QueryRequest) (einotools.PermissionedQueryResult, error) {
-			result, err := permissionedService.Query(ctx, request)
+			result, err := permissionedApplication.Query(ctx, request)
 			if err != nil {
 				return einotools.PermissionedQueryResult{}, err
 			}
@@ -117,17 +119,29 @@ func newRuntime(ctx context.Context, workspacePath string, resumeID string) (run
 		PermissionedQuery: permissionedQuery,
 		SideEffectGate:    func(context.Context, einotools.SideEffectRequest) error { return nil },
 	})
-	approvedEinoTools = permissionedToolMap(approvedEinoTools, repoCfg.KAG.Fake)
-	einoTools := einotools.NewWithOptions(einotools.Options{
+	approvedEinoTools = permissionedSideEffectToolMap(approvedEinoTools, permissionedConfig.Enabled)
+	var fakeBuildAuthorization runtime.AuthorizationContextProvider
+	if permissionedConfig.Fake {
+		fakeBuildAuthorization, err = fakeBuildAuthorizationProvider(workspace, repo, permissionedConfig.Principal)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	allEinoTools := einotools.NewWithOptions(einotools.Options{
 		Service:           knowledgeService,
 		PermissionedQuery: permissionedQuery,
-		SideEffectGate:    newEinoSideEffectGate(sideEffects, approvedEinoTools),
+		SideEffectGate:    newEinoSideEffectGate(sideEffects, approvedEinoTools, fakeBuildAuthorization),
 	})
-	einoTools = permissionedTools(einoTools, repoCfg.KAG.Fake)
-	toolExecutor := runtimeeino.NewToolExecutor(einoTools)
-	einoRunner, err := newEinoRunner(ctx, repoCfg, einoTools)
+	slashTools := permissionedSlashTools(allEinoTools, permissionedConfig.Enabled)
+	modelTools := permissionedModelTools(allEinoTools, permissionedConfig.Enabled)
+	toolExecutor := runtimeeino.NewToolExecutor(slashTools)
+	einoRunner, err := newEinoRunner(ctx, repoCfg, modelTools)
 	if err != nil {
 		return nil, nil, err
+	}
+	capabilities := runtime.DefaultSessionCapabilityProfile()
+	if permissionedConfig.Enabled {
+		capabilities = runtime.PermissionedSessionCapabilityProfile()
 	}
 	rt := runtime.New(runtime.Dependencies{
 		Workspace:                    workspace,
@@ -136,6 +150,7 @@ func newRuntime(ctx context.Context, workspacePath string, resumeID string) (run
 		Versions:                     repo,
 		WorkspaceRepo:                repo,
 		Knowledge:                    knowledgeService,
+		Capabilities:                 capabilities,
 		RunnerMode:                   runtime.RunnerModeEino,
 		EinoRunner:                   einoRunner,
 		AuthorizationContextProvider: authorizationProvider,

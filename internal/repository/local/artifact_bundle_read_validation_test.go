@@ -179,3 +179,66 @@ func TestReadCurrentArtifactManifestRejectsDigestValidGraphProjectionMismatch(t 
 		t.Fatalf("digest-valid graph mismatch error = %v, want generic projection mismatch", err)
 	}
 }
+
+func TestReadCurrentArtifactBundleReturnsVerifiedIndependentSnapshot(t *testing.T) {
+	ctx := context.Background()
+	workspace := t.TempDir()
+	store := New(workspace)
+	set := testBundleArtifactSet(t, "prj_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "selected")
+	if err := store.WriteArtifacts(ctx, set); err != nil {
+		t.Fatal(err)
+	}
+
+	snapshot, err := store.ReadCurrentArtifactBundle(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := snapshot.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Manifest.ProjectionID != set.BundleManifest.ProjectionID || len(snapshot.Files) != len(set.BundleManifest.Files) {
+		t.Fatalf("unexpected selected snapshot: %+v", snapshot.Manifest)
+	}
+
+	snapshot.Files["summaries.jsonl"][0] ^= 0xff
+	fresh, err := store.ReadCurrentArtifactBundle(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fresh.Validate(); err != nil {
+		t.Fatalf("caller mutation changed store-owned selected bytes: %v", err)
+	}
+}
+
+func TestReadCurrentArtifactMetadataDoesNotReadEvidencePayloads(t *testing.T) {
+	ctx := context.Background()
+	workspace := t.TempDir()
+	store := New(workspace)
+	set := testBundleArtifactSet(t, "prj_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "selected")
+	if err := store.WriteArtifacts(ctx, set); err != nil {
+		t.Fatal(err)
+	}
+	bundleDir := filepath.Join(workspace, "artifacts", "bundles", set.BundleManifest.ProjectionID)
+	if err := os.WriteFile(filepath.Join(bundleDir, "summaries.jsonl"), []byte("corrupt\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	metadata, err := store.ReadCurrentArtifactMetadata(ctx)
+	if err != nil {
+		t.Fatalf("authorization metadata read evidence bytes: %v", err)
+	}
+	if err := metadata.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	metadata.ProjectionJSON[0] ^= 0xff
+	fresh, err := store.ReadCurrentArtifactMetadata(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fresh.Validate(); err != nil {
+		t.Fatalf("caller mutation changed store-owned authorization metadata: %v", err)
+	}
+	if _, err := store.ReadCurrentArtifactBundle(ctx); err == nil {
+		t.Fatal("post-authorization bundle load accepted corrupt evidence")
+	}
+}

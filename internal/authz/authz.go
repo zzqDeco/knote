@@ -282,6 +282,12 @@ func validateSubject(name, value string) error {
 	return err
 }
 
+// ValidateConcreteUserID validates an opaque user ID before it is prefixed for
+// an OpenFGA check request.
+func ValidateConcreteUserID(value string) error {
+	return validatePrincipal("user", TypeUser+":"+value)
+}
+
 func validatePrincipal(name, value string) error {
 	ref, err := parseReference(name, value, false)
 	if err != nil {

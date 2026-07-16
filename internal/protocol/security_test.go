@@ -130,6 +130,11 @@ func TestResourceHandleValidatesAuthorizationScope(t *testing.T) {
 	if err := crossKnowledgeBase.ValidateFor(auth); err == nil {
 		t.Fatal("cross-knowledge-base resource should fail")
 	}
+	staleACL := resource
+	staleACL.Versions.ACL = "acl-v0"
+	if err := staleACL.ValidateFor(auth); err == nil {
+		t.Fatal("resource from a stale ACL revision should fail")
+	}
 	invalidAuth := auth
 	invalidAuth.RequestID = ""
 	if err := resource.ValidateFor(invalidAuth); err == nil {
