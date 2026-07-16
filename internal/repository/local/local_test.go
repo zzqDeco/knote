@@ -21,6 +21,7 @@ func TestStoreImplementsRepositoryContracts(t *testing.T) {
 	var _ repository.Workspace = Store{}
 	var _ repository.Sessions = Store{}
 	var _ repository.PermissionedSessions = Store{}
+	var _ repository.RebindablePermissionedSessions = Store{}
 	var _ repository.Versions = Store{}
 }
 
@@ -241,6 +242,87 @@ func TestSessionAuthorizationBindRejectsMismatch(t *testing.T) {
 	}
 	if loaded != original {
 		t.Fatalf("mismatched bind replaced original envelope: got %+v want %+v", loaded, original)
+	}
+}
+
+func TestSessionAuthorizationRebindUsesExpectedEnvelope(t *testing.T) {
+	ctx := context.Background()
+	store := New(t.TempDir())
+	original := testSessionAuthorizationEnvelope(t, "sess_one", "request-1", time.Unix(1, 0).UTC())
+	if err := store.BindAuthorization(ctx, original); err != nil {
+		t.Fatal(err)
+	}
+	replacement := original
+	replacement.TenantID = "tenant-2"
+	replacement.KnowledgeBaseID = "knowledge-2"
+	replacement.ACLWatermark = "acl-v2"
+	replacement.BoundAt = time.Unix(2, 0).UTC()
+	if err := store.RebindAuthorization(ctx, original, replacement); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := store.LoadAuthorization(ctx, original.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded != replacement {
+		t.Fatalf("rebound envelope = %+v, want %+v", loaded, replacement)
+	}
+
+	staleExpected := replacement
+	staleExpected.BoundAt = time.Unix(99, 0).UTC()
+	staleReplacement := replacement
+	staleReplacement.ACLWatermark = "acl-v3"
+	staleReplacement.BoundAt = time.Unix(3, 0).UTC()
+	if err := store.RebindAuthorization(ctx, staleExpected, staleReplacement); err == nil {
+		t.Fatal("stale expected envelope replaced the current authorization binding")
+	}
+	loaded, err = store.LoadAuthorization(ctx, original.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded != replacement {
+		t.Fatalf("stale rebind changed envelope: got %+v want %+v", loaded, replacement)
+	}
+}
+
+func TestSessionAuthorizationRebindHasOneCompareAndSwapWinner(t *testing.T) {
+	ctx := context.Background()
+	store := New(t.TempDir())
+	original := testSessionAuthorizationEnvelope(t, "sess_one", "request-1", time.Unix(1, 0).UTC())
+	if err := store.BindAuthorization(ctx, original); err != nil {
+		t.Fatal(err)
+	}
+	first := original
+	first.ACLWatermark = "acl-v2"
+	first.BoundAt = time.Unix(2, 0).UTC()
+	second := original
+	second.ACLWatermark = "acl-v3"
+	second.BoundAt = time.Unix(3, 0).UTC()
+
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	for _, replacement := range []protocol.SessionAuthorizationEnvelope{first, second} {
+		go func() {
+			<-start
+			results <- store.RebindAuthorization(ctx, original, replacement)
+		}()
+	}
+	close(start)
+	successes := 0
+	for range 2 {
+		if err := <-results; err == nil {
+			successes++
+		}
+	}
+	if successes != 1 {
+		t.Fatalf("concurrent rebinds succeeded %d times, want exactly one", successes)
+	}
+	loaded, err := store.LoadAuthorization(ctx, original.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded != first && loaded != second {
+		t.Fatalf("persisted envelope is not a complete winner: %+v", loaded)
 	}
 }
 

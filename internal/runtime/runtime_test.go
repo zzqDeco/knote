@@ -504,6 +504,163 @@ func TestRuntimeEinoSessionRejectsAuthorizationBindingChangesBeforeHistoryOrRunn
 	}
 }
 
+func TestRuntimeExplicitlyRebindsConfirmedArtifactScopeChanges(t *testing.T) {
+	workspace := t.TempDir()
+	store := local.New(workspace)
+	runner := &fakeEinoRunner{events: []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, "", "authorized answer", nil)}}
+	current := testAuthorizationContext("sess_eino")
+	rt := New(Dependencies{
+		Workspace:    workspace,
+		Capabilities: PermissionedSessionCapabilityProfile(),
+		Sessions:     store,
+		EinoRunner:   runner,
+		AuthorizationContextProvider: func(_ context.Context, sessionID string) (protocol.AuthorizationContext, error) {
+			authorization := current
+			authorization.SessionID = sessionID
+			return authorization, nil
+		},
+		NewSessionID: func() string { return "sess_eino" },
+	})
+	if _, err := rt.Start(context.Background(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if events := rt.SendMessage(context.Background(), "before scope change"); hasEvent(events, protocol.EventError) {
+		t.Fatalf("initial authorization failed: %+v", events)
+	}
+
+	expected := current
+	expectedEnvelope, err := store.LoadAuthorization(context.Background(), "sess_eino")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rebindCtx, err := protocol.WithAuthorizationContext(context.Background(), expected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rebindCtx = withExpectedSessionAuthorizationEnvelope(rebindCtx, expectedEnvelope)
+	current.TenantID = "tenant-v2"
+	current.KnowledgeBaseID = "knowledge-v2"
+	current.ACLWatermark = "acl-v2"
+	current.RequestID = "request-2"
+	if err := rt.RebindSessionAuthorization(rebindCtx, "sess_eino"); err != nil {
+		t.Fatalf("explicit scope rebind failed: %v", err)
+	}
+	if events := rt.SendMessage(context.Background(), "after scope change"); hasEvent(events, protocol.EventError) {
+		t.Fatalf("request after explicit scope rebind failed: %+v", events)
+	}
+	envelope, err := store.LoadAuthorization(context.Background(), "sess_eino")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := envelope.ValidateFor(current); err != nil {
+		t.Fatalf("persisted scope rebind does not match provider: %v", err)
+	}
+	current.ACLWatermark = "acl-v3"
+	current.RequestID = "request-3"
+	if err := rt.RebindSessionAuthorization(rebindCtx, "sess_eino"); err == nil {
+		t.Fatal("stale confirmed authorization rebound an already transitioned session")
+	}
+	current.ACLWatermark = "acl-v2"
+	current.RequestID = "request-2"
+
+	resumed := New(Dependencies{
+		Workspace:                    workspace,
+		Capabilities:                 PermissionedSessionCapabilityProfile(),
+		Sessions:                     store,
+		EinoRunner:                   runner,
+		AuthorizationContextProvider: rt.deps.AuthorizationContextProvider,
+		NewSessionID:                 func() string { return "unused" },
+	})
+	if _, err := resumed.Start(context.Background(), StartOptions{ResumeID: "sess_eino"}); err != nil {
+		t.Fatalf("resume after scope rebind failed: %v", err)
+	}
+}
+
+func TestRuntimeExplicitScopeRebindRejectsIdentityChanges(t *testing.T) {
+	workspace := t.TempDir()
+	store := local.New(workspace)
+	current := testAuthorizationContext("sess_eino")
+	rt := New(Dependencies{
+		Workspace:    workspace,
+		Capabilities: PermissionedSessionCapabilityProfile(),
+		Sessions:     store,
+		EinoRunner:   &fakeEinoRunner{events: []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, "", "authorized answer", nil)}},
+		AuthorizationContextProvider: func(_ context.Context, sessionID string) (protocol.AuthorizationContext, error) {
+			authorization := current
+			authorization.SessionID = sessionID
+			return authorization, nil
+		},
+		NewSessionID: func() string { return "sess_eino" },
+	})
+	if _, err := rt.Start(context.Background(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if events := rt.SendMessage(context.Background(), "bind session"); hasEvent(events, protocol.EventError) {
+		t.Fatalf("initial authorization failed: %+v", events)
+	}
+	original, err := store.LoadAuthorization(context.Background(), "sess_eino")
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := current
+	rebindCtx, err := protocol.WithAuthorizationContext(context.Background(), expected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rebindCtx = withExpectedSessionAuthorizationEnvelope(rebindCtx, original)
+	current.PrincipalID = "other-user"
+	current.RequestID = "request-2"
+	if err := rt.RebindSessionAuthorization(rebindCtx, "sess_eino"); err == nil {
+		t.Fatal("explicit scope rebind accepted an identity change")
+	}
+	loaded, err := store.LoadAuthorization(context.Background(), "sess_eino")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded != original {
+		t.Fatalf("rejected identity change replaced envelope: got %+v want %+v", loaded, original)
+	}
+}
+
+func TestRuntimeNoopScopeRebindStillRequiresDurableEnvelope(t *testing.T) {
+	workspace := t.TempDir()
+	store := local.New(workspace)
+	current := testAuthorizationContext("sess_eino")
+	rt := New(Dependencies{
+		Workspace:    workspace,
+		Capabilities: PermissionedSessionCapabilityProfile(),
+		Sessions:     store,
+		EinoRunner:   &fakeEinoRunner{events: []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, "", "authorized answer", nil)}},
+		AuthorizationContextProvider: func(_ context.Context, sessionID string) (protocol.AuthorizationContext, error) {
+			authorization := current
+			authorization.SessionID = sessionID
+			return authorization, nil
+		},
+		NewSessionID: func() string { return "sess_eino" },
+	})
+	if _, err := rt.Start(context.Background(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if events := rt.SendMessage(context.Background(), "bind session"); hasEvent(events, protocol.EventError) {
+		t.Fatalf("initial authorization failed: %+v", events)
+	}
+	expectedEnvelope, err := store.LoadAuthorization(context.Background(), "sess_eino")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rebindCtx, err := protocol.WithAuthorizationContext(context.Background(), current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rebindCtx = withExpectedSessionAuthorizationEnvelope(rebindCtx, expectedEnvelope)
+	if err := os.Remove(filepath.Join(workspace, ".knote", "sessions", "sess_eino.authorization.json")); err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.RebindSessionAuthorization(rebindCtx, "sess_eino"); err == nil {
+		t.Fatal("no-op scope rebind succeeded without a durable envelope")
+	}
+}
+
 func TestRuntimeNewSessionBypassesStaleLiveAuthorizationWithoutPersistingToOldSession(t *testing.T) {
 	workspace := t.TempDir()
 	store := local.New(workspace)
@@ -931,6 +1088,9 @@ func TestRuntimeEinoModeConfirmsSideEffectTool(t *testing.T) {
 	}
 	if !einoRunner.executionAuthorizationBound || einoRunner.executionAuthorization != testAuthorizationContext("sess_eino") {
 		t.Fatalf("approved side-effect authorization = bound:%t context:%+v", einoRunner.executionAuthorizationBound, einoRunner.executionAuthorization)
+	}
+	if !einoRunner.executionExpectedEnvelopeBound || einoRunner.executionExpectedEnvelope.ValidateFor(einoRunner.executionAuthorization) != nil {
+		t.Fatalf("approved side-effect expected envelope = bound:%t envelope:%+v", einoRunner.executionExpectedEnvelopeBound, einoRunner.executionExpectedEnvelope)
 	}
 	loaded, err := store.Load(context.Background(), "sess_eino")
 	if err != nil {
@@ -1426,11 +1586,13 @@ func (e *fakeToolExecutor) Invoke(ctx context.Context, sessionID string, toolNam
 }
 
 type sideEffectEinoRunner struct {
-	bridge                      *SideEffectBridge
-	executions                  int
-	executionErr                error
-	executionAuthorization      protocol.AuthorizationContext
-	executionAuthorizationBound bool
+	bridge                         *SideEffectBridge
+	executions                     int
+	executionErr                   error
+	executionAuthorization         protocol.AuthorizationContext
+	executionAuthorizationBound    bool
+	executionExpectedEnvelope      protocol.SessionAuthorizationEnvelope
+	executionExpectedEnvelopeBound bool
 }
 
 func (r *sideEffectEinoRunner) Ready(context.Context) error {
@@ -1450,6 +1612,7 @@ func (r *sideEffectEinoRunner) Run(ctx context.Context, input EinoRunInput) ([]p
 		Execute: func(ctx context.Context, _ SideEffectRequest) ([]protocol.Event, error) {
 			r.executions++
 			r.executionAuthorization, r.executionAuthorizationBound = protocol.AuthorizationContextFrom(ctx)
+			r.executionExpectedEnvelope, r.executionExpectedEnvelopeBound = expectedSessionAuthorizationEnvelopeFrom(ctx)
 			if r.executionErr != nil {
 				return nil, r.executionErr
 			}
