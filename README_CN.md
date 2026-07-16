@@ -4,7 +4,7 @@
 
 ## 版本状态
 
-最新已发布 tag 以 [GitHub Releases](https://github.com/zzqDeco/knote/releases) 为准。`v0.3.0` 发布线把已完成的 permissioned KAG runtime 提升为可选的 operator 路径：基于 OpenFGA 的授权、经过校验的 selected-bundle evidence loading、确定性 projection 与 graph binding、无正文 retrieval primitive、逐跳授权的有界 Claim traversal、可安全撤权的 cache/citation/session replay、受保护的可观察面、无正文 operational telemetry，以及强制的 built-binary 验收。真实 permissioned mode 仍需显式设置 `KNOTE_PERMISSIONED=1`；配置不完整或依赖失败时会 fail closed。相对 `v0.2.1` 的发布差异见 `CHANGELOG.md`。
+最新已发布 tag 以 [GitHub Releases](https://github.com/zzqDeco/knote/releases) 为准。`v0.3.1` 热修复保持 `v0.3.0` 的 permissioned KAG runtime 边界不变，并在真实 permissioned 模式成功执行 `/build` 或 `/checkout` 后刷新授权作用域，使后续查询无需重启即可使用新选中的 projection。真实 permissioned mode 仍需显式设置 `KNOTE_PERMISSIONED=1`；配置不完整、依赖失败或作用域刷新失败时会 fail closed。相对 `v0.3.0` 的发布差异见 `CHANGELOG.md`。
 
 当前 MVP 调整为 Go-first：
 
@@ -176,6 +176,6 @@ scripts/smoke_permissioned_graph_real.sh
 
 ## 当前范围
 
-`v0.3.0` 包含 OpenFGA 授权契约、确定性 catalog/projection bundle、精确 resource/graph/Claim binding、无正文 discover/retrieve/expand、只接收已授权 evidence 的 generate、有界逐跳 Claim traversal、可安全撤权的 cache/citation/session replay、受保护查询面、可选真实 operator composition、无正文 telemetry，以及确定性、built-binary 与真实 permissioned acceptance。
+`v0.3.1` 包含 `v0.3.0` 的 OpenFGA 授权契约、确定性 catalog/projection bundle、精确 resource/graph/Claim binding、无正文 discover/retrieve/expand、只接收已授权 evidence 的 generate、有界逐跳 Claim traversal、可安全撤权的 cache/citation/session replay、受保护查询面、可选真实 operator composition、无正文 telemetry，以及确定性、built-binary 与真实 permissioned acceptance；同时修复 artifact-changing side effect 后的授权作用域刷新。
 
-`v0.3.0` 不包含 web UI、desktop app、cloud sync、多用户协作 UI、独立版本数据库、把 OpenSPG 作为 serving 授权边界、默认开启 permissioned mode、permissioned `/eval`，或 MCP 依赖。推进 `main` 和创建 release tag 仍必须分别经过评审和明确确认。
+`v0.3.1` 不包含 web UI、desktop app、cloud sync、多用户协作 UI、独立版本数据库、把 OpenSPG 作为 serving 授权边界、默认开启 permissioned mode、permissioned `/eval`，或 MCP 依赖。推进 `main` 和创建 release tag 仍必须分别经过评审和明确确认。
