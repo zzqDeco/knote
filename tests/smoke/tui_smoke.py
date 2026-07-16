@@ -225,7 +225,8 @@ def run_startup(driver: PTYDriver) -> None:
     driver.read_once(0.5)
     if not driver.clean():
         driver.poke("\r")
-    driver.expect("session ready", "session sess_", "tasks", "kag fake", timeout=15)
+    # Permissioned fake mode suppresses branch and KAG-mode observables.
+    driver.expect("session ready", "session sess_", "branch unknown", "tasks", "kag unknown", timeout=15)
 
 
 def run_fake_mvp(driver: PTYDriver, workspace: Path) -> None:
@@ -238,7 +239,7 @@ def run_fake_mvp(driver: PTYDriver, workspace: Path) -> None:
     wait_file(workspace / "artifacts" / "manifest.json", timeout=30)
 
     driver.send("/diff\r")
-    driver.expect("diff is unavail", timeout=20)
+    driver.expect("command is unavail", timeout=20)
 
     driver.send("/commit acceptance build\r")
     driver.expect("Confirm Eino tool", "Commit the current k", timeout=10)
@@ -246,7 +247,7 @@ def run_fake_mvp(driver: PTYDriver, workspace: Path) -> None:
     wait_git_clean(workspace, timeout=30)
 
     driver.send("/diff\r")
-    driver.expect("diff is unavail", timeout=20)
+    driver.expect("command is unavail", timeout=20)
 
     driver.send("/new\r")
     driver.expect("knote ready", timeout=15)
@@ -255,7 +256,7 @@ def run_fake_mvp(driver: PTYDriver, workspace: Path) -> None:
     driver.expect("session resumed", timeout=20)
 
     driver.send("/eval\r")
-    driver.expect("eval is unavail", timeout=10)
+    driver.expect("command is unavail", timeout=10)
     assert_paths_absent(workspace, "evals/report.md", "evals/results.jsonl")
 
 

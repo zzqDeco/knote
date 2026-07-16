@@ -160,6 +160,56 @@ func TestPermissionedApplicationOnlyWiresCachedRevocationPathInFakeMode(t *testi
 	}
 }
 
+func TestFakeBuildAuthorizationMatchesWorkspaceMaterializationScope(t *testing.T) {
+	workspace := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(workspace, "sources"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "sources", "intro.md"), []byte("# Intro\n\nfake build content\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store := local.New(workspace)
+	cfg, err := store.Config(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.KAG.Namespace = "Fixture_KB"
+	if err := store.SaveConfig(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	provider, err := fakeBuildAuthorizationProvider(workspace, cfg, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorization, err := provider(context.Background(), "sess_fake_build")
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope, err := versioned.ResolveMaterializationAuthorizationScope(workspace, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if authorization.TenantID != scope.TenantID ||
+		authorization.KnowledgeBaseID != scope.KnowledgeBaseID ||
+		authorization.ACLWatermark != scope.ACLWatermark {
+		t.Fatalf("fake build authorization = %+v, want scope %+v", authorization, scope)
+	}
+	buildCtx, err := protocol.WithAuthorizationContext(context.Background(), authorization)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := versioned.New(versioned.Options{
+		Workspace: workspace, Repo: store, Backend: permissionedBuildBackend{}, Mode: versioned.ModeFake,
+	})
+	result, err := service.Build(buildCtx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := result.BundleManifest.Validate(); err != nil {
+		t.Fatalf("fake permissioned build manifest: %v", err)
+	}
+}
+
 func TestPermissionedApplicationWiresRealSelectedBundleScope(t *testing.T) {
 	workspace := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(workspace, "sources"), 0o755); err != nil {

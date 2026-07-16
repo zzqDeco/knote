@@ -120,10 +120,17 @@ func newRuntime(ctx context.Context, workspacePath string, resumeID string) (run
 		SideEffectGate:    func(context.Context, einotools.SideEffectRequest) error { return nil },
 	})
 	approvedEinoTools = permissionedSideEffectToolMap(approvedEinoTools, permissionedConfig.Enabled)
+	var fakeBuildAuthorization runtime.AuthorizationContextProvider
+	if permissionedConfig.Fake {
+		fakeBuildAuthorization, err = fakeBuildAuthorizationProvider(workspace, repoCfg, permissionedConfig.Principal)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
 	allEinoTools := einotools.NewWithOptions(einotools.Options{
 		Service:           knowledgeService,
 		PermissionedQuery: permissionedQuery,
-		SideEffectGate:    newEinoSideEffectGate(sideEffects, approvedEinoTools),
+		SideEffectGate:    newEinoSideEffectGate(sideEffects, approvedEinoTools, fakeBuildAuthorization),
 	})
 	slashTools := permissionedSlashTools(allEinoTools, permissionedConfig.Enabled)
 	modelTools := permissionedModelTools(allEinoTools, permissionedConfig.Enabled)
