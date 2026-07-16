@@ -260,12 +260,11 @@ func newPermissionedApplication(
 
 func fakeBuildAuthorizationProvider(
 	workspace string,
-	cfg repository.Config,
+	repo repository.Workspace,
 	principal string,
 ) (runtime.AuthorizationContextProvider, error) {
-	scope, err := versioned.ResolveMaterializationAuthorizationScope(workspace, cfg)
-	if err != nil {
-		return nil, fmt.Errorf("resolve fake build authorization scope: %w", err)
+	if repo == nil {
+		return nil, fmt.Errorf("fake build authorization requires a workspace repository")
 	}
 	return func(ctx context.Context, sessionID string) (protocol.AuthorizationContext, error) {
 		if ctx == nil {
@@ -273,6 +272,14 @@ func fakeBuildAuthorizationProvider(
 		}
 		if err := ctx.Err(); err != nil {
 			return protocol.AuthorizationContext{}, err
+		}
+		cfg, err := repo.Config(ctx)
+		if err != nil {
+			return protocol.AuthorizationContext{}, fmt.Errorf("load fake build authorization config: %w", err)
+		}
+		scope, err := versioned.ResolveMaterializationAuthorizationScope(workspace, cfg)
+		if err != nil {
+			return protocol.AuthorizationContext{}, fmt.Errorf("resolve fake build authorization scope: %w", err)
 		}
 		authorization := fixture.Authorization(principal, sessionID)
 		authorization.TenantID = scope.TenantID

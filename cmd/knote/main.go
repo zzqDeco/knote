@@ -122,7 +122,7 @@ func newRuntime(ctx context.Context, workspacePath string, resumeID string) (run
 	approvedEinoTools = permissionedSideEffectToolMap(approvedEinoTools, permissionedConfig.Enabled)
 	var fakeBuildAuthorization runtime.AuthorizationContextProvider
 	if permissionedConfig.Fake {
-		fakeBuildAuthorization, err = fakeBuildAuthorizationProvider(workspace, repoCfg, permissionedConfig.Principal)
+		fakeBuildAuthorization, err = fakeBuildAuthorizationProvider(workspace, repo, permissionedConfig.Principal)
 		if err != nil {
 			return nil, nil, err
 		}

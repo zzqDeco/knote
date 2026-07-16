@@ -177,8 +177,12 @@ func TestFakeBuildAuthorizationMatchesWorkspaceMaterializationScope(t *testing.T
 	if err := store.SaveConfig(context.Background(), cfg); err != nil {
 		t.Fatal(err)
 	}
-	provider, err := fakeBuildAuthorizationProvider(workspace, cfg, "alice")
+	provider, err := fakeBuildAuthorizationProvider(workspace, store, "alice")
 	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.KAG.Namespace = "Updated_Fixture_KB"
+	if err := store.SaveConfig(context.Background(), cfg); err != nil {
 		t.Fatal(err)
 	}
 	authorization, err := provider(context.Background(), "sess_fake_build")
