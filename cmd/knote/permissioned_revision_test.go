@@ -55,6 +55,60 @@ func TestPermissionedRevisionStateRejectsRevisionChangeDuringRead(t *testing.T) 
 	}
 }
 
+func TestPermissionedRevisionStateRejectsProjectionDrift(t *testing.T) {
+	state, config, scope := newTestPermissionedRevisionState(t)
+	ctx := context.Background()
+	current, err := state.currentForScope(ctx, config, scope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	drifted := scope
+	drifted.ProjectionVersion = "projection_v2"
+	if _, err := state.currentForScope(ctx, config, drifted); !errors.Is(err, errPermissionedRevisionUnavailable) {
+		t.Fatalf("projection drift context error = %v", err)
+	}
+	state.scopeProvider = func(context.Context) (authorized.ArtifactAuthorizationScope, error) {
+		return drifted, nil
+	}
+	if _, err := state.begin(ctx, testRevisionAuthorization(current, scope)); !errors.Is(err, errPermissionedRevisionUnavailable) {
+		t.Fatalf("projection drift read error = %v", err)
+	}
+	if err := state.finish(ctx, current, nil); !errors.Is(err, errPermissionedRevisionUnavailable) {
+		t.Fatalf("projection drift finish error = %v", err)
+	}
+}
+
+func TestPermissionedRevisionStateRefreshesScopeAfterArtifactChange(t *testing.T) {
+	state, config, scope := newTestPermissionedRevisionState(t)
+	ctx := context.Background()
+	nextScope := scope
+	state.scopeProvider = func(context.Context) (authorized.ArtifactAuthorizationScope, error) {
+		return nextScope, nil
+	}
+	base, err := state.currentForScope(ctx, config, scope)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	nextScope.ProjectionVersion = "projection_v2"
+	if err := state.refreshScope(ctx); err != nil {
+		t.Fatal(err)
+	}
+	current, err := state.currentForScope(ctx, config, nextScope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Epoch != base.Epoch+1 || current.ACLWatermark != base.ACLWatermark {
+		t.Fatalf("refreshed revision = %+v, want epoch %d with unchanged ACL", current, base.Epoch+1)
+	}
+	if err := state.finish(ctx, base, nil); !errors.Is(err, errPermissionedRevisionUnavailable) {
+		t.Fatalf("in-flight pre-refresh revision error = %v", err)
+	}
+	if _, err := state.begin(ctx, testRevisionAuthorization(current, nextScope)); err != nil {
+		t.Fatalf("refreshed scope remained unavailable: %v", err)
+	}
+}
+
 func TestPermissionedRevisionStateRequiresNewRevisionForRegrant(t *testing.T) {
 	state, _, _ := newTestPermissionedRevisionState(t)
 	ctx := context.Background()
@@ -118,7 +172,12 @@ func newTestPermissionedRevisionState(
 	if err != nil {
 		t.Fatal(err)
 	}
-	state, err := newPermissionedRevisionState(config, scope, cache)
+	state, err := newPermissionedRevisionState(
+		config,
+		scope,
+		cache,
+		func(context.Context) (authorized.ArtifactAuthorizationScope, error) { return scope, nil },
+	)
 	if err != nil {
 		t.Fatal(err)
 	}

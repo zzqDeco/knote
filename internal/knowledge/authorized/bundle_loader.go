@@ -260,8 +260,15 @@ func (i selectedBundleIndex) supportsFromIDs(prefix string, ids []string) ([]pro
 		if !ok {
 			return nil, fmt.Errorf("evidence resource %s is not serving in the selected projection", value)
 		}
+		resource := handle
+		if handle.Type == protocol.ResourceChunk {
+			resource, ok = i.handles[handle.AuthorizationResourceID]
+			if !ok || resource.Type != protocol.ResourceDocument {
+				return nil, fmt.Errorf("evidence chunk %s has no serving parent document", value)
+			}
+		}
 		supports[position] = protocol.ProvenanceSupport{
-			SupportID: prefix + "-" + value, Resource: handle,
+			SupportID: prefix + "-" + value, Resource: resource,
 			Evidence: []protocol.ResourceHandle{handle}, Complete: true,
 		}
 	}

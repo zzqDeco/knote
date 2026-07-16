@@ -83,6 +83,14 @@ func TestBundleEvidenceLoaderUsesOnlyExactSelectedContent(t *testing.T) {
 			t.Fatalf("loaded item %d has no provenance", index)
 		}
 	}
+	entity := items[2]
+	for _, support := range entity.Supports {
+		if support.Resource.Type != protocol.ResourceDocument || len(support.Evidence) != 1 ||
+			support.Evidence[0].Type != protocol.ResourceChunk ||
+			support.Evidence[0].AuthorizationResourceID != support.Resource.ResourceID {
+			t.Fatalf("entity support does not bind chunk evidence to its parent document: %+v", support)
+		}
+	}
 
 	stale := requested[0]
 	stale.ContentDigest = protocol.NewContentDigest("stale")

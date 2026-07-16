@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/zzqDeco/knote/internal/authz"
@@ -14,15 +15,22 @@ import (
 var errPermissionedRevisionUnavailable = errors.New("permissioned authorization revision is unavailable")
 
 type permissionedRevisionState struct {
-	publisher authz.RevisionPublisher
-	lifecycle authz.RevocationLifecycle
+	publisher     authz.RevisionPublisher
+	lifecycle     authz.RevocationLifecycle
+	scopeMu       sync.RWMutex
+	scope         authorized.ArtifactAuthorizationScope
+	scopeProvider func(context.Context) (authorized.ArtifactAuthorizationScope, error)
 }
 
 func newPermissionedRevisionState(
 	config permissionedRuntimeConfig,
 	scope authorized.ArtifactAuthorizationScope,
 	cache *authorized.QueryCache,
+	scopeProvider func(context.Context) (authorized.ArtifactAuthorizationScope, error),
 ) (*permissionedRevisionState, error) {
+	if scopeProvider == nil {
+		return nil, errPermissionedRevisionUnavailable
+	}
 	initial := authz.AuthorizationRevision{
 		StoreID:              config.OpenFGA.StoreID,
 		AuthorizationModelID: config.OpenFGA.AuthorizationModelID,
@@ -57,7 +65,9 @@ func newPermissionedRevisionState(
 	if err != nil {
 		return nil, err
 	}
-	return &permissionedRevisionState{publisher: publisher, lifecycle: lifecycle}, nil
+	return &permissionedRevisionState{
+		publisher: publisher, lifecycle: lifecycle, scope: scope, scopeProvider: scopeProvider,
+	}, nil
 }
 
 func (s *permissionedRevisionState) currentForScope(
@@ -65,17 +75,68 @@ func (s *permissionedRevisionState) currentForScope(
 	config permissionedRuntimeConfig,
 	scope authorized.ArtifactAuthorizationScope,
 ) (authz.AuthorizationRevision, error) {
-	if s == nil || s.publisher == nil || s.lifecycle == nil || ctx == nil {
+	if s == nil || s.publisher == nil || s.lifecycle == nil || s.scopeProvider == nil || ctx == nil {
 		return authz.AuthorizationRevision{}, errPermissionedRevisionUnavailable
 	}
 	current, err := s.publisher.Current(ctx)
+	boundScope := s.boundScope()
 	if err != nil || current.StoreID != config.OpenFGA.StoreID ||
 		current.AuthorizationModelID != config.OpenFGA.AuthorizationModelID ||
 		current.IdentityWatermark != config.IdentityWatermark ||
-		current.ACLWatermark != scope.ACLWatermark {
+		current.ACLWatermark != scope.ACLWatermark || scope != boundScope {
 		return authz.AuthorizationRevision{}, errPermissionedRevisionUnavailable
 	}
 	return current, nil
+}
+
+func (s *permissionedRevisionState) boundScope() authorized.ArtifactAuthorizationScope {
+	s.scopeMu.RLock()
+	defer s.scopeMu.RUnlock()
+	return s.scope
+}
+
+func (s *permissionedRevisionState) refreshScope(ctx context.Context) error {
+	if s == nil || s.publisher == nil || s.lifecycle == nil || s.scopeProvider == nil || ctx == nil {
+		return errPermissionedRevisionUnavailable
+	}
+	nextScope, err := s.scopeProvider(ctx)
+	if err != nil {
+		return errPermissionedRevisionUnavailable
+	}
+
+	s.scopeMu.Lock()
+	defer s.scopeMu.Unlock()
+	if nextScope == s.scope {
+		return nil
+	}
+	current, err := s.publisher.Current(ctx)
+	if err != nil {
+		return errPermissionedRevisionUnavailable
+	}
+	target := current
+	target.ACLWatermark = nextScope.ACLWatermark
+	target.Epoch++
+	reservation, err := s.publisher.Reserve(ctx, current, target)
+	if err != nil {
+		return errPermissionedRevisionUnavailable
+	}
+	if err := s.publisher.Publish(ctx, reservation); err != nil {
+		s.publisher.Abort(reservation)
+		return errPermissionedRevisionUnavailable
+	}
+	s.scope = nextScope
+	return nil
+}
+
+func (s *permissionedRevisionState) verifyCurrentScope(ctx context.Context) error {
+	if s == nil || s.scopeProvider == nil || ctx == nil {
+		return errPermissionedRevisionUnavailable
+	}
+	current, err := s.scopeProvider(ctx)
+	if err != nil || current != s.boundScope() {
+		return errPermissionedRevisionUnavailable
+	}
+	return nil
 }
 
 func (s *permissionedRevisionState) begin(
@@ -84,6 +145,9 @@ func (s *permissionedRevisionState) begin(
 ) (authz.AuthorizationRevision, error) {
 	if s == nil || s.publisher == nil || s.lifecycle == nil || ctx == nil {
 		return authz.AuthorizationRevision{}, errPermissionedRevisionUnavailable
+	}
+	if err := s.verifyCurrentScope(ctx); err != nil {
+		return authz.AuthorizationRevision{}, err
 	}
 	if err := authorization.Validate(); err != nil {
 		return authz.AuthorizationRevision{}, errPermissionedRevisionUnavailable
@@ -104,6 +168,9 @@ func (s *permissionedRevisionState) finish(
 ) error {
 	if s == nil || s.publisher == nil || s.lifecycle == nil || ctx == nil {
 		return errPermissionedRevisionUnavailable
+	}
+	if err := s.verifyCurrentScope(ctx); err != nil {
+		return err
 	}
 	current, err := s.publisher.Current(ctx)
 	if err != nil || current != expected {
