@@ -16,6 +16,7 @@ import (
 	"github.com/zzqDeco/knote/internal/knowledge/authorized"
 	"github.com/zzqDeco/knote/internal/knowledge/authorized/fixture"
 	"github.com/zzqDeco/knote/internal/knowledge/kag"
+	"github.com/zzqDeco/knote/internal/knowledge/versioned"
 	"github.com/zzqDeco/knote/internal/protocol"
 	"github.com/zzqDeco/knote/internal/repository"
 	"github.com/zzqDeco/knote/internal/runtime"
@@ -254,6 +255,40 @@ func newPermissionedApplication(
 	}
 	return &permissionedApplication{
 		service: service, authorizationProvider: provider, revisionState: revisionState,
+	}, nil
+}
+
+func fakeBuildAuthorizationProvider(
+	workspace string,
+	repo repository.Workspace,
+	principal string,
+) (runtime.AuthorizationContextProvider, error) {
+	if repo == nil {
+		return nil, fmt.Errorf("fake build authorization requires a workspace repository")
+	}
+	return func(ctx context.Context, sessionID string) (protocol.AuthorizationContext, error) {
+		if ctx == nil {
+			return protocol.AuthorizationContext{}, fmt.Errorf("fake build authorization requires a context")
+		}
+		if err := ctx.Err(); err != nil {
+			return protocol.AuthorizationContext{}, err
+		}
+		cfg, err := repo.Config(ctx)
+		if err != nil {
+			return protocol.AuthorizationContext{}, fmt.Errorf("load fake build authorization config: %w", err)
+		}
+		scope, err := versioned.ResolveMaterializationAuthorizationScope(workspace, cfg)
+		if err != nil {
+			return protocol.AuthorizationContext{}, fmt.Errorf("resolve fake build authorization scope: %w", err)
+		}
+		authorization := fixture.Authorization(principal, sessionID)
+		authorization.TenantID = scope.TenantID
+		authorization.KnowledgeBaseID = scope.KnowledgeBaseID
+		authorization.ACLWatermark = scope.ACLWatermark
+		if err := authorization.Validate(); err != nil {
+			return protocol.AuthorizationContext{}, fmt.Errorf("fake build authorization context: %w", err)
+		}
+		return authorization, nil
 	}, nil
 }
 

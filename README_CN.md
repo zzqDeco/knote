@@ -4,7 +4,7 @@
 
 ## 版本状态
 
-`v0.1.1` 是已发布的 runtime/Eino 基线。`v0.2.0` 发布线新增 permissioned KAG serving 基础和真实 primitive-provider 路径：基于 OpenFGA 的授权、确定性 projection 与 graph binding、无正文 retrieval primitive、逐跳授权的有界 Claim traversal、可安全撤权的 cache/citation/session replay，以及确定性与真实 OpenFGA/OpenSPG 验收门禁。CLI 当前只在确定性 fake mode 中选择 authorization-aware query tools；默认尚未启用真实 operator runtime composition。
+最新已发布 tag 以 [GitHub Releases](https://github.com/zzqDeco/knote/releases) 为准。`v0.3.0` 发布线把已完成的 permissioned KAG runtime 提升为可选的 operator 路径：基于 OpenFGA 的授权、经过校验的 selected-bundle evidence loading、确定性 projection 与 graph binding、无正文 retrieval primitive、逐跳授权的有界 Claim traversal、可安全撤权的 cache/citation/session replay、受保护的可观察面、无正文 operational telemetry，以及强制的 built-binary 验收。真实 permissioned mode 仍需显式设置 `KNOTE_PERMISSIONED=1`；配置不完整或依赖失败时会 fail closed。相对 `v0.2.1` 的发布差异见 `CHANGELOG.md`。
 
 当前 MVP 调整为 Go-first：
 
@@ -62,7 +62,7 @@ KNOTE_KAG_FAKE=1 go test ./...
 scripts/smoke_fake_mvp.sh
 ```
 
-`scripts/smoke_fake_mvp.sh` 会优先复用已有的 `bin/knote`；如需验证其他 binary，可设置 `KNOTE_BIN=/path/to/knote`。macOS 下默认用 `go run` 驱动 PTY，避免本机未签名 binary 偶发启动卡住；如需强制验证已构建 binary，设置 `KNOTE_SMOKE_FORCE_BIN=1`。
+`scripts/smoke_fake_mvp.sh` 会优先复用已有的 `bin/knote`；如需验证其他 binary，可设置 `KNOTE_BIN=/path/to/knote`。macOS 下默认用 `go run` 驱动 PTY，避免本机未签名 binary 偶发启动卡住；如需强制验证已构建 binary，设置 `KNOTE_SMOKE_FORCE_BIN=1`。该 legacy fake smoke 不能替代 built-binary permissioned acceptance。
 
 如需指定 Python 解释器，设置 `KNOTE_PYTHON=/path/to/python`。
 
@@ -83,6 +83,8 @@ scripts/smoke_permissioned_graph_real.sh
 
 CI 会运行不需要凭据的确定性部分：`python3 tests/smoke/permissioned_graph_real_smoke.py --self-test`。固定镜像 digest、外部临时 stack 规则和完整阶段说明见 `docs/permissioned-kag-real-smoke.md`。
 
+真实 permissioned CLI composition 需要显式设置 `KNOTE_PERMISSIONED=1`，关闭 `KNOTE_KAG_FAKE`，配置真实的 `KNOTE_KAG_PERMISSIONED_PROVIDER=module:factory`、当前 selected artifact bundle，以及完整的 OpenFGA principal、identity、endpoint、store、model 和 token。配置不完整会在 TUI 启动前失败；provider 或网络在请求期间失败时会 fail closed，且不会回退到 legacy query。变量、启动边界、信任模型和无泄露排障流程见 `docs/permissioned-kag-operations.md`。
+
 adapter 会在 `.knote/kag-runtime/` 写入稳定排序的 JSON corpus 和生成的 starter config；需要自定义模型、namespace 或 project 时，把该 config 复制到 `.knote/kag_config.yaml`。KAG runtime 缓存不会进 Git。
 
 ## 会话
@@ -90,6 +92,8 @@ adapter 会在 `.knote/kag-runtime/` 写入稳定排序的 JSON corpus 和生成
 会话以 JSONL event log 保存在 `.knote/sessions/`。`/clear` 只清空当前 TUI 投影视图，不删除历史；`/new` 创建新 session；`/resume` 列出最近 session；`/resume <session-id>` 在 TUI 中恢复历史。
 
 Permissioned session 还会保存只含元数据的 authorization envelope。只有当前 tenant、knowledge base、principal、authorization model、identity/ACL watermark、task scope 和 consistency preference 全部匹配时才允许 replay；缺失或变化都会在加载历史前 fail closed。撤权会阻止之后的 cache、citation 和 session replay，但无法收回用户已经查看或复制的内容。
+
+`KNOTE_PERMISSIONED_TELEMETRY_PATH` 是可选的无正文 operational JSONL sink。其封闭 schema 只包含固定事件分类、聚合计数、布尔值、耗时、比率和 percentile/budget 结果，不包含正文、标识符、路径、prompt、错误文本、endpoint 或 secret。sink 失败不会影响授权，也不会进入 TUI 或 session history。
 
 ## Runtime 分层
 
@@ -122,7 +126,7 @@ scripts/smoke_eino_local_proxy.sh
 
 `knote` 使用 Git commit 表示知识版本，Git tag 表示发布版本，branch 表示候选实验版本。
 
-- `/diff` 显示 `.knote/config.yaml`、`sources/`、`artifacts/`、`evals/` 的当前知识变更。
+- 未配置 authorization provider 时，`/diff` 显示 `.knote/config.yaml`、`sources/`、`artifacts/`、`evals/` 的当前知识变更。Permissioned runtime 会阻止 raw diff，因为其内容没有绑定授权上下文。
 - `/commit [message]` 只 stage 上述知识路径，并在确认后提交。
 - `/versions` 列出最近 commit、tag 和当前版本标记。
 - `/checkout <ref>` 必须确认，dirty workspace 时会显示额外警告。
@@ -141,8 +145,11 @@ python3 -m unittest discover -s adapters/kag -p '*test*.py'
 GOTOOLCHAIN=go1.25.12 go run github.com/openfga/cli/cmd/fga@v0.7.17 model test --tests internal/authz/model/authorization.fga.yaml
 python3 tests/smoke/permissioned_graph_real_smoke.py --self-test
 CGO_ENABLED=0 go build -o bin/knote ./cmd/knote
+scripts/smoke_permissioned_binary.sh --bin bin/knote --timeout 180
 PYTHON=/usr/bin/python3 KNOTE_SMOKE_FORCE_BIN=1 scripts/smoke_fake_mvp.sh
 ```
+
+`scripts/smoke_permissioned_binary.sh` 使用同一个已构建 binary，覆盖 authorized query/explain/resume、permission-bound 与 revoked resume、deny、empty result、telemetry sink failure、provider failure 和 OpenFGA backend failure。编译检查、`go run`、直接 Go service test 或 fake MVP smoke 都不能替代该门禁。
 
 手动 Eino/OpenAI-compatible 验收：
 
@@ -169,6 +176,6 @@ scripts/smoke_permissioned_graph_real.sh
 
 ## 当前范围
 
-`v0.2.0` 包含 OpenFGA 授权契约、确定性 catalog/projection bundle、精确 resource/graph/Claim binding、无正文 discover/retrieve/expand、只接收已授权 evidence 的 generate、有界逐跳 Claim traversal、可安全撤权的 cache/citation/session replay、受保护查询面，以及确定性与真实 permissioned acceptance。
+`v0.3.0` 包含 OpenFGA 授权契约、确定性 catalog/projection bundle、精确 resource/graph/Claim binding、无正文 discover/retrieve/expand、只接收已授权 evidence 的 generate、有界逐跳 Claim traversal、可安全撤权的 cache/citation/session replay、受保护查询面、可选真实 operator composition、无正文 telemetry，以及确定性、built-binary 与真实 permissioned acceptance。
 
-`v0.2.0` 不包含 web UI、desktop app、cloud sync、多用户协作 UI、独立版本数据库、把 OpenSPG 作为 serving 授权边界、默认真实 CLI operator-provider composition、permissioned `/eval`，或 MCP 依赖。推进 `main` 仍必须经过已评审的 release PR，创建 release tag 仍需要明确确认。
+`v0.3.0` 不包含 web UI、desktop app、cloud sync、多用户协作 UI、独立版本数据库、把 OpenSPG 作为 serving 授权边界、默认开启 permissioned mode、permissioned `/eval`，或 MCP 依赖。推进 `main` 和创建 release tag 仍必须分别经过评审和明确确认。

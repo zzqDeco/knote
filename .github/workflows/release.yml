@@ -71,6 +71,9 @@ jobs:
             exit 1
           }
 
+      - name: Permissioned built-binary acceptance
+        run: scripts/smoke_permissioned_binary.sh --bin bin/knote --timeout 180
+
   release:
     needs: verify
     runs-on: ubuntu-latest

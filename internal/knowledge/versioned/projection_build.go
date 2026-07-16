@@ -69,6 +69,14 @@ type projectionBuild struct {
 	noop            bool
 }
 
+// MaterializationAuthorizationScope is the trusted workspace boundary used
+// when a confirmed permissioned build writes derived artifact security records.
+type MaterializationAuthorizationScope struct {
+	TenantID        string
+	KnowledgeBaseID string
+	ACLWatermark    string
+}
+
 type projectionRootProvider interface {
 	ProjectionStoreRoot() string
 }
@@ -108,17 +116,19 @@ func (s service) prepareArtifactProjection(ctx context.Context) (repository.Arti
 		return repository.ArtifactSet{}, projectionBuild{}, fmt.Errorf("KAG corpus contains no non-blank sources")
 	}
 
-	namespace, err := effectiveKAGNamespace(s.workspace, cfg)
+	materializationScope, err := ResolveMaterializationAuthorizationScope(s.workspace, cfg)
 	if err != nil {
 		return repository.ArtifactSet{}, projectionBuild{}, err
 	}
-	namespaceBase := canonicalNamespace(namespace)
-	scope := catalog.Scope{TenantID: localTenantID, KnowledgeBaseID: namespaceBase}
+	namespaceBase := materializationScope.KnowledgeBaseID
+	scope := catalog.Scope{
+		TenantID: materializationScope.TenantID, KnowledgeBaseID: materializationScope.KnowledgeBaseID,
+	}
 	snapshotVersion, err := sourceSnapshotVersion(scope, loaded)
 	if err != nil {
 		return repository.ArtifactSet{}, projectionBuild{}, err
 	}
-	aclVersion := canonicalACLVersion(scope)
+	aclVersion := materializationScope.ACLWatermark
 	buildConfigVersion, err := kagBuildConfigVersion(s.workspace, cfg)
 	if err != nil {
 		return repository.ArtifactSet{}, projectionBuild{}, err
@@ -1231,6 +1241,24 @@ func canonicalACLVersion(scope catalog.Scope) string {
 		"document-boundary-v1",
 	}, "\x00")
 	return "acl_" + fullHash([]byte(payload))[:24]
+}
+
+// ResolveMaterializationAuthorizationScope returns the exact scope the build
+// planner derives from the effective workspace configuration. Permissioned
+// callers use this rather than reconstructing security identifiers separately.
+func ResolveMaterializationAuthorizationScope(
+	workspace string,
+	cfg repository.Config,
+) (MaterializationAuthorizationScope, error) {
+	namespace, err := effectiveKAGNamespace(workspace, cfg)
+	if err != nil {
+		return MaterializationAuthorizationScope{}, err
+	}
+	scope := catalog.Scope{TenantID: localTenantID, KnowledgeBaseID: canonicalNamespace(namespace)}
+	return MaterializationAuthorizationScope{
+		TenantID: scope.TenantID, KnowledgeBaseID: scope.KnowledgeBaseID,
+		ACLWatermark: canonicalACLVersion(scope),
+	}, nil
 }
 
 func projectionKAGBuildIdempotencyKey(projectionVersion string) string {

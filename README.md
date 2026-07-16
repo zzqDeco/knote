@@ -4,7 +4,7 @@
 
 ## Version Status
 
-Current `dev` includes the permissioned KAG serving foundation and opt-in real operator composition: OpenFGA-backed authorization, verified selected-bundle evidence loading, deterministic projection and graph bindings, body-free retrieval primitives, bounded per-hop authorized Claim traversal, revocation-safe cache/citation/session replay, and protected observable surfaces. Issue #78 adds acceptance and operational evidence for that composition; it does not publish a new GitHub Release.
+The latest published tag is listed on [GitHub Releases](https://github.com/zzqDeco/knote/releases). The `v0.3.0` release line promotes the completed permissioned KAG runtime into an opt-in operator path: OpenFGA-backed authorization, verified selected-bundle evidence loading, deterministic projection and graph bindings, body-free retrieval primitives, bounded per-hop authorized Claim traversal, revocation-safe cache/citation/session replay, protected observable surfaces, content-free operational telemetry, and mandatory built-binary acceptance. Real permissioned mode remains opt-in through `KNOTE_PERMISSIONED=1` and fails closed on partial configuration or dependency failure. See `CHANGELOG.md` for the release delta from `v0.2.1`.
 
 This MVP is Go-first:
 
@@ -227,4 +227,4 @@ MVP scope includes:
 - optional content-free permissioned telemetry isolated from authorization and session history
 - mandatory credential-free built-binary acceptance plus an optional pinned disposable OpenFGA/OpenSPG live smoke
 
-Out of scope for the current Phase 2 acceptance slice: web UI, desktop app, cloud sync, multi-user collaboration UI, an independent version database, OpenSPG as the serving authorization boundary, default-on permissioned mode, permissioned `/eval`, an MCP dependency, or publishing a GitHub Release. Main-branch promotion and any future tag remain separate reviewed actions.
+Out of scope for `v0.3.0`: web UI, desktop app, cloud sync, multi-user collaboration UI, an independent version database, OpenSPG as the serving authorization boundary, default-on permissioned mode, permissioned `/eval`, or an MCP dependency. Main-branch promotion and release tags remain separate reviewed actions.
