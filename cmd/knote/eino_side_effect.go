@@ -17,6 +17,7 @@ func newEinoSideEffectGate(
 	bridge *runtime.SideEffectBridge,
 	approvedTools map[string]einotool.InvokableTool,
 	fakeBuildAuthorization runtime.AuthorizationContextProvider,
+	permissionedScopeRefresh func(context.Context) error,
 ) einotools.SideEffectGate {
 	execute := runtimeeino.NewSideEffectExecutor(approvedTools)
 	return func(ctx context.Context, req einotools.SideEffectRequest) error {
@@ -43,6 +44,33 @@ func newEinoSideEffectGate(
 				return execute(runCtx, sideEffect)
 			}
 		}
+		request.Execute = withPermissionedScopeRefresh(
+			req.ToolName, request.Execute, permissionedScopeRefresh,
+		)
 		return bridge.Request(ctx, request)
 	}
+}
+
+func withPermissionedScopeRefresh(
+	toolName string,
+	execute runtime.SideEffectExecutor,
+	refresh func(context.Context) error,
+) runtime.SideEffectExecutor {
+	if execute == nil || refresh == nil || !permissionedScopeChangingTool(toolName) {
+		return execute
+	}
+	return func(ctx context.Context, request runtime.SideEffectRequest) ([]protocol.Event, error) {
+		events, err := execute(ctx, request)
+		if err != nil {
+			return events, err
+		}
+		if err := refresh(ctx); err != nil {
+			return nil, errors.New("side effect failed")
+		}
+		return events, nil
+	}
+}
+
+func permissionedScopeChangingTool(toolName string) bool {
+	return toolName == einotools.NameBuild || toolName == einotools.NameCheckout
 }
