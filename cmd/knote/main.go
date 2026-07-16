@@ -98,6 +98,9 @@ func newRuntime(ctx context.Context, workspacePath string, resumeID string) (run
 	var authorizationProvider runtime.AuthorizationContextProvider
 	var permissionedQuery einotools.PermissionedQuery
 	var protectedContentAuthorizer runtime.ProtectedContentAuthorizer
+	var permissionedScopeRefresh func(context.Context) error
+	var permissionedSessionRebind func(context.Context, string) error
+	var rt *runtime.Manager
 	if permissionedApplication != nil {
 		authorizationProvider = permissionedApplication.AuthorizationContextProvider()
 		permissionedQuery = func(ctx context.Context, request protocol.QueryRequest) (einotools.PermissionedQueryResult, error) {
@@ -112,6 +115,15 @@ func newRuntime(ctx context.Context, workspacePath string, resumeID string) (run
 			}, nil
 		}
 		protectedContentAuthorizer = permissionedApplication.AuthorizeProtectedContent
+		if !permissionedConfig.Fake {
+			permissionedScopeRefresh = permissionedApplication.RefreshAuthorizationScope
+			permissionedSessionRebind = func(ctx context.Context, sessionID string) error {
+				if rt == nil {
+					return fmt.Errorf("permissioned runtime is not initialized")
+				}
+				return rt.RebindSessionAuthorization(ctx, sessionID)
+			}
+		}
 	}
 	sideEffects := runtime.NewSideEffectBridge()
 	approvedEinoTools := einotools.ByNameWithOptions(einotools.Options{
@@ -130,7 +142,9 @@ func newRuntime(ctx context.Context, workspacePath string, resumeID string) (run
 	allEinoTools := einotools.NewWithOptions(einotools.Options{
 		Service:           knowledgeService,
 		PermissionedQuery: permissionedQuery,
-		SideEffectGate:    newEinoSideEffectGate(sideEffects, approvedEinoTools, fakeBuildAuthorization),
+		SideEffectGate: newEinoSideEffectGate(
+			sideEffects, approvedEinoTools, fakeBuildAuthorization, permissionedScopeRefresh, permissionedSessionRebind,
+		),
 	})
 	slashTools := permissionedSlashTools(allEinoTools, permissionedConfig.Enabled)
 	modelTools := permissionedModelTools(allEinoTools, permissionedConfig.Enabled)
@@ -143,7 +157,7 @@ func newRuntime(ctx context.Context, workspacePath string, resumeID string) (run
 	if permissionedConfig.Enabled {
 		capabilities = runtime.PermissionedSessionCapabilityProfile()
 	}
-	rt := runtime.New(runtime.Dependencies{
+	rt = runtime.New(runtime.Dependencies{
 		Workspace:                    workspace,
 		Config:                       repoCfg,
 		Sessions:                     repo,

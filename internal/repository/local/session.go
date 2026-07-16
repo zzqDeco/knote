@@ -207,6 +207,55 @@ func bindSessionAuthorization(ctx context.Context, workspace string, envelope pr
 	return validateSameAuthorizationBinding(existing, envelope)
 }
 
+func rebindSessionAuthorization(
+	ctx context.Context,
+	workspace string,
+	expected protocol.SessionAuthorizationEnvelope,
+	replacement protocol.SessionAuthorizationEnvelope,
+) error {
+	sessionAuthorizationMu.Lock()
+	defer sessionAuthorizationMu.Unlock()
+
+	if err := expected.Validate(); err != nil {
+		return err
+	}
+	if err := replacement.Validate(); err != nil {
+		return err
+	}
+	if expected.SessionID != replacement.SessionID {
+		return fmt.Errorf("session authorization rebind must keep the same session id")
+	}
+	if err := validateSessionID(expected.SessionID); err != nil {
+		return err
+	}
+	if err := secureSessionDirectory(workspace, false); err != nil {
+		return err
+	}
+	existing, err := loadSessionAuthorizationLocked(workspace, expected.SessionID)
+	if err != nil {
+		return err
+	}
+	if existing != expected {
+		return fmt.Errorf("session authorization envelope changed before rebind")
+	}
+	if validateSameAuthorizationBinding(expected, replacement) == nil {
+		return nil
+	}
+
+	data, err := json.MarshalIndent(replacement, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	path := sessionAuthorizationPath(workspace, expected.SessionID)
+	temporary, err := stageSessionAuthorization(path, data)
+	if err != nil {
+		return err
+	}
+	defer os.Remove(temporary)
+	return replaceSessionAuthorization(ctx, workspace, temporary, path, expected)
+}
+
 func loadSessionAuthorization(workspace string, sessionID string) (protocol.SessionAuthorizationEnvelope, error) {
 	sessionAuthorizationMu.RLock()
 	defer sessionAuthorizationMu.RUnlock()
@@ -369,6 +418,51 @@ func publishSessionAuthorization(ctx context.Context, temporary, path string) (b
 		case <-ctx.Done():
 			timer.Stop()
 			return false, ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func replaceSessionAuthorization(
+	ctx context.Context,
+	workspace string,
+	temporary string,
+	path string,
+	expected protocol.SessionAuthorizationEnvelope,
+) error {
+	lockPath := path + sessionAuthorizationLockSuffix
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := os.Mkdir(lockPath, 0o700); err == nil {
+			defer os.Remove(lockPath)
+			existing, err := loadSessionAuthorizationLocked(workspace, expected.SessionID)
+			if err != nil {
+				return err
+			}
+			if existing != expected {
+				return fmt.Errorf("session authorization envelope changed before rebind")
+			}
+			if err := replaceArtifactFile(temporary, path); err != nil {
+				return err
+			}
+			if err := syncArtifactDirectory(filepath.Dir(path)); err != nil {
+				return err
+			}
+			return nil
+		} else if !errors.Is(err, os.ErrExist) {
+			return fmt.Errorf("acquire session authorization publish lock: %w", err)
+		}
+
+		if _, err := recoverStaleSessionAuthorizationLock(lockPath, temporary); err != nil {
+			return err
+		}
+		timer := time.NewTimer(sessionAuthorizationLockPollInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
 		case <-timer.C:
 		}
 	}

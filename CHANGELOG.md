@@ -3,6 +3,21 @@
 This project follows semantic versioning. GitHub Releases remains the source of
 truth for published tags and binary assets.
 
+## [0.3.1] - 2026-07-16
+
+### Fixed
+
+- Refreshed the real permissioned authorization scope after a successful
+  `/build` or `/checkout`, so later queries use the newly selected projection
+  without requiring a process restart.
+
+### Security
+
+- Scope-changing side effects now publish a new authorization revision epoch
+  and invalidate reads that began against the previous projection.
+- A scope-refresh failure discards success events and fails closed without
+  exposing the underlying authorization error.
+
 ## [0.3.0] - 2026-07-16
 
 ### Added
@@ -48,5 +63,6 @@ truth for published tags and binary assets.
 - Included KAG adapters in Windows release archives.
 - Hardened verified-tag release publication and asset checks.
 
+[0.3.1]: https://github.com/zzqDeco/knote/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/zzqDeco/knote/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/zzqDeco/knote/releases/tag/v0.2.1

@@ -318,6 +318,13 @@ func (a *permissionedApplication) AuthorizationContextProvider() runtime.Authori
 	return a.authorizationProvider
 }
 
+func (a *permissionedApplication) RefreshAuthorizationScope(ctx context.Context) error {
+	if a == nil || a.revisionState == nil {
+		return errPermissionedRevisionUnavailable
+	}
+	return a.revisionState.refreshScope(ctx)
+}
+
 func (a *permissionedApplication) Query(
 	ctx context.Context,
 	request protocol.QueryRequest,
