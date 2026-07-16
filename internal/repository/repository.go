@@ -95,6 +95,14 @@ type PermissionedSessions interface {
 	ListAuthorization(ctx context.Context) ([]protocol.SessionAuthorizationEnvelope, error)
 }
 
+// RebindablePermissionedSessions supports an explicit compare-and-swap
+// transition after a confirmed artifact scope change. Ordinary session binds
+// remain immutable through PermissionedSessions.BindAuthorization.
+type RebindablePermissionedSessions interface {
+	PermissionedSessions
+	RebindAuthorization(ctx context.Context, expected, replacement protocol.SessionAuthorizationEnvelope) error
+}
+
 type Versions interface {
 	Status(ctx context.Context) (Status, error)
 	Diff(ctx context.Context, ref string) (string, error)

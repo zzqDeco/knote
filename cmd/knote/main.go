@@ -99,6 +99,8 @@ func newRuntime(ctx context.Context, workspacePath string, resumeID string) (run
 	var permissionedQuery einotools.PermissionedQuery
 	var protectedContentAuthorizer runtime.ProtectedContentAuthorizer
 	var permissionedScopeRefresh func(context.Context) error
+	var permissionedSessionRebind func(context.Context, string) error
+	var rt *runtime.Manager
 	if permissionedApplication != nil {
 		authorizationProvider = permissionedApplication.AuthorizationContextProvider()
 		permissionedQuery = func(ctx context.Context, request protocol.QueryRequest) (einotools.PermissionedQueryResult, error) {
@@ -115,6 +117,12 @@ func newRuntime(ctx context.Context, workspacePath string, resumeID string) (run
 		protectedContentAuthorizer = permissionedApplication.AuthorizeProtectedContent
 		if !permissionedConfig.Fake {
 			permissionedScopeRefresh = permissionedApplication.RefreshAuthorizationScope
+			permissionedSessionRebind = func(ctx context.Context, sessionID string) error {
+				if rt == nil {
+					return fmt.Errorf("permissioned runtime is not initialized")
+				}
+				return rt.RebindSessionAuthorization(ctx, sessionID)
+			}
 		}
 	}
 	sideEffects := runtime.NewSideEffectBridge()
@@ -135,7 +143,7 @@ func newRuntime(ctx context.Context, workspacePath string, resumeID string) (run
 		Service:           knowledgeService,
 		PermissionedQuery: permissionedQuery,
 		SideEffectGate: newEinoSideEffectGate(
-			sideEffects, approvedEinoTools, fakeBuildAuthorization, permissionedScopeRefresh,
+			sideEffects, approvedEinoTools, fakeBuildAuthorization, permissionedScopeRefresh, permissionedSessionRebind,
 		),
 	})
 	slashTools := permissionedSlashTools(allEinoTools, permissionedConfig.Enabled)
@@ -149,7 +157,7 @@ func newRuntime(ctx context.Context, workspacePath string, resumeID string) (run
 	if permissionedConfig.Enabled {
 		capabilities = runtime.PermissionedSessionCapabilityProfile()
 	}
-	rt := runtime.New(runtime.Dependencies{
+	rt = runtime.New(runtime.Dependencies{
 		Workspace:                    workspace,
 		Config:                       repoCfg,
 		Sessions:                     repo,

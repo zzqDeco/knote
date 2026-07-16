@@ -26,6 +26,8 @@ type authorizationBinding struct {
 	consistency          protocol.ConsistencyPreference
 }
 
+type expectedSessionAuthorizationEnvelopeKey struct{}
+
 func (provider AuthorizationContextProvider) authorizationContext(ctx context.Context, sessionID string) (protocol.AuthorizationContext, error) {
 	if provider == nil {
 		return protocol.AuthorizationContext{}, fmt.Errorf("authorization context provider is not configured")
@@ -70,6 +72,116 @@ func newAuthorizationBinding(authorization protocol.AuthorizationContext) author
 		taskID:               authorization.TaskID,
 		consistency:          authorization.Consistency,
 	}
+}
+
+func authorizationBindingFromEnvelope(envelope protocol.SessionAuthorizationEnvelope) authorizationBinding {
+	return authorizationBinding{
+		tenantID:             envelope.TenantID,
+		knowledgeBaseID:      envelope.KnowledgeBaseID,
+		principalID:          envelope.PrincipalID,
+		authorizationModelID: envelope.AuthorizationModelID,
+		identityWatermark:    envelope.IdentityWatermark,
+		aclWatermark:         envelope.ACLWatermark,
+		agentID:              envelope.AgentID,
+		taskID:               envelope.TaskID,
+		consistency:          envelope.Consistency,
+	}
+}
+
+func allowsArtifactScopeTransition(current, next authorizationBinding) bool {
+	return current.principalID == next.principalID &&
+		current.authorizationModelID == next.authorizationModelID &&
+		current.identityWatermark == next.identityWatermark &&
+		current.agentID == next.agentID &&
+		current.taskID == next.taskID &&
+		current.consistency == next.consistency
+}
+
+func withExpectedSessionAuthorizationEnvelope(
+	ctx context.Context,
+	envelope protocol.SessionAuthorizationEnvelope,
+) context.Context {
+	return context.WithValue(ctx, expectedSessionAuthorizationEnvelopeKey{}, envelope)
+}
+
+func expectedSessionAuthorizationEnvelopeFrom(ctx context.Context) (protocol.SessionAuthorizationEnvelope, bool) {
+	envelope, ok := ctx.Value(expectedSessionAuthorizationEnvelopeKey{}).(protocol.SessionAuthorizationEnvelope)
+	return envelope, ok
+}
+
+func (m *Manager) withSessionAuthorizationExpectation(
+	ctx context.Context,
+	sessionID string,
+	authorization protocol.AuthorizationContext,
+) (context.Context, error) {
+	sessions, ok := m.deps.Sessions.(repository.PermissionedSessions)
+	if !ok {
+		return nil, sessionAuthorizationError()
+	}
+	envelope, err := sessions.LoadAuthorization(ctx, sessionID)
+	if err != nil || envelope.ValidateFor(authorization) != nil {
+		return nil, sessionAuthorizationError()
+	}
+	return withExpectedSessionAuthorizationEnvelope(ctx, envelope), nil
+}
+
+// RebindSessionAuthorization transitions a live permissioned session only
+// after a trusted, confirmed artifact scope change. Query-time provider drift
+// continues to use bindSessionAuthorization and remains immutable.
+func (m *Manager) RebindSessionAuthorization(ctx context.Context, sessionID string) error {
+	if !m.deps.Capabilities.IsPermissioned() {
+		return sessionAuthorizationError()
+	}
+	expectedAuthorization, ok := protocol.AuthorizationContextFrom(ctx)
+	if !ok || expectedAuthorization.SessionID != sessionID {
+		return sessionAuthorizationError()
+	}
+	expectedBinding := newAuthorizationBinding(expectedAuthorization)
+	expectedEnvelope, ok := expectedSessionAuthorizationEnvelopeFrom(ctx)
+	if !ok || expectedEnvelope.SessionID != sessionID || authorizationBindingFromEnvelope(expectedEnvelope) != expectedBinding {
+		return sessionAuthorizationError()
+	}
+	sessions, ok := m.deps.Sessions.(repository.RebindablePermissionedSessions)
+	if !ok {
+		return sessionAuthorizationError()
+	}
+	authorization, err := m.deps.AuthorizationContextProvider.authorizationContext(ctx, sessionID)
+	if err != nil {
+		return sessionAuthorizationError()
+	}
+	replacement, err := protocol.NewSessionAuthorizationEnvelope(authorization, time.Now().UTC())
+	if err != nil {
+		return sessionAuthorizationError()
+	}
+	nextBinding := newAuthorizationBinding(authorization)
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.einoSession.ID != sessionID || m.authorizationBinding == nil {
+		return sessionAuthorizationError()
+	}
+	currentBinding := *m.authorizationBinding
+	if currentBinding != expectedBinding {
+		return sessionAuthorizationError()
+	}
+	if !allowsArtifactScopeTransition(currentBinding, nextBinding) {
+		return sessionAuthorizationError()
+	}
+	existing, err := sessions.LoadAuthorization(ctx, sessionID)
+	if currentBinding == nextBinding {
+		if err != nil || existing != expectedEnvelope {
+			return sessionAuthorizationError()
+		}
+		return nil
+	}
+	if err != nil {
+		return sessionAuthorizationError()
+	}
+	if err := sessions.RebindAuthorization(ctx, expectedEnvelope, replacement); err != nil {
+		return sessionAuthorizationError()
+	}
+	m.authorizationBinding = &nextBinding
+	return nil
 }
 
 func (m *Manager) bindSessionAuthorization(ctx context.Context, sessionID string, authorization protocol.AuthorizationContext) error {
