@@ -93,6 +93,9 @@ func loadPermissionedRuntimeConfig(fake bool) (permissionedRuntimeConfig, error)
 	if err != nil {
 		return permissionedRuntimeConfig{}, err
 	}
+	if err := authz.ValidateConcreteUserID(principal); err != nil {
+		return permissionedRuntimeConfig{}, fmt.Errorf("%s: %w", permissionedPrincipalEnv, err)
+	}
 	identityWatermark, err := requiredPermissionedEnv(permissionedIdentityWatermarkEnv)
 	if err != nil {
 		return permissionedRuntimeConfig{}, err
@@ -204,7 +207,7 @@ func newPermissionedApplication(
 	if err != nil {
 		return nil, fmt.Errorf("initialize permissioned artifact scope: %w", err)
 	}
-	revisionState, err := newPermissionedRevisionState(config, scope, cache)
+	revisionState, err := newPermissionedRevisionState(config, scope, cache, loader.CurrentAuthorizationScope)
 	if err != nil {
 		return nil, fmt.Errorf("initialize permissioned authorization revision: %w", err)
 	}

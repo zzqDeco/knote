@@ -118,6 +118,11 @@ func TestPermissionedRuntimeConfigIsExplicitAndComplete(t *testing.T) {
 		t.Fatalf("partial real config should fail closed, got %v", err)
 	}
 
+	t.Setenv(permissionedPrincipalEnv, "user:alice")
+	if _, err := loadPermissionedRuntimeConfig(false); err == nil || !strings.Contains(err.Error(), permissionedPrincipalEnv) {
+		t.Fatalf("prefixed real principal should fail closed, got %v", err)
+	}
+
 	t.Setenv(permissionedPrincipalEnv, "alice")
 	t.Setenv(permissionedIdentityWatermarkEnv, "identity_v1")
 	t.Setenv(permissionedProviderEnv, "permissioned_provider:create")

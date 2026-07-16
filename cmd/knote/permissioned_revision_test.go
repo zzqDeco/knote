@@ -55,6 +55,29 @@ func TestPermissionedRevisionStateRejectsRevisionChangeDuringRead(t *testing.T) 
 	}
 }
 
+func TestPermissionedRevisionStateRejectsProjectionDrift(t *testing.T) {
+	state, config, scope := newTestPermissionedRevisionState(t)
+	ctx := context.Background()
+	current, err := state.currentForScope(ctx, config, scope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	drifted := scope
+	drifted.ProjectionVersion = "projection_v2"
+	if _, err := state.currentForScope(ctx, config, drifted); !errors.Is(err, errPermissionedRevisionUnavailable) {
+		t.Fatalf("projection drift context error = %v", err)
+	}
+	state.scopeProvider = func(context.Context) (authorized.ArtifactAuthorizationScope, error) {
+		return drifted, nil
+	}
+	if _, err := state.begin(ctx, testRevisionAuthorization(current, scope)); !errors.Is(err, errPermissionedRevisionUnavailable) {
+		t.Fatalf("projection drift read error = %v", err)
+	}
+	if err := state.finish(ctx, current, nil); !errors.Is(err, errPermissionedRevisionUnavailable) {
+		t.Fatalf("projection drift finish error = %v", err)
+	}
+}
+
 func TestPermissionedRevisionStateRequiresNewRevisionForRegrant(t *testing.T) {
 	state, _, _ := newTestPermissionedRevisionState(t)
 	ctx := context.Background()
@@ -118,7 +141,12 @@ func newTestPermissionedRevisionState(
 	if err != nil {
 		t.Fatal(err)
 	}
-	state, err := newPermissionedRevisionState(config, scope, cache)
+	state, err := newPermissionedRevisionState(
+		config,
+		scope,
+		cache,
+		func(context.Context) (authorized.ArtifactAuthorizationScope, error) { return scope, nil },
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
