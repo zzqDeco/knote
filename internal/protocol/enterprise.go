@@ -536,6 +536,27 @@ func (f AgentTaskScopeFingerprint) Validate() error {
 	return nil
 }
 
+type ToolInvocationRequest struct {
+	Version    string `json:"version"`
+	ToolName   string `json:"tool_name"`
+	Action     string `json:"action"`
+	Relation   string `json:"relation"`
+	SideEffect bool   `json:"side_effect"`
+}
+
+func (r ToolInvocationRequest) Validate() error {
+	if r.Version != EnterpriseContractVersion {
+		return fmt.Errorf("unsupported tool invocation request version %q", r.Version)
+	}
+	if err := validateEnterpriseFields(
+		"tool_name", r.ToolName,
+		"action", r.Action,
+	); err != nil {
+		return err
+	}
+	return validateAuthorizationName("relation", r.Relation)
+}
+
 type ToolInvocationAuthorization struct {
 	Version              string                `json:"version"`
 	CorrelationID        string                `json:"correlation_id"`
@@ -558,9 +579,12 @@ type ToolInvocationAuthorization struct {
 	CheckedAt            time.Time             `json:"checked_at"`
 }
 
-func (a ToolInvocationAuthorization) ValidateFor(auth AuthorizationContext) error {
+func (a ToolInvocationAuthorization) ValidateFor(auth AuthorizationContext, request ToolInvocationRequest) error {
 	if a.Version != EnterpriseContractVersion {
 		return fmt.Errorf("unsupported tool invocation authorization version %q", a.Version)
+	}
+	if err := request.Validate(); err != nil {
+		return err
 	}
 	if err := auth.Validate(); err != nil {
 		return err
@@ -572,8 +596,10 @@ func (a ToolInvocationAuthorization) ValidateFor(auth AuthorizationContext) erro
 		"correlation_id", a.CorrelationID,
 		"tool_name", a.ToolName,
 		"action", a.Action,
-		"relation", a.Relation,
 	); err != nil {
+		return err
+	}
+	if err := validateAuthorizationName("relation", a.Relation); err != nil {
 		return err
 	}
 	if a.Outcome != DecisionAllow {
@@ -603,6 +629,9 @@ func (a ToolInvocationAuthorization) ValidateFor(auth AuthorizationContext) erro
 		if binding.got != binding.want {
 			return fmt.Errorf("tool invocation authorization %s does not match the authorization context", binding.name)
 		}
+	}
+	if a.ToolName != request.ToolName || a.Action != request.Action || a.Relation != request.Relation || a.SideEffect != request.SideEffect {
+		return fmt.Errorf("tool invocation authorization does not match the requested invocation")
 	}
 	return nil
 }
@@ -641,7 +670,7 @@ func (r ToolResultAuthorization) ValidateFor(auth AuthorizationContext) error {
 	if err := validateEnterpriseID("tool_name", r.ToolName); err != nil {
 		return err
 	}
-	if err := validateEnterpriseID("relation", r.Relation); err != nil {
+	if err := validateAuthorizationName("relation", r.Relation); err != nil {
 		return err
 	}
 	bindings := []struct {
@@ -1095,8 +1124,8 @@ func validateAuthorizationReference(name, value string, allowUserset, allowWildc
 	if err := validateAuthorizationName(name+" type", typeName); err != nil {
 		return err
 	}
-	if id == "*" && !allowWildcard {
-		return fmt.Errorf("%s cannot be a wildcard", name)
+	if id == "*" && (!allowWildcard || hasUserset) {
+		return fmt.Errorf("%s cannot use this wildcard", name)
 	}
 	for _, character := range id {
 		if unicode.IsSpace(character) || unicode.IsControl(character) || character == '#' {

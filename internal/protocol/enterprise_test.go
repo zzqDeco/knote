@@ -212,39 +212,63 @@ func TestAgentTaskScopeBindsExactAuthorizationContext(t *testing.T) {
 
 func TestToolContractsAuthorizeInvocationAndSortedReturnedHandles(t *testing.T) {
 	auth := enterpriseTestAuthorization()
+	request := ToolInvocationRequest{
+		Version: EnterpriseContractVersion, ToolName: "knote-query", Action: "invoke",
+		Relation: EvidenceReadRelation, SideEffect: false,
+	}
 	invocation := ToolInvocationAuthorization{
 		Version: EnterpriseContractVersion, CorrelationID: "tool-invocation-1",
 		TenantID: auth.TenantID, KnowledgeBaseID: auth.KnowledgeBaseID,
 		PrincipalID: auth.PrincipalID, AgentID: auth.AgentID, TaskID: auth.TaskID,
-		SessionID: auth.SessionID, RequestID: auth.RequestID, ToolName: "knote-query",
-		Action: "invoke", Relation: EvidenceReadRelation, AuthorizationModelID: auth.AuthorizationModelID,
+		SessionID: auth.SessionID, RequestID: auth.RequestID, ToolName: request.ToolName,
+		Action: request.Action, Relation: request.Relation, AuthorizationModelID: auth.AuthorizationModelID,
 		IdentityWatermark: auth.IdentityWatermark, ACLWatermark: auth.ACLWatermark, SideEffect: false,
 		Outcome: DecisionAllow, Consistency: auth.Consistency, CheckedAt: enterpriseTestTime(),
 	}
-	if err := invocation.ValidateFor(auth); err != nil {
+	if err := invocation.ValidateFor(auth, request); err != nil {
 		t.Fatalf("invocation ValidateFor: %v", err)
 	}
 	wrongTask := invocation
 	wrongTask.TaskID = "task-2"
-	if err := wrongTask.ValidateFor(auth); err == nil {
+	if err := wrongTask.ValidateFor(auth, request); err == nil {
 		t.Fatal("tool invocation with wrong task was accepted")
 	}
 	deniedInvocation := invocation
 	deniedInvocation.Outcome = DecisionDeny
-	if err := deniedInvocation.ValidateFor(auth); err == nil {
+	if err := deniedInvocation.ValidateFor(auth, request); err == nil {
 		t.Fatal("denied tool invocation was accepted")
 	}
 	weakConsistency := invocation
 	weakConsistency.Consistency = ConsistencyMinimizeLatency
-	if err := weakConsistency.ValidateFor(auth); err == nil {
+	if err := weakConsistency.ValidateFor(auth, request); err == nil {
 		t.Fatal("tool invocation with weaker consistency was accepted")
 	}
 	nonCanonicalAuth := auth
 	nonCanonicalAuth.RequestID = "request/1"
 	nonCanonicalInvocation := invocation
 	nonCanonicalInvocation.RequestID = nonCanonicalAuth.RequestID
-	if err := nonCanonicalInvocation.ValidateFor(nonCanonicalAuth); err == nil {
+	if err := nonCanonicalInvocation.ValidateFor(nonCanonicalAuth, request); err == nil {
 		t.Fatal("tool invocation with a non-canonical authorization context was accepted")
+	}
+	wrongToolRequest := request
+	wrongToolRequest.ToolName = "knote-release"
+	if err := invocation.ValidateFor(auth, wrongToolRequest); err == nil {
+		t.Fatal("tool authorization was replayed for a different tool")
+	}
+	wrongActionRequest := request
+	wrongActionRequest.Action = "execute"
+	if err := invocation.ValidateFor(auth, wrongActionRequest); err == nil {
+		t.Fatal("tool authorization was replayed for a different action")
+	}
+	sideEffectRequest := request
+	sideEffectRequest.SideEffect = true
+	if err := invocation.ValidateFor(auth, sideEffectRequest); err == nil {
+		t.Fatal("read-only tool authorization was replayed for a side effect")
+	}
+	malformedRelationRequest := request
+	malformedRelationRequest.Relation = "can-view"
+	if err := invocation.ValidateFor(auth, malformedRelationRequest); err == nil {
+		t.Fatal("tool request with a malformed authorization relation was accepted")
 	}
 
 	resources := []ResourceHandle{enterpriseTestResource(t, "doc-a"), enterpriseTestResource(t, "doc-b")}
@@ -373,6 +397,12 @@ func TestPolicyAuditAndResidencyContractsArePinnedAndNonMutating(t *testing.T) {
 	malformedUserset.Entries[0].SubjectID = "group:engineering#member#nested"
 	if err := malformedUserset.ValidateFor(request, scope); err == nil {
 		t.Fatal("malformed userset policy impact was accepted")
+	}
+	wildcardUserset := usersetImpact
+	wildcardUserset.Entries = append([]PolicyImpactEntry(nil), usersetImpact.Entries...)
+	wildcardUserset.Entries[0].SubjectID = "group:*#member"
+	if err := wildcardUserset.ValidateFor(request, scope); err == nil {
+		t.Fatal("wildcard userset policy impact was accepted")
 	}
 
 	audit := AuditRecordReference{
