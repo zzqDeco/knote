@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode"
 )
 
 const EnterpriseContractVersion = "v1"
@@ -536,24 +537,25 @@ func (f AgentTaskScopeFingerprint) Validate() error {
 }
 
 type ToolInvocationAuthorization struct {
-	Version              string          `json:"version"`
-	CorrelationID        string          `json:"correlation_id"`
-	TenantID             string          `json:"tenant_id"`
-	KnowledgeBaseID      string          `json:"knowledge_base_id"`
-	PrincipalID          string          `json:"principal_id"`
-	AgentID              string          `json:"agent_id,omitempty"`
-	TaskID               string          `json:"task_id,omitempty"`
-	SessionID            string          `json:"session_id"`
-	RequestID            string          `json:"request_id"`
-	ToolName             string          `json:"tool_name"`
-	Action               string          `json:"action"`
-	Relation             string          `json:"relation"`
-	AuthorizationModelID string          `json:"authorization_model_id"`
-	IdentityWatermark    string          `json:"identity_watermark"`
-	ACLWatermark         string          `json:"acl_watermark"`
-	SideEffect           bool            `json:"side_effect"`
-	Outcome              DecisionOutcome `json:"outcome"`
-	CheckedAt            time.Time       `json:"checked_at"`
+	Version              string                `json:"version"`
+	CorrelationID        string                `json:"correlation_id"`
+	TenantID             string                `json:"tenant_id"`
+	KnowledgeBaseID      string                `json:"knowledge_base_id"`
+	PrincipalID          string                `json:"principal_id"`
+	AgentID              string                `json:"agent_id,omitempty"`
+	TaskID               string                `json:"task_id,omitempty"`
+	SessionID            string                `json:"session_id"`
+	RequestID            string                `json:"request_id"`
+	ToolName             string                `json:"tool_name"`
+	Action               string                `json:"action"`
+	Relation             string                `json:"relation"`
+	AuthorizationModelID string                `json:"authorization_model_id"`
+	IdentityWatermark    string                `json:"identity_watermark"`
+	ACLWatermark         string                `json:"acl_watermark"`
+	SideEffect           bool                  `json:"side_effect"`
+	Outcome              DecisionOutcome       `json:"outcome"`
+	Consistency          ConsistencyPreference `json:"consistency"`
+	CheckedAt            time.Time             `json:"checked_at"`
 }
 
 func (a ToolInvocationAuthorization) ValidateFor(auth AuthorizationContext) error {
@@ -561,6 +563,9 @@ func (a ToolInvocationAuthorization) ValidateFor(auth AuthorizationContext) erro
 		return fmt.Errorf("unsupported tool invocation authorization version %q", a.Version)
 	}
 	if err := auth.Validate(); err != nil {
+		return err
+	}
+	if err := validateEnterpriseAuthorizationContext(auth); err != nil {
 		return err
 	}
 	if err := validateEnterpriseFields(
@@ -592,6 +597,7 @@ func (a ToolInvocationAuthorization) ValidateFor(auth AuthorizationContext) erro
 		{"authorization_model_id", a.AuthorizationModelID, auth.AuthorizationModelID},
 		{"identity_watermark", a.IdentityWatermark, auth.IdentityWatermark},
 		{"acl_watermark", a.ACLWatermark, auth.ACLWatermark},
+		{"consistency", string(a.Consistency), string(auth.Consistency)},
 	}
 	for _, binding := range bindings {
 		if binding.got != binding.want {
@@ -627,6 +633,9 @@ func (r ToolResultAuthorization) ValidateFor(auth AuthorizationContext) error {
 		return fmt.Errorf("unsupported tool result authorization version %q", r.Version)
 	}
 	if err := auth.Validate(); err != nil {
+		return err
+	}
+	if err := validateEnterpriseAuthorizationContext(auth); err != nil {
 		return err
 	}
 	if err := validateEnterpriseID("tool_name", r.ToolName); err != nil {
@@ -673,6 +682,9 @@ func (r ToolResultAuthorization) ValidateFor(auth AuthorizationContext) error {
 		}
 		decision := r.Decisions[index]
 		if err := decision.ValidateFor(auth); err != nil {
+			return fmt.Errorf("tool result decision %d: %w", index, err)
+		}
+		if err := validateUTC("tool_result_decision_checked_at", decision.CheckedAt); err != nil {
 			return fmt.Errorf("tool result decision %d: %w", index, err)
 		}
 		if !decision.Authorized() {
@@ -761,10 +773,16 @@ type PolicyImpactEntry struct {
 func (e PolicyImpactEntry) Validate() error {
 	if err := validateEnterpriseFields(
 		"correlation_id", e.CorrelationID,
-		"subject_id", e.SubjectID,
-		"relation", e.Relation,
-		"object", e.Object,
 	); err != nil {
+		return err
+	}
+	if err := validateAuthorizationReference("subject_id", e.SubjectID, true, true); err != nil {
+		return err
+	}
+	if err := validateAuthorizationName("relation", e.Relation); err != nil {
+		return err
+	}
+	if err := validateAuthorizationReference("object", e.Object, false, false); err != nil {
 		return err
 	}
 	if err := validateDecisionOutcome("before", e.Before); err != nil {
@@ -1026,6 +1044,75 @@ func validateEnterpriseFields(fields ...string) error {
 	for index := 0; index < len(fields); index += 2 {
 		if err := validateEnterpriseID(fields[index], fields[index+1]); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+func validateEnterpriseAuthorizationContext(auth AuthorizationContext) error {
+	if err := validateEnterpriseFields(
+		"tenant_id", auth.TenantID,
+		"knowledge_base_id", auth.KnowledgeBaseID,
+		"principal_id", auth.PrincipalID,
+		"session_id", auth.SessionID,
+		"request_id", auth.RequestID,
+		"authorization_model_id", auth.AuthorizationModelID,
+		"identity_watermark", auth.IdentityWatermark,
+		"acl_watermark", auth.ACLWatermark,
+	); err != nil {
+		return err
+	}
+	if auth.AgentID != "" {
+		if err := validateEnterpriseID("agent_id", auth.AgentID); err != nil {
+			return err
+		}
+	}
+	if auth.TaskID != "" {
+		if err := validateEnterpriseID("task_id", auth.TaskID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateAuthorizationReference(name, value string, allowUserset, allowWildcard bool) error {
+	if value == "" || len(value) > 256 {
+		return fmt.Errorf("%s is empty or too long", name)
+	}
+	base, usersetRelation, hasUserset := strings.Cut(value, "#")
+	if hasUserset {
+		if !allowUserset || strings.Contains(usersetRelation, "#") {
+			return fmt.Errorf("%s has an invalid userset", name)
+		}
+		if err := validateAuthorizationName(name+" userset relation", usersetRelation); err != nil {
+			return err
+		}
+	}
+	typeName, id, ok := strings.Cut(base, ":")
+	if !ok || id == "" || strings.Contains(id, ":") {
+		return fmt.Errorf("%s must be type:opaque-id", name)
+	}
+	if err := validateAuthorizationName(name+" type", typeName); err != nil {
+		return err
+	}
+	if id == "*" && !allowWildcard {
+		return fmt.Errorf("%s cannot be a wildcard", name)
+	}
+	for _, character := range id {
+		if unicode.IsSpace(character) || unicode.IsControl(character) || character == '#' {
+			return fmt.Errorf("%s contains invalid characters", name)
+		}
+	}
+	return nil
+}
+
+func validateAuthorizationName(name, value string) error {
+	if value == "" || len(value) > 64 {
+		return fmt.Errorf("%s is empty or too long", name)
+	}
+	for index, character := range []byte(value) {
+		if !(character >= 'a' && character <= 'z' || index > 0 && (character >= '0' && character <= '9' || character == '_')) {
+			return fmt.Errorf("%s must be a canonical authorization name", name)
 		}
 	}
 	return nil

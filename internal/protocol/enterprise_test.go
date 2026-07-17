@@ -219,7 +219,7 @@ func TestToolContractsAuthorizeInvocationAndSortedReturnedHandles(t *testing.T) 
 		SessionID: auth.SessionID, RequestID: auth.RequestID, ToolName: "knote-query",
 		Action: "invoke", Relation: EvidenceReadRelation, AuthorizationModelID: auth.AuthorizationModelID,
 		IdentityWatermark: auth.IdentityWatermark, ACLWatermark: auth.ACLWatermark, SideEffect: false,
-		Outcome: DecisionAllow, CheckedAt: enterpriseTestTime(),
+		Outcome: DecisionAllow, Consistency: auth.Consistency, CheckedAt: enterpriseTestTime(),
 	}
 	if err := invocation.ValidateFor(auth); err != nil {
 		t.Fatalf("invocation ValidateFor: %v", err)
@@ -233,6 +233,18 @@ func TestToolContractsAuthorizeInvocationAndSortedReturnedHandles(t *testing.T) 
 	deniedInvocation.Outcome = DecisionDeny
 	if err := deniedInvocation.ValidateFor(auth); err == nil {
 		t.Fatal("denied tool invocation was accepted")
+	}
+	weakConsistency := invocation
+	weakConsistency.Consistency = ConsistencyMinimizeLatency
+	if err := weakConsistency.ValidateFor(auth); err == nil {
+		t.Fatal("tool invocation with weaker consistency was accepted")
+	}
+	nonCanonicalAuth := auth
+	nonCanonicalAuth.RequestID = "request/1"
+	nonCanonicalInvocation := invocation
+	nonCanonicalInvocation.RequestID = nonCanonicalAuth.RequestID
+	if err := nonCanonicalInvocation.ValidateFor(nonCanonicalAuth); err == nil {
+		t.Fatal("tool invocation with a non-canonical authorization context was accepted")
 	}
 
 	resources := []ResourceHandle{enterpriseTestResource(t, "doc-a"), enterpriseTestResource(t, "doc-b")}
@@ -290,6 +302,23 @@ func TestToolContractsAuthorizeInvocationAndSortedReturnedHandles(t *testing.T) 
 	if err := wrongRelation.ValidateFor(auth); err == nil {
 		t.Fatal("tool result with a mismatched relation decision was accepted")
 	}
+	nonUTCDecision := result
+	nonUTCDecision.Decisions = append([]AuthorizationDecision(nil), result.Decisions...)
+	nonUTCDecision.Decisions[0].CheckedAt = time.Date(2026, time.July, 17, 20, 0, 0, 0, time.FixedZone("UTC+8", 8*60*60))
+	if err := nonUTCDecision.ValidateFor(auth); err == nil {
+		t.Fatal("tool result with a non-UTC decision timestamp was accepted")
+	}
+	nonCanonicalResultAuth := auth
+	nonCanonicalResultAuth.RequestID = "request/1"
+	nonCanonicalResult := result
+	nonCanonicalResult.RequestID = nonCanonicalResultAuth.RequestID
+	nonCanonicalResult.Decisions = append([]AuthorizationDecision(nil), result.Decisions...)
+	for index := range nonCanonicalResult.Decisions {
+		nonCanonicalResult.Decisions[index].RequestID = nonCanonicalResultAuth.RequestID
+	}
+	if err := nonCanonicalResult.ValidateFor(nonCanonicalResultAuth); err == nil {
+		t.Fatal("tool result with a non-canonical authorization context was accepted")
+	}
 }
 
 func TestPolicyAuditAndResidencyContractsArePinnedAndNonMutating(t *testing.T) {
@@ -314,8 +343,8 @@ func TestPolicyAuditAndResidencyContractsArePinnedAndNonMutating(t *testing.T) {
 		Version: EnterpriseContractVersion, TenantID: scope.TenantID,
 		SimulationID: request.SimulationID, GeneratedAt: now.Add(time.Minute),
 		Entries: []PolicyImpactEntry{
-			{CorrelationID: "impact-1", SubjectID: "user:alice", Relation: "can-view", Object: "document:doc-a", Kind: PolicyImpactGrant, Before: DecisionDeny, After: DecisionAllow},
-			{CorrelationID: "impact-2", SubjectID: "user:bob", Relation: "can-view", Object: "document:doc-b", Kind: PolicyImpactRevoke, Before: DecisionAllow, After: DecisionDeny},
+			{CorrelationID: "impact-1", SubjectID: "user:alice", Relation: "can_view", Object: "document:doc-a", Kind: PolicyImpactGrant, Before: DecisionDeny, After: DecisionAllow},
+			{CorrelationID: "impact-2", SubjectID: "user:bob", Relation: "can_view", Object: "document:doc-b", Kind: PolicyImpactRevoke, Before: DecisionAllow, After: DecisionDeny},
 		},
 	}
 	if err := report.ValidateFor(request, scope); err != nil {
@@ -332,6 +361,18 @@ func TestPolicyAuditAndResidencyContractsArePinnedAndNonMutating(t *testing.T) {
 	duplicateTuple.Entries = []PolicyImpactEntry{report.Entries[0], duplicate}
 	if err := duplicateTuple.ValidateFor(request, scope); err == nil {
 		t.Fatal("duplicate policy impact tuple was accepted")
+	}
+	usersetImpact := report
+	usersetImpact.Entries = append([]PolicyImpactEntry(nil), report.Entries...)
+	usersetImpact.Entries[0].SubjectID = "group:engineering#member"
+	if err := usersetImpact.ValidateFor(request, scope); err != nil {
+		t.Fatalf("userset policy impact was rejected: %v", err)
+	}
+	malformedUserset := usersetImpact
+	malformedUserset.Entries = append([]PolicyImpactEntry(nil), usersetImpact.Entries...)
+	malformedUserset.Entries[0].SubjectID = "group:engineering#member#nested"
+	if err := malformedUserset.ValidateFor(request, scope); err == nil {
+		t.Fatal("malformed userset policy impact was accepted")
 	}
 
 	audit := AuditRecordReference{
