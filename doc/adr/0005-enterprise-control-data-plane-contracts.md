@@ -80,7 +80,7 @@ Tool execution uses two independent authorization stages:
 
 Action confirmation remains separate. A side-effecting tool must pass resource/action authorization and then receive explicit confirmation. Confirmation never grants data access.
 
-Tool result contracts contain sorted exact `ResourceHandle` values only. Protected bodies use `EvidencePackage` or another exact authorization-bound content container. Unregistered tools, unknown actions, malformed obligations, mixed-tenant results, partial decisions, and indeterminate responses fail closed.
+Tool invocation contracts are explicit allow decisions bound to the exact tool, action, relation, side-effect class, request, authorization model, and watermarks. Tool result contracts contain sorted exact `ResourceHandle` values plus one matching content-free allow decision per resource. Protected bodies use `EvidencePackage` or another exact authorization-bound content container. Unregistered tools, unknown actions, malformed obligations, mixed-tenant results, partial decisions, and indeterminate responses fail closed.
 
 ### Policy simulation and impact analysis are read only
 

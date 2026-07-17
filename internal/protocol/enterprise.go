@@ -109,8 +109,11 @@ func (s IdentitySnapshot) ValidateFor(scope TenantScope) error {
 	return nil
 }
 
-func (s IdentitySnapshot) UsableAt(at time.Time) error {
+func (s IdentitySnapshot) UsableAt(currentIdentityWatermark string, at time.Time) error {
 	if err := s.Validate(); err != nil {
+		return err
+	}
+	if err := validateEnterpriseID("current_identity_watermark", currentIdentityWatermark); err != nil {
 		return err
 	}
 	if err := validateUTC("evaluation_time", at); err != nil {
@@ -118,6 +121,9 @@ func (s IdentitySnapshot) UsableAt(at time.Time) error {
 	}
 	if s.State != IdentityActive {
 		return fmt.Errorf("identity snapshot is not active")
+	}
+	if s.Watermark != currentIdentityWatermark {
+		return fmt.Errorf("identity snapshot watermark is stale")
 	}
 	if at.Before(s.IssuedAt) || !at.Before(s.ExpiresAt) {
 		return fmt.Errorf("identity snapshot is not valid at the evaluation time")
@@ -530,21 +536,24 @@ func (f AgentTaskScopeFingerprint) Validate() error {
 }
 
 type ToolInvocationAuthorization struct {
-	Version              string `json:"version"`
-	TenantID             string `json:"tenant_id"`
-	KnowledgeBaseID      string `json:"knowledge_base_id"`
-	PrincipalID          string `json:"principal_id"`
-	AgentID              string `json:"agent_id,omitempty"`
-	TaskID               string `json:"task_id,omitempty"`
-	SessionID            string `json:"session_id"`
-	RequestID            string `json:"request_id"`
-	ToolName             string `json:"tool_name"`
-	Action               string `json:"action"`
-	Relation             string `json:"relation"`
-	AuthorizationModelID string `json:"authorization_model_id"`
-	IdentityWatermark    string `json:"identity_watermark"`
-	ACLWatermark         string `json:"acl_watermark"`
-	SideEffect           bool   `json:"side_effect"`
+	Version              string          `json:"version"`
+	CorrelationID        string          `json:"correlation_id"`
+	TenantID             string          `json:"tenant_id"`
+	KnowledgeBaseID      string          `json:"knowledge_base_id"`
+	PrincipalID          string          `json:"principal_id"`
+	AgentID              string          `json:"agent_id,omitempty"`
+	TaskID               string          `json:"task_id,omitempty"`
+	SessionID            string          `json:"session_id"`
+	RequestID            string          `json:"request_id"`
+	ToolName             string          `json:"tool_name"`
+	Action               string          `json:"action"`
+	Relation             string          `json:"relation"`
+	AuthorizationModelID string          `json:"authorization_model_id"`
+	IdentityWatermark    string          `json:"identity_watermark"`
+	ACLWatermark         string          `json:"acl_watermark"`
+	SideEffect           bool            `json:"side_effect"`
+	Outcome              DecisionOutcome `json:"outcome"`
+	CheckedAt            time.Time       `json:"checked_at"`
 }
 
 func (a ToolInvocationAuthorization) ValidateFor(auth AuthorizationContext) error {
@@ -555,10 +564,17 @@ func (a ToolInvocationAuthorization) ValidateFor(auth AuthorizationContext) erro
 		return err
 	}
 	if err := validateEnterpriseFields(
+		"correlation_id", a.CorrelationID,
 		"tool_name", a.ToolName,
 		"action", a.Action,
 		"relation", a.Relation,
 	); err != nil {
+		return err
+	}
+	if a.Outcome != DecisionAllow {
+		return fmt.Errorf("tool invocation authorization requires an allow decision")
+	}
+	if err := validateUTC("checked_at", a.CheckedAt); err != nil {
 		return err
 	}
 	bindings := []struct {
@@ -585,23 +601,25 @@ func (a ToolInvocationAuthorization) ValidateFor(auth AuthorizationContext) erro
 	return nil
 }
 
-// ToolResultAuthorization contains handles only. Protected bodies must remain in
-// EvidencePackage or another exact, authorization-bound content container.
+// ToolResultAuthorization contains handles and content-free allow decisions.
+// Protected bodies must remain in EvidencePackage or another exact,
+// authorization-bound content container.
 type ToolResultAuthorization struct {
-	Version              string           `json:"version"`
-	TenantID             string           `json:"tenant_id"`
-	KnowledgeBaseID      string           `json:"knowledge_base_id"`
-	PrincipalID          string           `json:"principal_id"`
-	AgentID              string           `json:"agent_id,omitempty"`
-	TaskID               string           `json:"task_id,omitempty"`
-	SessionID            string           `json:"session_id"`
-	RequestID            string           `json:"request_id"`
-	ToolName             string           `json:"tool_name"`
-	Relation             string           `json:"relation"`
-	AuthorizationModelID string           `json:"authorization_model_id"`
-	IdentityWatermark    string           `json:"identity_watermark"`
-	ACLWatermark         string           `json:"acl_watermark"`
-	Resources            []ResourceHandle `json:"resources"`
+	Version              string                  `json:"version"`
+	TenantID             string                  `json:"tenant_id"`
+	KnowledgeBaseID      string                  `json:"knowledge_base_id"`
+	PrincipalID          string                  `json:"principal_id"`
+	AgentID              string                  `json:"agent_id,omitempty"`
+	TaskID               string                  `json:"task_id,omitempty"`
+	SessionID            string                  `json:"session_id"`
+	RequestID            string                  `json:"request_id"`
+	ToolName             string                  `json:"tool_name"`
+	Relation             string                  `json:"relation"`
+	AuthorizationModelID string                  `json:"authorization_model_id"`
+	IdentityWatermark    string                  `json:"identity_watermark"`
+	ACLWatermark         string                  `json:"acl_watermark"`
+	Resources            []ResourceHandle        `json:"resources"`
+	Decisions            []AuthorizationDecision `json:"decisions"`
 }
 
 func (r ToolResultAuthorization) ValidateFor(auth AuthorizationContext) error {
@@ -641,6 +659,9 @@ func (r ToolResultAuthorization) ValidateFor(auth AuthorizationContext) error {
 	if len(r.Resources) == 0 {
 		return fmt.Errorf("tool result authorization requires at least one resource")
 	}
+	if len(r.Decisions) != len(r.Resources) {
+		return fmt.Errorf("tool result authorization requires one decision per resource")
+	}
 	var previous string
 	for index, resource := range r.Resources {
 		if err := resource.ValidateFor(auth); err != nil {
@@ -649,6 +670,19 @@ func (r ToolResultAuthorization) ValidateFor(auth AuthorizationContext) error {
 		current := string(resource.ResourceID)
 		if index > 0 && current <= previous {
 			return fmt.Errorf("tool result resources must be sorted by unique resource_id")
+		}
+		decision := r.Decisions[index]
+		if err := decision.ValidateFor(auth); err != nil {
+			return fmt.Errorf("tool result decision %d: %w", index, err)
+		}
+		if !decision.Authorized() {
+			return fmt.Errorf("tool result decision %d is not allow", index)
+		}
+		if decision.Relation != r.Relation {
+			return fmt.Errorf("tool result decision %d relation does not match the result", index)
+		}
+		if decision.Resource != resource {
+			return fmt.Errorf("tool result decision %d resource does not match the returned handle", index)
 		}
 		previous = current
 	}

@@ -20,7 +20,7 @@ func TestEnterpriseTenantIdentityContractsFailClosed(t *testing.T) {
 	if err := snapshot.ValidateFor(scope); err != nil {
 		t.Fatalf("ValidateFor: %v", err)
 	}
-	if err := snapshot.UsableAt(now.Add(time.Minute)); err != nil {
+	if err := snapshot.UsableAt(snapshot.Watermark, now.Add(time.Minute)); err != nil {
 		t.Fatalf("UsableAt: %v", err)
 	}
 
@@ -38,11 +38,14 @@ func TestEnterpriseTenantIdentityContractsFailClosed(t *testing.T) {
 
 	deprovisioned := snapshot
 	deprovisioned.State = IdentityDeprovisioned
-	if err := deprovisioned.UsableAt(now.Add(time.Minute)); err == nil {
+	if err := deprovisioned.UsableAt(deprovisioned.Watermark, now.Add(time.Minute)); err == nil {
 		t.Fatal("deprovisioned identity snapshot was usable")
 	}
-	if err := snapshot.UsableAt(snapshot.ExpiresAt); err == nil {
+	if err := snapshot.UsableAt(snapshot.Watermark, snapshot.ExpiresAt); err == nil {
 		t.Fatal("expired identity snapshot was usable")
+	}
+	if err := snapshot.UsableAt("identity-v2", now.Add(time.Minute)); err == nil {
+		t.Fatal("stale identity snapshot watermark was usable")
 	}
 
 	auth := enterpriseTestAuthorization()
@@ -210,11 +213,13 @@ func TestAgentTaskScopeBindsExactAuthorizationContext(t *testing.T) {
 func TestToolContractsAuthorizeInvocationAndSortedReturnedHandles(t *testing.T) {
 	auth := enterpriseTestAuthorization()
 	invocation := ToolInvocationAuthorization{
-		Version: EnterpriseContractVersion, TenantID: auth.TenantID, KnowledgeBaseID: auth.KnowledgeBaseID,
+		Version: EnterpriseContractVersion, CorrelationID: "tool-invocation-1",
+		TenantID: auth.TenantID, KnowledgeBaseID: auth.KnowledgeBaseID,
 		PrincipalID: auth.PrincipalID, AgentID: auth.AgentID, TaskID: auth.TaskID,
 		SessionID: auth.SessionID, RequestID: auth.RequestID, ToolName: "knote-query",
 		Action: "invoke", Relation: EvidenceReadRelation, AuthorizationModelID: auth.AuthorizationModelID,
 		IdentityWatermark: auth.IdentityWatermark, ACLWatermark: auth.ACLWatermark, SideEffect: false,
+		Outcome: DecisionAllow, CheckedAt: enterpriseTestTime(),
 	}
 	if err := invocation.ValidateFor(auth); err != nil {
 		t.Fatalf("invocation ValidateFor: %v", err)
@@ -224,15 +229,25 @@ func TestToolContractsAuthorizeInvocationAndSortedReturnedHandles(t *testing.T) 
 	if err := wrongTask.ValidateFor(auth); err == nil {
 		t.Fatal("tool invocation with wrong task was accepted")
 	}
+	deniedInvocation := invocation
+	deniedInvocation.Outcome = DecisionDeny
+	if err := deniedInvocation.ValidateFor(auth); err == nil {
+		t.Fatal("denied tool invocation was accepted")
+	}
 
 	resources := []ResourceHandle{enterpriseTestResource(t, "doc-a"), enterpriseTestResource(t, "doc-b")}
 	sort.Slice(resources, func(i, j int) bool { return resources[i].ResourceID < resources[j].ResourceID })
+	decisions := []AuthorizationDecision{
+		enterpriseTestAllowDecision(auth, resources[0], invocation.Relation, "tool-result-1"),
+		enterpriseTestAllowDecision(auth, resources[1], invocation.Relation, "tool-result-2"),
+	}
 	result := ToolResultAuthorization{
 		Version: EnterpriseContractVersion, TenantID: auth.TenantID, KnowledgeBaseID: auth.KnowledgeBaseID,
 		PrincipalID: auth.PrincipalID, AgentID: auth.AgentID, TaskID: auth.TaskID,
 		SessionID: auth.SessionID, RequestID: auth.RequestID, ToolName: invocation.ToolName,
 		Relation: EvidenceReadRelation, AuthorizationModelID: auth.AuthorizationModelID,
-		IdentityWatermark: auth.IdentityWatermark, ACLWatermark: auth.ACLWatermark, Resources: resources,
+		IdentityWatermark: auth.IdentityWatermark, ACLWatermark: auth.ACLWatermark,
+		Resources: resources, Decisions: decisions,
 	}
 	if err := result.ValidateFor(auth); err != nil {
 		t.Fatalf("result ValidateFor: %v", err)
@@ -257,6 +272,23 @@ func TestToolContractsAuthorizeInvocationAndSortedReturnedHandles(t *testing.T) 
 	staleIdentity.IdentityWatermark = "identity-v0"
 	if err := staleIdentity.ValidateFor(auth); err == nil {
 		t.Fatal("tool result with a stale identity watermark was accepted")
+	}
+	deniedResult := result
+	deniedResult.Decisions = append([]AuthorizationDecision(nil), result.Decisions...)
+	deniedResult.Decisions[0].Outcome = DecisionDeny
+	if err := deniedResult.ValidateFor(auth); err == nil {
+		t.Fatal("tool result with a denied resource was accepted")
+	}
+	partialResult := result
+	partialResult.Decisions = append([]AuthorizationDecision(nil), result.Decisions[:1]...)
+	if err := partialResult.ValidateFor(auth); err == nil {
+		t.Fatal("tool result with a missing resource decision was accepted")
+	}
+	wrongRelation := result
+	wrongRelation.Decisions = append([]AuthorizationDecision(nil), result.Decisions...)
+	wrongRelation.Decisions[0].Relation = "can-edit"
+	if err := wrongRelation.ValidateFor(auth); err == nil {
+		t.Fatal("tool result with a mismatched relation decision was accepted")
 	}
 }
 
@@ -414,5 +446,15 @@ func enterpriseTestResource(t *testing.T, sourceKey string) ResourceHandle {
 			Index: "index-v1", Graph: "graph-v1", Projection: "projection-v1",
 		},
 		ServingState: ServingActive,
+	}
+}
+
+func enterpriseTestAllowDecision(auth AuthorizationContext, resource ResourceHandle, relation, correlationID string) AuthorizationDecision {
+	return AuthorizationDecision{
+		CorrelationID: correlationID, RequestID: auth.RequestID, SessionID: auth.SessionID,
+		PrincipalID: auth.PrincipalID, AgentID: auth.AgentID, TaskID: auth.TaskID,
+		Relation: relation, Resource: resource, AuthorizationResource: resource, Outcome: DecisionAllow,
+		AuthorizationModelID: auth.AuthorizationModelID, IdentityWatermark: auth.IdentityWatermark,
+		ACLWatermark: auth.ACLWatermark, Consistency: auth.Consistency, CheckedAt: enterpriseTestTime(),
 	}
 }
