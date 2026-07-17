@@ -280,6 +280,10 @@ func (c ConnectorCheckpoint) ValidateEvent(event ConnectorEventEnvelope) error {
 	if event.Sequence > c.LastSequence && event.Sequence != c.LastSequence+1 {
 		return fmt.Errorf("connector event leaves a sequence gap after the committed checkpoint")
 	}
+	if event.Sequence == c.LastSequence+1 &&
+		(event.EventID == c.CommittedEventID || event.IdempotencyKey == c.IdempotencyKey) {
+		return fmt.Errorf("connector event reuses a committed identifier at a new sequence")
+	}
 	if event.Sequence == c.LastSequence {
 		fingerprint, err := NewConnectorEventFingerprint(event)
 		if err != nil {
@@ -459,11 +463,14 @@ func (s AgentTaskScope) Validate() error {
 	return nil
 }
 
-func (s AgentTaskScope) ValidateFor(auth AuthorizationContext, at time.Time) error {
+func (s AgentTaskScope) ValidateFor(auth AuthorizationContext, currentDelegationWatermark string, at time.Time) error {
 	if err := s.Validate(); err != nil {
 		return err
 	}
 	if err := auth.Validate(); err != nil {
+		return err
+	}
+	if err := validateEnterpriseID("current_delegation_watermark", currentDelegationWatermark); err != nil {
 		return err
 	}
 	if err := validateUTC("evaluation_time", at); err != nil {
@@ -485,6 +492,7 @@ func (s AgentTaskScope) ValidateFor(auth AuthorizationContext, at time.Time) err
 		{"authorization_model_id", s.AuthorizationModelID, auth.AuthorizationModelID},
 		{"identity_watermark", s.IdentityWatermark, auth.IdentityWatermark},
 		{"acl_watermark", s.ACLWatermark, auth.ACLWatermark},
+		{"delegation_watermark", s.DelegationWatermark, currentDelegationWatermark},
 	}
 	for _, binding := range bindings {
 		if binding.got != binding.want {
@@ -580,17 +588,20 @@ func (a ToolInvocationAuthorization) ValidateFor(auth AuthorizationContext) erro
 // ToolResultAuthorization contains handles only. Protected bodies must remain in
 // EvidencePackage or another exact, authorization-bound content container.
 type ToolResultAuthorization struct {
-	Version         string           `json:"version"`
-	TenantID        string           `json:"tenant_id"`
-	KnowledgeBaseID string           `json:"knowledge_base_id"`
-	PrincipalID     string           `json:"principal_id"`
-	AgentID         string           `json:"agent_id,omitempty"`
-	TaskID          string           `json:"task_id,omitempty"`
-	SessionID       string           `json:"session_id"`
-	RequestID       string           `json:"request_id"`
-	ToolName        string           `json:"tool_name"`
-	Relation        string           `json:"relation"`
-	Resources       []ResourceHandle `json:"resources"`
+	Version              string           `json:"version"`
+	TenantID             string           `json:"tenant_id"`
+	KnowledgeBaseID      string           `json:"knowledge_base_id"`
+	PrincipalID          string           `json:"principal_id"`
+	AgentID              string           `json:"agent_id,omitempty"`
+	TaskID               string           `json:"task_id,omitempty"`
+	SessionID            string           `json:"session_id"`
+	RequestID            string           `json:"request_id"`
+	ToolName             string           `json:"tool_name"`
+	Relation             string           `json:"relation"`
+	AuthorizationModelID string           `json:"authorization_model_id"`
+	IdentityWatermark    string           `json:"identity_watermark"`
+	ACLWatermark         string           `json:"acl_watermark"`
+	Resources            []ResourceHandle `json:"resources"`
 }
 
 func (r ToolResultAuthorization) ValidateFor(auth AuthorizationContext) error {
@@ -618,6 +629,9 @@ func (r ToolResultAuthorization) ValidateFor(auth AuthorizationContext) error {
 		{"task_id", r.TaskID, auth.TaskID},
 		{"session_id", r.SessionID, auth.SessionID},
 		{"request_id", r.RequestID, auth.RequestID},
+		{"authorization_model_id", r.AuthorizationModelID, auth.AuthorizationModelID},
+		{"identity_watermark", r.IdentityWatermark, auth.IdentityWatermark},
+		{"acl_watermark", r.ACLWatermark, auth.ACLWatermark},
 	}
 	for _, binding := range bindings {
 		if binding.got != binding.want {
@@ -779,6 +793,12 @@ func (r PolicyImpactReport) ValidateFor(request PolicySimulationRequest, scope T
 		}
 		if index > 0 && entry.CorrelationID <= previous {
 			return fmt.Errorf("policy impact entries must be sorted by unique correlation_id")
+		}
+		for prior := 0; prior < index; prior++ {
+			candidate := r.Entries[prior]
+			if entry.SubjectID == candidate.SubjectID && entry.Relation == candidate.Relation && entry.Object == candidate.Object {
+				return fmt.Errorf("policy impact entries must use unique subject, relation, and object tuples")
+			}
 		}
 		previous = entry.CorrelationID
 	}
@@ -1000,7 +1020,8 @@ func validateUTC(name string, value time.Time) error {
 	if value.IsZero() {
 		return fmt.Errorf("%s is required", name)
 	}
-	if value.Location() != time.UTC {
+	_, offset := value.Zone()
+	if offset != 0 {
 		return fmt.Errorf("%s must be UTC", name)
 	}
 	return nil

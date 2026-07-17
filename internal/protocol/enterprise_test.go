@@ -104,6 +104,16 @@ func TestConnectorContractsBindReplayDLQAndTombstones(t *testing.T) {
 	if err := checkpoint.ValidateEvent(next); err != nil {
 		t.Fatalf("new event after checkpoint: %v", err)
 	}
+	reusedEventID := next
+	reusedEventID.EventID = event.EventID
+	if err := checkpoint.ValidateEvent(reusedEventID); err == nil {
+		t.Fatal("new event with the committed event ID was accepted")
+	}
+	reusedIdempotencyKey := next
+	reusedIdempotencyKey.IdempotencyKey = event.IdempotencyKey
+	if err := checkpoint.ValidateEvent(reusedIdempotencyKey); err == nil {
+		t.Fatal("new event with the committed idempotency key was accepted")
+	}
 	gap := next
 	gap.Sequence++
 	gap.EventID = "event-12"
@@ -164,7 +174,7 @@ func TestAgentTaskScopeBindsExactAuthorizationContext(t *testing.T) {
 		ACLWatermark: auth.ACLWatermark, DelegationWatermark: "delegation-v1",
 		IssuedAt: now, ExpiresAt: now.Add(time.Hour),
 	}
-	if err := scope.ValidateFor(auth, now.Add(time.Minute)); err != nil {
+	if err := scope.ValidateFor(auth, "delegation-v1", now.Add(time.Minute)); err != nil {
 		t.Fatalf("ValidateFor: %v", err)
 	}
 	first, err := NewAgentTaskScopeFingerprint(scope)
@@ -181,16 +191,19 @@ func TestAgentTaskScopeBindsExactAuthorizationContext(t *testing.T) {
 
 	wrongAgent := auth
 	wrongAgent.AgentID = "agent-2"
-	if err := scope.ValidateFor(wrongAgent, now.Add(time.Minute)); err == nil {
+	if err := scope.ValidateFor(wrongAgent, "delegation-v1", now.Add(time.Minute)); err == nil {
 		t.Fatal("mismatched agent was accepted")
 	}
-	if err := scope.ValidateFor(auth, scope.ExpiresAt); err == nil {
+	if err := scope.ValidateFor(auth, "delegation-v1", scope.ExpiresAt); err == nil {
 		t.Fatal("expired agent task scope was accepted")
 	}
 	noTask := auth
 	noTask.TaskID = ""
-	if err := scope.ValidateFor(noTask, now.Add(time.Minute)); err == nil {
+	if err := scope.ValidateFor(noTask, "delegation-v1", now.Add(time.Minute)); err == nil {
 		t.Fatal("authorization context without task was accepted")
+	}
+	if err := scope.ValidateFor(auth, "delegation-v2", now.Add(time.Minute)); err == nil {
+		t.Fatal("stale agent task delegation watermark was accepted")
 	}
 }
 
@@ -218,7 +231,8 @@ func TestToolContractsAuthorizeInvocationAndSortedReturnedHandles(t *testing.T) 
 		Version: EnterpriseContractVersion, TenantID: auth.TenantID, KnowledgeBaseID: auth.KnowledgeBaseID,
 		PrincipalID: auth.PrincipalID, AgentID: auth.AgentID, TaskID: auth.TaskID,
 		SessionID: auth.SessionID, RequestID: auth.RequestID, ToolName: invocation.ToolName,
-		Relation: EvidenceReadRelation, Resources: resources,
+		Relation: EvidenceReadRelation, AuthorizationModelID: auth.AuthorizationModelID,
+		IdentityWatermark: auth.IdentityWatermark, ACLWatermark: auth.ACLWatermark, Resources: resources,
 	}
 	if err := result.ValidateFor(auth); err != nil {
 		t.Fatalf("result ValidateFor: %v", err)
@@ -233,6 +247,16 @@ func TestToolContractsAuthorizeInvocationAndSortedReturnedHandles(t *testing.T) 
 	crossTenant.Resources[0].TenantID = "tenant-b"
 	if err := crossTenant.ValidateFor(auth); err == nil {
 		t.Fatal("cross-tenant returned resource was accepted")
+	}
+	staleModel := result
+	staleModel.AuthorizationModelID = "model-v0"
+	if err := staleModel.ValidateFor(auth); err == nil {
+		t.Fatal("tool result with a stale authorization model was accepted")
+	}
+	staleIdentity := result
+	staleIdentity.IdentityWatermark = "identity-v0"
+	if err := staleIdentity.ValidateFor(auth); err == nil {
+		t.Fatal("tool result with a stale identity watermark was accepted")
 	}
 }
 
@@ -269,6 +293,13 @@ func TestPolicyAuditAndResidencyContractsArePinnedAndNonMutating(t *testing.T) {
 	unsorted.Entries = []PolicyImpactEntry{report.Entries[1], report.Entries[0]}
 	if err := unsorted.ValidateFor(request, scope); err == nil {
 		t.Fatal("unsorted impact report was accepted")
+	}
+	duplicateTuple := report
+	duplicate := report.Entries[0]
+	duplicate.CorrelationID = "impact-3"
+	duplicateTuple.Entries = []PolicyImpactEntry{report.Entries[0], duplicate}
+	if err := duplicateTuple.ValidateFor(request, scope); err == nil {
+		t.Fatal("duplicate policy impact tuple was accepted")
 	}
 
 	audit := AuditRecordReference{
@@ -335,6 +366,23 @@ func TestEnterpriseContractsSerializeDeterministicallyWithoutPayloads(t *testing
 
 func enterpriseTestTime() time.Time {
 	return time.Date(2026, time.July, 17, 12, 0, 0, 0, time.UTC)
+}
+
+func TestEnterpriseUTCValidationAcceptsRFC3339ZeroOffset(t *testing.T) {
+	zeroOffset, err := time.Parse(time.RFC3339, "2026-07-17T12:00:00+00:00")
+	if err != nil {
+		t.Fatalf("parse zero-offset timestamp: %v", err)
+	}
+	if err := validateUTC("wire_time", zeroOffset); err != nil {
+		t.Fatalf("zero-offset RFC3339 timestamp was rejected: %v", err)
+	}
+	nonUTC, err := time.Parse(time.RFC3339, "2026-07-17T12:00:00+08:00")
+	if err != nil {
+		t.Fatalf("parse non-UTC timestamp: %v", err)
+	}
+	if err := validateUTC("wire_time", nonUTC); err == nil {
+		t.Fatal("non-zero-offset timestamp was accepted")
+	}
 }
 
 func enterpriseTestTenantScope() TenantScope {
