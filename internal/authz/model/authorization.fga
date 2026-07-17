@@ -3,6 +3,15 @@ model
 
 type user
 
+# These types are isolated from every protected-resource relation. They bind
+# one OpenFGA store to one identity tenant without granting data access.
+type identity_tenant
+
+type identity_control
+  relations
+    define claimed: [identity_control]
+    define tenant: [identity_tenant]
+
 type group
   relations
     define member: [user]

@@ -109,3 +109,44 @@ func TestOpenFGAApplyTupleChangesRejectsRevisionMismatchWithoutWrite(t *testing.
 		t.Fatalf("mismatched revision issued %d writes", calls.Load())
 	}
 }
+
+func TestOpenFGAApplyTupleChangesRejectsIdentityControlTuplesWithoutWrite(t *testing.T) {
+	tests := []struct {
+		name   string
+		tuple  Tuple
+		delete bool
+	}{
+		{
+			name:  "write claim lock",
+			tuple: Tuple{User: identityClaimUser, Relation: identityClaimRelation, Object: identityControlObject},
+		},
+		{
+			name:   "delete tenant binding",
+			tuple:  Tuple{User: identityTenantType + ":tenant-acme", Relation: identityTenantRelation, Object: identityControlObject},
+			delete: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var calls atomic.Int32
+			authorizer := newTestOpenFGA(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+				calls.Add(1)
+			}))
+			request := TupleWriteRequest{
+				StoreID: openFGATestStoreID, AuthorizationModelID: openFGATestModelID,
+			}
+			if test.delete {
+				request.Deletes = []Tuple{test.tuple}
+			} else {
+				request.Writes = []Tuple{test.tuple}
+			}
+			err := authorizer.ApplyTupleChanges(context.Background(), request)
+			if !errors.Is(err, ErrInvalidRequest) {
+				t.Fatalf("ApplyTupleChanges error = %v, want %v", err, ErrInvalidRequest)
+			}
+			if calls.Load() != 0 {
+				t.Fatalf("rejected control tuple issued %d HTTP writes", calls.Load())
+			}
+		})
+	}
+}
