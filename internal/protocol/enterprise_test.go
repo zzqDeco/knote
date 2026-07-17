@@ -278,58 +278,83 @@ func TestToolContractsAuthorizeInvocationAndSortedReturnedHandles(t *testing.T) 
 		enterpriseTestAllowDecision(auth, resources[1], invocation.Relation, "tool-result-2"),
 	}
 	result := ToolResultAuthorization{
-		Version: EnterpriseContractVersion, TenantID: auth.TenantID, KnowledgeBaseID: auth.KnowledgeBaseID,
+		Version: EnterpriseContractVersion, CorrelationID: invocation.CorrelationID,
+		TenantID: auth.TenantID, KnowledgeBaseID: auth.KnowledgeBaseID,
 		PrincipalID: auth.PrincipalID, AgentID: auth.AgentID, TaskID: auth.TaskID,
 		SessionID: auth.SessionID, RequestID: auth.RequestID, ToolName: invocation.ToolName,
-		Relation: EvidenceReadRelation, AuthorizationModelID: auth.AuthorizationModelID,
-		IdentityWatermark: auth.IdentityWatermark, ACLWatermark: auth.ACLWatermark,
+		Action: invocation.Action, Relation: EvidenceReadRelation, SideEffect: invocation.SideEffect,
+		AuthorizationModelID: auth.AuthorizationModelID,
+		IdentityWatermark:    auth.IdentityWatermark, ACLWatermark: auth.ACLWatermark,
 		Resources: resources, Decisions: decisions,
 	}
-	if err := result.ValidateFor(auth); err != nil {
+	if err := result.ValidateFor(auth, invocation, request); err != nil {
 		t.Fatalf("result ValidateFor: %v", err)
+	}
+	otherRequest := request
+	otherRequest.ToolName = "knote-export"
+	otherInvocation := invocation
+	otherInvocation.CorrelationID = "tool-invocation-2"
+	otherInvocation.ToolName = otherRequest.ToolName
+	if err := result.ValidateFor(auth, otherInvocation, otherRequest); err == nil {
+		t.Fatal("tool result was replayed for a different invocation")
+	}
+	wrongCorrelationResult := result
+	wrongCorrelationResult.CorrelationID = otherInvocation.CorrelationID
+	if err := wrongCorrelationResult.ValidateFor(auth, invocation, request); err == nil {
+		t.Fatal("tool result with a mismatched invocation correlation was accepted")
+	}
+	wrongActionResult := result
+	wrongActionResult.Action = "execute"
+	if err := wrongActionResult.ValidateFor(auth, invocation, request); err == nil {
+		t.Fatal("tool result with a mismatched invocation action was accepted")
+	}
+	wrongSideEffectResult := result
+	wrongSideEffectResult.SideEffect = true
+	if err := wrongSideEffectResult.ValidateFor(auth, invocation, request); err == nil {
+		t.Fatal("tool result with a mismatched invocation side effect was accepted")
 	}
 	unsorted := result
 	unsorted.Resources = []ResourceHandle{resources[1], resources[0]}
-	if err := unsorted.ValidateFor(auth); err == nil {
+	if err := unsorted.ValidateFor(auth, invocation, request); err == nil {
 		t.Fatal("unsorted tool resources were accepted")
 	}
 	crossTenant := result
 	crossTenant.Resources = append([]ResourceHandle(nil), result.Resources...)
 	crossTenant.Resources[0].TenantID = "tenant-b"
-	if err := crossTenant.ValidateFor(auth); err == nil {
+	if err := crossTenant.ValidateFor(auth, invocation, request); err == nil {
 		t.Fatal("cross-tenant returned resource was accepted")
 	}
 	staleModel := result
 	staleModel.AuthorizationModelID = "model-v0"
-	if err := staleModel.ValidateFor(auth); err == nil {
+	if err := staleModel.ValidateFor(auth, invocation, request); err == nil {
 		t.Fatal("tool result with a stale authorization model was accepted")
 	}
 	staleIdentity := result
 	staleIdentity.IdentityWatermark = "identity-v0"
-	if err := staleIdentity.ValidateFor(auth); err == nil {
+	if err := staleIdentity.ValidateFor(auth, invocation, request); err == nil {
 		t.Fatal("tool result with a stale identity watermark was accepted")
 	}
 	deniedResult := result
 	deniedResult.Decisions = append([]AuthorizationDecision(nil), result.Decisions...)
 	deniedResult.Decisions[0].Outcome = DecisionDeny
-	if err := deniedResult.ValidateFor(auth); err == nil {
+	if err := deniedResult.ValidateFor(auth, invocation, request); err == nil {
 		t.Fatal("tool result with a denied resource was accepted")
 	}
 	partialResult := result
 	partialResult.Decisions = append([]AuthorizationDecision(nil), result.Decisions[:1]...)
-	if err := partialResult.ValidateFor(auth); err == nil {
+	if err := partialResult.ValidateFor(auth, invocation, request); err == nil {
 		t.Fatal("tool result with a missing resource decision was accepted")
 	}
 	wrongRelation := result
 	wrongRelation.Decisions = append([]AuthorizationDecision(nil), result.Decisions...)
 	wrongRelation.Decisions[0].Relation = "can-edit"
-	if err := wrongRelation.ValidateFor(auth); err == nil {
+	if err := wrongRelation.ValidateFor(auth, invocation, request); err == nil {
 		t.Fatal("tool result with a mismatched relation decision was accepted")
 	}
 	nonUTCDecision := result
 	nonUTCDecision.Decisions = append([]AuthorizationDecision(nil), result.Decisions...)
 	nonUTCDecision.Decisions[0].CheckedAt = time.Date(2026, time.July, 17, 20, 0, 0, 0, time.FixedZone("UTC+8", 8*60*60))
-	if err := nonUTCDecision.ValidateFor(auth); err == nil {
+	if err := nonUTCDecision.ValidateFor(auth, invocation, request); err == nil {
 		t.Fatal("tool result with a non-UTC decision timestamp was accepted")
 	}
 	nonCanonicalResultAuth := auth
@@ -340,7 +365,9 @@ func TestToolContractsAuthorizeInvocationAndSortedReturnedHandles(t *testing.T) 
 	for index := range nonCanonicalResult.Decisions {
 		nonCanonicalResult.Decisions[index].RequestID = nonCanonicalResultAuth.RequestID
 	}
-	if err := nonCanonicalResult.ValidateFor(nonCanonicalResultAuth); err == nil {
+	nonCanonicalResultInvocation := invocation
+	nonCanonicalResultInvocation.RequestID = nonCanonicalResultAuth.RequestID
+	if err := nonCanonicalResult.ValidateFor(nonCanonicalResultAuth, nonCanonicalResultInvocation, request); err == nil {
 		t.Fatal("tool result with a non-canonical authorization context was accepted")
 	}
 }

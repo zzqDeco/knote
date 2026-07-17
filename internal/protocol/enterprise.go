@@ -641,6 +641,7 @@ func (a ToolInvocationAuthorization) ValidateFor(auth AuthorizationContext, requ
 // authorization-bound content container.
 type ToolResultAuthorization struct {
 	Version              string                  `json:"version"`
+	CorrelationID        string                  `json:"correlation_id"`
 	TenantID             string                  `json:"tenant_id"`
 	KnowledgeBaseID      string                  `json:"knowledge_base_id"`
 	PrincipalID          string                  `json:"principal_id"`
@@ -649,7 +650,9 @@ type ToolResultAuthorization struct {
 	SessionID            string                  `json:"session_id"`
 	RequestID            string                  `json:"request_id"`
 	ToolName             string                  `json:"tool_name"`
+	Action               string                  `json:"action"`
 	Relation             string                  `json:"relation"`
+	SideEffect           bool                    `json:"side_effect"`
 	AuthorizationModelID string                  `json:"authorization_model_id"`
 	IdentityWatermark    string                  `json:"identity_watermark"`
 	ACLWatermark         string                  `json:"acl_watermark"`
@@ -657,17 +660,22 @@ type ToolResultAuthorization struct {
 	Decisions            []AuthorizationDecision `json:"decisions"`
 }
 
-func (r ToolResultAuthorization) ValidateFor(auth AuthorizationContext) error {
+func (r ToolResultAuthorization) ValidateFor(
+	auth AuthorizationContext,
+	invocation ToolInvocationAuthorization,
+	request ToolInvocationRequest,
+) error {
 	if r.Version != EnterpriseContractVersion {
 		return fmt.Errorf("unsupported tool result authorization version %q", r.Version)
 	}
-	if err := auth.Validate(); err != nil {
+	if err := invocation.ValidateFor(auth, request); err != nil {
 		return err
 	}
-	if err := validateEnterpriseAuthorizationContext(auth); err != nil {
-		return err
-	}
-	if err := validateEnterpriseID("tool_name", r.ToolName); err != nil {
+	if err := validateEnterpriseFields(
+		"correlation_id", r.CorrelationID,
+		"tool_name", r.ToolName,
+		"action", r.Action,
+	); err != nil {
 		return err
 	}
 	if err := validateAuthorizationName("relation", r.Relation); err != nil {
@@ -693,6 +701,10 @@ func (r ToolResultAuthorization) ValidateFor(auth AuthorizationContext) error {
 		if binding.got != binding.want {
 			return fmt.Errorf("tool result authorization %s does not match the authorization context", binding.name)
 		}
+	}
+	if r.CorrelationID != invocation.CorrelationID || r.ToolName != invocation.ToolName ||
+		r.Action != invocation.Action || r.Relation != invocation.Relation || r.SideEffect != invocation.SideEffect {
+		return fmt.Errorf("tool result authorization does not match the authorized invocation")
 	}
 	if len(r.Resources) == 0 {
 		return fmt.Errorf("tool result authorization requires at least one resource")
@@ -868,6 +880,7 @@ func (r PolicyImpactReport) ValidateFor(request PolicySimulationRequest, scope T
 		return fmt.Errorf("policy impact report requires at least one entry")
 	}
 	var previous string
+	seenTuples := make(map[[3]string]struct{}, len(r.Entries))
 	for index, entry := range r.Entries {
 		if err := entry.Validate(); err != nil {
 			return fmt.Errorf("policy impact entry %d: %w", index, err)
@@ -875,12 +888,11 @@ func (r PolicyImpactReport) ValidateFor(request PolicySimulationRequest, scope T
 		if index > 0 && entry.CorrelationID <= previous {
 			return fmt.Errorf("policy impact entries must be sorted by unique correlation_id")
 		}
-		for prior := 0; prior < index; prior++ {
-			candidate := r.Entries[prior]
-			if entry.SubjectID == candidate.SubjectID && entry.Relation == candidate.Relation && entry.Object == candidate.Object {
-				return fmt.Errorf("policy impact entries must use unique subject, relation, and object tuples")
-			}
+		tuple := [3]string{entry.SubjectID, entry.Relation, entry.Object}
+		if _, exists := seenTuples[tuple]; exists {
+			return fmt.Errorf("policy impact entries must use unique subject, relation, and object tuples")
 		}
+		seenTuples[tuple] = struct{}{}
 		previous = entry.CorrelationID
 	}
 	return nil
