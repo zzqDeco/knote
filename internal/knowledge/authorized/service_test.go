@@ -264,6 +264,45 @@ func TestQueryFailsClosedBeforeRankingWhenDiscoveryIsIncomplete(t *testing.T) {
 	}
 }
 
+func TestQueryRunsFinalAuthorizationGateBeforeGeneration(t *testing.T) {
+	document := queryTestDocument(queryTestModelID, "content", "projection-v1")
+	events := []string{}
+	backend := &queryTestKAG{events: &events, retrieveResult: queryTestRetrieve(document)}
+	authorizer := &queryTestAuthorizer{events: &events}
+	loader := &queryTestLoader{events: &events, items: map[protocol.ResourceID]protocol.EvidenceItem{
+		document.ResourceID: queryTestItem(document),
+	}}
+	wantAuthorization := queryTestAuthorization("alice", "request-final-identity-gate")
+	service, err := New(Options{
+		KAG: backend, Authorizer: authorizer, Loader: loader,
+		RetrieveLimit: 10, EvidenceLimit: 2,
+		Now: func() time.Time { return time.Date(2026, 7, 13, 1, 0, 0, 0, time.UTC) },
+		FinalAuthorizationGate: func(_ context.Context, authorization protocol.AuthorizationContext) error {
+			events = append(events, "identity-gate")
+			if authorization != wantAuthorization {
+				t.Fatalf("final gate authorization = %+v, want %+v", authorization, wantAuthorization)
+			}
+			return errors.New("provider identity detail must not escape")
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = service.Query(context.Background(), protocol.QueryRequest{
+		Question: "shared question", Authorization: wantAuthorization,
+	})
+	if err != ErrProtectedContentUnavailable || err.Error() != ErrProtectedContentUnavailable.Error() {
+		t.Fatalf("query error = %v, want exact protected content unavailable", err)
+	}
+	if backend.generateCalls != 0 {
+		t.Fatalf("generate calls = %d, want 0", backend.generateCalls)
+	}
+	if got, want := events, []string{"discover", "authz", "retrieve", "load", "authz", "identity-gate"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("events = %v, want %v", got, want)
+	}
+}
+
 func TestQueryHidesDeniedResourceExistence(t *testing.T) {
 	document := queryTestDocument(queryTestModelID, "content", "projection-v1")
 	request := protocol.QueryRequest{

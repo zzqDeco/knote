@@ -241,7 +241,8 @@ func newPermissionedApplication(
 	}
 	service, err := authorized.New(authorized.Options{
 		KAG: backend, Authorizer: authorizer, Loader: loader, Cache: cache,
-		RetrieverVersion: permissionedRetrieverVersion, PromptVersion: permissionedPromptVersion,
+		FinalAuthorizationGate: identitySession.validate,
+		RetrieverVersion:       permissionedRetrieverVersion, PromptVersion: permissionedPromptVersion,
 		RetrieveLimit: 20, EvidenceLimit: 8, Traversal: productionTraversalConfig(),
 		Telemetry: telemetrySink,
 	})
