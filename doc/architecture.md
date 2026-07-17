@@ -7,7 +7,7 @@
 3. `internal/runtime` owns Eino-only session/thread lifecycle, event dispatch, task controls, slash routing, confirm routing, and runner management.
 4. `internal/knowledge/versioned` owns versioned build/query/explain/eval/diff/commit/release/checkout/status operations and projection builds.
 5. `internal/knowledge/authorized` owns the authorization-aware query gateway, bounded Claim traversal, cache, citations, and revocation handling.
-6. `internal/authz` owns local/OpenFGA authorization checks and model contracts; `internal/catalog` owns deterministic projection planning, immutable serving snapshots, and graph bindings.
+6. `internal/protocol` owns stable security and enterprise wire contracts; `internal/authz` owns local/OpenFGA authorization checks and model contracts; `internal/catalog` owns deterministic projection planning, immutable serving snapshots, and graph bindings.
 7. `internal/eino/tools` exposes versioned and permissioned knowledge operations as shallow Eino `InvokableTool` adapters.
 8. `internal/runtime/eino` is the Eino ADK runner bridge. It constructs an OpenAI-compatible `ChatModelAgent`, inventories knote tools, and projects ADK events back to knote events.
 9. `internal/repository` defines workspace/session/version interfaces; `internal/repository/local` implements them with the local filesystem and Git CLI.
@@ -47,7 +47,7 @@ flowchart LR
   RepoIf -. future .-> Remote["internal/repository/remote"]
 ```
 
-`cmd/knote` is the composition root that creates `local.Store`, `kag.Client`, `versioned.Service`, Eino tools, the Eino runner, and `runtime.Manager`. The permissioned query application is currently selected only for deterministic fake mode; real primitive-provider composition is exercised by the dedicated smoke harness rather than the normal CLI. `internal/runtime` does not import the local repository, KAG backend, Python adapter, or TUI.
+`cmd/knote` is the composition root that creates `local.Store`, `kag.Client`, `versioned.Service`, Eino tools, the Eino runner, and `runtime.Manager`. When permissioned mode is enabled, the normal CLI selects the same authorization-aware application for deterministic fake mode and for the configured real primitive provider. `internal/runtime` does not import the local repository, KAG backend, Python adapter, or TUI.
 
 ## Runtime Layers
 
@@ -102,7 +102,7 @@ The first five methods are legacy/build compatibility contracts. The complete re
 
 The four permissioned primitives are the current authorized boundary. Discover returns a complete deterministic body-free resource catalog. Retrieve and expand return exact versioned resource handles without bodies, predicate labels, or relation text. Generate accepts only the already-authorized, digest-verified exact evidence set. `internal/knowledge/authorized.Service` owns `discover -> pre-ranking authorize -> retrieve -> per-hop authorize/expand -> exact load -> final authorize -> generate`; it never falls back to legacy `kag.query` or `kag.explain`.
 
-Fake mode implements the boundary deterministically. Real mode validates the immutable graph bundle before loading an operator-configured provider. The provider can return only allowlisted opaque graph IDs for retrieve; expand traverses verified `claim_bindings.jsonl` one structural hop at a time; generate receives only validated evidence. Provider output cannot define resource metadata, citations, or trace membership. ADR 0002 records the interception decision, ADR 0003 defines graph identity, and ADR 0004 defines the real provider contract. These real primitives and the OpenFGA/OpenSPG path are smoke-tested, but the normal CLI does not yet select the real permissioned composition.
+Fake mode implements the boundary deterministically. Real mode validates the immutable graph bundle before loading an operator-configured provider. The provider can return only allowlisted opaque graph IDs for retrieve; expand traverses verified `claim_bindings.jsonl` one structural hop at a time; generate receives only validated evidence. Provider output cannot define resource metadata, citations, or trace membership. ADR 0002 records the interception decision, ADR 0003 defines graph identity, and ADR 0004 defines the real provider contract. These real primitives and the OpenFGA/OpenSPG path are smoke-tested through the same permissioned application selected by the normal CLI.
 
 Each Go client call starts one adapter subprocess. Context cancellation or timeout terminates that subprocess through `exec.CommandContext` and returns the caller's context error after reaping it. Real provider calls run behind an isolated runner and guardian with process-group or descendant cleanup, Linux subreaping, and a Windows kill-on-close job so detached helpers cannot outlive cancellation. `kag.cancel` remains a compatibility acknowledgement for its own one-request process and cannot interrupt another call.
 
@@ -115,6 +115,28 @@ Fake mode is selected with `KNOTE_KAG_FAKE=1` and returns deterministic response
 `internal/authz` batches authorization decisions through a strict fail-closed contract. `internal/knowledge/authorized` authorizes the body-free catalog before ranking, authorizes each traversal frontier and Claim/object hop, validates exact content digests before use, and authorizes the final path/evidence set before generation. Denied or cross-tenant resources cannot participate in relevance, traversal, exact load, generation, traces, or citations.
 
 Authorized cache keys bind visibility, execution, traversal, projection, identity, and ACL state; cache hits are live-revalidated. Revocation installs permanent tombstones before further authorization, blocks in-flight repopulation, and closes future cache, citation, and protected-session replay. This cannot retract content that a user already viewed or copied.
+
+## Enterprise Control And Data Plane
+
+ADR 0005 defines the Phase 3 contracts before provider-specific implementations land. `internal/protocol` now models tenant scope, normalized identity snapshots, durable connector events and checkpoints, delivery receipts and tombstones, exact agent/task delegation, tool invocation and result obligations, read-only policy simulation, impact records, audit-chain references, and regional residency checks.
+
+The enterprise control plane contains only tenant-scoped, content-free metadata and digests. Protected source bodies, graph text, prompts, answers, assertions, and credentials remain in the tenant data plane. Tenant is the root partition for identities, connectors, projections, checkpoints, DLQs, serving pointers, caches, sessions, and audit chains.
+
+Phase 3 implementations follow this dependency flow:
+
+```mermaid
+flowchart LR
+  Contracts["Protocol contracts and ADR"] --> Identity["Trusted identity and tenant isolation"]
+  Contracts --> Connector["Connector ACL sync and durable events"]
+  Identity --> Agent["User-agent-task intersection"]
+  Connector --> Agent
+  Agent --> Tools["Invocation and returned-resource authorization"]
+  Tools --> Governance["Simulation, audit, residency, governance TUI"]
+  Connector --> Governance
+  Governance --> Acceptance["Enterprise security acceptance"]
+```
+
+Connector checkpoints advance only after all required content, ACL, catalog, graph, index, authorization, and invalidation work succeeds. Exact committed-event replay is idempotent; conflicting or stale events fail closed; poison events move to a tenant-scoped DLQ without advancing serving state. Agent access is always the intersection of user permission, agent delegation, and task assignment. Tool action authorization and action confirmation are independent gates.
 
 ## Local Repository
 
