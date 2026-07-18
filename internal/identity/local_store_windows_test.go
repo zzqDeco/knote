@@ -4,8 +4,10 @@ package identity
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"unsafe"
 
@@ -15,7 +17,7 @@ import (
 func TestOpenLocalStoreCreatesProtectedOwnerOnlyDirectoryACLs(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "identity")
 	if _, err := OpenLocalStore(root); err != nil {
-		t.Fatal(err)
+		t.Fatalf("%v; %s", err, describeWindowsIdentityDirectoryACL(root))
 	}
 	for _, path := range []string{
 		root,
@@ -24,6 +26,46 @@ func TestOpenLocalStoreCreatesProtectedOwnerOnlyDirectoryACLs(t *testing.T) {
 	} {
 		assertOwnerOnlyIdentityDirectoryACL(t, path)
 	}
+}
+
+func describeWindowsIdentityDirectoryACL(path string) string {
+	descriptor, err := windows.GetNamedSecurityInfo(
+		path,
+		windows.SE_FILE_OBJECT,
+		windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION,
+	)
+	if err != nil {
+		return fmt.Sprintf("read ACL for %s: %v", path, err)
+	}
+	control, _, controlErr := descriptor.Control()
+	owner, _, ownerErr := descriptor.Owner()
+	dacl, _, daclErr := descriptor.DACL()
+	parts := []string{
+		fmt.Sprintf("path=%s", path),
+		fmt.Sprintf("control=%#x error=%v", control, controlErr),
+		fmt.Sprintf("owner=%v error=%v", owner, ownerErr),
+	}
+	if daclErr != nil || dacl == nil {
+		return strings.Join(append(parts, fmt.Sprintf("dacl=%v error=%v", dacl, daclErr)), "; ")
+	}
+	parts = append(parts, fmt.Sprintf("ace_count=%d", dacl.AceCount))
+	for index := uint32(0); index < uint32(dacl.AceCount); index++ {
+		var ace *windows.ACCESS_ALLOWED_ACE
+		if err := windows.GetAce(dacl, index, &ace); err != nil {
+			parts = append(parts, fmt.Sprintf("ace[%d]=error:%v", index, err))
+			continue
+		}
+		sid := (*windows.SID)(unsafe.Pointer(&ace.SidStart))
+		parts = append(parts, fmt.Sprintf(
+			"ace[%d]=type:%#x flags:%#x mask:%#x sid:%s",
+			index,
+			ace.Header.AceType,
+			ace.Header.AceFlags,
+			ace.Mask,
+			sid.String(),
+		))
+	}
+	return strings.Join(parts, "; ")
 }
 
 func TestOpenLocalStoreRejectsPermissiveWindowsRootWithoutMutation(t *testing.T) {
