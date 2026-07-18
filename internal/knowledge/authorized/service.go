@@ -31,33 +31,35 @@ type EvidenceLoader interface {
 }
 
 type Options struct {
-	KAG              kag.PrimitiveBackend
-	Authorizer       authz.BatchChecker
-	Loader           EvidenceLoader
-	Cache            *QueryCache
-	Traversal        TraversalConfig
-	RetrieverVersion string
-	PromptVersion    string
-	RetrieveLimit    int
-	EvidenceLimit    int
-	ExpandLimit      int
-	Now              func() time.Time
-	Telemetry        telemetry.Sink
+	KAG                    kag.PrimitiveBackend
+	Authorizer             authz.BatchChecker
+	Loader                 EvidenceLoader
+	FinalAuthorizationGate func(context.Context, protocol.AuthorizationContext) error
+	Cache                  *QueryCache
+	Traversal              TraversalConfig
+	RetrieverVersion       string
+	PromptVersion          string
+	RetrieveLimit          int
+	EvidenceLimit          int
+	ExpandLimit            int
+	Now                    func() time.Time
+	Telemetry              telemetry.Sink
 }
 
 type Service struct {
-	kag              kag.PrimitiveBackend
-	authorizer       authz.BatchChecker
-	loader           EvidenceLoader
-	cache            *QueryCache
-	retrieverVersion string
-	promptVersion    string
-	retrieveLimit    int
-	evidenceLimit    int
-	traversal        traversalConfig
-	traversalDigest  traversalPlanDigest
-	now              func() time.Time
-	telemetry        telemetry.Sink
+	kag                    kag.PrimitiveBackend
+	authorizer             authz.BatchChecker
+	loader                 EvidenceLoader
+	finalAuthorizationGate func(context.Context, protocol.AuthorizationContext) error
+	cache                  *QueryCache
+	retrieverVersion       string
+	promptVersion          string
+	retrieveLimit          int
+	evidenceLimit          int
+	traversal              traversalConfig
+	traversalDigest        traversalPlanDigest
+	now                    func() time.Time
+	telemetry              telemetry.Sink
 }
 
 type QueryResult struct {
@@ -114,7 +116,8 @@ func New(options Options) (*Service, error) {
 	}
 	return &Service{
 		kag: options.KAG, authorizer: options.Authorizer, loader: options.Loader, cache: options.Cache,
-		retrieverVersion: options.RetrieverVersion, promptVersion: options.PromptVersion,
+		finalAuthorizationGate: options.FinalAuthorizationGate,
+		retrieverVersion:       options.RetrieverVersion, promptVersion: options.PromptVersion,
 		retrieveLimit: options.RetrieveLimit, evidenceLimit: options.EvidenceLimit,
 		traversal: traversal, traversalDigest: traversalDigest,
 		now: options.Now, telemetry: options.Telemetry,
@@ -154,6 +157,9 @@ func (s *Service) Query(ctx context.Context, request protocol.QueryRequest) (res
 		if snapshot, ok := s.cache.get(cacheKey); ok {
 			cached, err := s.revalidateCached(queryContext, request, snapshot.result, nil)
 			if err == nil && s.cache.containsRevision(cacheKey, snapshot.revision) {
+				if err := s.runFinalAuthorizationGate(queryContext, request.Authorization); err != nil {
+					return QueryResult{}, err
+				}
 				return cached, nil
 			}
 			s.cache.deleteIfRevision(cacheKey, snapshot.revision)
@@ -273,6 +279,9 @@ func (s *Service) Query(ctx context.Context, request protocol.QueryRequest) (res
 				return QueryResult{}, ErrProtectedContentUnavailable
 			}
 			budget.setCompletePaths(len(cached.Evidence.Items))
+			if err := s.runFinalAuthorizationGate(queryContext, request.Authorization); err != nil {
+				return QueryResult{}, err
+			}
 			return cached, nil
 		}
 	}
@@ -303,6 +312,9 @@ func (s *Service) Query(ctx context.Context, request protocol.QueryRequest) (res
 			return QueryResult{}, err
 		}
 	}
+	if err := s.runFinalAuthorizationGate(queryContext, authorization); err != nil {
+		return QueryResult{}, err
+	}
 	generation, err := s.kag.Generate(queryContext, generateRequest)
 	if err != nil {
 		if budget != nil {
@@ -323,6 +335,19 @@ func (s *Service) Query(ctx context.Context, request protocol.QueryRequest) (res
 		return QueryResult{}, ErrProtectedContentUnavailable
 	}
 	return result, nil
+}
+
+func (s *Service) runFinalAuthorizationGate(
+	ctx context.Context,
+	authorization protocol.AuthorizationContext,
+) error {
+	if s.finalAuthorizationGate == nil {
+		return nil
+	}
+	if err := s.finalAuthorizationGate(ctx, authorization); err != nil {
+		return ErrProtectedContentUnavailable
+	}
+	return nil
 }
 
 func (s *Service) discoverAuthorizedResources(
@@ -738,6 +763,9 @@ func (s *Service) OpenCitation(
 	}
 	if s.cache != nil && s.cache.containsInvalidatedResource(resourceIDs) {
 		return protocol.EvidenceItem{}, ErrCitationUnavailable
+	}
+	if err := s.runFinalAuthorizationGate(ctx, current); err != nil {
+		return protocol.EvidenceItem{}, err
 	}
 	return selected, nil
 }

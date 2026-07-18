@@ -6,13 +6,14 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync/atomic"
+	"sync"
 	"time"
 
 	einotool "github.com/cloudwego/eino/components/tool"
 
 	"github.com/zzqDeco/knote/internal/authz"
 	einotools "github.com/zzqDeco/knote/internal/eino/tools"
+	"github.com/zzqDeco/knote/internal/identity"
 	"github.com/zzqDeco/knote/internal/knowledge/authorized"
 	"github.com/zzqDeco/knote/internal/knowledge/authorized/fixture"
 	"github.com/zzqDeco/knote/internal/knowledge/kag"
@@ -23,34 +24,38 @@ import (
 )
 
 const (
-	permissionedEnabledEnv           = "KNOTE_PERMISSIONED"
-	permissionedPrincipalEnv         = "KNOTE_PERMISSIONED_PRINCIPAL"
-	permissionedIdentityWatermarkEnv = "KNOTE_PERMISSIONED_IDENTITY_WATERMARK"
-	permissionedProviderEnv          = "KNOTE_KAG_PERMISSIONED_PROVIDER"
-	openFGAEndpointEnv               = "KNOTE_OPENFGA_ENDPOINT"
-	openFGAStoreIDEnv                = "KNOTE_OPENFGA_STORE_ID"
-	openFGAModelIDEnv                = "KNOTE_OPENFGA_MODEL_ID"
-	openFGATimeoutEnv                = "KNOTE_OPENFGA_TIMEOUT"
-	openFGAConsistencyEnv            = "KNOTE_OPENFGA_CONSISTENCY"
-	permissionedTelemetryPathEnv     = "KNOTE_PERMISSIONED_TELEMETRY_PATH"
+	permissionedEnabledEnv       = "KNOTE_PERMISSIONED"
+	permissionedPrincipalEnv     = "KNOTE_PERMISSIONED_PRINCIPAL"
+	permissionedProviderEnv      = "KNOTE_KAG_PERMISSIONED_PROVIDER"
+	openFGAEndpointEnv           = "KNOTE_OPENFGA_ENDPOINT"
+	openFGAStoreIDEnv            = "KNOTE_OPENFGA_STORE_ID"
+	openFGAModelIDEnv            = "KNOTE_OPENFGA_MODEL_ID"
+	openFGATimeoutEnv            = "KNOTE_OPENFGA_TIMEOUT"
+	openFGAConsistencyEnv        = "KNOTE_OPENFGA_CONSISTENCY"
+	permissionedTelemetryPathEnv = "KNOTE_PERMISSIONED_TELEMETRY_PATH"
 
 	permissionedQueryCacheSize   = 64
 	permissionedRetrieverVersion = "permissioned-retriever-v1"
 	permissionedPromptVersion    = "permissioned-prompt-v1"
 	defaultOpenFGATimeout        = 3 * time.Second
+	maxIdentityPublicationChecks = 8
 )
 
-var permissionedRequestSequence atomic.Uint64
+type permissionedMembershipPublisher interface {
+	PublishLatest(context.Context) (identity.MembershipPublicationReceipt, error)
+}
 
 type permissionedRuntimeConfig struct {
-	Enabled           bool
-	Fake              bool
-	Principal         string
-	IdentityWatermark string
-	Provider          string
-	TelemetryPath     string
-	OpenFGA           authz.OpenFGAConfig
-	Consistency       protocol.ConsistencyPreference
+	Enabled             bool
+	Fake                bool
+	Principal           string
+	IdentityWatermark   string
+	Provider            string
+	TelemetryPath       string
+	OpenFGA             authz.OpenFGAConfig
+	Consistency         protocol.ConsistencyPreference
+	identity            *permissionedIdentitySession
+	membershipPublisher permissionedMembershipPublisher
 }
 
 type permissionedApplication struct {
@@ -58,6 +63,7 @@ type permissionedApplication struct {
 	fixture               *fixture.Application
 	authorizationProvider runtime.AuthorizationContextProvider
 	revisionState         *permissionedRevisionState
+	identity              *permissionedIdentitySession
 }
 
 func loadPermissionedRuntimeConfig(fake bool) (permissionedRuntimeConfig, error) {
@@ -89,17 +95,6 @@ func loadPermissionedRuntimeConfig(fake bool) (permissionedRuntimeConfig, error)
 		return permissionedRuntimeConfig{}, err
 	}
 
-	principal, err := requiredPermissionedEnv(permissionedPrincipalEnv)
-	if err != nil {
-		return permissionedRuntimeConfig{}, err
-	}
-	if err := authz.ValidateConcreteUserID(principal); err != nil {
-		return permissionedRuntimeConfig{}, fmt.Errorf("%s: %w", permissionedPrincipalEnv, err)
-	}
-	identityWatermark, err := requiredPermissionedEnv(permissionedIdentityWatermarkEnv)
-	if err != nil {
-		return permissionedRuntimeConfig{}, err
-	}
 	provider, err := requiredPermissionedEnv(permissionedProviderEnv)
 	if err != nil {
 		return permissionedRuntimeConfig{}, err
@@ -140,7 +135,7 @@ func loadPermissionedRuntimeConfig(fake bool) (permissionedRuntimeConfig, error)
 		}
 	}
 	return permissionedRuntimeConfig{
-		Enabled: true, Principal: principal, IdentityWatermark: identityWatermark, Provider: provider,
+		Enabled: true, Provider: provider,
 		TelemetryPath: telemetryPath,
 		OpenFGA: authz.OpenFGAConfig{
 			Endpoint: endpoint, StoreID: storeID, AuthorizationModelID: modelID,
@@ -207,7 +202,20 @@ func newPermissionedApplication(
 	if err != nil {
 		return nil, fmt.Errorf("initialize permissioned artifact scope: %w", err)
 	}
-	revisionState, err := newPermissionedRevisionState(config, scope, cache, loader.CurrentAuthorizationScope)
+	identitySession := config.identity
+	var identitySnapshot protocol.IdentitySnapshot
+	if identitySession == nil {
+		identitySession, identitySnapshot, err = loadPermissionedIdentitySession(ctx)
+	} else {
+		identitySnapshot, err = identitySession.gateway.CurrentSnapshot(ctx, identitySession.authenticated)
+	}
+	if err != nil || identitySnapshot.TenantID != scope.TenantID {
+		return nil, fmt.Errorf("initialize permissioned identity: %w", authorized.ErrProtectedContentUnavailable)
+	}
+	trustedConfig := config
+	trustedConfig.Principal = identitySnapshot.PrincipalID
+	trustedConfig.IdentityWatermark = identitySnapshot.Watermark
+	revisionState, err := newPermissionedRevisionState(trustedConfig, scope, cache, loader.CurrentAuthorizationScope)
 	if err != nil {
 		return nil, fmt.Errorf("initialize permissioned authorization revision: %w", err)
 	}
@@ -215,50 +223,116 @@ func newPermissionedApplication(
 	if err != nil {
 		return nil, fmt.Errorf("initialize permissioned OpenFGA authorizer: %w", err)
 	}
+	membershipPublisher := config.membershipPublisher
+	if membershipPublisher == nil {
+		if identitySession.store == nil {
+			return nil, fmt.Errorf("initialize permissioned identity membership publication: %w", authorized.ErrProtectedContentUnavailable)
+		}
+		membershipPublisher, err = authz.NewIdentityMembershipPublisher(
+			identitySession.store,
+			authorizer,
+			identitySnapshot.TenantID,
+			config.OpenFGA.StoreID,
+			config.OpenFGA.AuthorizationModelID,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("initialize permissioned identity membership publication: %w", authorized.ErrProtectedContentUnavailable)
+		}
+	}
 	service, err := authorized.New(authorized.Options{
 		KAG: backend, Authorizer: authorizer, Loader: loader, Cache: cache,
-		RetrieverVersion: permissionedRetrieverVersion, PromptVersion: permissionedPromptVersion,
+		FinalAuthorizationGate: identitySession.validate,
+		RetrieverVersion:       permissionedRetrieverVersion, PromptVersion: permissionedPromptVersion,
 		RetrieveLimit: 20, EvidenceLimit: 8, Traversal: productionTraversalConfig(),
 		Telemetry: telemetrySink,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("initialize permissioned query service: %w", err)
 	}
-	provider := func(ctx context.Context, sessionID string) (protocol.AuthorizationContext, error) {
+	provider := newProductionAuthorizationContextProvider(
+		config,
+		trustedConfig,
+		identitySession,
+		membershipPublisher,
+		revisionState,
+		loader.CurrentAuthorizationScope,
+	)
+	if _, err := provider(ctx, "session_permissioned_startup"); err != nil {
+		return nil, fmt.Errorf("validate permissioned authorization context: %w", err)
+	}
+	return &permissionedApplication{
+		service: service, authorizationProvider: provider, revisionState: revisionState, identity: identitySession,
+	}, nil
+}
+
+func newProductionAuthorizationContextProvider(
+	config permissionedRuntimeConfig,
+	trustedConfig permissionedRuntimeConfig,
+	identitySession *permissionedIdentitySession,
+	membershipPublisher permissionedMembershipPublisher,
+	revisionState *permissionedRevisionState,
+	scopeProvider func(context.Context) (authorized.ArtifactAuthorizationScope, error),
+) runtime.AuthorizationContextProvider {
+	var issuanceMu sync.Mutex
+	return func(ctx context.Context, sessionID string) (protocol.AuthorizationContext, error) {
 		if ctx == nil {
 			return protocol.AuthorizationContext{}, fmt.Errorf("permissioned authorization requires a context")
 		}
 		if err := ctx.Err(); err != nil {
 			return protocol.AuthorizationContext{}, err
 		}
-		scope, err := loader.CurrentAuthorizationScope(ctx)
-		if err != nil {
-			return protocol.AuthorizationContext{}, err
-		}
-		revision, err := revisionState.currentForScope(ctx, config, scope)
-		if err != nil {
+		issuanceMu.Lock()
+		defer issuanceMu.Unlock()
+		if identitySession == nil || membershipPublisher == nil || revisionState == nil || scopeProvider == nil {
 			return protocol.AuthorizationContext{}, authorized.ErrProtectedContentUnavailable
 		}
-		authorization := protocol.AuthorizationContext{
-			Version:  protocol.SecurityContractVersion,
-			TenantID: scope.TenantID, KnowledgeBaseID: scope.KnowledgeBaseID,
-			PrincipalID: config.Principal, SessionID: sessionID,
-			RequestID:            fmt.Sprintf("request_permissioned_%020d", permissionedRequestSequence.Add(1)),
-			AuthorizationModelID: revision.AuthorizationModelID,
-			IdentityWatermark:    revision.IdentityWatermark, ACLWatermark: revision.ACLWatermark,
-			Consistency: config.Consistency,
+		for range maxIdentityPublicationChecks {
+			scope, err := scopeProvider(ctx)
+			if err != nil {
+				return protocol.AuthorizationContext{}, authorized.ErrProtectedContentUnavailable
+			}
+			authorization, err := identitySession.authorizationContext(ctx, identity.AuthorizationScope{
+				TenantID: scope.TenantID, KnowledgeBaseID: scope.KnowledgeBaseID,
+				AuthorizationModelID: config.OpenFGA.AuthorizationModelID, ACLWatermark: scope.ACLWatermark,
+				Consistency: config.Consistency,
+			}, sessionID)
+			if err != nil {
+				return protocol.AuthorizationContext{}, authorized.ErrProtectedContentUnavailable
+			}
+			target := identity.MembershipPublicationTarget{
+				TenantID:             scope.TenantID,
+				StoreID:              config.OpenFGA.StoreID,
+				AuthorizationModelID: config.OpenFGA.AuthorizationModelID,
+			}
+			receipt, err := membershipPublisher.PublishLatest(ctx)
+			if err != nil || receipt.Validate() != nil || receipt.TenantID != target.TenantID ||
+				receipt.StoreID != target.StoreID || receipt.AuthorizationModelID != target.AuthorizationModelID {
+				return protocol.AuthorizationContext{}, authorized.ErrProtectedContentUnavailable
+			}
+			if !receipt.Matches(target, authorization.IdentityWatermark) {
+				continue
+			}
+			if err := identitySession.validate(ctx, authorization); err != nil {
+				continue
+			}
+			if err := revisionState.refreshIdentityWatermark(ctx, authorization.IdentityWatermark); err != nil {
+				return protocol.AuthorizationContext{}, authorized.ErrProtectedContentUnavailable
+			}
+			currentConfig := trustedConfig
+			currentConfig.IdentityWatermark = authorization.IdentityWatermark
+			revision, err := revisionState.currentForScope(ctx, currentConfig, scope)
+			if err != nil || authorization.AuthorizationModelID != revision.AuthorizationModelID ||
+				authorization.IdentityWatermark != revision.IdentityWatermark ||
+				authorization.ACLWatermark != revision.ACLWatermark {
+				return protocol.AuthorizationContext{}, authorized.ErrProtectedContentUnavailable
+			}
+			if err := identitySession.validate(ctx, authorization); err != nil {
+				continue
+			}
+			return authorization, nil
 		}
-		if err := authorization.Validate(); err != nil {
-			return protocol.AuthorizationContext{}, fmt.Errorf("permissioned authorization context: %w", err)
-		}
-		return authorization, nil
+		return protocol.AuthorizationContext{}, authorized.ErrProtectedContentUnavailable
 	}
-	if _, err := provider(ctx, "session_permissioned_startup"); err != nil {
-		return nil, fmt.Errorf("validate permissioned authorization context: %w", err)
-	}
-	return &permissionedApplication{
-		service: service, authorizationProvider: provider, revisionState: revisionState,
-	}, nil
 }
 
 func fakeBuildAuthorizationProvider(
@@ -335,6 +409,9 @@ func (a *permissionedApplication) Query(
 	if a.revisionState == nil {
 		return a.service.Query(ctx, request)
 	}
+	if err := a.validateIdentityAuthorization(ctx, request.Authorization); err != nil {
+		return authorized.QueryResult{}, authorized.ErrProtectedContentUnavailable
+	}
 	revision, err := a.revisionState.begin(ctx, request.Authorization)
 	if err != nil {
 		return authorized.QueryResult{}, authorized.ErrProtectedContentUnavailable
@@ -342,6 +419,9 @@ func (a *permissionedApplication) Query(
 	result, err := a.service.Query(ctx, request)
 	if err != nil {
 		return authorized.QueryResult{}, err
+	}
+	if err := a.validateIdentityAuthorization(ctx, request.Authorization); err != nil {
+		return authorized.QueryResult{}, authorized.ErrProtectedContentUnavailable
 	}
 	if err := a.revisionState.finish(ctx, revision, permissionedEvidenceResourceIDs(result.Evidence)); err != nil {
 		return authorized.QueryResult{}, authorized.ErrProtectedContentUnavailable
@@ -360,6 +440,9 @@ func (a *permissionedApplication) ReadDerivedArtifact(
 	if a.revisionState == nil {
 		return a.service.ReadDerivedArtifact(ctx, authorization, resource)
 	}
+	if err := a.validateIdentityAuthorization(ctx, authorization); err != nil {
+		return protocol.EvidenceItem{}, authorized.ErrProtectedContentUnavailable
+	}
 	revision, err := a.revisionState.begin(ctx, authorization)
 	if err != nil {
 		return protocol.EvidenceItem{}, authorized.ErrProtectedContentUnavailable
@@ -367,6 +450,9 @@ func (a *permissionedApplication) ReadDerivedArtifact(
 	item, err := a.service.ReadDerivedArtifact(ctx, authorization, resource)
 	if err != nil {
 		return protocol.EvidenceItem{}, err
+	}
+	if err := a.validateIdentityAuthorization(ctx, authorization); err != nil {
+		return protocol.EvidenceItem{}, authorized.ErrProtectedContentUnavailable
 	}
 	if err := a.revisionState.finish(ctx, revision, permissionedDerivedArtifactResourceIDs(item)); err != nil {
 		return protocol.EvidenceItem{}, authorized.ErrProtectedContentUnavailable
@@ -386,6 +472,9 @@ func (a *permissionedApplication) AuthorizeProtectedContent(
 		_, err := a.service.AuthorizeProtectedContent(ctx, current, binding)
 		return err
 	}
+	if err := a.validateIdentityAuthorization(ctx, current); err != nil {
+		return authorized.ErrProtectedContentUnavailable
+	}
 	revision, err := a.revisionState.begin(ctx, current)
 	if err != nil {
 		return authorized.ErrProtectedContentUnavailable
@@ -393,10 +482,23 @@ func (a *permissionedApplication) AuthorizeProtectedContent(
 	if _, err := a.service.AuthorizeProtectedContent(ctx, current, binding); err != nil {
 		return err
 	}
+	if err := a.validateIdentityAuthorization(ctx, current); err != nil {
+		return authorized.ErrProtectedContentUnavailable
+	}
 	if err := a.revisionState.finish(ctx, revision, permissionedBindingResourceIDs(binding)); err != nil {
 		return authorized.ErrProtectedContentUnavailable
 	}
 	return nil
+}
+
+func (a *permissionedApplication) validateIdentityAuthorization(
+	ctx context.Context,
+	authorization protocol.AuthorizationContext,
+) error {
+	if a == nil || a.identity == nil {
+		return nil
+	}
+	return a.identity.validate(ctx, authorization)
 }
 
 func (a *permissionedApplication) ApplyRevocation(

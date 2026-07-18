@@ -21,8 +21,15 @@ Before enabling permissioned mode:
    of the trusted deployment, but provider output is never an authorization
    decision.
 5. Provision the exact OpenFGA store and authorization model referenced below.
-   The principal and tuples in that store must use the same identity mapping as
-   the selected workspace projection.
+   Policy tuples must use the same group mapping as the identity store. Knote
+   owns the direct `user:<principal> member group:<group>` tuples and publishes
+   them from the canonical identity membership projection.
+6. Provision the tenant, trusted SSO provider, SCIM users, groups, and
+   memberships in a private identity store through the trusted identity control
+   plane. Do not edit the store JSON directly. The store and its parent
+   directory must be accessible only to the knote service account. Each OpenFGA
+   store is durably bound to one tenant; sharing it with another tenant fails
+   closed.
 
 The KAG part of `.knote/config.yaml` has this shape:
 
@@ -41,6 +48,74 @@ kag:
 Use absolute paths for deployment-specific files. Do not put OpenFGA tokens,
 model-provider keys, or other credentials in repository configuration.
 
+## Trusted identity control entrypoint
+
+The production identity control plane is a non-interactive mode of the same
+`knote` binary. It branches before workspace configuration or TUI
+initialization and accepts no identity payload from arguments or environment
+variables. `KNOTE_IDENTITY_STORE_PATH` selects the private state directory; the
+complete request is read once from an inherited descriptor.
+
+The request is one JSON object of at most 256 KiB with exactly this envelope:
+
+```json
+{
+  "version": "v1",
+  "operation": "tenant.register",
+  "scope": {
+    "version": "v1",
+    "tenant_id": "tenant-acme",
+    "region": "cn-east"
+  },
+  "input": {}
+}
+```
+
+All envelope, scope, and input objects are strict. Unknown or duplicate fields,
+unknown operations, a missing required field, malformed JSON, a second JSON
+value, and trailing non-whitespace data are rejected before the identity store
+is opened. The supported operations and their exact `input` fields are:
+
+| Operation | Required `input` fields |
+|---|---|
+| `tenant.register` | No fields; use `{}`. |
+| `provider.register` | `provider_id`, `issuer`, `audiences`. |
+| `user.upsert` | `provider_id`, `external_id`, `external_subject_id`, `principal_id`. The user is active; grant-bearing identifiers are immutable after first registration. |
+| `user.deprovision` | `provider_id`, `external_id`. |
+| `group.upsert` | `provider_id`, `external_id`, `group_id`, `display_name`. The group is active; `group_id` is immutable after first registration. |
+| `group.deprovision` | `provider_id`, `external_id`. |
+| `membership.upsert` | `provider_id`, `group_external_id`, `user_external_id`, and required Boolean `active`. |
+| `membership.replace` | `provider_id`, `group_external_id`, and required `user_external_ids` array. An empty array clears the group. |
+
+Compute the confirmation over the exact request bytes. Only the canonical
+lowercase `sha256:<64 hex characters>` digest and descriptor number appear on
+the command line:
+
+```sh
+chmod 0600 /run/knote/identity/request.json
+digest="$(shasum -a 256 /run/knote/identity/request.json | awk '{print $1}')"
+exec 3< /run/knote/identity/request.json
+
+KNOTE_IDENTITY_STORE_PATH='/var/lib/knote/identity' \
+  /usr/local/bin/knote identity-control \
+  --request-fd=3 \
+  --confirm="sha256:${digest}"
+
+exec 3<&-
+```
+
+The descriptor is consumed and closed. A digest mismatch is rejected before
+any store side effect. Success emits exactly one compact, content-free JSON
+receipt followed by a newline:
+
+```json
+{"version":"v1","request_digest":"sha256:<digest>","changed":true,"revision_number":2,"identity_watermark":"identity_<opaque-watermark>"}
+```
+
+No tenant, provider, subject, principal, group, membership, assertion,
+credential, or secret body is returned. Failure writes only
+`identity control request rejected` to standard error and exits non-zero.
+
 ## Exact runtime configuration
 
 Real permissioned mode is enabled only by `KNOTE_PERMISSIONED=1`. For a real KAG
@@ -53,8 +128,9 @@ whitespace.
 | Variable | Requirement |
 |---|---|
 | `KNOTE_PERMISSIONED` | Required literal `1`. |
-| `KNOTE_PERMISSIONED_PRINCIPAL` | Required raw principal ID mapped to the OpenFGA `user` subject. Do not include the `user:` prefix; knote adds it to checks. The value comes from the trusted process environment, never tool input. |
-| `KNOTE_PERMISSIONED_IDENTITY_WATERMARK` | Required current identity revision selected by the operator. |
+| `KNOTE_IDENTITY_STORE_PATH` | Required path to the private tenant-scoped identity store provisioned by the trusted SCIM control plane. An absolute path is recommended. |
+| `KNOTE_IDENTITY_ED25519_PUBLIC_KEY` | Required canonical unpadded base64url Ed25519 public key used to verify the one-shot provider-neutral assertion. |
+| `KNOTE_IDENTITY_ASSERTION_FD` | Required inherited file descriptor number, at least `3`, containing one signed assertion of at most 64 KiB. The descriptor is consumed and closed before the TUI starts. Each process launch requires a fresh, unexpired assertion with a new nonce. |
 | `KNOTE_KAG_PERMISSIONED_PROVIDER` | Required Python provider in `module:factory` form. |
 | `KNOTE_OPENFGA_ENDPOINT` | Required absolute HTTP(S) URL. Plain HTTP is accepted only for loopback; credentials, query strings, and fragments are rejected. |
 | `KNOTE_OPENFGA_STORE_ID` | Required canonical OpenFGA store ULID. |
@@ -75,9 +151,14 @@ Example invocation:
 ```sh
 CGO_ENABLED=0 go build -o /tmp/knote-permissioned ./cmd/knote
 
+# The assertion is supplied by the trusted SSO gateway or secret manager. It is
+# never placed in an environment variable or command-line argument.
+exec 3< /run/knote/identity/assertion.jwt
+
 KNOTE_PERMISSIONED=1 \
-KNOTE_PERMISSIONED_PRINCIPAL='<openfga-user-id>' \
-KNOTE_PERMISSIONED_IDENTITY_WATERMARK='<identity-revision>' \
+KNOTE_IDENTITY_STORE_PATH='/var/lib/knote/identity' \
+KNOTE_IDENTITY_ED25519_PUBLIC_KEY='<canonical-base64url-ed25519-public-key>' \
+KNOTE_IDENTITY_ASSERTION_FD=3 \
 KNOTE_KAG_PERMISSIONED_PROVIDER='operator_provider:create' \
 KNOTE_OPENFGA_ENDPOINT='https://openfga.example.internal' \
 KNOTE_OPENFGA_STORE_ID='<store-ulid>' \
@@ -90,10 +171,14 @@ KNOTE_EINO_MODEL='<model>' \
 KNOTE_EINO_API_KEY='<model-key-from-secret-manager>' \
 KNOTE_EINO_BASE_URL='https://model.example.internal/v1' \
 /tmp/knote-permissioned --workspace /absolute/path/to/workspace
+
+exec 3<&-
 ```
 
-Prefer process injection from a secret manager over shell history for the two
-credentials shown as placeholders.
+Prefer process injection from a secret manager over shell history for API keys,
+tokens, and assertion material. `KNOTE_PERMISSIONED_PRINCIPAL` and
+`KNOTE_PERMISSIONED_IDENTITY_WATERMARK` are legacy inputs and are ignored by
+real permissioned mode; the verified identity snapshot is authoritative.
 
 ## Fail-closed startup boundary
 
@@ -102,25 +187,34 @@ The TUI is created only after the runtime has completed the following boundary:
 1. validate the runtime mode and load the workspace configuration;
 2. reject fake/real conflicts and incomplete or malformed permissioned
    environment configuration;
-3. read and validate the selected artifact metadata and published projection;
-4. bind tenant, knowledge base, projection, ACL watermark, OpenFGA store/model,
-   and identity watermark into the initial authorization revision;
-5. construct the OpenFGA client and require its environment-only token;
-6. construct the verified-bundle evidence loader, authorized query service,
+3. read the one-shot assertion descriptor, verify its Ed25519 signature, issuer,
+   audience, tenant, subject, validity window, and replay nonce, then close it;
+4. resolve an active SCIM identity and current group membership from the private
+   tenant store without persisting the raw assertion;
+5. read and validate the selected artifact metadata and published projection;
+6. bind tenant, knowledge base, projection, ACL watermark, OpenFGA store/model,
+   and the verified identity watermark into the initial authorization revision;
+7. construct the OpenFGA client and require its environment-only token;
+8. reconcile the tenant's exact canonical membership projection to OpenFGA and
+   durably record a receipt for the tenant, store, model, and identity watermark;
+9. construct the verified-bundle evidence loader, authorized query service,
    permissioned capability profile, and trusted authorization-context provider;
-7. validate a startup authorization context before exposing query or explain
+10. validate a startup authorization context whose identity watermark exactly
+   matches that publication receipt before exposing query or explain
    tools or loading a resumable permissioned session.
 
 A failure in any of these steps exits before the TUI starts. There is no partial
 permissioned tool set and no fallback to legacy `kag.query`, `kag.explain`, raw
 workspace summaries, or an unbound session.
 
-Startup validates configuration and the local selected revision; it does not
-prove that a remote OpenFGA endpoint is reachable or import and execute the KAG
-provider. Those operations occur on a protected request. A timeout, unavailable
-endpoint, provider import failure, malformed provider response, stale revision,
-digest mismatch, or incomplete authorization response fails that request closed
-with a generic public error. It does not fall back to non-permissioned content.
+Startup validates configuration and the local selected revision. A pending or
+changed identity membership projection must be published successfully to
+OpenFGA before startup continues; an already-current empty or unchanged receipt
+does not issue a health-check write. KAG provider execution still occurs on a
+protected request. A timeout, unavailable endpoint, publication failure,
+provider import failure, malformed provider response, stale revision, digest
+mismatch, or incomplete authorization response fails closed with a generic
+public error. It does not fall back to non-permissioned content.
 
 ## Trust and threat boundaries
 

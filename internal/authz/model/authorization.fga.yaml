@@ -2,6 +2,35 @@ name: knote authorization model
 model_file: ./authorization.fga
 
 tests:
+  - name: identity-control-is-non-authorizing
+    tuples:
+      - user: identity_control:claim
+        relation: claimed
+        object: identity_control:membership
+      - user: identity_tenant:tenant-acme
+        relation: tenant
+        object: identity_control:membership
+      - user: organization:acme
+        relation: organization
+        object: document:protected
+      - user: user:mallory
+        relation: viewer
+        object: document:protected
+    check:
+      - user: user:mallory
+        object: document:protected
+        assertions:
+          can_view: false
+      - user: identity_control:claim
+        object: document:protected
+        assertions:
+          can_view: false
+          can_edit: false
+      - user: identity_tenant:tenant-acme
+        object: document:protected
+        assertions:
+          can_view: false
+          can_edit: false
   - name: cross-tenant-direct-share
     tuples:
       - user: user:mallory

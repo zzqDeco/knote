@@ -27,6 +27,13 @@ var (
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == identityControlCommand {
+		if err := runIdentityControl(context.Background(), os.Args[2:], os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, errIdentityControlRejected)
+			os.Exit(1)
+		}
+		return
+	}
 	workspace := flag.String("workspace", ".", "workspace path")
 	resume := flag.String("resume", "", "session id to resume")
 	showVersion := flag.Bool("version", false, "print version")

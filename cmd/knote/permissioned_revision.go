@@ -128,6 +128,33 @@ func (s *permissionedRevisionState) refreshScope(ctx context.Context) error {
 	return nil
 }
 
+func (s *permissionedRevisionState) refreshIdentityWatermark(ctx context.Context, watermark string) error {
+	if s == nil || s.publisher == nil || s.lifecycle == nil || s.scopeProvider == nil || ctx == nil || watermark == "" {
+		return errPermissionedRevisionUnavailable
+	}
+	s.scopeMu.Lock()
+	defer s.scopeMu.Unlock()
+	current, err := s.publisher.Current(ctx)
+	if err != nil {
+		return errPermissionedRevisionUnavailable
+	}
+	if current.IdentityWatermark == watermark {
+		return nil
+	}
+	target := current
+	target.IdentityWatermark = watermark
+	target.Epoch++
+	reservation, err := s.publisher.Reserve(ctx, current, target)
+	if err != nil {
+		return errPermissionedRevisionUnavailable
+	}
+	if err := s.publisher.Publish(ctx, reservation); err != nil {
+		s.publisher.Abort(reservation)
+		return errPermissionedRevisionUnavailable
+	}
+	return nil
+}
+
 func (s *permissionedRevisionState) verifyCurrentScope(ctx context.Context) error {
 	if s == nil || s.scopeProvider == nil || ctx == nil {
 		return errPermissionedRevisionUnavailable

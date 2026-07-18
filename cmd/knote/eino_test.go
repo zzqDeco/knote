@@ -7,11 +7,13 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	einotool "github.com/cloudwego/eino/components/tool"
 
 	"github.com/zzqDeco/knote/internal/authz"
 	einotools "github.com/zzqDeco/knote/internal/eino/tools"
+	"github.com/zzqDeco/knote/internal/identity"
 	"github.com/zzqDeco/knote/internal/knowledge/kag"
 	"github.com/zzqDeco/knote/internal/knowledge/versioned"
 	"github.com/zzqDeco/knote/internal/protocol"
@@ -101,7 +103,7 @@ func TestPermissionedFixturePrincipalUsesTrustedRuntimeEnvironment(t *testing.T)
 
 func TestPermissionedRuntimeConfigIsExplicitAndComplete(t *testing.T) {
 	for _, name := range []string{
-		permissionedEnabledEnv, permissionedPrincipalEnv, permissionedIdentityWatermarkEnv,
+		permissionedEnabledEnv, permissionedPrincipalEnv, "KNOTE_PERMISSIONED_IDENTITY_WATERMARK",
 		permissionedProviderEnv, openFGAEndpointEnv, openFGAStoreIDEnv, openFGAModelIDEnv,
 		openFGATimeoutEnv, openFGAConsistencyEnv, "KNOTE_OPENFGA_API_TOKEN",
 		permissionedTelemetryPathEnv,
@@ -114,17 +116,12 @@ func TestPermissionedRuntimeConfigIsExplicitAndComplete(t *testing.T) {
 	}
 
 	t.Setenv(permissionedEnabledEnv, "1")
-	if _, err := loadPermissionedRuntimeConfig(false); err == nil || !strings.Contains(err.Error(), permissionedPrincipalEnv) {
+	if _, err := loadPermissionedRuntimeConfig(false); err == nil || !strings.Contains(err.Error(), permissionedProviderEnv) {
 		t.Fatalf("partial real config should fail closed, got %v", err)
 	}
 
-	t.Setenv(permissionedPrincipalEnv, "user:alice")
-	if _, err := loadPermissionedRuntimeConfig(false); err == nil || !strings.Contains(err.Error(), permissionedPrincipalEnv) {
-		t.Fatalf("prefixed real principal should fail closed, got %v", err)
-	}
-
-	t.Setenv(permissionedPrincipalEnv, "alice")
-	t.Setenv(permissionedIdentityWatermarkEnv, "identity_v1")
+	t.Setenv(permissionedPrincipalEnv, "attacker-controlled-principal")
+	t.Setenv("KNOTE_PERMISSIONED_IDENTITY_WATERMARK", "attacker-controlled-watermark")
 	t.Setenv(permissionedProviderEnv, "permissioned_provider:create")
 	t.Setenv(openFGAEndpointEnv, "http://127.0.0.1:8080")
 	t.Setenv(openFGAStoreIDEnv, "01ARZ3NDEKTSV4RRFFQ69G5FAV")
@@ -135,6 +132,9 @@ func TestPermissionedRuntimeConfigIsExplicitAndComplete(t *testing.T) {
 	config, err = loadPermissionedRuntimeConfig(false)
 	if err != nil || !config.Enabled || config.Fake || config.Provider != "permissioned_provider:create" {
 		t.Fatalf("real config = %+v, %v", config, err)
+	}
+	if config.Principal != "" || config.IdentityWatermark != "" {
+		t.Fatalf("production config trusted legacy identity environment: %+v", config)
 	}
 	if config.TelemetryPath != telemetryPath {
 		t.Fatalf("telemetry path = %q", config.TelemetryPath)
@@ -234,9 +234,17 @@ func TestPermissionedApplicationWiresRealSelectedBundleScope(t *testing.T) {
 	if _, err := service.Build(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	identityFixture := newCommandIdentityFixture(t, "local", "alice")
+	identitySession, identitySnapshot, err := newPermissionedIdentitySession(
+		context.Background(), identityFixture.root, identityFixture.publicKey, identityFixture.assertion,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
 	t.Setenv(authz.APITokenEnv, "test-token")
 	config := permissionedRuntimeConfig{
 		Enabled: true, Principal: "alice", IdentityWatermark: "identity_v1",
+		identity: identitySession,
 		OpenFGA: authz.OpenFGAConfig{
 			Endpoint: "http://127.0.0.1:8080", StoreID: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
 			AuthorizationModelID: "01ARZ3NDEKTSV4RRFFQ69G5FAW", Timeout: defaultOpenFGATimeout,
@@ -244,6 +252,10 @@ func TestPermissionedApplicationWiresRealSelectedBundleScope(t *testing.T) {
 		},
 		Consistency: protocol.ConsistencyHigherConsistency,
 	}
+	membershipPublisher := &commandMembershipPublisher{
+		receipt: commandMembershipReceipt(config, identityFixture.scope.TenantID, identitySnapshot.Watermark),
+	}
+	config.membershipPublisher = membershipPublisher
 	application, err := newPermissionedApplication(context.Background(), config, kag.Client{Fake: true}, store)
 	if err != nil {
 		t.Fatal(err)
@@ -260,6 +272,33 @@ func TestPermissionedApplicationWiresRealSelectedBundleScope(t *testing.T) {
 		authorization.AuthorizationModelID != config.OpenFGA.AuthorizationModelID ||
 		authorization.TenantID != "local" || authorization.KnowledgeBaseID == "" || authorization.ACLWatermark == "" {
 		t.Fatalf("unexpected real authorization context: %+v", authorization)
+	}
+	envelope, err := protocol.NewSessionAuthorizationEnvelope(authorization, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, identityChange, err := identityFixture.store.UpsertGroup(context.Background(), identityFixture.scope, identity.GroupUpsert{
+		ProviderID: "provider-main", ExternalID: "group-refresh",
+		GroupID: "group-refresh", DisplayName: "Refresh Group", Active: true,
+	})
+	if err != nil || !identityChange.Changed {
+		t.Fatalf("identity revision change = %+v, %v", identityChange, err)
+	}
+	membershipPublisher.set(commandMembershipReceipt(
+		config, identityFixture.scope.TenantID, identityChange.Revision.Watermark,
+	), nil)
+	if err := application.validateIdentityAuthorization(context.Background(), authorization); err == nil {
+		t.Fatal("application accepted stale gateway authorization")
+	}
+	refreshed, err := provider(context.Background(), "sess_real")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if refreshed.IdentityWatermark == authorization.IdentityWatermark {
+		t.Fatalf("provider did not advance identity watermark: old=%+v new=%+v", authorization, refreshed)
+	}
+	if err := envelope.ValidateFor(refreshed); err == nil {
+		t.Fatal("session resume accepted the pre-change identity watermark")
 	}
 }
 
@@ -359,7 +398,10 @@ func clearEinoEnv(t *testing.T) {
 		"KNOTE_RUNTIME_MODE",
 		permissionedEnabledEnv,
 		permissionedPrincipalEnv,
-		permissionedIdentityWatermarkEnv,
+		"KNOTE_PERMISSIONED_IDENTITY_WATERMARK",
+		identityStorePathEnv,
+		identityPublicKeyEnv,
+		identityAssertionFDEnv,
 		permissionedProviderEnv,
 		openFGAEndpointEnv,
 		openFGAStoreIDEnv,

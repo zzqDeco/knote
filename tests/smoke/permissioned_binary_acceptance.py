@@ -207,6 +207,87 @@ class FixtureState:
         )
 
 
+@dataclass
+class IdentityFixture:
+    root: Path
+    store_path: Path
+    public_key: str
+    assertion_paths: tuple[Path, ...]
+    identity_watermark: str
+    next_assertion: int = 0
+
+    def take_assertion(self) -> Path:
+        if self.next_assertion >= len(self.assertion_paths):
+            raise AcceptanceError("identity", "assertion_pool_exhausted")
+        path = self.assertion_paths[self.next_assertion]
+        self.next_assertion += 1
+        return path
+
+
+def run_identity_fixture(root: Path, *arguments: str) -> dict[str, Any]:
+    command = [
+        "go",
+        "run",
+        "./tests/fixtures/permissioned-binary/identity_fixture",
+        *arguments,
+    ]
+    completed = subprocess.run(
+        command,
+        cwd=root,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    require(completed.returncode == 0, "identity", "fixture_failed")
+    try:
+        value = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise AcceptanceError("identity", "fixture_output_invalid") from exc
+    require(isinstance(value, dict), "identity", "fixture_output_invalid")
+    return value
+
+
+def initialize_identity_fixture(root: Path, run_root: Path) -> IdentityFixture:
+    fixture_root = (run_root / "identity").resolve()
+    value = run_identity_fixture(
+        root,
+        "--mode=init",
+        f"--root={fixture_root}",
+        "--count=24",
+    )
+    store_path = Path(value.get("store_path", ""))
+    assertion_paths = tuple(Path(path) for path in value.get("assertion_paths", []))
+    public_key = value.get("public_key", "")
+    watermark = value.get("identity_watermark", "")
+    require(store_path.is_absolute() and store_path.is_dir(), "identity", "store_missing")
+    require(len(assertion_paths) == 24, "identity", "assertion_pool_invalid")
+    require(all(path.is_absolute() and path.is_file() for path in assertion_paths), "identity", "assertion_missing")
+    require(isinstance(public_key, str) and public_key, "identity", "public_key_missing")
+    require(isinstance(watermark, str) and watermark, "identity", "watermark_missing")
+    return IdentityFixture(
+        root=fixture_root,
+        store_path=store_path,
+        public_key=public_key,
+        assertion_paths=assertion_paths,
+        identity_watermark=watermark,
+    )
+
+
+def bump_identity_fixture(root: Path, fixture: IdentityFixture) -> str:
+    value = run_identity_fixture(
+        root,
+        "--mode=bump",
+        f"--root={fixture.root}",
+        "--generation=2",
+    )
+    watermark = value.get("identity_watermark", "")
+    require(isinstance(watermark, str) and watermark, "identity", "watermark_missing")
+    require(watermark != fixture.identity_watermark, "identity", "watermark_did_not_advance")
+    fixture.identity_watermark = watermark
+    return watermark
+
+
 def _versions(role: str) -> dict[str, str]:
     return {
         "source": SOURCE_VERSION,
@@ -680,6 +761,7 @@ class OpenFGAState:
         self.mode = "allow"
         self.requests = 0
         self.server_errors = 0
+        self.tuples: set[tuple[str, str, str]] = set()
 
     def set_mode(self, mode: str) -> None:
         require(mode in {"allow", "deny", "backend_failure"}, "openfga", "invalid_mode")
@@ -698,6 +780,79 @@ class OpenFGAState:
     def record_server_error(self) -> None:
         with self.lock:
             self.server_errors += 1
+
+    def read_tuples(self, key: dict[str, Any]) -> list[tuple[str, str, str]]:
+        user = key.get("user", "")
+        relation = key.get("relation", "")
+        object_name = key.get("object", "")
+        require(all(isinstance(value, str) for value in (user, relation, object_name)), "openfga", "read_filter_invalid")
+        with self.lock:
+            return sorted(
+                item for item in self.tuples
+                if (not user or item[0] == user)
+                and (not relation or item[1] == relation)
+                and (not object_name or item[2] == object_name)
+            )
+
+    def apply_tuples(
+        self,
+        writes: list[tuple[str, str, str]],
+        deletes: list[tuple[str, str, str]],
+        duplicate_policy: str,
+        missing_policy: str,
+    ) -> bool:
+        with self.lock:
+            if duplicate_policy == "error" and any(item in self.tuples for item in writes):
+                return False
+            if missing_policy == "error" and any(item not in self.tuples for item in deletes):
+                return False
+            for item in deletes:
+                self.tuples.discard(item)
+            self.tuples.update(writes)
+            return True
+
+
+def _openfga_tuple(value: Any) -> tuple[str, str, str]:
+    require(isinstance(value, dict), "openfga", "tuple_invalid")
+    require(set(value) == {"user", "relation", "object"}, "openfga", "tuple_fields_invalid")
+    user = value.get("user")
+    relation = value.get("relation")
+    object_name = value.get("object")
+    require(
+        all(isinstance(item, str) and item for item in (user, relation, object_name)),
+        "openfga",
+        "tuple_value_invalid",
+    )
+    return user, relation, object_name
+
+
+def _identity_publication_fence(value: tuple[str, str, str]) -> tuple[str, int]:
+    user, relation, object_name = value
+    prefix = "identity_control:publication_v1_"
+    require(
+        relation == "claimed" and object_name == "identity_control:membership" and user.startswith(prefix),
+        "openfga",
+        "identity_publication_fence_invalid",
+    )
+    parts = user.removeprefix(prefix).split("_")
+    require(
+        len(parts) == 5
+        and parts[0] in {"a", "p"}
+        and re.fullmatch(r"[0-9]{20}", parts[1]) is not None
+        and re.fullmatch(r"[0-9]{20}", parts[2]) is not None
+        and re.fullmatch(r"[0-9a-f]{32}", parts[3]) is not None
+        and re.fullmatch(r"[0-9a-f]{64}", parts[4]) is not None,
+        "openfga",
+        "identity_publication_fence_invalid",
+    )
+    attempt = int(parts[1])
+    revision = int(parts[2])
+    require(
+        revision > 0 and attempt > 0,
+        "openfga",
+        "identity_publication_fence_invalid",
+    )
+    return parts[0], attempt
 
 
 def openfga_handler() -> type[http.server.BaseHTTPRequestHandler]:
@@ -719,6 +874,132 @@ def openfga_handler() -> type[http.server.BaseHTTPRequestHandler]:
                 require(0 < length <= 2_000_000, "openfga", "invalid_request_size")
                 body = json.loads(self.rfile.read(length))
                 allowed = mode == "allow"
+                if self.path == f"/stores/{STORE_ID}/read":
+                    require(body.get("page_size") == 100, "openfga", "read_page_size_invalid")
+                    require(
+                        body.get("consistency") == "HIGHER_CONSISTENCY",
+                        "openfga",
+                        "read_consistency_invalid",
+                    )
+                    require(not body.get("continuation_token"), "openfga", "unexpected_continuation")
+                    key = body.get("tuple_key")
+                    require(isinstance(key, dict), "openfga", "read_filter_invalid")
+                    tuples = [
+                        {
+                            "key": {"user": user, "relation": relation, "object": object_name},
+                            "timestamp": "2026-07-17T00:00:00Z",
+                        }
+                        for user, relation, object_name in state.read_tuples(key)
+                    ]
+                    self._json(200, {"tuples": tuples, "continuation_token": ""})
+                    return
+                if self.path == f"/stores/{STORE_ID}/write":
+                    require(
+                        body.get("authorization_model_id") == MODEL_ID,
+                        "openfga",
+                        "write_model_mismatch",
+                    )
+                    writes = body.get("writes")
+                    deletes = body.get("deletes")
+                    write_tuples: list[Any] = []
+                    delete_tuples: list[Any] = []
+                    if writes is not None:
+                        require(isinstance(writes, dict), "openfga", "writes_invalid")
+                        write_tuples = writes.get("tuple_keys", [])
+                        require(isinstance(write_tuples, list), "openfga", "write_tuples_invalid")
+                    if deletes is not None:
+                        require(isinstance(deletes, dict), "openfga", "deletes_invalid")
+                        delete_tuples = deletes.get("tuple_keys", [])
+                        require(isinstance(delete_tuples, list), "openfga", "delete_tuples_invalid")
+                    require(write_tuples or delete_tuples, "openfga", "empty_tuple_write")
+                    canonical_writes = [_openfga_tuple(item) for item in write_tuples]
+                    canonical_deletes = [_openfga_tuple(item) for item in delete_tuples]
+                    fixed_claim = ("identity_control:claim", "claimed", "identity_control:membership")
+                    tenant_binding = (f"identity_tenant:{TENANT_ID}", "tenant", "identity_control:membership")
+                    control_writes = [item for item in canonical_writes if item[2] == "identity_control:membership"]
+                    control_deletes = [item for item in canonical_deletes if item[2] == "identity_control:membership"]
+                    if fixed_claim in canonical_writes:
+                        require(not canonical_deletes, "openfga", "control_delete_invalid")
+                        require(
+                            writes.get("on_duplicate") == "error",
+                            "openfga",
+                            "control_duplicate_policy_invalid",
+                        )
+                        require(
+                            len(canonical_writes) == 3
+                            and canonical_writes[:2] == [fixed_claim, tenant_binding],
+                            "openfga",
+                            "control_claim_invalid",
+                        )
+                        state_name, attempt = _identity_publication_fence(canonical_writes[2])
+                        require(state_name == "a" and attempt == 1, "openfga", "control_claim_fence_invalid")
+                    elif control_writes or control_deletes:
+                        require(
+                            len(control_writes) == 1 and len(control_deletes) == 1,
+                            "openfga",
+                            "identity_publication_fence_count_invalid",
+                        )
+                        require(
+                            writes is not None
+                            and writes.get("on_duplicate") == "error"
+                            and deletes is not None
+                            and deletes.get("on_missing") == "error",
+                            "openfga",
+                            "identity_publication_conflict_policy_invalid",
+                        )
+                        _, previous_attempt = _identity_publication_fence(control_deletes[0])
+                        _, next_attempt = _identity_publication_fence(control_writes[0])
+                        require(
+                            next_attempt == previous_attempt + 1,
+                            "openfga",
+                            "identity_publication_fence_not_monotonic",
+                        )
+                        require(
+                            len(canonical_writes) + len(canonical_deletes) <= 100,
+                            "openfga",
+                            "identity_publication_batch_too_large",
+                        )
+                        for user, relation, object_name in canonical_writes + canonical_deletes:
+                            if object_name == "identity_control:membership":
+                                continue
+                            require(
+                                user.startswith("user:")
+                                and relation == "member"
+                                and object_name.startswith("group:"),
+                                "openfga",
+                                "identity_membership_tuple_invalid",
+                            )
+                    else:
+                        require(
+                            writes is None or writes.get("on_duplicate") == "ignore",
+                            "openfga",
+                            "duplicate_policy_invalid",
+                        )
+                        require(
+                            deletes is None or deletes.get("on_missing") == "ignore",
+                            "openfga",
+                            "missing_delete_policy_invalid",
+                        )
+                        for user, relation, object_name in canonical_writes + canonical_deletes:
+                            require(
+                                user.startswith("user:")
+                                and relation == "member"
+                                and object_name.startswith("group:"),
+                                "openfga",
+                                "identity_membership_tuple_invalid",
+                            )
+                    duplicate_policy = writes.get("on_duplicate", "error") if writes is not None else "error"
+                    missing_policy = deletes.get("on_missing", "error") if deletes is not None else "error"
+                    if not state.apply_tuples(
+                        canonical_writes,
+                        canonical_deletes,
+                        duplicate_policy,
+                        missing_policy,
+                    ):
+                        self._json(409, {"code": "write_failed_due_to_invalid_input", "message": "tuple conflict"})
+                        return
+                    self._json(200, {})
+                    return
                 if self.path == f"/stores/{STORE_ID}/batch-check":
                     checks = body.get("checks")
                     require(isinstance(checks, list) and checks, "openfga", "missing_checks")
@@ -780,6 +1061,7 @@ def build_environment(
     root: Path,
     fixture_dir: Path,
     fixture: FixtureState,
+    identity_fixture: IdentityFixture,
     control: Path,
     stats: Path,
     model_url: str,
@@ -789,14 +1071,17 @@ def build_environment(
     env = os.environ.copy()
     env.pop("KNOTE_KAG_FAKE", None)
     env.pop(TELEMETRY_ENV, None)
+    env.pop("KNOTE_PERMISSIONED_PRINCIPAL", None)
+    env.pop("KNOTE_PERMISSIONED_IDENTITY_WATERMARK", None)
+    env.pop("KNOTE_IDENTITY_ASSERTION_FD", None)
     env.update({
         "TERM": "xterm-256color",
         "COLUMNS": "120",
         "LINES": "40",
         "KNOTE_RUNTIME_MODE": "eino",
         "KNOTE_PERMISSIONED": "1",
-        "KNOTE_PERMISSIONED_PRINCIPAL": PRINCIPAL_ID,
-        "KNOTE_PERMISSIONED_IDENTITY_WATERMARK": IDENTITY_WATERMARK,
+        "KNOTE_IDENTITY_STORE_PATH": str(identity_fixture.store_path),
+        "KNOTE_IDENTITY_ED25519_PUBLIC_KEY": identity_fixture.public_key,
         "KNOTE_KAG_PERMISSIONED_PROVIDER": "permissioned_binary_provider:create",
         "KNOTE_PERMISSIONED_BINARY_CONTROL": str(control),
         "KNOTE_PERMISSIONED_BINARY_STATS": str(stats),
@@ -839,12 +1124,22 @@ def running_driver(
     root: Path,
     workspace: Path,
     env: dict[str, str],
+    identity_fixture: IdentityFixture,
     resume: str = "",
 ) -> Iterator[PTYDriver]:
     command = [str(binary), "--workspace", str(workspace)]
     if resume:
         command.extend(["--resume", resume])
-    driver = PTYDriver(command, env=env, cwd=root)
+    assertion = identity_fixture.take_assertion().open("rb")
+    descriptor = assertion.fileno()
+    child_env = env.copy()
+    child_env["KNOTE_IDENTITY_ASSERTION_FD"] = str(descriptor)
+    try:
+        os.set_inheritable(descriptor, True)
+        driver = PTYDriver(command, env=child_env, cwd=root)
+    finally:
+        os.set_inheritable(descriptor, False)
+        assertion.close()
     set_pty_size(driver)
     try:
         yield driver
@@ -857,6 +1152,21 @@ def expect_startup(driver: PTYDriver, timeout: float = 20) -> None:
     if not driver.clean():
         driver.poke("\r")
     driver.expect("session ready", timeout=timeout)
+
+
+def expect_startup_failure(driver: PTYDriver, timeout: float = 20) -> str:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        driver.read_once(0.1)
+        code = driver.poll()
+        if code is None:
+            continue
+        output = driver.clean()
+        require(code != 0, "startup", "failure_returned_success")
+        require(FAILURE_MESSAGE in output, "startup", "generic_failure_missing")
+        require("session ready" not in output, "startup", "tui_started_after_failure")
+        return output
+    raise AcceptanceError("startup", "failure_timeout")
 
 
 def run_query(
@@ -1105,6 +1415,7 @@ def run_acceptance(root: Path, binary: Path, run_root: Path) -> dict[str, Any]:
     stats = run_root / "provider-stats.jsonl"
     write_control(control, "success")
     write_private(stats, b"")
+    identity_fixture = initialize_identity_fixture(root, run_root)
 
     allowed = materialize_workspace(run_root / "workspace-allowed")
     denied = materialize_workspace(run_root / "workspace-denied")
@@ -1127,6 +1438,7 @@ def run_acceptance(root: Path, binary: Path, run_root: Path) -> dict[str, Any]:
                 root,
                 fixture_dir,
                 fixture,
+                identity_fixture,
                 control,
                 stats,
                 model_server.url,
@@ -1145,6 +1457,7 @@ def run_acceptance(root: Path, binary: Path, run_root: Path) -> dict[str, Any]:
             root,
             allowed.workspace,
             environment(allowed, allowed_telemetry),
+            identity_fixture,
         ) as driver:
             expect_startup(driver)
             output, observed = run_query(
@@ -1178,7 +1491,7 @@ def run_acceptance(root: Path, binary: Path, run_root: Path) -> dict[str, Any]:
         provider_before = provider_counts(stats)
         model_before = model_state.snapshot()
         fga_before = openfga_state.snapshot()[1]
-        with running_driver(binary, root, allowed.workspace, environment(allowed)) as driver:
+        with running_driver(binary, root, allowed.workspace, environment(allowed), identity_fixture) as driver:
             expect_startup(driver)
             output, observed = run_query(
                 driver,
@@ -1198,28 +1511,15 @@ def run_acceptance(root: Path, binary: Path, run_root: Path) -> dict[str, Any]:
         cases.append("authorized_explain")
 
         fga_before = openfga_state.snapshot()[1]
-        with running_driver(binary, root, allowed.workspace, environment(allowed), session_id) as driver:
+        with running_driver(
+            binary, root, allowed.workspace, environment(allowed), identity_fixture, session_id
+        ) as driver:
             expect_startup(driver)
             driver.expect(AUTHORIZED_TUI_ANSWER, timeout=10)
             output = driver.clean()
         assert_no_leaks(output.replace(AUTHORIZED_TUI_ANSWER, ""), allowed, "authorized_resume")
         require(openfga_state.snapshot()[1] > fga_before, "authorized_resume", "replay_not_reauthorized")
         cases.append("authorized_resume")
-
-        mismatched_env = environment(allowed)
-        mismatched_env["KNOTE_PERMISSIONED_IDENTITY_WATERMARK"] = "identity_permissioned_binary_v2"
-        command = [str(binary), "--workspace", str(allowed.workspace), "--resume", session_id]
-        mismatch_driver = PTYDriver(command, env=mismatched_env, cwd=root)
-        set_pty_size(mismatch_driver)
-        try:
-            mismatch_driver.expect("resume authorization failed", timeout=15)
-            code = mismatch_driver.wait(timeout=5)
-            output = mismatch_driver.clean()
-        finally:
-            mismatch_driver.close()
-        require(code != 0, "permission_bound_resume", "mismatch_was_accepted")
-        assert_no_leaks(output, allowed, "permission_bound_resume")
-        cases.append("permission_bound_resume")
 
         openfga_state.set_mode("deny")
         write_control(control, "success")
@@ -1230,6 +1530,7 @@ def run_acceptance(root: Path, binary: Path, run_root: Path) -> dict[str, Any]:
             root,
             denied.workspace,
             environment(denied, denied_telemetry),
+            identity_fixture,
         ) as driver:
             expect_startup(driver)
             output, _observed = run_query(driver, FAILURE_MESSAGE)
@@ -1240,7 +1541,9 @@ def run_acceptance(root: Path, binary: Path, run_root: Path) -> dict[str, Any]:
         cases.append("denied_query")
 
         fga_before = openfga_state.snapshot()[1]
-        with running_driver(binary, root, allowed.workspace, environment(allowed), session_id) as driver:
+        with running_driver(
+            binary, root, allowed.workspace, environment(allowed), identity_fixture, session_id
+        ) as driver:
             expect_startup(driver)
             driver.read_once(0.5)
             output = driver.clean()
@@ -1248,6 +1551,28 @@ def run_acceptance(root: Path, binary: Path, run_root: Path) -> dict[str, Any]:
         require(AUTHORIZED_TUI_ANSWER not in output, "revoked_resume", "revoked_answer_replayed")
         assert_no_leaks(output, allowed, "revoked_resume")
         cases.append("revoked_resume")
+
+        previous_identity_watermark = identity_fixture.identity_watermark
+        current_identity_watermark = bump_identity_fixture(root, identity_fixture)
+        require(
+            current_identity_watermark != previous_identity_watermark,
+            "permission_bound_resume",
+            "identity_watermark_static",
+        )
+        with running_driver(
+            binary,
+            root,
+            allowed.workspace,
+            environment(allowed),
+            identity_fixture,
+            session_id,
+        ) as mismatch_driver:
+            mismatch_driver.expect("resume authorization failed", timeout=15)
+            code = mismatch_driver.wait(timeout=5)
+            output = mismatch_driver.clean()
+        require(code != 0, "permission_bound_resume", "mismatch_was_accepted")
+        assert_no_leaks(output, allowed, "permission_bound_resume")
+        cases.append("permission_bound_resume")
 
         openfga_state.set_mode("allow")
         write_control(control, "empty")
@@ -1258,6 +1583,7 @@ def run_acceptance(root: Path, binary: Path, run_root: Path) -> dict[str, Any]:
             root,
             empty_result.workspace,
             environment(empty_result, empty_telemetry),
+            identity_fixture,
         ) as driver:
             expect_startup(driver)
             output, _observed = run_query(driver, FAILURE_MESSAGE)
@@ -1277,6 +1603,7 @@ def run_acceptance(root: Path, binary: Path, run_root: Path) -> dict[str, Any]:
             root,
             telemetry_failure.workspace,
             environment(telemetry_failure, unwritable_telemetry),
+            identity_fixture,
         ) as driver:
             expect_startup(driver)
             output, observed = run_query(
@@ -1296,7 +1623,9 @@ def run_acceptance(root: Path, binary: Path, run_root: Path) -> dict[str, Any]:
 
         write_control(control, "provider_failure")
         provider_before = provider_counts(stats)
-        with running_driver(binary, root, provider_failure.workspace, environment(provider_failure)) as driver:
+        with running_driver(
+            binary, root, provider_failure.workspace, environment(provider_failure), identity_fixture
+        ) as driver:
             expect_startup(driver)
             output, _observed = run_query(driver, FAILURE_MESSAGE)
         provider_after = provider_counts(stats)
@@ -1312,9 +1641,10 @@ def run_acceptance(root: Path, binary: Path, run_root: Path) -> dict[str, Any]:
         openfga_state.set_mode("backend_failure")
         write_control(control, "success")
         provider_before = provider_counts(stats)
-        with running_driver(binary, root, backend_failure.workspace, environment(backend_failure)) as driver:
-            expect_startup(driver)
-            output, _observed = run_query(driver, FAILURE_MESSAGE)
+        with running_driver(
+            binary, root, backend_failure.workspace, environment(backend_failure), identity_fixture
+        ) as driver:
+            output = expect_startup_failure(driver)
         require(provider_counts(stats) == provider_before, "backend_failure", "provider_called_after_backend_failure")
         assert_no_leaks(output, backend_failure, "backend_failure")
         assert_no_leaks(session_text(backend_failure.workspace), backend_failure, "backend_failure_session")

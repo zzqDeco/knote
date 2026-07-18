@@ -74,3 +74,6 @@ jobs:
 
       - name: Projection store tests
         run: go test ./internal/catalog/...
+
+      - name: Identity store tests
+        run: go test ./internal/identity/...
