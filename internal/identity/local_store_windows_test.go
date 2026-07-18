@@ -15,7 +15,25 @@ import (
 )
 
 func protectTestStoreRoot(path string) error {
-	return protectPrivateDirectory(path)
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	tooBroad, err := directoryPermissionsTooBroad(path, info.Mode())
+	if err != nil || !tooBroad {
+		return err
+	}
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return err
+	}
+	if len(entries) != 0 {
+		return os.ErrPermission
+	}
+	if err := os.Remove(path); err != nil {
+		return err
+	}
+	return createPrivateDirectoryTree(path)
 }
 
 func TestOpenLocalStoreCreatesProtectedOwnerOnlyDirectoryACLs(t *testing.T) {
