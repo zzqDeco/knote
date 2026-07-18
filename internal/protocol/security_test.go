@@ -7,6 +7,11 @@ import (
 	"time"
 )
 
+const (
+	testDelegationWatermark = "delegation-v1"
+	testScopeFingerprint    = AgentTaskScopeFingerprint("scope_0123456789abcdef0123456789abcdef")
+)
+
 func TestAuthorizationContextRoundTripAndValidation(t *testing.T) {
 	auth := testAuthorizationContext()
 	if err := auth.Validate(); err != nil {
@@ -16,7 +21,14 @@ func TestAuthorizationContextRoundTripAndValidation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal context: %v", err)
 	}
-	for _, field := range []string{"tenant_id", "principal_id", "authorization_model_id", "acl_watermark"} {
+	for _, field := range []string{
+		"tenant_id",
+		"principal_id",
+		"authorization_model_id",
+		"acl_watermark",
+		"delegation_watermark",
+		"agent_task_scope_fingerprint",
+	} {
 		if !strings.Contains(string(data), `"`+field+`"`) {
 			t.Fatalf("serialized context missing %s: %s", field, data)
 		}
@@ -43,6 +55,171 @@ func TestAuthorizationContextRoundTripAndValidation(t *testing.T) {
 	invalid.RequestID = ""
 	if err := invalid.Validate(); err == nil {
 		t.Fatal("missing request id should fail")
+	}
+}
+
+func TestAuthorizationContextAgentTaskBindingIsAllOrNone(t *testing.T) {
+	delegated := testAuthorizationContext()
+	missing := map[string]func(*AuthorizationContext){
+		"agent":                func(value *AuthorizationContext) { value.AgentID = "" },
+		"task":                 func(value *AuthorizationContext) { value.TaskID = "" },
+		"delegation watermark": func(value *AuthorizationContext) { value.DelegationWatermark = "" },
+		"scope fingerprint":    func(value *AuthorizationContext) { value.AgentTaskScopeFingerprint = "" },
+	}
+	for name, mutate := range missing {
+		t.Run("missing "+name, func(t *testing.T) {
+			candidate := delegated
+			mutate(&candidate)
+			if err := candidate.Validate(); err == nil {
+				t.Fatal("partial delegated authorization context was accepted")
+			}
+		})
+	}
+
+	direct := testDirectAuthorizationContext()
+	if err := direct.Validate(); err != nil {
+		t.Fatalf("direct-user authorization context: %v", err)
+	}
+	isolated := map[string]func(*AuthorizationContext){
+		"agent":                func(value *AuthorizationContext) { value.AgentID = delegated.AgentID },
+		"task":                 func(value *AuthorizationContext) { value.TaskID = delegated.TaskID },
+		"delegation watermark": func(value *AuthorizationContext) { value.DelegationWatermark = delegated.DelegationWatermark },
+		"scope fingerprint": func(value *AuthorizationContext) {
+			value.AgentTaskScopeFingerprint = delegated.AgentTaskScopeFingerprint
+		},
+	}
+	for name, mutate := range isolated {
+		t.Run("isolated "+name, func(t *testing.T) {
+			candidate := direct
+			mutate(&candidate)
+			if err := candidate.Validate(); err == nil {
+				t.Fatal("legacy partial authorization context was accepted")
+			}
+		})
+	}
+
+	malformed := delegated
+	malformed.AgentTaskScopeFingerprint = "scope_not-a-valid-fingerprint"
+	if err := malformed.Validate(); err == nil {
+		t.Fatal("malformed scope fingerprint was accepted")
+	}
+	malformed = delegated
+	malformed.DelegationWatermark = "delegation\nwatermark"
+	if err := malformed.Validate(); err == nil {
+		t.Fatal("malformed delegation watermark was accepted")
+	}
+
+	data, err := json.Marshal(direct)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"agent_id", "task_id", "delegation_watermark", "agent_task_scope_fingerprint"} {
+		if strings.Contains(string(data), `"`+field+`"`) {
+			t.Fatalf("direct-user JSON contains delegated field %q: %s", field, data)
+		}
+	}
+}
+
+func TestAuthorizationContextValidatesExactAgentTaskScope(t *testing.T) {
+	issuedAt := time.Date(2026, time.July, 18, 8, 0, 0, 0, time.UTC)
+	scope := testAgentTaskScope(testAuthorizationContext(), issuedAt, issuedAt.Add(time.Hour))
+	fingerprint, err := NewAgentTaskScopeFingerprint(scope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	auth := testAuthorizationContext()
+	auth.AgentTaskScopeFingerprint = fingerprint
+	if err := auth.ValidateAgentTaskScope(scope, scope.DelegationWatermark, issuedAt.Add(time.Minute)); err != nil {
+		t.Fatalf("exact agent task scope: %v", err)
+	}
+
+	tests := map[string]struct {
+		auth  AuthorizationContext
+		scope AgentTaskScope
+		at    time.Time
+	}{
+		"fingerprint tampering": {
+			auth: func() AuthorizationContext {
+				value := auth
+				value.AgentTaskScopeFingerprint = testScopeFingerprint
+				return value
+			}(),
+			scope: scope,
+			at:    issuedAt.Add(time.Minute),
+		},
+		"scope expiry drift": {
+			auth: auth,
+			scope: func() AgentTaskScope {
+				value := scope
+				value.ExpiresAt = value.ExpiresAt.Add(time.Minute)
+				return value
+			}(),
+			at: issuedAt.Add(time.Minute),
+		},
+		"model drift": {
+			auth: func() AuthorizationContext {
+				value := auth
+				value.AuthorizationModelID = "model-v2"
+				return value
+			}(),
+			scope: scope,
+			at:    issuedAt.Add(time.Minute),
+		},
+		"agent scope mismatch": {
+			auth: func() AuthorizationContext {
+				value := auth
+				value.AgentID = "agent-2"
+				return value
+			}(),
+			scope: scope,
+			at:    issuedAt.Add(time.Minute),
+		},
+		"identity watermark drift": {
+			auth: func() AuthorizationContext {
+				value := auth
+				value.IdentityWatermark = "identity-v2"
+				return value
+			}(),
+			scope: scope,
+			at:    issuedAt.Add(time.Minute),
+		},
+		"acl watermark drift": {
+			auth: func() AuthorizationContext {
+				value := auth
+				value.ACLWatermark = "acl-v2"
+				return value
+			}(),
+			scope: scope,
+			at:    issuedAt.Add(time.Minute),
+		},
+		"delegation watermark drift": {
+			auth: func() AuthorizationContext {
+				value := auth
+				value.DelegationWatermark = "delegation-v2"
+				return value
+			}(),
+			scope: scope,
+			at:    issuedAt.Add(time.Minute),
+		},
+		"expired scope": {
+			auth:  auth,
+			scope: scope,
+			at:    scope.ExpiresAt,
+		},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			if err := test.auth.ValidateAgentTaskScope(
+				test.scope, test.scope.DelegationWatermark, test.at,
+			); err == nil {
+				t.Fatal("drifted or tampered agent task scope was accepted")
+			}
+		})
+	}
+
+	direct := testDirectAuthorizationContext()
+	if err := direct.ValidateAgentTaskScope(scope, scope.DelegationWatermark, issuedAt.Add(time.Minute)); err == nil {
+		t.Fatal("direct-user authorization context accepted a delegated scope")
 	}
 }
 
@@ -303,20 +480,22 @@ func TestEvidencePackageBinding(t *testing.T) {
 		Evidence: []ResourceHandle{resource}, Complete: true,
 	}
 	pkg := EvidencePackage{
-		Version:               SecurityContractVersion,
-		TenantID:              auth.TenantID,
-		KnowledgeBaseID:       auth.KnowledgeBaseID,
-		PrincipalID:           auth.PrincipalID,
-		SessionID:             auth.SessionID,
-		RequestID:             auth.RequestID,
-		AgentID:               auth.AgentID,
-		TaskID:                auth.TaskID,
-		AuthorizationModelID:  auth.AuthorizationModelID,
-		IdentityWatermark:     auth.IdentityWatermark,
-		ACLWatermark:          auth.ACLWatermark,
-		Consistency:           auth.Consistency,
-		ProjectionVersion:     resource.Versions.Projection,
-		VisibilityFingerprint: fingerprint,
+		Version:                   SecurityContractVersion,
+		TenantID:                  auth.TenantID,
+		KnowledgeBaseID:           auth.KnowledgeBaseID,
+		PrincipalID:               auth.PrincipalID,
+		SessionID:                 auth.SessionID,
+		RequestID:                 auth.RequestID,
+		AgentID:                   auth.AgentID,
+		TaskID:                    auth.TaskID,
+		DelegationWatermark:       auth.DelegationWatermark,
+		AgentTaskScopeFingerprint: auth.AgentTaskScopeFingerprint,
+		AuthorizationModelID:      auth.AuthorizationModelID,
+		IdentityWatermark:         auth.IdentityWatermark,
+		ACLWatermark:              auth.ACLWatermark,
+		Consistency:               auth.Consistency,
+		ProjectionVersion:         resource.Versions.Projection,
+		VisibilityFingerprint:     fingerprint,
 		Items: []EvidenceItem{{
 			Resource: resource, Content: "authorized content", Derivation: DerivationAnySupport,
 			Supports: []ProvenanceSupport{support}, Citation: Citation{Handle: "citation-1", Resource: resource},
@@ -491,20 +670,22 @@ func TestEntityEvidenceRequiresAuthorizedSourceSupport(t *testing.T) {
 		t.Fatal(err)
 	}
 	pkg := EvidencePackage{
-		Version:               SecurityContractVersion,
-		TenantID:              auth.TenantID,
-		KnowledgeBaseID:       auth.KnowledgeBaseID,
-		PrincipalID:           auth.PrincipalID,
-		SessionID:             auth.SessionID,
-		RequestID:             auth.RequestID,
-		AgentID:               auth.AgentID,
-		TaskID:                auth.TaskID,
-		AuthorizationModelID:  auth.AuthorizationModelID,
-		IdentityWatermark:     auth.IdentityWatermark,
-		ACLWatermark:          auth.ACLWatermark,
-		Consistency:           auth.Consistency,
-		ProjectionVersion:     entity.Versions.Projection,
-		VisibilityFingerprint: fingerprint,
+		Version:                   SecurityContractVersion,
+		TenantID:                  auth.TenantID,
+		KnowledgeBaseID:           auth.KnowledgeBaseID,
+		PrincipalID:               auth.PrincipalID,
+		SessionID:                 auth.SessionID,
+		RequestID:                 auth.RequestID,
+		AgentID:                   auth.AgentID,
+		TaskID:                    auth.TaskID,
+		DelegationWatermark:       auth.DelegationWatermark,
+		AgentTaskScopeFingerprint: auth.AgentTaskScopeFingerprint,
+		AuthorizationModelID:      auth.AuthorizationModelID,
+		IdentityWatermark:         auth.IdentityWatermark,
+		ACLWatermark:              auth.ACLWatermark,
+		Consistency:               auth.Consistency,
+		ProjectionVersion:         entity.Versions.Projection,
+		VisibilityFingerprint:     fingerprint,
 		Items: []EvidenceItem{{
 			Resource: entity, Content: "knote", Derivation: DerivationAnySupport,
 			Supports: []ProvenanceSupport{{
@@ -556,6 +737,7 @@ func TestNestedEntityProvenanceRequiresAuthorizedSourceSupport(t *testing.T) {
 		PrincipalID: auth.PrincipalID, SessionID: auth.SessionID, RequestID: auth.RequestID,
 		AgentID: auth.AgentID, TaskID: auth.TaskID, AuthorizationModelID: auth.AuthorizationModelID,
 		IdentityWatermark: auth.IdentityWatermark, ACLWatermark: auth.ACLWatermark,
+		DelegationWatermark: auth.DelegationWatermark, AgentTaskScopeFingerprint: auth.AgentTaskScopeFingerprint,
 		Consistency: auth.Consistency, ProjectionVersion: document.Versions.Projection,
 		VisibilityFingerprint: fingerprint,
 		Items: []EvidenceItem{{
@@ -614,6 +796,7 @@ func TestDerivedArtifactDefaultsToAllRequiredProvenance(t *testing.T) {
 		PrincipalID: auth.PrincipalID, SessionID: auth.SessionID, RequestID: auth.RequestID,
 		AgentID: auth.AgentID, TaskID: auth.TaskID, AuthorizationModelID: auth.AuthorizationModelID,
 		IdentityWatermark: auth.IdentityWatermark, ACLWatermark: auth.ACLWatermark,
+		DelegationWatermark: auth.DelegationWatermark, AgentTaskScopeFingerprint: auth.AgentTaskScopeFingerprint,
 		Consistency: auth.Consistency, ProjectionVersion: artifact.Versions.Projection,
 		VisibilityFingerprint: fingerprint,
 		Items: []EvidenceItem{{
@@ -662,18 +845,46 @@ func TestActionApprovalCompatibilityAliases(t *testing.T) {
 
 func testAuthorizationContext() AuthorizationContext {
 	return AuthorizationContext{
-		Version:              SecurityContractVersion,
-		TenantID:             "local",
-		KnowledgeBaseID:      "default",
-		PrincipalID:          "local-user",
-		SessionID:            "session-1",
-		RequestID:            "request-1",
-		AgentID:              "agent-1",
-		TaskID:               "task-1",
-		AuthorizationModelID: "local-v1",
-		IdentityWatermark:    "identity-v1",
-		ACLWatermark:         "acl-v1",
-		Consistency:          ConsistencyHigherConsistency,
+		Version:                   SecurityContractVersion,
+		TenantID:                  "local",
+		KnowledgeBaseID:           "default",
+		PrincipalID:               "local-user",
+		SessionID:                 "session-1",
+		RequestID:                 "request-1",
+		AgentID:                   "agent-1",
+		TaskID:                    "task-1",
+		DelegationWatermark:       testDelegationWatermark,
+		AgentTaskScopeFingerprint: testScopeFingerprint,
+		AuthorizationModelID:      "local-v1",
+		IdentityWatermark:         "identity-v1",
+		ACLWatermark:              "acl-v1",
+		Consistency:               ConsistencyHigherConsistency,
+	}
+}
+
+func testDirectAuthorizationContext() AuthorizationContext {
+	auth := testAuthorizationContext()
+	auth.AgentID = ""
+	auth.TaskID = ""
+	auth.DelegationWatermark = ""
+	auth.AgentTaskScopeFingerprint = ""
+	return auth
+}
+
+func testAgentTaskScope(auth AuthorizationContext, issuedAt, expiresAt time.Time) AgentTaskScope {
+	return AgentTaskScope{
+		Version:              EnterpriseContractVersion,
+		TenantID:             auth.TenantID,
+		KnowledgeBaseID:      auth.KnowledgeBaseID,
+		PrincipalID:          auth.PrincipalID,
+		AgentID:              auth.AgentID,
+		TaskID:               auth.TaskID,
+		AuthorizationModelID: auth.AuthorizationModelID,
+		IdentityWatermark:    auth.IdentityWatermark,
+		ACLWatermark:         auth.ACLWatermark,
+		DelegationWatermark:  auth.DelegationWatermark,
+		IssuedAt:             issuedAt,
+		ExpiresAt:            expiresAt,
 	}
 }
 
@@ -684,20 +895,22 @@ func testEvidencePackage(t *testing.T, auth AuthorizationContext, resource Resou
 		t.Fatalf("visibility fingerprint: %v", err)
 	}
 	return EvidencePackage{
-		Version:               SecurityContractVersion,
-		TenantID:              auth.TenantID,
-		KnowledgeBaseID:       auth.KnowledgeBaseID,
-		PrincipalID:           auth.PrincipalID,
-		SessionID:             auth.SessionID,
-		RequestID:             auth.RequestID,
-		AgentID:               auth.AgentID,
-		TaskID:                auth.TaskID,
-		AuthorizationModelID:  auth.AuthorizationModelID,
-		IdentityWatermark:     auth.IdentityWatermark,
-		ACLWatermark:          auth.ACLWatermark,
-		Consistency:           auth.Consistency,
-		ProjectionVersion:     resource.Versions.Projection,
-		VisibilityFingerprint: fingerprint,
+		Version:                   SecurityContractVersion,
+		TenantID:                  auth.TenantID,
+		KnowledgeBaseID:           auth.KnowledgeBaseID,
+		PrincipalID:               auth.PrincipalID,
+		SessionID:                 auth.SessionID,
+		RequestID:                 auth.RequestID,
+		AgentID:                   auth.AgentID,
+		TaskID:                    auth.TaskID,
+		DelegationWatermark:       auth.DelegationWatermark,
+		AgentTaskScopeFingerprint: auth.AgentTaskScopeFingerprint,
+		AuthorizationModelID:      auth.AuthorizationModelID,
+		IdentityWatermark:         auth.IdentityWatermark,
+		ACLWatermark:              auth.ACLWatermark,
+		Consistency:               auth.Consistency,
+		ProjectionVersion:         resource.Versions.Projection,
+		VisibilityFingerprint:     fingerprint,
 		Items: []EvidenceItem{{
 			Resource:   resource,
 			Content:    "authorized content",
@@ -737,7 +950,9 @@ func testDecision(t *testing.T, id ResourceID) AuthorizationDecision {
 	decision := AuthorizationDecision{
 		CorrelationID: "decision-1", RequestID: "request-1", SessionID: "session-1", PrincipalID: "local-user",
 		AgentID: "agent-1", TaskID: "task-1",
-		Relation: EvidenceReadRelation, Resource: resource, AuthorizationResource: resource,
+		DelegationWatermark:       testDelegationWatermark,
+		AgentTaskScopeFingerprint: testScopeFingerprint,
+		Relation:                  EvidenceReadRelation, Resource: resource, AuthorizationResource: resource,
 		Outcome: DecisionAllow, AuthorizationModelID: "local-v1", IdentityWatermark: "identity-v1",
 		ACLWatermark: "acl-v1", Consistency: ConsistencyHigherConsistency,
 		CheckedAt: time.Unix(1, 0).UTC(),

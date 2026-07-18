@@ -11,18 +11,20 @@ const SessionAuthorizationEnvelopeVersion = "v1"
 // state that created it. RequestID is intentionally excluded because it is
 // scoped to a single request rather than the session.
 type SessionAuthorizationEnvelope struct {
-	Version              string                `json:"version"`
-	TenantID             string                `json:"tenant_id"`
-	KnowledgeBaseID      string                `json:"knowledge_base_id"`
-	PrincipalID          string                `json:"principal_id"`
-	SessionID            string                `json:"session_id"`
-	AuthorizationModelID string                `json:"authorization_model_id"`
-	IdentityWatermark    string                `json:"identity_watermark"`
-	ACLWatermark         string                `json:"acl_watermark"`
-	AgentID              string                `json:"agent_id,omitempty"`
-	TaskID               string                `json:"task_id,omitempty"`
-	Consistency          ConsistencyPreference `json:"consistency"`
-	BoundAt              time.Time             `json:"bound_at"`
+	Version                   string                    `json:"version"`
+	TenantID                  string                    `json:"tenant_id"`
+	KnowledgeBaseID           string                    `json:"knowledge_base_id"`
+	PrincipalID               string                    `json:"principal_id"`
+	SessionID                 string                    `json:"session_id"`
+	AuthorizationModelID      string                    `json:"authorization_model_id"`
+	IdentityWatermark         string                    `json:"identity_watermark"`
+	ACLWatermark              string                    `json:"acl_watermark"`
+	AgentID                   string                    `json:"agent_id,omitempty"`
+	TaskID                    string                    `json:"task_id,omitempty"`
+	DelegationWatermark       string                    `json:"delegation_watermark,omitempty"`
+	AgentTaskScopeFingerprint AgentTaskScopeFingerprint `json:"agent_task_scope_fingerprint,omitempty"`
+	Consistency               ConsistencyPreference     `json:"consistency"`
+	BoundAt                   time.Time                 `json:"bound_at"`
 }
 
 func NewSessionAuthorizationEnvelope(auth AuthorizationContext, boundAt time.Time) (SessionAuthorizationEnvelope, error) {
@@ -30,18 +32,20 @@ func NewSessionAuthorizationEnvelope(auth AuthorizationContext, boundAt time.Tim
 		return SessionAuthorizationEnvelope{}, err
 	}
 	envelope := SessionAuthorizationEnvelope{
-		Version:              SessionAuthorizationEnvelopeVersion,
-		TenantID:             auth.TenantID,
-		KnowledgeBaseID:      auth.KnowledgeBaseID,
-		PrincipalID:          auth.PrincipalID,
-		SessionID:            auth.SessionID,
-		AuthorizationModelID: auth.AuthorizationModelID,
-		IdentityWatermark:    auth.IdentityWatermark,
-		ACLWatermark:         auth.ACLWatermark,
-		AgentID:              auth.AgentID,
-		TaskID:               auth.TaskID,
-		Consistency:          auth.Consistency,
-		BoundAt:              boundAt.UTC(),
+		Version:                   SessionAuthorizationEnvelopeVersion,
+		TenantID:                  auth.TenantID,
+		KnowledgeBaseID:           auth.KnowledgeBaseID,
+		PrincipalID:               auth.PrincipalID,
+		SessionID:                 auth.SessionID,
+		AuthorizationModelID:      auth.AuthorizationModelID,
+		IdentityWatermark:         auth.IdentityWatermark,
+		ACLWatermark:              auth.ACLWatermark,
+		AgentID:                   auth.AgentID,
+		TaskID:                    auth.TaskID,
+		DelegationWatermark:       auth.DelegationWatermark,
+		AgentTaskScopeFingerprint: auth.AgentTaskScopeFingerprint,
+		Consistency:               auth.Consistency,
+		BoundAt:                   boundAt.UTC(),
 	}
 	if err := envelope.Validate(); err != nil {
 		return SessionAuthorizationEnvelope{}, err
@@ -71,15 +75,13 @@ func (e SessionAuthorizationEnvelope) Validate() error {
 	if e.Version != SessionAuthorizationEnvelopeVersion {
 		return fmt.Errorf("unsupported session authorization envelope version %q", e.Version)
 	}
-	if e.AgentID != "" {
-		if err := validateToken("agent_id", e.AgentID); err != nil {
-			return err
-		}
-	}
-	if e.TaskID != "" {
-		if err := validateToken("task_id", e.TaskID); err != nil {
-			return err
-		}
+	if err := validateAgentTaskBinding(
+		e.AgentID,
+		e.TaskID,
+		e.DelegationWatermark,
+		e.AgentTaskScopeFingerprint,
+	); err != nil {
+		return err
 	}
 	switch e.Consistency {
 	case ConsistencyMinimizeLatency, ConsistencyHigherConsistency:
@@ -116,6 +118,8 @@ func (e SessionAuthorizationEnvelope) ValidateFor(auth AuthorizationContext) err
 		{"acl_watermark", e.ACLWatermark, auth.ACLWatermark},
 		{"agent_id", e.AgentID, auth.AgentID},
 		{"task_id", e.TaskID, auth.TaskID},
+		{"delegation_watermark", e.DelegationWatermark, auth.DelegationWatermark},
+		{"agent_task_scope_fingerprint", string(e.AgentTaskScopeFingerprint), string(auth.AgentTaskScopeFingerprint)},
 		{"consistency", string(e.Consistency), string(auth.Consistency)},
 	}
 	for _, binding := range bindings {

@@ -434,3 +434,33 @@ tests:
         object: claim:cross-tenant
         assertions:
           can_view: false
+
+  - name: agent-task-intersection
+    tuples:
+      - user: user:alice
+        relation: member
+        object: organization:acme
+      - user: organization:acme
+        relation: organization
+        object: document:scoped
+      - user: user:alice
+        relation: viewer
+        object: document:scoped
+      - user: user:alice
+        relation: delegate
+        object: agent:research
+      - user: agent:research
+        relation: agent
+        object: task:answer
+      - user: user:alice
+        relation: assignee
+        object: task:answer
+      - user: task:answer
+        relation: active_task
+        object: document:scoped
+    check:
+      - user: user:alice
+        object: document:scoped
+        assertions:
+          can_view: true
+          can_view_in_task: true

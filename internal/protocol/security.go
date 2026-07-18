@@ -21,18 +21,20 @@ const (
 )
 
 type AuthorizationContext struct {
-	Version              string                `json:"version"`
-	TenantID             string                `json:"tenant_id"`
-	KnowledgeBaseID      string                `json:"knowledge_base_id"`
-	PrincipalID          string                `json:"principal_id"`
-	SessionID            string                `json:"session_id"`
-	RequestID            string                `json:"request_id"`
-	AuthorizationModelID string                `json:"authorization_model_id"`
-	IdentityWatermark    string                `json:"identity_watermark"`
-	ACLWatermark         string                `json:"acl_watermark"`
-	AgentID              string                `json:"agent_id,omitempty"`
-	TaskID               string                `json:"task_id,omitempty"`
-	Consistency          ConsistencyPreference `json:"consistency"`
+	Version                   string                    `json:"version"`
+	TenantID                  string                    `json:"tenant_id"`
+	KnowledgeBaseID           string                    `json:"knowledge_base_id"`
+	PrincipalID               string                    `json:"principal_id"`
+	SessionID                 string                    `json:"session_id"`
+	RequestID                 string                    `json:"request_id"`
+	AuthorizationModelID      string                    `json:"authorization_model_id"`
+	IdentityWatermark         string                    `json:"identity_watermark"`
+	ACLWatermark              string                    `json:"acl_watermark"`
+	AgentID                   string                    `json:"agent_id,omitempty"`
+	TaskID                    string                    `json:"task_id,omitempty"`
+	DelegationWatermark       string                    `json:"delegation_watermark,omitempty"`
+	AgentTaskScopeFingerprint AgentTaskScopeFingerprint `json:"agent_task_scope_fingerprint,omitempty"`
+	Consistency               ConsistencyPreference     `json:"consistency"`
 }
 
 func (c AuthorizationContext) Validate() error {
@@ -55,15 +57,13 @@ func (c AuthorizationContext) Validate() error {
 	if c.Version != SecurityContractVersion {
 		return fmt.Errorf("unsupported authorization context version %q", c.Version)
 	}
-	if c.AgentID != "" {
-		if err := validateToken("agent_id", c.AgentID); err != nil {
-			return err
-		}
-	}
-	if c.TaskID != "" {
-		if err := validateToken("task_id", c.TaskID); err != nil {
-			return err
-		}
+	if err := validateAgentTaskBinding(
+		c.AgentID,
+		c.TaskID,
+		c.DelegationWatermark,
+		c.AgentTaskScopeFingerprint,
+	); err != nil {
+		return err
 	}
 	switch c.Consistency {
 	case ConsistencyMinimizeLatency, ConsistencyHigherConsistency:
@@ -71,6 +71,62 @@ func (c AuthorizationContext) Validate() error {
 	default:
 		return fmt.Errorf("unsupported consistency preference %q", c.Consistency)
 	}
+}
+
+// ValidateAgentTaskScope verifies that the trusted delegated binding matches
+// the exact, currently valid scope that produced its fingerprint.
+func (c AuthorizationContext) ValidateAgentTaskScope(
+	scope AgentTaskScope,
+	currentDelegationWatermark string,
+	at time.Time,
+) error {
+	if err := c.Validate(); err != nil {
+		return err
+	}
+	if c.AgentID == "" {
+		return fmt.Errorf("authorization context is not bound to an agent task scope")
+	}
+	if err := scope.ValidateFor(c, currentDelegationWatermark, at); err != nil {
+		return err
+	}
+	fingerprint, err := NewAgentTaskScopeFingerprint(scope)
+	if err != nil {
+		return err
+	}
+	if fingerprint != c.AgentTaskScopeFingerprint {
+		return fmt.Errorf("agent task scope fingerprint does not match the authorization context")
+	}
+	return nil
+}
+
+func validateAgentTaskBinding(
+	agentID string,
+	taskID string,
+	delegationWatermark string,
+	fingerprint AgentTaskScopeFingerprint,
+) error {
+	present := 0
+	for _, value := range []string{agentID, taskID, delegationWatermark, string(fingerprint)} {
+		if value != "" {
+			present++
+		}
+	}
+	if present == 0 {
+		return nil
+	}
+	if present != 4 {
+		return fmt.Errorf("agent task binding requires agent_id, task_id, delegation_watermark, and agent_task_scope_fingerprint together")
+	}
+	for name, value := range map[string]string{
+		"agent_id":             agentID,
+		"task_id":              taskID,
+		"delegation_watermark": delegationWatermark,
+	} {
+		if err := validateToken(name, value); err != nil {
+			return err
+		}
+	}
+	return fingerprint.Validate()
 }
 
 type ResourceID string
@@ -292,21 +348,23 @@ const (
 )
 
 type AuthorizationDecision struct {
-	CorrelationID         string                `json:"correlation_id"`
-	RequestID             string                `json:"request_id"`
-	SessionID             string                `json:"session_id"`
-	PrincipalID           string                `json:"principal_id"`
-	AgentID               string                `json:"agent_id,omitempty"`
-	TaskID                string                `json:"task_id,omitempty"`
-	Relation              string                `json:"relation"`
-	Resource              ResourceHandle        `json:"resource"`
-	AuthorizationResource ResourceHandle        `json:"authorization_resource"`
-	Outcome               DecisionOutcome       `json:"outcome"`
-	AuthorizationModelID  string                `json:"authorization_model_id"`
-	IdentityWatermark     string                `json:"identity_watermark"`
-	ACLWatermark          string                `json:"acl_watermark"`
-	Consistency           ConsistencyPreference `json:"consistency"`
-	CheckedAt             time.Time             `json:"checked_at"`
+	CorrelationID             string                    `json:"correlation_id"`
+	RequestID                 string                    `json:"request_id"`
+	SessionID                 string                    `json:"session_id"`
+	PrincipalID               string                    `json:"principal_id"`
+	AgentID                   string                    `json:"agent_id,omitempty"`
+	TaskID                    string                    `json:"task_id,omitempty"`
+	DelegationWatermark       string                    `json:"delegation_watermark,omitempty"`
+	AgentTaskScopeFingerprint AgentTaskScopeFingerprint `json:"agent_task_scope_fingerprint,omitempty"`
+	Relation                  string                    `json:"relation"`
+	Resource                  ResourceHandle            `json:"resource"`
+	AuthorizationResource     ResourceHandle            `json:"authorization_resource"`
+	Outcome                   DecisionOutcome           `json:"outcome"`
+	AuthorizationModelID      string                    `json:"authorization_model_id"`
+	IdentityWatermark         string                    `json:"identity_watermark"`
+	ACLWatermark              string                    `json:"acl_watermark"`
+	Consistency               ConsistencyPreference     `json:"consistency"`
+	CheckedAt                 time.Time                 `json:"checked_at"`
 }
 
 func (d AuthorizationDecision) Authorized() bool {
@@ -328,15 +386,13 @@ func (d AuthorizationDecision) Validate() error {
 			return err
 		}
 	}
-	if d.AgentID != "" {
-		if err := validateToken("agent_id", d.AgentID); err != nil {
-			return err
-		}
-	}
-	if d.TaskID != "" {
-		if err := validateToken("task_id", d.TaskID); err != nil {
-			return err
-		}
+	if err := validateAgentTaskBinding(
+		d.AgentID,
+		d.TaskID,
+		d.DelegationWatermark,
+		d.AgentTaskScopeFingerprint,
+	); err != nil {
+		return err
 	}
 	if err := d.Resource.Validate(); err != nil {
 		return err
@@ -380,6 +436,8 @@ func (d AuthorizationDecision) ValidateFor(auth AuthorizationContext) error {
 		{"principal_id", d.PrincipalID, auth.PrincipalID},
 		{"agent_id", d.AgentID, auth.AgentID},
 		{"task_id", d.TaskID, auth.TaskID},
+		{"delegation_watermark", d.DelegationWatermark, auth.DelegationWatermark},
+		{"agent_task_scope_fingerprint", string(d.AgentTaskScopeFingerprint), string(auth.AgentTaskScopeFingerprint)},
 		{"authorization_model_id", d.AuthorizationModelID, auth.AuthorizationModelID},
 		{"identity_watermark", d.IdentityWatermark, auth.IdentityWatermark},
 		{"acl_watermark", d.ACLWatermark, auth.ACLWatermark},
@@ -445,7 +503,8 @@ func NewVisibilityFingerprint(auth AuthorizationContext, projectionVersion strin
 	parts := []string{
 		auth.Version, auth.TenantID, auth.KnowledgeBaseID, auth.PrincipalID,
 		auth.AuthorizationModelID, auth.IdentityWatermark, auth.ACLWatermark,
-		auth.AgentID, auth.TaskID, string(auth.Consistency), projectionVersion,
+		auth.AgentID, auth.TaskID, auth.DelegationWatermark,
+		string(auth.AgentTaskScopeFingerprint), string(auth.Consistency), projectionVersion,
 	}
 	sum := sha256.Sum256([]byte(strings.Join(parts, "\x00")))
 	return VisibilityFingerprint("vis_" + hex.EncodeToString(sum[:16])), nil
@@ -465,22 +524,24 @@ type EvidenceItem struct {
 }
 
 type EvidencePackage struct {
-	Version               string                  `json:"version"`
-	TenantID              string                  `json:"tenant_id"`
-	KnowledgeBaseID       string                  `json:"knowledge_base_id"`
-	PrincipalID           string                  `json:"principal_id"`
-	SessionID             string                  `json:"session_id"`
-	RequestID             string                  `json:"request_id"`
-	AgentID               string                  `json:"agent_id,omitempty"`
-	TaskID                string                  `json:"task_id,omitempty"`
-	AuthorizationModelID  string                  `json:"authorization_model_id"`
-	IdentityWatermark     string                  `json:"identity_watermark"`
-	ACLWatermark          string                  `json:"acl_watermark"`
-	Consistency           ConsistencyPreference   `json:"consistency"`
-	ProjectionVersion     string                  `json:"projection_version"`
-	VisibilityFingerprint VisibilityFingerprint   `json:"visibility_fingerprint"`
-	Items                 []EvidenceItem          `json:"items"`
-	Decisions             []AuthorizationDecision `json:"decisions"`
+	Version                   string                    `json:"version"`
+	TenantID                  string                    `json:"tenant_id"`
+	KnowledgeBaseID           string                    `json:"knowledge_base_id"`
+	PrincipalID               string                    `json:"principal_id"`
+	SessionID                 string                    `json:"session_id"`
+	RequestID                 string                    `json:"request_id"`
+	AgentID                   string                    `json:"agent_id,omitempty"`
+	TaskID                    string                    `json:"task_id,omitempty"`
+	DelegationWatermark       string                    `json:"delegation_watermark,omitempty"`
+	AgentTaskScopeFingerprint AgentTaskScopeFingerprint `json:"agent_task_scope_fingerprint,omitempty"`
+	AuthorizationModelID      string                    `json:"authorization_model_id"`
+	IdentityWatermark         string                    `json:"identity_watermark"`
+	ACLWatermark              string                    `json:"acl_watermark"`
+	Consistency               ConsistencyPreference     `json:"consistency"`
+	ProjectionVersion         string                    `json:"projection_version"`
+	VisibilityFingerprint     VisibilityFingerprint     `json:"visibility_fingerprint"`
+	Items                     []EvidenceItem            `json:"items"`
+	Decisions                 []AuthorizationDecision   `json:"decisions"`
 }
 
 func (p EvidencePackage) ValidateFor(auth AuthorizationContext) error {
@@ -502,6 +563,8 @@ func (p EvidencePackage) ValidateFor(auth AuthorizationContext) error {
 		{"request_id", p.RequestID, auth.RequestID},
 		{"agent_id", p.AgentID, auth.AgentID},
 		{"task_id", p.TaskID, auth.TaskID},
+		{"delegation_watermark", p.DelegationWatermark, auth.DelegationWatermark},
+		{"agent_task_scope_fingerprint", string(p.AgentTaskScopeFingerprint), string(auth.AgentTaskScopeFingerprint)},
 		{"authorization_model_id", p.AuthorizationModelID, auth.AuthorizationModelID},
 		{"identity_watermark", p.IdentityWatermark, auth.IdentityWatermark},
 		{"acl_watermark", p.ACLWatermark, auth.ACLWatermark},
@@ -543,7 +606,9 @@ func (p EvidencePackage) ValidateFor(auth AuthorizationContext) error {
 			return fmt.Errorf("decision authorization binding does not match evidence package")
 		}
 		if decision.RequestID != p.RequestID || decision.SessionID != p.SessionID ||
-			decision.PrincipalID != p.PrincipalID || decision.AgentID != p.AgentID || decision.TaskID != p.TaskID {
+			decision.PrincipalID != p.PrincipalID || decision.AgentID != p.AgentID || decision.TaskID != p.TaskID ||
+			decision.DelegationWatermark != p.DelegationWatermark ||
+			decision.AgentTaskScopeFingerprint != p.AgentTaskScopeFingerprint {
 			return fmt.Errorf("decision request binding does not match evidence package")
 		}
 		if decision.Relation != EvidenceReadRelation {

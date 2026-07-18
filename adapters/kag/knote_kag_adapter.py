@@ -120,11 +120,20 @@ AUTHORIZATION_REQUIRED_FIELDS = frozenset(
         "consistency",
     }
 )
-AUTHORIZATION_OPTIONAL_FIELDS = frozenset({"agent_id", "task_id"})
+AUTHORIZATION_AGENT_TASK_FIELDS = frozenset(
+    {
+        "agent_id",
+        "task_id",
+        "delegation_watermark",
+        "agent_task_scope_fingerprint",
+    }
+)
+AUTHORIZATION_OPTIONAL_FIELDS = AUTHORIZATION_AGENT_TASK_FIELDS
 AUTHORIZATION_CONSISTENCY_VALUES = frozenset(
     {"minimize_latency", "higher_consistency"}
 )
 AUTHORIZATION_CONTEXT_VERSION = "v1"
+AGENT_TASK_SCOPE_FINGERPRINT_RE = re.compile(r"scope_[0-9a-f]{32}\Z")
 RESOURCE_ID_RE = re.compile(r"res_[0-9a-f]{32}\Z")
 CONTENT_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 RESOURCE_TYPES = frozenset({"document", "chunk", "entity", "claim", "derived_artifact"})
@@ -1780,6 +1789,13 @@ def validate_authorization(value: Any) -> dict[str, Any]:
             f"{field} has invalid fields ({'; '.join(details)})"
         )
 
+    agent_task_fields = actual & AUTHORIZATION_AGENT_TASK_FIELDS
+    if agent_task_fields and agent_task_fields != AUTHORIZATION_AGENT_TASK_FIELDS:
+        raise AdapterRequestError(
+            f"{field} agent task binding requires agent_id, task_id, "
+            "delegation_watermark, and agent_task_scope_fingerprint together"
+        )
+
     normalized = {
         name: required_authorization_token(value.get(name), f"{field}.{name}")
         for name in sorted(AUTHORIZATION_REQUIRED_FIELDS)
@@ -1795,6 +1811,13 @@ def validate_authorization(value: Any) -> dict[str, Any]:
             normalized[name] = required_authorization_token(
                 value.get(name), f"{field}.{name}"
             )
+    if agent_task_fields and not AGENT_TASK_SCOPE_FINGERPRINT_RE.fullmatch(
+        normalized["agent_task_scope_fingerprint"]
+    ):
+        raise AdapterRequestError(
+            f"{field}.agent_task_scope_fingerprint must match "
+            "scope_<32 lowercase hex characters>"
+        )
     return normalized
 
 

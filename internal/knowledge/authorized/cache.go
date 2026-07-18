@@ -36,6 +36,8 @@ type queryCacheKey struct {
 	aclWatermark        string
 	agentID             string
 	taskID              string
+	delegationWatermark string
+	agentTaskScope      protocol.AgentTaskScopeFingerprint
 	consistency         protocol.ConsistencyPreference
 	retrieverVersion    string
 	promptVersion       string
@@ -106,6 +108,8 @@ func newQueryCacheKey(
 		aclWatermark:        authorization.ACLWatermark,
 		agentID:             authorization.AgentID,
 		taskID:              authorization.TaskID,
+		delegationWatermark: authorization.DelegationWatermark,
+		agentTaskScope:      authorization.AgentTaskScopeFingerprint,
 		consistency:         authorization.Consistency,
 		retrieverVersion:    retrieverVersion,
 		promptVersion:       promptVersion,

@@ -668,7 +668,7 @@ func testProtectedBinding(t *testing.T, authorization protocol.AuthorizationCont
 		},
 		ServingState: protocol.ServingActive,
 	}
-	binding, err := protocol.NewProtectedContentBindingFromResources(authorization.SessionID, authorization.RequestID, []protocol.ProtectedResourceBinding{{
+	binding, err := protocol.NewProtectedContentBindingFromResourcesForAuthorization(authorization, []protocol.ProtectedResourceBinding{{
 		Resource: resource, AuthorizationResource: resource,
 	}})
 	if err != nil {

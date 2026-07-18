@@ -783,6 +783,14 @@ func TestRuntimeStartResumeRejectsChangedAuthorizationBeforeHistoryLoad(t *testi
 		{name: "authorization model", change: func(auth *protocol.AuthorizationContext) { auth.AuthorizationModelID = "local-v2" }},
 		{name: "identity watermark", change: func(auth *protocol.AuthorizationContext) { auth.IdentityWatermark = "identity-v2" }},
 		{name: "acl watermark", change: func(auth *protocol.AuthorizationContext) { auth.ACLWatermark = "acl-v2" }},
+		{name: "agent", change: func(auth *protocol.AuthorizationContext) { auth.AgentID = "agent-2" }},
+		{name: "task", change: func(auth *protocol.AuthorizationContext) { auth.TaskID = "task-2" }},
+		{name: "delegation watermark", change: func(auth *protocol.AuthorizationContext) {
+			auth.DelegationWatermark = "delegation-v2"
+		}},
+		{name: "scope fingerprint", change: func(auth *protocol.AuthorizationContext) {
+			auth.AgentTaskScopeFingerprint = "scope_00000000000000000000000000000002"
+		}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1687,18 +1695,20 @@ func testAuthorizationContextProvider(_ context.Context, sessionID string) (prot
 
 func testAuthorizationContext(sessionID string) protocol.AuthorizationContext {
 	return protocol.AuthorizationContext{
-		Version:              protocol.SecurityContractVersion,
-		TenantID:             "local",
-		KnowledgeBaseID:      "default",
-		PrincipalID:          "local-user",
-		SessionID:            sessionID,
-		RequestID:            "request-1",
-		AgentID:              "agent-1",
-		TaskID:               "task-1",
-		AuthorizationModelID: "local-v1",
-		IdentityWatermark:    "identity-v1",
-		ACLWatermark:         "acl-v1",
-		Consistency:          protocol.ConsistencyHigherConsistency,
+		Version:                   protocol.SecurityContractVersion,
+		TenantID:                  "local",
+		KnowledgeBaseID:           "default",
+		PrincipalID:               "local-user",
+		SessionID:                 sessionID,
+		RequestID:                 "request-1",
+		AgentID:                   "agent-1",
+		TaskID:                    "task-1",
+		DelegationWatermark:       "delegation-v1",
+		AgentTaskScopeFingerprint: "scope_00000000000000000000000000000001",
+		AuthorizationModelID:      "local-v1",
+		IdentityWatermark:         "identity-v1",
+		ACLWatermark:              "acl-v1",
+		Consistency:               protocol.ConsistencyHigherConsistency,
 	}
 }
 

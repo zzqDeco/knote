@@ -33,6 +33,7 @@ type GatewayOptions struct {
 	Clock                Clock
 	MaxAssertionLifetime time.Duration
 	RequestIDs           RequestIDSource
+	AgentTaskScopes      protocol.AgentTaskScopeAuthority
 }
 
 type Gateway struct {
@@ -42,6 +43,7 @@ type Gateway struct {
 	clock                Clock
 	maxAssertionLifetime time.Duration
 	requestIDs           RequestIDSource
+	agentTaskScopes      protocol.AgentTaskScopeAuthority
 }
 
 // AuthenticatedIdentity has no exported fields, so callers cannot construct or
@@ -61,8 +63,7 @@ type AuthorizationScope struct {
 	KnowledgeBaseID      string
 	AuthorizationModelID string
 	ACLWatermark         string
-	AgentID              string
-	TaskID               string
+	AgentTaskScope       *protocol.AgentTaskScope
 	Consistency          protocol.ConsistencyPreference
 }
 
@@ -90,6 +91,7 @@ func NewGateway(
 	return &Gateway{
 		directory: directory, verifier: verifier, nonces: nonces, clock: options.Clock,
 		maxAssertionLifetime: options.MaxAssertionLifetime, requestIDs: options.RequestIDs,
+		agentTaskScopes: options.AgentTaskScopes,
 	}, nil
 }
 
@@ -187,7 +189,23 @@ func (g *Gateway) AuthorizationContext(
 		PrincipalID: snapshot.PrincipalID, SessionID: sessionID, RequestID: requestID,
 		AuthorizationModelID: scope.AuthorizationModelID,
 		IdentityWatermark:    snapshot.Watermark, ACLWatermark: scope.ACLWatermark,
-		AgentID: scope.AgentID, TaskID: scope.TaskID, Consistency: scope.Consistency,
+		Consistency: scope.Consistency,
+	}
+	if scope.AgentTaskScope != nil {
+		delegated := *scope.AgentTaskScope
+		fingerprint, err := protocol.NewAgentTaskScopeFingerprint(delegated)
+		if err != nil {
+			return protocol.AuthorizationContext{}, ErrAuthorizationUnavailable
+		}
+		authorization.AgentID = delegated.AgentID
+		authorization.TaskID = delegated.TaskID
+		authorization.DelegationWatermark = delegated.DelegationWatermark
+		authorization.AgentTaskScopeFingerprint = fingerprint
+		if _, err := protocol.ResolveCurrentAgentTaskScope(
+			ctx, g.agentTaskScopes, authorization, g.clock.Now().UTC(),
+		); err != nil {
+			return protocol.AuthorizationContext{}, ErrAuthorizationUnavailable
+		}
 	}
 	if err := authorization.Validate(); err != nil {
 		return protocol.AuthorizationContext{}, ErrAuthorizationUnavailable
@@ -207,6 +225,11 @@ func (g *Gateway) ValidateAuthorizationContext(
 	if err != nil || authorization.TenantID != snapshot.TenantID ||
 		authorization.PrincipalID != snapshot.PrincipalID ||
 		authorization.IdentityWatermark != snapshot.Watermark {
+		return ErrAuthorizationUnavailable
+	}
+	if _, err := protocol.ResolveCurrentAgentTaskScope(
+		ctx, g.agentTaskScopes, authorization, g.clock.Now().UTC(),
+	); err != nil {
 		return ErrAuthorizationUnavailable
 	}
 	return nil

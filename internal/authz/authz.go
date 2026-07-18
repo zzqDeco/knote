@@ -21,6 +21,8 @@ const (
 
 const (
 	TypeUser          = "user"
+	TypeAgent         = "agent"
+	TypeTask          = "task"
 	TypeGroup         = "group"
 	TypeOrganization  = "organization"
 	TypeKnowledgeBase = "knowledge_base"
@@ -31,6 +33,11 @@ const (
 
 const (
 	RelationMember         = "member"
+	RelationDelegate       = "delegate"
+	RelationAssignee       = "assignee"
+	RelationAgent          = "agent"
+	RelationActiveTask     = "active_task"
+	RelationCanViewInTask  = "can_view_in_task"
 	RelationOrganization   = "organization"
 	RelationParent         = "parent"
 	RelationSourceDocument = "source_document"
@@ -123,6 +130,7 @@ type CheckRequest struct {
 	Object               string
 	AuthorizationModelID string
 	Consistency          Consistency
+	AgentTaskScope       *AgentTaskScope
 }
 
 func (r CheckRequest) Validate() error {
@@ -138,14 +146,18 @@ func (r CheckRequest) Validate() error {
 	if err := validateObject("object", r.Object); err != nil {
 		return err
 	}
+	if err := validateAgentTaskScope(r.User, r.Relation, r.Object, r.AuthorizationModelID, r.AgentTaskScope); err != nil {
+		return err
+	}
 	return r.Consistency.validate(true)
 }
 
 type BatchCheckItem struct {
-	CorrelationID string
-	User          string
-	Relation      string
-	Object        string
+	CorrelationID  string
+	User           string
+	Relation       string
+	Object         string
+	AgentTaskScope *AgentTaskScope
 }
 
 type BatchCheckRequest struct {
@@ -180,6 +192,9 @@ func (r BatchCheckRequest) Validate() error {
 			return fmt.Errorf("check %q: %w", check.CorrelationID, err)
 		}
 		if err := validateObject("object", check.Object); err != nil {
+			return fmt.Errorf("check %q: %w", check.CorrelationID, err)
+		}
+		if err := validateAgentTaskScope(check.User, check.Relation, check.Object, r.AuthorizationModelID, check.AgentTaskScope); err != nil {
 			return fmt.Errorf("check %q: %w", check.CorrelationID, err)
 		}
 	}

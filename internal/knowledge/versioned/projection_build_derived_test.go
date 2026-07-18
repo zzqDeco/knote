@@ -80,6 +80,34 @@ func TestDerivedSummaryMaterializationUsesTrustedAuthorizationContext(t *testing
 	}
 }
 
+func TestPermissionedDerivedBuildConfigVersionBindsAgentTaskScope(t *testing.T) {
+	authorization := derivedMaterializationAuthorization(
+		catalog.Scope{TenantID: localTenantID, KnowledgeBaseID: "kb-derived"},
+		"acl-derived",
+	)
+	baseline := permissionedDerivedBuildConfigVersion("build-base", authorization)
+
+	for _, test := range []struct {
+		name   string
+		mutate func(*protocol.AuthorizationContext)
+	}{
+		{name: "delegation watermark", mutate: func(auth *protocol.AuthorizationContext) {
+			auth.DelegationWatermark = "materialize-delegation-v2"
+		}},
+		{name: "scope fingerprint", mutate: func(auth *protocol.AuthorizationContext) {
+			auth.AgentTaskScopeFingerprint = "scope_ffffffffffffffffffffffffffffffff"
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			changed := authorization
+			test.mutate(&changed)
+			if got := permissionedDerivedBuildConfigVersion("build-base", changed); got == baseline {
+				t.Fatalf("changed %s reused permissioned build config version %q", test.name, got)
+			}
+		})
+	}
+}
+
 func TestDerivedSummaryMaterializationRejectsTrustedScopeDrift(t *testing.T) {
 	for _, test := range []struct {
 		name   string
@@ -129,7 +157,9 @@ func derivedMaterializationAuthorization(
 		TenantID: scope.TenantID, KnowledgeBaseID: scope.KnowledgeBaseID,
 		PrincipalID: "permissioned-user", SessionID: "materialize-session", RequestID: "materialize-request",
 		AgentID: "materialize-agent", TaskID: "materialize-task",
-		AuthorizationModelID: "permissioned-model-v1", IdentityWatermark: "permissioned-identity-v1",
+		DelegationWatermark:       "materialize-delegation-v1",
+		AgentTaskScopeFingerprint: "scope_00000000000000000000000000000001",
+		AuthorizationModelID:      "permissioned-model-v1", IdentityWatermark: "permissioned-identity-v1",
 		ACLWatermark: aclVersion, Consistency: protocol.ConsistencyHigherConsistency,
 	}
 }

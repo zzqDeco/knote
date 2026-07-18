@@ -1525,18 +1525,20 @@ func sourcePaths(sources []repository.Source) []string {
 func testSessionAuthorizationEnvelope(t *testing.T, sessionID, requestID string, boundAt time.Time) protocol.SessionAuthorizationEnvelope {
 	t.Helper()
 	auth := protocol.AuthorizationContext{
-		Version:              protocol.SecurityContractVersion,
-		TenantID:             "tenant-1",
-		KnowledgeBaseID:      "kb-1",
-		PrincipalID:          "principal-1",
-		SessionID:            sessionID,
-		RequestID:            requestID,
-		AuthorizationModelID: "model-1",
-		IdentityWatermark:    "identity-v1",
-		ACLWatermark:         "acl-v1",
-		AgentID:              "agent-1",
-		TaskID:               "task-1",
-		Consistency:          protocol.ConsistencyHigherConsistency,
+		Version:                   protocol.SecurityContractVersion,
+		TenantID:                  "tenant-1",
+		KnowledgeBaseID:           "kb-1",
+		PrincipalID:               "principal-1",
+		SessionID:                 sessionID,
+		RequestID:                 requestID,
+		AuthorizationModelID:      "model-1",
+		IdentityWatermark:         "identity-v1",
+		ACLWatermark:              "acl-v1",
+		AgentID:                   "agent-1",
+		TaskID:                    "task-1",
+		DelegationWatermark:       "delegation-v1",
+		AgentTaskScopeFingerprint: "scope_00000000000000000000000000000001",
+		Consistency:               protocol.ConsistencyHigherConsistency,
 	}
 	envelope, err := protocol.NewSessionAuthorizationEnvelope(auth, boundAt)
 	if err != nil {

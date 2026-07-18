@@ -518,6 +518,8 @@ func permissionedDerivedBuildConfigVersion(
 		authorization.PrincipalID,
 		authorization.AgentID,
 		authorization.TaskID,
+		authorization.DelegationWatermark,
+		string(authorization.AgentTaskScopeFingerprint),
 		string(authorization.Consistency),
 		authorization.AuthorizationModelID,
 		authorization.IdentityWatermark,

@@ -82,23 +82,25 @@ type DerivedArtifactSupportGroup struct {
 // DerivedArtifactSecurityRecord preserves support grouping separately from
 // the catalog's flattened dependency index.
 type DerivedArtifactSecurityRecord struct {
-	Version               string                          `json:"version"`
-	Kind                  string                          `json:"kind"`
-	Artifact              DerivedArtifactResourceIdentity `json:"artifact"`
-	DerivationMode        DerivationMode                  `json:"derivation_mode"`
-	Supports              []DerivedArtifactSupportGroup   `json:"supports"`
-	TenantID              string                          `json:"tenant_id"`
-	KnowledgeBaseID       string                          `json:"knowledge_base_id"`
-	SecurityDomain        string                          `json:"security_domain"`
-	PrincipalID           string                          `json:"principal_id"`
-	AgentID               string                          `json:"agent_id,omitempty"`
-	TaskID                string                          `json:"task_id,omitempty"`
-	Consistency           ConsistencyPreference           `json:"consistency"`
-	AuthorizationModelID  string                          `json:"authorization_model_id"`
-	IdentityWatermark     string                          `json:"identity_watermark"`
-	ACLWatermark          string                          `json:"acl_watermark"`
-	ProjectionWatermark   string                          `json:"projection_watermark"`
-	VisibilityFingerprint VisibilityFingerprint           `json:"visibility_fingerprint"`
+	Version                   string                          `json:"version"`
+	Kind                      string                          `json:"kind"`
+	Artifact                  DerivedArtifactResourceIdentity `json:"artifact"`
+	DerivationMode            DerivationMode                  `json:"derivation_mode"`
+	Supports                  []DerivedArtifactSupportGroup   `json:"supports"`
+	TenantID                  string                          `json:"tenant_id"`
+	KnowledgeBaseID           string                          `json:"knowledge_base_id"`
+	SecurityDomain            string                          `json:"security_domain"`
+	PrincipalID               string                          `json:"principal_id"`
+	AgentID                   string                          `json:"agent_id,omitempty"`
+	TaskID                    string                          `json:"task_id,omitempty"`
+	DelegationWatermark       string                          `json:"delegation_watermark,omitempty"`
+	AgentTaskScopeFingerprint AgentTaskScopeFingerprint       `json:"agent_task_scope_fingerprint,omitempty"`
+	Consistency               ConsistencyPreference           `json:"consistency"`
+	AuthorizationModelID      string                          `json:"authorization_model_id"`
+	IdentityWatermark         string                          `json:"identity_watermark"`
+	ACLWatermark              string                          `json:"acl_watermark"`
+	ProjectionWatermark       string                          `json:"projection_watermark"`
+	VisibilityFingerprint     VisibilityFingerprint           `json:"visibility_fingerprint"`
 }
 
 func NewDerivedArtifactSecurityRecord(
@@ -120,9 +122,12 @@ func NewDerivedArtifactSecurityRecord(
 		DerivationMode: mode, Supports: supports,
 		TenantID: auth.TenantID, KnowledgeBaseID: auth.KnowledgeBaseID,
 		SecurityDomain: securityDomain, PrincipalID: auth.PrincipalID,
-		AgentID: auth.AgentID, TaskID: auth.TaskID, Consistency: auth.Consistency,
-		AuthorizationModelID: auth.AuthorizationModelID,
-		IdentityWatermark:    auth.IdentityWatermark, ACLWatermark: auth.ACLWatermark,
+		AgentID: auth.AgentID, TaskID: auth.TaskID,
+		DelegationWatermark:       auth.DelegationWatermark,
+		AgentTaskScopeFingerprint: auth.AgentTaskScopeFingerprint,
+		Consistency:               auth.Consistency,
+		AuthorizationModelID:      auth.AuthorizationModelID,
+		IdentityWatermark:         auth.IdentityWatermark, ACLWatermark: auth.ACLWatermark,
 		ProjectionWatermark: artifact.Versions.Projection,
 	}
 	record = record.normalized()
@@ -148,15 +153,13 @@ func (r DerivedArtifactSecurityRecord) Validate() error {
 			return err
 		}
 	}
-	if r.AgentID != "" {
-		if err := validateToken("agent_id", r.AgentID); err != nil {
-			return err
-		}
-	}
-	if r.TaskID != "" {
-		if err := validateToken("task_id", r.TaskID); err != nil {
-			return err
-		}
+	if err := validateAgentTaskBinding(
+		r.AgentID,
+		r.TaskID,
+		r.DelegationWatermark,
+		r.AgentTaskScopeFingerprint,
+	); err != nil {
+		return err
 	}
 	switch r.Consistency {
 	case ConsistencyMinimizeLatency, ConsistencyHigherConsistency:
@@ -243,6 +246,8 @@ func (r DerivedArtifactSecurityRecord) ValidateFor(
 		{r.TenantID, auth.TenantID}, {r.KnowledgeBaseID, auth.KnowledgeBaseID},
 		{r.SecurityDomain, securityDomain}, {r.PrincipalID, auth.PrincipalID},
 		{r.AgentID, auth.AgentID}, {r.TaskID, auth.TaskID},
+		{r.DelegationWatermark, auth.DelegationWatermark},
+		{string(r.AgentTaskScopeFingerprint), string(auth.AgentTaskScopeFingerprint)},
 		{string(r.Consistency), string(auth.Consistency)},
 		{r.AuthorizationModelID, auth.AuthorizationModelID},
 		{r.IdentityWatermark, auth.IdentityWatermark}, {r.ACLWatermark, auth.ACLWatermark},
@@ -295,7 +300,8 @@ func (r DerivedArtifactSecurityRecord) expectedVisibilityFingerprint() Visibilit
 	parts := []string{
 		SecurityContractVersion, r.TenantID, r.KnowledgeBaseID, r.PrincipalID,
 		r.AuthorizationModelID, r.IdentityWatermark, r.ACLWatermark,
-		r.AgentID, r.TaskID, string(r.Consistency), r.ProjectionWatermark,
+		r.AgentID, r.TaskID, r.DelegationWatermark,
+		string(r.AgentTaskScopeFingerprint), string(r.Consistency), r.ProjectionWatermark,
 	}
 	sum := sha256.Sum256([]byte(strings.Join(parts, "\x00")))
 	return VisibilityFingerprint("vis_" + hex.EncodeToString(sum[:16]))
