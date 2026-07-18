@@ -191,6 +191,10 @@ func TestAgentTaskScopeBindsExactAuthorizationContext(t *testing.T) {
 	if err := first.Validate(); err != nil {
 		t.Fatalf("fingerprint Validate: %v", err)
 	}
+	auth.AgentTaskScopeFingerprint = first
+	if err := auth.ValidateAgentTaskScope(scope, scope.DelegationWatermark, now.Add(time.Minute)); err != nil {
+		t.Fatalf("authorization context scope binding: %v", err)
+	}
 
 	wrongAgent := auth
 	wrongAgent.AgentID = "agent-2"
@@ -222,8 +226,10 @@ func TestToolContractsAuthorizeInvocationAndSortedReturnedHandles(t *testing.T) 
 		PrincipalID: auth.PrincipalID, AgentID: auth.AgentID, TaskID: auth.TaskID,
 		SessionID: auth.SessionID, RequestID: auth.RequestID, ToolName: request.ToolName,
 		Action: request.Action, Relation: request.Relation, AuthorizationModelID: auth.AuthorizationModelID,
-		IdentityWatermark: auth.IdentityWatermark, ACLWatermark: auth.ACLWatermark, SideEffect: false,
-		Outcome: DecisionAllow, Consistency: auth.Consistency, CheckedAt: enterpriseTestTime(),
+		IdentityWatermark: auth.IdentityWatermark, ACLWatermark: auth.ACLWatermark,
+		DelegationWatermark: auth.DelegationWatermark, AgentTaskScopeFingerprint: auth.AgentTaskScopeFingerprint,
+		SideEffect: false,
+		Outcome:    DecisionAllow, Consistency: auth.Consistency, CheckedAt: enterpriseTestTime(),
 	}
 	if err := invocation.ValidateFor(auth, request); err != nil {
 		t.Fatalf("invocation ValidateFor: %v", err)
@@ -232,6 +238,16 @@ func TestToolContractsAuthorizeInvocationAndSortedReturnedHandles(t *testing.T) 
 	wrongTask.TaskID = "task-2"
 	if err := wrongTask.ValidateFor(auth, request); err == nil {
 		t.Fatal("tool invocation with wrong task was accepted")
+	}
+	wrongDelegation := invocation
+	wrongDelegation.DelegationWatermark = "delegation-v2"
+	if err := wrongDelegation.ValidateFor(auth, request); err == nil {
+		t.Fatal("tool invocation with wrong delegation watermark was accepted")
+	}
+	wrongScope := invocation
+	wrongScope.AgentTaskScopeFingerprint = "scope_ffffffffffffffffffffffffffffffff"
+	if err := wrongScope.ValidateFor(auth, request); err == nil {
+		t.Fatal("tool invocation with wrong agent task scope fingerprint was accepted")
 	}
 	deniedInvocation := invocation
 	deniedInvocation.Outcome = DecisionDeny
@@ -285,6 +301,7 @@ func TestToolContractsAuthorizeInvocationAndSortedReturnedHandles(t *testing.T) 
 		Action: invocation.Action, Relation: EvidenceReadRelation, SideEffect: invocation.SideEffect,
 		AuthorizationModelID: auth.AuthorizationModelID,
 		IdentityWatermark:    auth.IdentityWatermark, ACLWatermark: auth.ACLWatermark,
+		DelegationWatermark: auth.DelegationWatermark, AgentTaskScopeFingerprint: auth.AgentTaskScopeFingerprint,
 		Resources: resources, Decisions: decisions,
 	}
 	if err := result.ValidateFor(auth, invocation, request); err != nil {
@@ -312,6 +329,11 @@ func TestToolContractsAuthorizeInvocationAndSortedReturnedHandles(t *testing.T) 
 	wrongSideEffectResult.SideEffect = true
 	if err := wrongSideEffectResult.ValidateFor(auth, invocation, request); err == nil {
 		t.Fatal("tool result with a mismatched invocation side effect was accepted")
+	}
+	wrongScopeResult := result
+	wrongScopeResult.AgentTaskScopeFingerprint = "scope_ffffffffffffffffffffffffffffffff"
+	if err := wrongScopeResult.ValidateFor(auth, invocation, request); err == nil {
+		t.Fatal("tool result with a mismatched agent task scope fingerprint was accepted")
 	}
 	unsorted := result
 	unsorted.Resources = []ResourceHandle{resources[1], resources[0]}
@@ -524,8 +546,9 @@ func enterpriseTestAuthorization() AuthorizationContext {
 		Version: SecurityContractVersion, TenantID: "tenant-a", KnowledgeBaseID: "kb-a",
 		PrincipalID: "principal-1", AgentID: "agent-1", TaskID: "task-1",
 		SessionID: "session-1", RequestID: "request-1", AuthorizationModelID: "model-v1",
-		IdentityWatermark: "identity-v1", ACLWatermark: "acl-v1",
-		Consistency: ConsistencyHigherConsistency,
+		IdentityWatermark: "identity-v1", ACLWatermark: "acl-v1", DelegationWatermark: testDelegationWatermark,
+		AgentTaskScopeFingerprint: testScopeFingerprint,
+		Consistency:               ConsistencyHigherConsistency,
 	}
 }
 
@@ -553,6 +576,8 @@ func enterpriseTestAllowDecision(auth AuthorizationContext, resource ResourceHan
 		PrincipalID: auth.PrincipalID, AgentID: auth.AgentID, TaskID: auth.TaskID,
 		Relation: relation, Resource: resource, AuthorizationResource: resource, Outcome: DecisionAllow,
 		AuthorizationModelID: auth.AuthorizationModelID, IdentityWatermark: auth.IdentityWatermark,
-		ACLWatermark: auth.ACLWatermark, Consistency: auth.Consistency, CheckedAt: enterpriseTestTime(),
+		ACLWatermark: auth.ACLWatermark, DelegationWatermark: auth.DelegationWatermark,
+		AgentTaskScopeFingerprint: auth.AgentTaskScopeFingerprint,
+		Consistency:               auth.Consistency, CheckedAt: enterpriseTestTime(),
 	}
 }

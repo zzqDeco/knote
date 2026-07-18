@@ -499,12 +499,15 @@ func (s AgentTaskScope) ValidateFor(auth AuthorizationContext, currentDelegation
 		{"authorization_model_id", s.AuthorizationModelID, auth.AuthorizationModelID},
 		{"identity_watermark", s.IdentityWatermark, auth.IdentityWatermark},
 		{"acl_watermark", s.ACLWatermark, auth.ACLWatermark},
-		{"delegation_watermark", s.DelegationWatermark, currentDelegationWatermark},
+		{"delegation_watermark", s.DelegationWatermark, auth.DelegationWatermark},
 	}
 	for _, binding := range bindings {
 		if binding.got != binding.want {
 			return fmt.Errorf("agent task scope %s does not match the authorization context", binding.name)
 		}
+	}
+	if s.DelegationWatermark != currentDelegationWatermark {
+		return fmt.Errorf("agent task scope delegation_watermark is not current")
 	}
 	return nil
 }
@@ -558,25 +561,27 @@ func (r ToolInvocationRequest) Validate() error {
 }
 
 type ToolInvocationAuthorization struct {
-	Version              string                `json:"version"`
-	CorrelationID        string                `json:"correlation_id"`
-	TenantID             string                `json:"tenant_id"`
-	KnowledgeBaseID      string                `json:"knowledge_base_id"`
-	PrincipalID          string                `json:"principal_id"`
-	AgentID              string                `json:"agent_id,omitempty"`
-	TaskID               string                `json:"task_id,omitempty"`
-	SessionID            string                `json:"session_id"`
-	RequestID            string                `json:"request_id"`
-	ToolName             string                `json:"tool_name"`
-	Action               string                `json:"action"`
-	Relation             string                `json:"relation"`
-	AuthorizationModelID string                `json:"authorization_model_id"`
-	IdentityWatermark    string                `json:"identity_watermark"`
-	ACLWatermark         string                `json:"acl_watermark"`
-	SideEffect           bool                  `json:"side_effect"`
-	Outcome              DecisionOutcome       `json:"outcome"`
-	Consistency          ConsistencyPreference `json:"consistency"`
-	CheckedAt            time.Time             `json:"checked_at"`
+	Version                   string                    `json:"version"`
+	CorrelationID             string                    `json:"correlation_id"`
+	TenantID                  string                    `json:"tenant_id"`
+	KnowledgeBaseID           string                    `json:"knowledge_base_id"`
+	PrincipalID               string                    `json:"principal_id"`
+	AgentID                   string                    `json:"agent_id,omitempty"`
+	TaskID                    string                    `json:"task_id,omitempty"`
+	SessionID                 string                    `json:"session_id"`
+	RequestID                 string                    `json:"request_id"`
+	ToolName                  string                    `json:"tool_name"`
+	Action                    string                    `json:"action"`
+	Relation                  string                    `json:"relation"`
+	AuthorizationModelID      string                    `json:"authorization_model_id"`
+	IdentityWatermark         string                    `json:"identity_watermark"`
+	ACLWatermark              string                    `json:"acl_watermark"`
+	DelegationWatermark       string                    `json:"delegation_watermark,omitempty"`
+	AgentTaskScopeFingerprint AgentTaskScopeFingerprint `json:"agent_task_scope_fingerprint,omitempty"`
+	SideEffect                bool                      `json:"side_effect"`
+	Outcome                   DecisionOutcome           `json:"outcome"`
+	Consistency               ConsistencyPreference     `json:"consistency"`
+	CheckedAt                 time.Time                 `json:"checked_at"`
 }
 
 func (a ToolInvocationAuthorization) ValidateFor(auth AuthorizationContext, request ToolInvocationRequest) error {
@@ -623,6 +628,8 @@ func (a ToolInvocationAuthorization) ValidateFor(auth AuthorizationContext, requ
 		{"authorization_model_id", a.AuthorizationModelID, auth.AuthorizationModelID},
 		{"identity_watermark", a.IdentityWatermark, auth.IdentityWatermark},
 		{"acl_watermark", a.ACLWatermark, auth.ACLWatermark},
+		{"delegation_watermark", a.DelegationWatermark, auth.DelegationWatermark},
+		{"agent_task_scope_fingerprint", string(a.AgentTaskScopeFingerprint), string(auth.AgentTaskScopeFingerprint)},
 		{"consistency", string(a.Consistency), string(auth.Consistency)},
 	}
 	for _, binding := range bindings {
@@ -640,24 +647,26 @@ func (a ToolInvocationAuthorization) ValidateFor(auth AuthorizationContext, requ
 // Protected bodies must remain in EvidencePackage or another exact,
 // authorization-bound content container.
 type ToolResultAuthorization struct {
-	Version              string                  `json:"version"`
-	CorrelationID        string                  `json:"correlation_id"`
-	TenantID             string                  `json:"tenant_id"`
-	KnowledgeBaseID      string                  `json:"knowledge_base_id"`
-	PrincipalID          string                  `json:"principal_id"`
-	AgentID              string                  `json:"agent_id,omitempty"`
-	TaskID               string                  `json:"task_id,omitempty"`
-	SessionID            string                  `json:"session_id"`
-	RequestID            string                  `json:"request_id"`
-	ToolName             string                  `json:"tool_name"`
-	Action               string                  `json:"action"`
-	Relation             string                  `json:"relation"`
-	SideEffect           bool                    `json:"side_effect"`
-	AuthorizationModelID string                  `json:"authorization_model_id"`
-	IdentityWatermark    string                  `json:"identity_watermark"`
-	ACLWatermark         string                  `json:"acl_watermark"`
-	Resources            []ResourceHandle        `json:"resources"`
-	Decisions            []AuthorizationDecision `json:"decisions"`
+	Version                   string                    `json:"version"`
+	CorrelationID             string                    `json:"correlation_id"`
+	TenantID                  string                    `json:"tenant_id"`
+	KnowledgeBaseID           string                    `json:"knowledge_base_id"`
+	PrincipalID               string                    `json:"principal_id"`
+	AgentID                   string                    `json:"agent_id,omitempty"`
+	TaskID                    string                    `json:"task_id,omitempty"`
+	SessionID                 string                    `json:"session_id"`
+	RequestID                 string                    `json:"request_id"`
+	ToolName                  string                    `json:"tool_name"`
+	Action                    string                    `json:"action"`
+	Relation                  string                    `json:"relation"`
+	SideEffect                bool                      `json:"side_effect"`
+	AuthorizationModelID      string                    `json:"authorization_model_id"`
+	IdentityWatermark         string                    `json:"identity_watermark"`
+	ACLWatermark              string                    `json:"acl_watermark"`
+	DelegationWatermark       string                    `json:"delegation_watermark,omitempty"`
+	AgentTaskScopeFingerprint AgentTaskScopeFingerprint `json:"agent_task_scope_fingerprint,omitempty"`
+	Resources                 []ResourceHandle          `json:"resources"`
+	Decisions                 []AuthorizationDecision   `json:"decisions"`
 }
 
 func (r ToolResultAuthorization) ValidateFor(
@@ -696,6 +705,8 @@ func (r ToolResultAuthorization) ValidateFor(
 		{"authorization_model_id", r.AuthorizationModelID, auth.AuthorizationModelID},
 		{"identity_watermark", r.IdentityWatermark, auth.IdentityWatermark},
 		{"acl_watermark", r.ACLWatermark, auth.ACLWatermark},
+		{"delegation_watermark", r.DelegationWatermark, auth.DelegationWatermark},
+		{"agent_task_scope_fingerprint", string(r.AgentTaskScopeFingerprint), string(auth.AgentTaskScopeFingerprint)},
 	}
 	for _, binding := range bindings {
 		if binding.got != binding.want {

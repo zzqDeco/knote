@@ -15,15 +15,17 @@ const (
 )
 
 type authorizationBinding struct {
-	tenantID             string
-	knowledgeBaseID      string
-	principalID          string
-	authorizationModelID string
-	identityWatermark    string
-	aclWatermark         string
-	agentID              string
-	taskID               string
-	consistency          protocol.ConsistencyPreference
+	tenantID                  string
+	knowledgeBaseID           string
+	principalID               string
+	authorizationModelID      string
+	identityWatermark         string
+	aclWatermark              string
+	agentID                   string
+	taskID                    string
+	delegationWatermark       string
+	agentTaskScopeFingerprint protocol.AgentTaskScopeFingerprint
+	consistency               protocol.ConsistencyPreference
 }
 
 type expectedSessionAuthorizationEnvelopeKey struct{}
@@ -62,29 +64,33 @@ func (m *Manager) bindAuthorizationContext(sessionID string, authorization proto
 
 func newAuthorizationBinding(authorization protocol.AuthorizationContext) authorizationBinding {
 	return authorizationBinding{
-		tenantID:             authorization.TenantID,
-		knowledgeBaseID:      authorization.KnowledgeBaseID,
-		principalID:          authorization.PrincipalID,
-		authorizationModelID: authorization.AuthorizationModelID,
-		identityWatermark:    authorization.IdentityWatermark,
-		aclWatermark:         authorization.ACLWatermark,
-		agentID:              authorization.AgentID,
-		taskID:               authorization.TaskID,
-		consistency:          authorization.Consistency,
+		tenantID:                  authorization.TenantID,
+		knowledgeBaseID:           authorization.KnowledgeBaseID,
+		principalID:               authorization.PrincipalID,
+		authorizationModelID:      authorization.AuthorizationModelID,
+		identityWatermark:         authorization.IdentityWatermark,
+		aclWatermark:              authorization.ACLWatermark,
+		agentID:                   authorization.AgentID,
+		taskID:                    authorization.TaskID,
+		delegationWatermark:       authorization.DelegationWatermark,
+		agentTaskScopeFingerprint: authorization.AgentTaskScopeFingerprint,
+		consistency:               authorization.Consistency,
 	}
 }
 
 func authorizationBindingFromEnvelope(envelope protocol.SessionAuthorizationEnvelope) authorizationBinding {
 	return authorizationBinding{
-		tenantID:             envelope.TenantID,
-		knowledgeBaseID:      envelope.KnowledgeBaseID,
-		principalID:          envelope.PrincipalID,
-		authorizationModelID: envelope.AuthorizationModelID,
-		identityWatermark:    envelope.IdentityWatermark,
-		aclWatermark:         envelope.ACLWatermark,
-		agentID:              envelope.AgentID,
-		taskID:               envelope.TaskID,
-		consistency:          envelope.Consistency,
+		tenantID:                  envelope.TenantID,
+		knowledgeBaseID:           envelope.KnowledgeBaseID,
+		principalID:               envelope.PrincipalID,
+		authorizationModelID:      envelope.AuthorizationModelID,
+		identityWatermark:         envelope.IdentityWatermark,
+		aclWatermark:              envelope.ACLWatermark,
+		agentID:                   envelope.AgentID,
+		taskID:                    envelope.TaskID,
+		delegationWatermark:       envelope.DelegationWatermark,
+		agentTaskScopeFingerprint: envelope.AgentTaskScopeFingerprint,
+		consistency:               envelope.Consistency,
 	}
 }
 
@@ -94,6 +100,8 @@ func allowsArtifactScopeTransition(current, next authorizationBinding) bool {
 		current.identityWatermark == next.identityWatermark &&
 		current.agentID == next.agentID &&
 		current.taskID == next.taskID &&
+		current.delegationWatermark == next.delegationWatermark &&
+		current.agentTaskScopeFingerprint == next.agentTaskScopeFingerprint &&
 		current.consistency == next.consistency
 }
 

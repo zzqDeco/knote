@@ -954,7 +954,15 @@ class AdapterTest(unittest.TestCase):
                     adapter.validate_resource(malformed, "resource")
 
     def test_authorization_context_is_exact_and_fail_closed(self) -> None:
-        accepted = authorization_context(agent_id="agent_fake", task_id="task_fake")
+        direct = adapter.validate_authorization(authorization_context())
+        self.assertNotIn("agent_id", direct)
+
+        accepted = authorization_context(
+            agent_id="agent_fake",
+            task_id="task_fake",
+            delegation_watermark="delegation_fake",
+            agent_task_scope_fingerprint="scope_00000000000000000000000000000001",
+        )
         _, accepted_lines = call_adapter(
             {
                 "id": "accepted",
@@ -988,6 +996,28 @@ class AdapterTest(unittest.TestCase):
                 (
                     authorization_context(request_id="request\ninvalid"),
                     "authorization.request_id contains control characters",
+                ),
+                (
+                    authorization_context(
+                        agent_id="agent_fake",
+                        task_id="task_fake",
+                    ),
+                    "authorization agent task binding requires",
+                ),
+                (
+                    authorization_context(
+                        delegation_watermark="delegation_fake",
+                    ),
+                    "authorization agent task binding requires",
+                ),
+                (
+                    authorization_context(
+                        agent_id="agent_fake",
+                        task_id="task_fake",
+                        delegation_watermark="delegation_fake",
+                        agent_task_scope_fingerprint="scope_not_hex",
+                    ),
+                    "authorization.agent_task_scope_fingerprint must match",
                 ),
             ]
         )

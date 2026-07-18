@@ -82,7 +82,7 @@ func TestQueryCacheSeparatesVisibilityAndExecutionVersions(t *testing.T) {
 	}}
 	cache := mustQueryCache(t, 32)
 	service := cacheTestService(t, backend, authorizer, loader, cache, "retriever-v1", "prompt-v1")
-	base := queryTestAuthorization("alice", "request-base")
+	base := queryTestDelegatedAuthorization("alice", "request-base")
 	query := func(current protocol.AuthorizationContext, currentService *Service) {
 		t.Helper()
 		if _, err := currentService.Query(context.Background(), protocol.QueryRequest{
@@ -103,6 +103,12 @@ func TestQueryCacheSeparatesVisibilityAndExecutionVersions(t *testing.T) {
 		{name: "acl watermark", change: func(value *protocol.AuthorizationContext) { value.ACLWatermark = "acl-v2" }},
 		{name: "agent", change: func(value *protocol.AuthorizationContext) { value.AgentID = "agent-2" }},
 		{name: "task", change: func(value *protocol.AuthorizationContext) { value.TaskID = "task-2" }},
+		{name: "delegation watermark", change: func(value *protocol.AuthorizationContext) {
+			value.DelegationWatermark = "delegation-v2"
+		}},
+		{name: "scope fingerprint", change: func(value *protocol.AuthorizationContext) {
+			value.AgentTaskScopeFingerprint = "scope_00000000000000000000000000000002"
+		}},
 		{name: "consistency", change: func(value *protocol.AuthorizationContext) { value.Consistency = protocol.ConsistencyMinimizeLatency }},
 	}
 	for index, variation := range variations {
@@ -670,6 +676,9 @@ func cacheTestServiceWithLimits(
 		KAG: backend, Authorizer: authorizer, Loader: loader, Cache: cache,
 		RetrieverVersion: retrieverVersion, PromptVersion: promptVersion,
 		RetrieveLimit: retrieveLimit, EvidenceLimit: evidenceLimit,
+		FinalAuthorizationGate: func(_ context.Context, authorization protocol.AuthorizationContext) error {
+			return authorization.Validate()
+		},
 		Now: func() time.Time { return time.Date(2026, 7, 13, 6, 0, 0, 0, time.UTC) },
 	})
 	if err != nil {

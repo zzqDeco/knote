@@ -13,7 +13,9 @@ func testEinoAuthorization(sessionID string) protocol.AuthorizationContext {
 		Version:  protocol.SecurityContractVersion,
 		TenantID: "local", KnowledgeBaseID: "default", PrincipalID: "alice",
 		SessionID: sessionID, RequestID: "request-1", AgentID: "agent-1", TaskID: "task-1",
-		AuthorizationModelID: "model-v1", IdentityWatermark: "identity-v1", ACLWatermark: "acl-v1",
+		DelegationWatermark:       "delegation-v1",
+		AgentTaskScopeFingerprint: "scope_00000000000000000000000000000001",
+		AuthorizationModelID:      "model-v1", IdentityWatermark: "identity-v1", ACLWatermark: "acl-v1",
 		Consistency: protocol.ConsistencyHigherConsistency,
 	}
 }
@@ -42,7 +44,9 @@ func testEinoEvidencePackage(t *testing.T, authorization protocol.AuthorizationC
 	decision := protocol.AuthorizationDecision{
 		CorrelationID: "decision-1", RequestID: authorization.RequestID, SessionID: authorization.SessionID,
 		PrincipalID: authorization.PrincipalID, AgentID: authorization.AgentID, TaskID: authorization.TaskID,
-		Relation: protocol.EvidenceReadRelation, Resource: resource, AuthorizationResource: resource,
+		DelegationWatermark:       authorization.DelegationWatermark,
+		AgentTaskScopeFingerprint: authorization.AgentTaskScopeFingerprint,
+		Relation:                  protocol.EvidenceReadRelation, Resource: resource, AuthorizationResource: resource,
 		Outcome: protocol.DecisionAllow, AuthorizationModelID: authorization.AuthorizationModelID,
 		IdentityWatermark: authorization.IdentityWatermark, ACLWatermark: authorization.ACLWatermark,
 		Consistency: authorization.Consistency, CheckedAt: time.Unix(1, 0).UTC(),
@@ -57,8 +61,10 @@ func testEinoEvidencePackage(t *testing.T, authorization protocol.AuthorizationC
 		TenantID: authorization.TenantID, KnowledgeBaseID: authorization.KnowledgeBaseID,
 		PrincipalID: authorization.PrincipalID, SessionID: authorization.SessionID, RequestID: authorization.RequestID,
 		AgentID: authorization.AgentID, TaskID: authorization.TaskID,
-		AuthorizationModelID: authorization.AuthorizationModelID,
-		IdentityWatermark:    authorization.IdentityWatermark, ACLWatermark: authorization.ACLWatermark,
+		DelegationWatermark:       authorization.DelegationWatermark,
+		AgentTaskScopeFingerprint: authorization.AgentTaskScopeFingerprint,
+		AuthorizationModelID:      authorization.AuthorizationModelID,
+		IdentityWatermark:         authorization.IdentityWatermark, ACLWatermark: authorization.ACLWatermark,
 		Consistency: authorization.Consistency, ProjectionVersion: resource.Versions.Projection,
 		VisibilityFingerprint: fingerprint, Items: []protocol.EvidenceItem{item}, Decisions: []protocol.AuthorizationDecision{decision},
 	}

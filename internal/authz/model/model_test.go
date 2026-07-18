@@ -77,6 +77,7 @@ func TestAuthorizationModelTruthTable(t *testing.T) {
 		"direct-share":                             false,
 		"direct-share-revoke":                      false,
 		"entity-claim-policy-oracle":               false,
+		"agent-task-intersection":                  false,
 	}
 	for _, testCase := range suite.Tests {
 		testCase := testCase
@@ -84,6 +85,10 @@ func TestAuthorizationModelTruthTable(t *testing.T) {
 			required[testCase.Name] = true
 			testTuples := testCase.Tuples
 			testChecks := testCase.Check
+			var agentTaskScope *authz.AgentTaskScope
+			if testCase.Name == "agent-task-intersection" {
+				testTuples, agentTaskScope = protectedTruthTuplesWithoutAgentTaskContext(t, testCase.Tuples)
+			}
 			if testCase.Name == "identity-control-is-non-authorizing" {
 				testTuples = protectedTruthTuplesWithoutIdentityControl(t, testCase.Tuples)
 				testChecks = protectedTruthChecksWithoutIdentityControl(t, testCase.Check)
@@ -102,12 +107,20 @@ func TestAuthorizationModelTruthTable(t *testing.T) {
 				}
 				sort.Strings(relations)
 				for _, relation := range relations {
+					requestRelation := relation
+					var requestScope *authz.AgentTaskScope
+					if agentTaskScope != nil && relation == authz.RelationCanViewInTask {
+						requestRelation = authz.RelationCanView
+						scope := *agentTaskScope
+						requestScope = &scope
+					}
 					decision, err := authorizer.Check(context.Background(), authz.CheckRequest{
 						User:                 check.User,
-						Relation:             relation,
+						Relation:             requestRelation,
 						Object:               check.Object,
 						AuthorizationModelID: testModelID,
 						Consistency:          authz.ConsistencyHigherConsistency,
+						AgentTaskScope:       requestScope,
 					})
 					if err != nil {
 						t.Fatalf("check %s %s on %s: %v", check.User, relation, check.Object, err)
@@ -123,6 +136,46 @@ func TestAuthorizationModelTruthTable(t *testing.T) {
 		if !covered {
 			t.Errorf("required model scenario %q is missing", name)
 		}
+	}
+}
+
+func protectedTruthTuplesWithoutAgentTaskContext(t *testing.T, tuples []authz.Tuple) ([]authz.Tuple, *authz.AgentTaskScope) {
+	t.Helper()
+	evidence := []authz.Tuple{
+		{User: "user:alice", Relation: authz.RelationDelegate, Object: "agent:research"},
+		{User: "agent:research", Relation: authz.RelationAgent, Object: "task:answer"},
+		{User: "user:alice", Relation: authz.RelationAssignee, Object: "task:answer"},
+	}
+	expected := make(map[authz.Tuple]bool, len(evidence)+1)
+	for _, tuple := range evidence {
+		expected[tuple] = false
+	}
+	expected[authz.Tuple{
+		User: "task:answer", Relation: authz.RelationActiveTask, Object: "document:scoped",
+	}] = false
+
+	protected := make([]authz.Tuple, 0, len(tuples)-len(expected))
+	for _, tuple := range tuples {
+		if _, ok := expected[tuple]; !ok {
+			protected = append(protected, tuple)
+			continue
+		}
+		if expected[tuple] {
+			t.Fatalf("duplicate agent/task contextual truth tuple: %+v", tuple)
+		}
+		expected[tuple] = true
+	}
+	for tuple, present := range expected {
+		if !present {
+			t.Fatalf("agent/task truth fixture is missing contextual tuple %+v", tuple)
+		}
+	}
+	return protected, &authz.AgentTaskScope{
+		User:                 "user:alice",
+		Agent:                "agent:research",
+		Task:                 "task:answer",
+		AuthorizationModelID: testModelID,
+		ContextualTuples:     evidence,
 	}
 }
 

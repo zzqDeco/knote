@@ -768,9 +768,8 @@ func revocationTestBinding(
 	resource protocol.ResourceHandle,
 ) protocol.ProtectedContentBinding {
 	t.Helper()
-	binding, err := protocol.NewProtectedContentBindingFromResources(
-		authorization.SessionID,
-		authorization.RequestID,
+	binding, err := protocol.NewProtectedContentBindingFromResourcesForAuthorization(
+		authorization,
 		[]protocol.ProtectedResourceBinding{{Resource: resource, AuthorizationResource: resource}},
 	)
 	if err != nil {

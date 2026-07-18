@@ -43,8 +43,9 @@ func TestGatewayBuildsTrustedAuthorizationAndFailsClosedOnIdentityChange(t *test
 	}
 
 	_, privateKey, verifier := newTestVerifier(t)
+	agentTaskScopes := &gatewayTestAgentTaskScopeAuthority{}
 	gateway, err := NewGateway(store, verifier, store, GatewayOptions{
-		Clock: clock, RequestIDs: &testRequestIDs{},
+		Clock: clock, RequestIDs: &testRequestIDs{}, AgentTaskScopes: agentTaskScopes,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -77,6 +78,61 @@ func TestGatewayBuildsTrustedAuthorizationAndFailsClosedOnIdentityChange(t *test
 	envelope, err := protocol.NewSessionAuthorizationEnvelope(authorization, clock.Now())
 	if err != nil {
 		t.Fatal(err)
+	}
+	agentTaskScope := protocol.AgentTaskScope{
+		Version:  protocol.EnterpriseContractVersion,
+		TenantID: scope.TenantID, KnowledgeBaseID: authorizationScope.KnowledgeBaseID,
+		PrincipalID: snapshot.PrincipalID, AgentID: "agent-main", TaskID: "task-main",
+		AuthorizationModelID: authorizationScope.AuthorizationModelID,
+		IdentityWatermark:    snapshot.Watermark, ACLWatermark: authorizationScope.ACLWatermark,
+		DelegationWatermark: "delegation-0001",
+		IssuedAt:            clock.Now().Add(-time.Minute), ExpiresAt: clock.Now().Add(time.Hour),
+	}
+	agentTaskScopes.scope = agentTaskScope
+	agentTaskScopes.currentDelegationWatermark = agentTaskScope.DelegationWatermark
+	delegatedScope := authorizationScope
+	delegatedScope.AgentTaskScope = &agentTaskScope
+	withoutAgentTaskAuthority, err := NewGateway(store, verifier, store, GatewayOptions{
+		Clock: clock, RequestIDs: &testRequestIDs{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := withoutAgentTaskAuthority.AuthorizationContext(
+		ctx, authenticated, delegatedScope, "session-delegated",
+	); !errors.Is(err, ErrAuthorizationUnavailable) {
+		t.Fatalf("delegated authorization without current authority was accepted: %v", err)
+	}
+	delegated, err := gateway.AuthorizationContext(ctx, authenticated, delegatedScope, "session-delegated")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := delegated.ValidateAgentTaskScope(
+		agentTaskScope, agentTaskScopes.currentDelegationWatermark, clock.Now(),
+	); err != nil {
+		t.Fatalf("delegated authorization scope rejected: %v", err)
+	}
+	agentTaskScopes.currentDelegationWatermark = "delegation-0002"
+	if err := gateway.ValidateAuthorizationContext(ctx, authenticated, delegated); !errors.Is(err, ErrAuthorizationUnavailable) {
+		t.Fatalf("revoked delegated authorization was accepted: %v", err)
+	}
+	agentTaskScopes.currentDelegationWatermark = agentTaskScope.DelegationWatermark
+	if err := gateway.ValidateAuthorizationContext(ctx, authenticated, delegated); err != nil {
+		t.Fatalf("restored delegated authorization rejected: %v", err)
+	}
+
+	mismatchedScope := agentTaskScope
+	mismatchedScope.KnowledgeBaseID = "kb-other"
+	delegatedScope.AgentTaskScope = &mismatchedScope
+	if _, err := gateway.AuthorizationContext(ctx, authenticated, delegatedScope, "session-delegated"); !errors.Is(err, ErrAuthorizationUnavailable) {
+		t.Fatalf("mismatched agent task scope was accepted: %v", err)
+	}
+	expiredScope := agentTaskScope
+	expiredScope.IssuedAt = clock.Now().Add(-2 * time.Hour)
+	expiredScope.ExpiresAt = clock.Now().Add(-time.Hour)
+	delegatedScope.AgentTaskScope = &expiredScope
+	if _, err := gateway.AuthorizationContext(ctx, authenticated, delegatedScope, "session-delegated"); !errors.Is(err, ErrAuthorizationUnavailable) {
+		t.Fatalf("expired agent task scope was accepted: %v", err)
 	}
 
 	if _, err := gateway.AuthorizationContext(ctx, authenticated, AuthorizationScope{
@@ -134,6 +190,19 @@ func TestGatewayBuildsTrustedAuthorizationAndFailsClosedOnIdentityChange(t *test
 	if strings.Contains(string(persisted), claims.Nonce) || strings.Contains(string(persisted), string(assertion)) {
 		t.Fatal("durable identity state contains raw assertion material")
 	}
+}
+
+type gatewayTestAgentTaskScopeAuthority struct {
+	scope                      protocol.AgentTaskScope
+	currentDelegationWatermark string
+	err                        error
+}
+
+func (a *gatewayTestAgentTaskScopeAuthority) CurrentAgentTaskScope(
+	context.Context,
+	protocol.AuthorizationContext,
+) (protocol.AgentTaskScope, string, error) {
+	return a.scope, a.currentDelegationWatermark, a.err
 }
 
 func TestGatewayRejectsInvalidAssertionsWithoutDisclosure(t *testing.T) {

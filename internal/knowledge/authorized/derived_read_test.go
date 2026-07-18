@@ -602,7 +602,9 @@ func authorizationForDerivedRecord(record protocol.DerivedArtifactSecurityRecord
 		TenantID: record.TenantID, KnowledgeBaseID: record.KnowledgeBaseID,
 		PrincipalID: record.PrincipalID, SessionID: "derived-read-session", RequestID: "derived-read-request",
 		AgentID: record.AgentID, TaskID: record.TaskID,
-		AuthorizationModelID: record.AuthorizationModelID, IdentityWatermark: record.IdentityWatermark,
+		DelegationWatermark:       record.DelegationWatermark,
+		AgentTaskScopeFingerprint: record.AgentTaskScopeFingerprint,
+		AuthorizationModelID:      record.AuthorizationModelID, IdentityWatermark: record.IdentityWatermark,
 		ACLWatermark: record.ACLWatermark, Consistency: record.Consistency,
 	}
 }

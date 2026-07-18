@@ -59,12 +59,16 @@ func (b ProtectedResourceBinding) ValidateFor(auth AuthorizationContext) error {
 // ProtectedContentBinding binds every content-bearing event produced by one
 // permissioned query turn to the same fail-closed replay block.
 type ProtectedContentBinding struct {
-	Version       string                     `json:"version"`
-	BlockID       string                     `json:"block_id"`
-	SessionID     string                     `json:"session_id"`
-	RequestID     string                     `json:"request_id"`
-	EvidenceRoots []ResourceHandle           `json:"evidence_roots"`
-	Resources     []ProtectedResourceBinding `json:"resources"`
+	Version                   string                     `json:"version"`
+	BlockID                   string                     `json:"block_id"`
+	SessionID                 string                     `json:"session_id"`
+	RequestID                 string                     `json:"request_id"`
+	AgentID                   string                     `json:"agent_id,omitempty"`
+	TaskID                    string                     `json:"task_id,omitempty"`
+	DelegationWatermark       string                     `json:"delegation_watermark,omitempty"`
+	AgentTaskScopeFingerprint AgentTaskScopeFingerprint  `json:"agent_task_scope_fingerprint,omitempty"`
+	EvidenceRoots             []ResourceHandle           `json:"evidence_roots"`
+	Resources                 []ProtectedResourceBinding `json:"resources"`
 }
 
 // UnmarshalJSON rejects unknown fields and non-canonical bindings at the
@@ -118,7 +122,16 @@ func NewProtectedContentBinding(auth AuthorizationContext, packages ...EvidenceP
 			})
 		}
 	}
-	return newProtectedContentBinding(auth.SessionID, auth.RequestID, roots, resources)
+	return newProtectedContentBinding(
+		auth.SessionID,
+		auth.RequestID,
+		auth.AgentID,
+		auth.TaskID,
+		auth.DelegationWatermark,
+		auth.AgentTaskScopeFingerprint,
+		roots,
+		resources,
+	)
 }
 
 // NewProtectedContentBindingFromResources canonicalizes exact handles before
@@ -133,12 +146,42 @@ func NewProtectedContentBindingFromResources(
 	for index, resource := range resources {
 		roots[index] = resource.Resource
 	}
-	return newProtectedContentBinding(sessionID, requestID, roots, resources)
+	return newProtectedContentBinding(sessionID, requestID, "", "", "", "", roots, resources)
+}
+
+// NewProtectedContentBindingFromResourcesForAuthorization creates a binding
+// for callers that already hold exact authorization context but do not have an
+// EvidencePackage. It preserves delegated agent/task scope in the replay key.
+func NewProtectedContentBindingFromResourcesForAuthorization(
+	auth AuthorizationContext,
+	resources []ProtectedResourceBinding,
+) (ProtectedContentBinding, error) {
+	if err := auth.Validate(); err != nil {
+		return ProtectedContentBinding{}, err
+	}
+	roots := make([]ResourceHandle, len(resources))
+	for index, resource := range resources {
+		roots[index] = resource.Resource
+	}
+	return newProtectedContentBinding(
+		auth.SessionID,
+		auth.RequestID,
+		auth.AgentID,
+		auth.TaskID,
+		auth.DelegationWatermark,
+		auth.AgentTaskScopeFingerprint,
+		roots,
+		resources,
+	)
 }
 
 func newProtectedContentBinding(
 	sessionID string,
 	requestID string,
+	agentID string,
+	taskID string,
+	delegationWatermark string,
+	agentTaskScopeFingerprint AgentTaskScopeFingerprint,
 	roots []ResourceHandle,
 	resources []ProtectedResourceBinding,
 ) (ProtectedContentBinding, error) {
@@ -198,11 +241,15 @@ func newProtectedContentBinding(
 	}
 
 	binding := ProtectedContentBinding{
-		Version:       ProtectedContentBindingVersion,
-		SessionID:     sessionID,
-		RequestID:     requestID,
-		EvidenceRoots: append([]ResourceHandle(nil), deduplicatedRoots...),
-		Resources:     append([]ProtectedResourceBinding(nil), deduplicated...),
+		Version:                   ProtectedContentBindingVersion,
+		SessionID:                 sessionID,
+		RequestID:                 requestID,
+		AgentID:                   agentID,
+		TaskID:                    taskID,
+		DelegationWatermark:       delegationWatermark,
+		AgentTaskScopeFingerprint: agentTaskScopeFingerprint,
+		EvidenceRoots:             append([]ResourceHandle(nil), deduplicatedRoots...),
+		Resources:                 append([]ProtectedResourceBinding(nil), deduplicated...),
 	}
 	binding.BlockID = protectedContentBlockID(binding)
 	if err := binding.Validate(); err != nil {
@@ -222,6 +269,14 @@ func (b ProtectedContentBinding) Validate() error {
 		return err
 	}
 	if err := validateToken("protected request_id", b.RequestID); err != nil {
+		return err
+	}
+	if err := validateAgentTaskBinding(
+		b.AgentID,
+		b.TaskID,
+		b.DelegationWatermark,
+		b.AgentTaskScopeFingerprint,
+	); err != nil {
 		return err
 	}
 	if len(b.Resources) == 0 {
@@ -285,6 +340,21 @@ func (b ProtectedContentBinding) ValidateFor(auth AuthorizationContext) error {
 	if b.SessionID != auth.SessionID {
 		return fmt.Errorf("protected content session does not match authorization context")
 	}
+	scopeBindings := []struct {
+		name string
+		got  string
+		want string
+	}{
+		{"agent_id", b.AgentID, auth.AgentID},
+		{"task_id", b.TaskID, auth.TaskID},
+		{"delegation_watermark", b.DelegationWatermark, auth.DelegationWatermark},
+		{"agent_task_scope_fingerprint", string(b.AgentTaskScopeFingerprint), string(auth.AgentTaskScopeFingerprint)},
+	}
+	for _, binding := range scopeBindings {
+		if binding.got != binding.want {
+			return fmt.Errorf("protected content %s does not match authorization context", binding.name)
+		}
+	}
 	for index, resource := range b.Resources {
 		if err := resource.ValidateFor(auth); err != nil {
 			return fmt.Errorf("protected resource binding %d: %w", index, err)
@@ -310,15 +380,21 @@ func protectedEvidenceRootSortKey(resource ResourceHandle) string {
 
 func protectedContentBlockID(binding ProtectedContentBinding) string {
 	metadata := struct {
-		Version       string                     `json:"version"`
-		SessionID     string                     `json:"session_id"`
-		RequestID     string                     `json:"request_id"`
-		EvidenceRoots []ResourceHandle           `json:"evidence_roots"`
-		Resources     []ProtectedResourceBinding `json:"resources"`
+		Version                   string                     `json:"version"`
+		SessionID                 string                     `json:"session_id"`
+		RequestID                 string                     `json:"request_id"`
+		AgentID                   string                     `json:"agent_id,omitempty"`
+		TaskID                    string                     `json:"task_id,omitempty"`
+		DelegationWatermark       string                     `json:"delegation_watermark,omitempty"`
+		AgentTaskScopeFingerprint AgentTaskScopeFingerprint  `json:"agent_task_scope_fingerprint,omitempty"`
+		EvidenceRoots             []ResourceHandle           `json:"evidence_roots"`
+		Resources                 []ProtectedResourceBinding `json:"resources"`
 	}{
-		Version: binding.Version, SessionID: binding.SessionID,
-		RequestID: binding.RequestID, EvidenceRoots: binding.EvidenceRoots,
-		Resources: binding.Resources,
+		Version: binding.Version, SessionID: binding.SessionID, RequestID: binding.RequestID,
+		AgentID: binding.AgentID, TaskID: binding.TaskID,
+		DelegationWatermark:       binding.DelegationWatermark,
+		AgentTaskScopeFingerprint: binding.AgentTaskScopeFingerprint,
+		EvidenceRoots:             binding.EvidenceRoots, Resources: binding.Resources,
 	}
 	encoded, _ := json.Marshal(metadata)
 	sum := sha256.Sum256(encoded)

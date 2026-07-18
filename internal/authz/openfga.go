@@ -114,9 +114,10 @@ func (a *OpenFGAAuthorizer) Check(ctx context.Context, request CheckRequest) (De
 	defer cancel()
 	response, err := a.client.Check(callContext).
 		Body(fgaclient.ClientCheckRequest{
-			User:     request.User,
-			Relation: request.Relation,
-			Object:   request.Object,
+			User:             request.User,
+			Relation:         effectiveRelation(request.Relation, request.AgentTaskScope),
+			Object:           request.Object,
+			ContextualTuples: openFGAContextualTuples(request.User, request.Object, request.AgentTaskScope),
 		}).
 		Options(fgaclient.ClientCheckOptions{
 			AuthorizationModelId: &a.config.AuthorizationModelID,
@@ -161,10 +162,11 @@ func (a *OpenFGAAuthorizer) BatchCheck(ctx context.Context, request BatchCheckRe
 	expected := make(map[string]struct{}, len(request.Checks))
 	for index, check := range request.Checks {
 		checks[index] = fgaclient.ClientBatchCheckItem{
-			User:          check.User,
-			Relation:      check.Relation,
-			Object:        check.Object,
-			CorrelationId: check.CorrelationID,
+			User:             check.User,
+			Relation:         effectiveRelation(check.Relation, check.AgentTaskScope),
+			Object:           check.Object,
+			CorrelationId:    check.CorrelationID,
+			ContextualTuples: openFGAContextualTuples(check.User, check.Object, check.AgentTaskScope),
 		}
 		expected[check.CorrelationID] = struct{}{}
 	}
@@ -220,6 +222,20 @@ func (a *OpenFGAAuthorizer) BatchCheck(ctx context.Context, request BatchCheckRe
 		}
 	}
 	return decisions, nil
+}
+
+func openFGAContextualTuples(user, object string, scope *AgentTaskScope) []fgaclient.ClientContextualTupleKey {
+	tuples := contextualTuples(user, object, scope)
+	if len(tuples) == 0 {
+		return nil
+	}
+	result := make([]fgaclient.ClientContextualTupleKey, len(tuples))
+	for index, tuple := range tuples {
+		result[index] = fgaclient.ClientContextualTupleKey{
+			User: tuple.User, Relation: tuple.Relation, Object: tuple.Object,
+		}
+	}
+	return result
 }
 
 func (a *OpenFGAAuthorizer) consistency(requested Consistency) (*openfga.ConsistencyPreference, error) {

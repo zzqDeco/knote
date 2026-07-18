@@ -197,7 +197,7 @@ func TestQueryScopesEvidencePerPrincipal(t *testing.T) {
 				documentA.ResourceID: queryTestItem(documentA), documentB.ResourceID: queryTestItem(documentB),
 			}}
 			service := queryTestService(t, backend, authorizer, loader, 0, 4)
-			authorization := queryTestAuthorization(test.principal, "request-query")
+			authorization := queryTestDelegatedAuthorization(test.principal, "request-query")
 
 			result, err := service.Query(context.Background(), protocol.QueryRequest{
 				Question: "shared question", Authorization: authorization,
@@ -227,6 +227,20 @@ func TestQueryScopesEvidencePerPrincipal(t *testing.T) {
 				for _, check := range call.Checks {
 					if check.User != "user:"+test.principal {
 						t.Fatalf("authorization user = %q", check.User)
+					}
+					scope := check.AgentTaskScope
+					if scope == nil || scope.User != check.User || scope.Agent != "agent:"+authorization.AgentID ||
+						scope.Task != "task:"+authorization.TaskID ||
+						scope.AuthorizationModelID != authorization.AuthorizationModelID {
+						t.Fatalf("authorization agent/task scope = %#v", scope)
+					}
+					wantTuples := []authz.Tuple{
+						{User: check.User, Relation: authz.RelationDelegate, Object: scope.Agent},
+						{User: scope.Agent, Relation: authz.RelationAgent, Object: scope.Task},
+						{User: check.User, Relation: authz.RelationAssignee, Object: scope.Task},
+					}
+					if !reflect.DeepEqual(scope.ContextualTuples, wantTuples) {
+						t.Fatalf("authorization contextual tuples = %#v", scope.ContextualTuples)
 					}
 				}
 			}
@@ -300,6 +314,79 @@ func TestQueryRunsFinalAuthorizationGateBeforeGeneration(t *testing.T) {
 	}
 	if got, want := events, []string{"discover", "authz", "retrieve", "load", "authz", "identity-gate"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("events = %v, want %v", got, want)
+	}
+}
+
+func TestDelegatedQueryRevalidatesCurrentScopeBeforeAuthorizationAndReuse(t *testing.T) {
+	document := queryTestDocument(queryTestModelID, "content", "projection-v1")
+	newDependencies := func() (*queryTestKAG, *queryTestAuthorizer, *queryTestLoader) {
+		return &queryTestKAG{retrieveResult: queryTestRetrieve(document)},
+			&queryTestAuthorizer{},
+			&queryTestLoader{items: map[protocol.ResourceID]protocol.EvidenceItem{
+				document.ResourceID: queryTestItem(document),
+			}}
+	}
+
+	backend, authorizer, loader := newDependencies()
+	withoutGate, err := New(Options{KAG: backend, Authorizer: authorizer, Loader: loader})
+	if err != nil {
+		t.Fatal(err)
+	}
+	delegated := queryTestDelegatedAuthorization("alice", "request-no-current-scope")
+	if _, err := withoutGate.Query(context.Background(), protocol.QueryRequest{
+		Question: "delegated question", Authorization: delegated,
+	}); !errors.Is(err, ErrProtectedContentUnavailable) {
+		t.Fatalf("delegated query without current scope gate error = %v", err)
+	}
+	if len(authorizer.calls) != 0 {
+		t.Fatalf("delegated query reached authorization before current scope validation: %d calls", len(authorizer.calls))
+	}
+
+	backend, authorizer, loader = newDependencies()
+	cache := mustQueryCache(t, 4)
+	revoked := false
+	gateCalls := 0
+	service, err := New(Options{
+		KAG: backend, Authorizer: authorizer, Loader: loader, Cache: cache,
+		RetrieverVersion: "retriever-v1", PromptVersion: "prompt-v1",
+		FinalAuthorizationGate: func(context.Context, protocol.AuthorizationContext) error {
+			gateCalls++
+			if revoked {
+				return errors.New("agent task scope revoked")
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	delegated.RequestID = "request-current-scope"
+	result, err := service.Query(context.Background(), protocol.QueryRequest{
+		Question: "delegated question", Authorization: delegated,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gateCalls == 0 {
+		t.Fatal("delegated query did not validate current scope")
+	}
+
+	revoked = true
+	current := delegated
+	current.RequestID = "request-revoked-scope"
+	authorizationCalls := len(authorizer.calls)
+	if _, err := service.Query(context.Background(), protocol.QueryRequest{
+		Question: "delegated question", Authorization: current,
+	}); !errors.Is(err, ErrProtectedContentUnavailable) {
+		t.Fatalf("revoked delegated cache reuse error = %v", err)
+	}
+	if len(authorizer.calls) != authorizationCalls {
+		t.Fatal("revoked delegated cache reuse reached OpenFGA after the current scope gate")
+	}
+	if _, err := service.OpenCitation(
+		context.Background(), current, result.Evidence, result.Evidence.Items[0].Citation.Handle,
+	); !errors.Is(err, ErrCitationUnavailable) {
+		t.Fatalf("revoked delegated citation error = %v", err)
 	}
 }
 
@@ -1085,6 +1172,9 @@ func queryTestService(t *testing.T, backend *queryTestKAG, authorizer *queryTest
 	service, err := New(Options{
 		KAG: backend, Authorizer: authorizer, Loader: loader,
 		RetrieveLimit: 10, EvidenceLimit: evidenceLimit, ExpandLimit: expandLimit,
+		FinalAuthorizationGate: func(_ context.Context, authorization protocol.AuthorizationContext) error {
+			return authorization.Validate()
+		},
 		Now: func() time.Time { return time.Date(2026, 7, 13, 1, 0, 0, 0, time.UTC) },
 	})
 	if err != nil {
@@ -1097,10 +1187,19 @@ func queryTestAuthorization(principal, requestID string) protocol.AuthorizationC
 	return protocol.AuthorizationContext{
 		Version: protocol.SecurityContractVersion, TenantID: "tenant-1", KnowledgeBaseID: "kb-1",
 		PrincipalID: principal, SessionID: "session-1", RequestID: requestID,
-		AgentID: "agent-1", TaskID: "task-1", AuthorizationModelID: queryTestAuthModel,
-		IdentityWatermark: "identity-v1", ACLWatermark: "acl-v1",
+		AuthorizationModelID: queryTestAuthModel,
+		IdentityWatermark:    "identity-v1", ACLWatermark: "acl-v1",
 		Consistency: protocol.ConsistencyHigherConsistency,
 	}
+}
+
+func queryTestDelegatedAuthorization(principal, requestID string) protocol.AuthorizationContext {
+	authorization := queryTestAuthorization(principal, requestID)
+	authorization.AgentID = "agent-1"
+	authorization.TaskID = "task-1"
+	authorization.DelegationWatermark = "delegation-v1"
+	authorization.AgentTaskScopeFingerprint = "scope_00000000000000000000000000000001"
+	return authorization
 }
 
 func queryTestDocument(id protocol.ResourceID, content, projection string) protocol.ResourceHandle {

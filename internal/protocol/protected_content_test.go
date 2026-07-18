@@ -145,6 +145,48 @@ func TestProtectedContentBindingRejectsTamperingAndConflicts(t *testing.T) {
 	if err := binding.ValidateFor(current); err != nil {
 		t.Fatalf("a fresh replay request should validate: %v", err)
 	}
+	for name, mutate := range map[string]func(*AuthorizationContext){
+		"agent": func(value *AuthorizationContext) { value.AgentID = "other-agent" },
+		"task":  func(value *AuthorizationContext) { value.TaskID = "other-task" },
+		"delegation watermark": func(value *AuthorizationContext) {
+			value.DelegationWatermark = "delegation-v2"
+		},
+		"scope fingerprint": func(value *AuthorizationContext) {
+			value.AgentTaskScopeFingerprint = "scope_00000000000000000000000000000002"
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			changed := current
+			mutate(&changed)
+			if err := binding.ValidateFor(changed); err == nil {
+				t.Fatal("delegated replay accepted changed agent task scope")
+			}
+		})
+	}
+	legacy, err := NewProtectedContentBindingFromResources(
+		auth.SessionID,
+		auth.RequestID,
+		[]ProtectedResourceBinding{{Resource: resource, AuthorizationResource: resource}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.ValidateFor(current); err == nil {
+		t.Fatal("legacy unscoped replay binding was promoted into delegated mode")
+	}
+	scoped, err := NewProtectedContentBindingFromResourcesForAuthorization(
+		auth,
+		[]ProtectedResourceBinding{{Resource: resource, AuthorizationResource: resource}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := scoped.ValidateFor(current); err != nil {
+		t.Fatalf("resource-only delegated replay binding: %v", err)
+	}
+	if scoped.BlockID == legacy.BlockID {
+		t.Fatal("delegated scope did not change the protected block id")
+	}
 	crossTenant := current
 	crossTenant.TenantID = "other-tenant"
 	if err := binding.ValidateFor(crossTenant); err == nil {
@@ -270,7 +312,7 @@ func TestProtectedContentBindingContainsNoContentBearingFields(t *testing.T) {
 }
 
 func TestProtectedContentBindingPersistsExactChunkAuthorizationBoundary(t *testing.T) {
-	auth := testAuthorizationContext()
+	auth := testDirectAuthorizationContext()
 	parentID, err := NewStableResourceID(auth.TenantID, auth.KnowledgeBaseID, ResourceDocument, "sources/parent.md")
 	if err != nil {
 		t.Fatal(err)

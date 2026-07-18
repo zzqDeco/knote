@@ -3,6 +3,17 @@ model
 
 type user
 
+type agent
+  relations
+    define delegate: [user]
+
+type task
+  relations
+    define assignee: [user]
+    define agent: [agent]
+    define delegated_assignee: delegate from agent
+    define valid_assignee: assignee and delegated_assignee
+
 # These types are isolated from every protected-resource relation. They bind
 # one OpenFGA store to one identity tenant without granting data access.
 type identity_tenant
@@ -23,15 +34,19 @@ type organization
 type knowledge_base
   relations
     define organization: [organization]
+    define active_task: [task]
     define viewer: [user, group#member]
     define editor: [user, group#member]
     define unscoped_reader: viewer or editor
     define can_view: member from organization and unscoped_reader
     define can_edit: member from organization and editor
+    define task_assignee: valid_assignee from active_task
+    define can_view_in_task: can_view and task_assignee
 
 type document
   relations
     define organization: [organization]
+    define active_task: [task]
     define parent: [knowledge_base]
     define viewer: [user, group#member]
     define editor: [user, group#member]
@@ -42,10 +57,13 @@ type document
     define unscoped_editor: editor or inherited_editor
     define can_view: member from organization and unscoped_reader
     define can_edit: member from organization and unscoped_editor
+    define task_assignee: valid_assignee from active_task
+    define can_view_in_task: can_view and task_assignee
 
 type entity
   relations
     define organization: [organization]
+    define active_task: [task]
     define source_document: [document]
     define viewer: [user, group#member]
     define editor: [user, group#member]
@@ -56,10 +74,13 @@ type entity
     define unscoped_editor: editor or inherited_editor
     define can_view: member from organization and unscoped_reader
     define can_edit: member from organization and unscoped_editor
+    define task_assignee: valid_assignee from active_task
+    define can_view_in_task: can_view and task_assignee
 
 type claim
   relations
     define organization: [organization]
+    define active_task: [task]
     define source_document: [document]
     define subject: [entity]
     define object: [entity]
@@ -82,3 +103,5 @@ type claim
     define unscoped_editor: editor or inherited_editor
     define can_view: member from organization and unscoped_reader
     define can_edit: member from organization and unscoped_editor
+    define task_assignee: valid_assignee from active_task
+    define can_view_in_task: can_view and task_assignee

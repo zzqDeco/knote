@@ -342,6 +342,9 @@ func (s *Service) runFinalAuthorizationGate(
 	authorization protocol.AuthorizationContext,
 ) error {
 	if s.finalAuthorizationGate == nil {
+		if authorization.AgentID != "" {
+			return ErrProtectedContentUnavailable
+		}
 		return nil
 	}
 	if err := s.finalAuthorizationGate(ctx, authorization); err != nil {
@@ -637,21 +640,23 @@ func buildEvidencePackage(
 	for index, resource := range checked.handles {
 		result := checked.objects[resource.AuthorizationID]
 		decision := protocol.AuthorizationDecision{
-			CorrelationID:         result.correlationID,
-			RequestID:             authorization.RequestID,
-			SessionID:             authorization.SessionID,
-			PrincipalID:           authorization.PrincipalID,
-			AgentID:               authorization.AgentID,
-			TaskID:                authorization.TaskID,
-			Relation:              protocol.EvidenceReadRelation,
-			Resource:              resource,
-			AuthorizationResource: checked.boundaries[resource.ResourceID],
-			Outcome:               protocol.DecisionAllow,
-			AuthorizationModelID:  authorization.AuthorizationModelID,
-			IdentityWatermark:     authorization.IdentityWatermark,
-			ACLWatermark:          authorization.ACLWatermark,
-			Consistency:           authorization.Consistency,
-			CheckedAt:             checkedAt,
+			CorrelationID:             result.correlationID,
+			RequestID:                 authorization.RequestID,
+			SessionID:                 authorization.SessionID,
+			PrincipalID:               authorization.PrincipalID,
+			AgentID:                   authorization.AgentID,
+			TaskID:                    authorization.TaskID,
+			DelegationWatermark:       authorization.DelegationWatermark,
+			AgentTaskScopeFingerprint: authorization.AgentTaskScopeFingerprint,
+			Relation:                  protocol.EvidenceReadRelation,
+			Resource:                  resource,
+			AuthorizationResource:     checked.boundaries[resource.ResourceID],
+			Outcome:                   protocol.DecisionAllow,
+			AuthorizationModelID:      authorization.AuthorizationModelID,
+			IdentityWatermark:         authorization.IdentityWatermark,
+			ACLWatermark:              authorization.ACLWatermark,
+			Consistency:               authorization.Consistency,
+			CheckedAt:                 checkedAt,
 		}
 		if err := decision.ValidateFor(authorization); err != nil {
 			return protocol.EvidencePackage{}, fmt.Errorf("authorization decision for resource %s: %w", resource.ResourceID, err)
@@ -663,22 +668,24 @@ func buildEvidencePackage(
 		return protocol.EvidencePackage{}, fmt.Errorf("visibility fingerprint: %w", err)
 	}
 	result := protocol.EvidencePackage{
-		Version:               protocol.SecurityContractVersion,
-		TenantID:              authorization.TenantID,
-		KnowledgeBaseID:       authorization.KnowledgeBaseID,
-		PrincipalID:           authorization.PrincipalID,
-		SessionID:             authorization.SessionID,
-		RequestID:             authorization.RequestID,
-		AgentID:               authorization.AgentID,
-		TaskID:                authorization.TaskID,
-		AuthorizationModelID:  authorization.AuthorizationModelID,
-		IdentityWatermark:     authorization.IdentityWatermark,
-		ACLWatermark:          authorization.ACLWatermark,
-		Consistency:           authorization.Consistency,
-		ProjectionVersion:     checked.projection,
-		VisibilityFingerprint: fingerprint,
-		Items:                 cloneEvidenceItems(items),
-		Decisions:             decisions,
+		Version:                   protocol.SecurityContractVersion,
+		TenantID:                  authorization.TenantID,
+		KnowledgeBaseID:           authorization.KnowledgeBaseID,
+		PrincipalID:               authorization.PrincipalID,
+		SessionID:                 authorization.SessionID,
+		RequestID:                 authorization.RequestID,
+		AgentID:                   authorization.AgentID,
+		TaskID:                    authorization.TaskID,
+		DelegationWatermark:       authorization.DelegationWatermark,
+		AgentTaskScopeFingerprint: authorization.AgentTaskScopeFingerprint,
+		AuthorizationModelID:      authorization.AuthorizationModelID,
+		IdentityWatermark:         authorization.IdentityWatermark,
+		ACLWatermark:              authorization.ACLWatermark,
+		Consistency:               authorization.Consistency,
+		ProjectionVersion:         checked.projection,
+		VisibilityFingerprint:     fingerprint,
+		Items:                     cloneEvidenceItems(items),
+		Decisions:                 decisions,
 	}
 	if err := result.ValidateFor(authorization); err != nil {
 		return protocol.EvidencePackage{}, err
@@ -810,12 +817,21 @@ func (s *Service) checkObjects(
 	if err := authorization.Validate(); err != nil {
 		return nil, err
 	}
+	// A delegated context is only evidence of what was issued. Revalidate its
+	// current delegation, assignment, watermark, and expiry before adding any
+	// request-local OpenFGA tuples.
+	if authorization.AgentID != "" {
+		if err := s.runFinalAuthorizationGate(ctx, authorization); err != nil {
+			return nil, err
+		}
+	}
 	consistency, err := canonicalConsistency(authorization.Consistency)
 	if err != nil {
 		return nil, err
 	}
 	objects := make([]string, 0, len(resources))
 	seen := make(map[string]struct{}, len(resources))
+	scopedObjects := make(map[string]bool, len(resources))
 	for index, resource := range resources {
 		if err := resource.ValidateFor(authorization); err != nil {
 			return nil, fmt.Errorf("resource %d: %w", index, err)
@@ -825,11 +841,16 @@ func (s *Service) checkObjects(
 		}
 		seen[resource.AuthorizationID] = struct{}{}
 		objects = append(objects, resource.AuthorizationID)
+		// Derived artifacts are not OpenFGA objects. Their authorization is
+		// derived from the exact provenance resources checked below, so only
+		// those protected source objects receive the request-local task scope.
+		scopedObjects[resource.AuthorizationID] = resource.Type != protocol.ResourceDerivedArtifact
 	}
 	if len(objects) == 0 {
 		return nil, fmt.Errorf("authorization check requires at least one resource")
 	}
 	result := make(map[string]objectCheck, len(objects))
+	agentTaskScope := authorizationAgentTaskScope(authorization)
 	for start := 0; start < len(objects); start += authz.MaxBatchChecks {
 		end := start + authz.MaxBatchChecks
 		if end > len(objects) {
@@ -843,11 +864,16 @@ func (s *Service) checkObjects(
 		expected := make(map[string]string, len(request.Checks))
 		for index, object := range objects[start:end] {
 			correlationID := deterministicCorrelationID(stage, start+index, object)
+			var scope *authz.AgentTaskScope
+			if scopedObjects[object] {
+				scope = agentTaskScope
+			}
 			request.Checks[index] = authz.BatchCheckItem{
-				CorrelationID: correlationID,
-				User:          "user:" + authorization.PrincipalID,
-				Relation:      authz.RelationCanView,
-				Object:        object,
+				CorrelationID:  correlationID,
+				User:           "user:" + authorization.PrincipalID,
+				Relation:       authz.RelationCanView,
+				Object:         object,
+				AgentTaskScope: scope,
 			}
 			expected[correlationID] = object
 		}
@@ -883,6 +909,26 @@ func (s *Service) checkObjects(
 		}
 	}
 	return result, nil
+}
+
+func authorizationAgentTaskScope(authorization protocol.AuthorizationContext) *authz.AgentTaskScope {
+	if authorization.AgentID == "" {
+		return nil
+	}
+	user := "user:" + authorization.PrincipalID
+	agent := "agent:" + authorization.AgentID
+	task := "task:" + authorization.TaskID
+	return &authz.AgentTaskScope{
+		User:                 user,
+		Agent:                agent,
+		Task:                 task,
+		AuthorizationModelID: authorization.AuthorizationModelID,
+		ContextualTuples: []authz.Tuple{
+			{User: user, Relation: authz.RelationDelegate, Object: agent},
+			{User: agent, Relation: authz.RelationAgent, Object: task},
+			{User: user, Relation: authz.RelationAssignee, Object: task},
+		},
+	}
 }
 
 func (s *Service) loadExact(
@@ -1138,8 +1184,10 @@ func authorizationFromPackage(evidencePackage protocol.EvidencePackage) protocol
 		KnowledgeBaseID: evidencePackage.KnowledgeBaseID, PrincipalID: evidencePackage.PrincipalID,
 		SessionID: evidencePackage.SessionID, RequestID: evidencePackage.RequestID,
 		AgentID: evidencePackage.AgentID, TaskID: evidencePackage.TaskID,
-		AuthorizationModelID: evidencePackage.AuthorizationModelID,
-		IdentityWatermark:    evidencePackage.IdentityWatermark, ACLWatermark: evidencePackage.ACLWatermark,
+		DelegationWatermark:       evidencePackage.DelegationWatermark,
+		AgentTaskScopeFingerprint: evidencePackage.AgentTaskScopeFingerprint,
+		AuthorizationModelID:      evidencePackage.AuthorizationModelID,
+		IdentityWatermark:         evidencePackage.IdentityWatermark, ACLWatermark: evidencePackage.ACLWatermark,
 		Consistency: evidencePackage.Consistency,
 	}
 }
@@ -1154,6 +1202,8 @@ func validateCurrentCitationContext(current, original protocol.AuthorizationCont
 		{"session_id", current.SessionID, original.SessionID},
 		{"agent_id", current.AgentID, original.AgentID},
 		{"task_id", current.TaskID, original.TaskID},
+		{"delegation_watermark", current.DelegationWatermark, original.DelegationWatermark},
+		{"agent_task_scope_fingerprint", string(current.AgentTaskScopeFingerprint), string(original.AgentTaskScopeFingerprint)},
 	}
 	for _, binding := range bindings {
 		if binding.current != binding.original {

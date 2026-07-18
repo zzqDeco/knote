@@ -196,6 +196,7 @@ func derivedArtifactSecurityFixture(
 		PrincipalID: "user:alice", SessionID: "session-1", RequestID: "request-1",
 		AuthorizationModelID: "model-v1", IdentityWatermark: "identity-v1",
 		ACLWatermark: "acl-watermark-v1", AgentID: "agent-1", TaskID: "task-1",
+		DelegationWatermark: testDelegationWatermark, AgentTaskScopeFingerprint: testScopeFingerprint,
 		Consistency: ConsistencyHigherConsistency,
 	}
 	identity := func(resourceType ResourceType, sourceKey string) DerivedArtifactResourceIdentity {

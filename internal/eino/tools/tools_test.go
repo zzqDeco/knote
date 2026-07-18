@@ -426,17 +426,19 @@ func (*fakeService) Mode() versioned.Mode {
 
 func toolTestAuthorization() protocol.AuthorizationContext {
 	return protocol.AuthorizationContext{
-		Version:              protocol.SecurityContractVersion,
-		TenantID:             "local",
-		KnowledgeBaseID:      "default",
-		PrincipalID:          "local-user",
-		SessionID:            "session-1",
-		RequestID:            "request-1",
-		AgentID:              "agent-1",
-		TaskID:               "task-1",
-		AuthorizationModelID: "local-v1",
-		IdentityWatermark:    "identity-v1",
-		ACLWatermark:         "acl-v1",
-		Consistency:          protocol.ConsistencyHigherConsistency,
+		Version:                   protocol.SecurityContractVersion,
+		TenantID:                  "local",
+		KnowledgeBaseID:           "default",
+		PrincipalID:               "local-user",
+		SessionID:                 "session-1",
+		RequestID:                 "request-1",
+		AgentID:                   "agent-1",
+		TaskID:                    "task-1",
+		DelegationWatermark:       "delegation-v1",
+		AgentTaskScopeFingerprint: "scope_00000000000000000000000000000001",
+		AuthorizationModelID:      "local-v1",
+		IdentityWatermark:         "identity-v1",
+		ACLWatermark:              "acl-v1",
+		Consistency:               protocol.ConsistencyHigherConsistency,
 	}
 }

@@ -23,6 +23,9 @@ const (
 	relationEntitiesEditor    = "entities_editor"
 	relationInheritableReader = "inheritable_reader"
 	relationInheritableEditor = "inheritable_editor"
+	relationDelegatedAssignee = "delegated_assignee"
+	relationValidAssignee     = "valid_assignee"
+	relationTaskAssignee      = "task_assignee"
 )
 
 var singularClaimBindingRelations = [...]string{
@@ -368,7 +371,12 @@ func (a *LocalAuthorizer) Check(ctx context.Context, request CheckRequest) (Deci
 	}
 
 	a.mu.RLock()
-	allowed, err := a.evaluateLocked(request.User, request.Relation, request.Object, newEvaluationState(ctx))
+	allowed, err := a.evaluateLocked(
+		request.User,
+		effectiveRelation(request.Relation, request.AgentTaskScope),
+		request.Object,
+		newEvaluationState(ctx, contextualTuples(request.User, request.Object, request.AgentTaskScope)),
+	)
 	a.mu.RUnlock()
 	if err != nil {
 		return decision, err
@@ -405,7 +413,12 @@ func (a *LocalAuthorizer) BatchCheck(ctx context.Context, request BatchCheckRequ
 		if err := ctx.Err(); err != nil {
 			return denied, contextFailure(err)
 		}
-		allowed, err := a.evaluateLocked(check.User, check.Relation, check.Object, newEvaluationState(ctx))
+		allowed, err := a.evaluateLocked(
+			check.User,
+			effectiveRelation(check.Relation, check.AgentTaskScope),
+			check.Object,
+			newEvaluationState(ctx, contextualTuples(check.User, check.Object, check.AgentTaskScope)),
+		)
 		if err != nil {
 			return denied, err
 		}
@@ -431,12 +444,21 @@ type evaluationKey struct {
 }
 
 type evaluationState struct {
-	ctx      context.Context
-	visiting map[evaluationKey]bool
+	ctx              context.Context
+	visiting         map[evaluationKey]bool
+	contextualTuples map[Tuple]struct{}
 }
 
-func newEvaluationState(ctx context.Context) *evaluationState {
-	return &evaluationState{ctx: ctx, visiting: make(map[evaluationKey]bool)}
+func newEvaluationState(ctx context.Context, contextual []Tuple) *evaluationState {
+	tuples := make(map[Tuple]struct{}, len(contextual))
+	for _, tuple := range contextual {
+		tuples[tuple] = struct{}{}
+	}
+	return &evaluationState{
+		ctx:              ctx,
+		visiting:         make(map[evaluationKey]bool),
+		contextualTuples: tuples,
+	}
 }
 
 func (s *evaluationState) checkContext() error {
@@ -462,6 +484,10 @@ func (a *LocalAuthorizer) evaluateLocked(user, relation, object string, state *e
 		return false, err
 	}
 	switch objectRef.typeName {
+	case TypeAgent:
+		return a.evaluateAgentLocked(user, relation, object, state)
+	case TypeTask:
+		return a.evaluateTaskLocked(user, relation, object, state)
 	case TypeGroup:
 		if relation != RelationMember {
 			return false, unsupportedRelation(objectRef.typeName, relation)
@@ -485,9 +511,29 @@ func (a *LocalAuthorizer) evaluateLocked(user, relation, object string, state *e
 	}
 }
 
+func (a *LocalAuthorizer) evaluateAgentLocked(user, relation, object string, state *evaluationState) (bool, error) {
+	if relation != RelationDelegate {
+		return false, unsupportedRelation(TypeAgent, relation)
+	}
+	return a.directLocked(user, relation, object, state)
+}
+
+func (a *LocalAuthorizer) evaluateTaskLocked(user, relation, object string, state *evaluationState) (bool, error) {
+	switch relation {
+	case RelationAssignee, RelationAgent:
+		return a.directLocked(user, relation, object, state)
+	case relationDelegatedAssignee:
+		return a.memberOfRelatedObjectsLocked(user, RelationAgent, RelationDelegate, object, state)
+	case relationValidAssignee:
+		return a.allComputedRelationsLocked(user, object, state, RelationAssignee, relationDelegatedAssignee)
+	default:
+		return false, unsupportedRelation(TypeTask, relation)
+	}
+}
+
 func (a *LocalAuthorizer) evaluateKnowledgeBaseLocked(user, relation, object string, state *evaluationState) (bool, error) {
 	switch relation {
-	case RelationOrganization, RelationViewer, RelationEditor:
+	case RelationOrganization, RelationViewer, RelationEditor, RelationActiveTask:
 		return a.directLocked(user, relation, object, state)
 	case relationUnscopedReader:
 		viewer, err := a.directLocked(user, RelationViewer, object, state)
@@ -499,6 +545,10 @@ func (a *LocalAuthorizer) evaluateKnowledgeBaseLocked(user, relation, object str
 		return a.intersectOrganizationLocked(user, relationUnscopedReader, object, state)
 	case RelationCanEdit:
 		return a.intersectOrganizationLocked(user, RelationEditor, object, state)
+	case relationTaskAssignee:
+		return a.memberOfRelatedObjectsLocked(user, RelationActiveTask, relationValidAssignee, object, state)
+	case RelationCanViewInTask:
+		return a.allComputedRelationsLocked(user, object, state, RelationCanView, relationTaskAssignee)
 	default:
 		return false, unsupportedRelation(TypeKnowledgeBase, relation)
 	}
@@ -506,7 +556,7 @@ func (a *LocalAuthorizer) evaluateKnowledgeBaseLocked(user, relation, object str
 
 func (a *LocalAuthorizer) evaluateDocumentLocked(user, relation, object string, state *evaluationState) (bool, error) {
 	switch relation {
-	case RelationOrganization, RelationParent, RelationViewer, RelationEditor, RelationRestricted:
+	case RelationOrganization, RelationParent, RelationViewer, RelationEditor, RelationRestricted, RelationActiveTask:
 		return a.directLocked(user, relation, object, state)
 	case relationInheritedReader, relationInheritedEditor:
 		restricted, err := a.directLocked(user, RelationRestricted, object, state)
@@ -538,6 +588,10 @@ func (a *LocalAuthorizer) evaluateDocumentLocked(user, relation, object string, 
 		return a.intersectOrganizationLocked(user, relationUnscopedReader, object, state)
 	case RelationCanEdit:
 		return a.intersectOrganizationLocked(user, relationUnscopedEditor, object, state)
+	case relationTaskAssignee:
+		return a.memberOfRelatedObjectsLocked(user, RelationActiveTask, relationValidAssignee, object, state)
+	case RelationCanViewInTask:
+		return a.allComputedRelationsLocked(user, object, state, RelationCanView, relationTaskAssignee)
 	default:
 		return false, unsupportedRelation(TypeDocument, relation)
 	}
@@ -545,7 +599,7 @@ func (a *LocalAuthorizer) evaluateDocumentLocked(user, relation, object string, 
 
 func (a *LocalAuthorizer) evaluateEntityLocked(user, relation, object string, state *evaluationState) (bool, error) {
 	switch relation {
-	case RelationOrganization, RelationSourceDocument, RelationViewer, RelationEditor, RelationRestricted:
+	case RelationOrganization, RelationSourceDocument, RelationViewer, RelationEditor, RelationRestricted, RelationActiveTask:
 		return a.directLocked(user, relation, object, state)
 	case relationInheritedReader, relationInheritedEditor:
 		restricted, err := a.directLocked(user, RelationRestricted, object, state)
@@ -565,6 +619,10 @@ func (a *LocalAuthorizer) evaluateEntityLocked(user, relation, object string, st
 		return a.intersectOrganizationLocked(user, relationUnscopedReader, object, state)
 	case RelationCanEdit:
 		return a.intersectOrganizationLocked(user, relationUnscopedEditor, object, state)
+	case relationTaskAssignee:
+		return a.memberOfRelatedObjectsLocked(user, RelationActiveTask, relationValidAssignee, object, state)
+	case RelationCanViewInTask:
+		return a.allComputedRelationsLocked(user, object, state, RelationCanView, relationTaskAssignee)
 	default:
 		return false, unsupportedRelation(TypeEntity, relation)
 	}
@@ -580,7 +638,7 @@ func (a *LocalAuthorizer) evaluateClaimLocked(user, relation, object string, sta
 	}
 	switch relation {
 	case RelationOrganization, RelationSourceDocument, RelationSubject, RelationObject,
-		RelationViewer, RelationEditor, RelationRestricted:
+		RelationViewer, RelationEditor, RelationRestricted, RelationActiveTask:
 		return a.directLocked(user, relation, object, state)
 	case relationSourceReader:
 		return a.memberOfRelatedObjectsLocked(user, RelationSourceDocument, RelationCanView, object, state)
@@ -619,6 +677,10 @@ func (a *LocalAuthorizer) evaluateClaimLocked(user, relation, object string, sta
 		return a.intersectOrganizationLocked(user, relationUnscopedReader, object, state)
 	case RelationCanEdit:
 		return a.intersectOrganizationLocked(user, relationUnscopedEditor, object, state)
+	case relationTaskAssignee:
+		return a.memberOfRelatedObjectsLocked(user, RelationActiveTask, relationValidAssignee, object, state)
+	case RelationCanViewInTask:
+		return a.allComputedRelationsLocked(user, object, state, RelationCanView, relationTaskAssignee)
 	default:
 		return false, unsupportedRelation(TypeClaim, relation)
 	}
@@ -722,14 +784,26 @@ func (a *LocalAuthorizer) directLocked(user, relation, object string, state *eva
 }
 
 func (a *LocalAuthorizer) matchingTuplesLocked(relation, object string, state *evaluationState) ([]Tuple, error) {
-	var matches []Tuple
+	matching := make(map[Tuple]struct{})
 	for tuple := range a.tuples {
 		if err := state.checkContext(); err != nil {
 			return nil, err
 		}
 		if tuple.Relation == relation && tuple.Object == object {
-			matches = append(matches, tuple)
+			matching[tuple] = struct{}{}
 		}
+	}
+	for tuple := range state.contextualTuples {
+		if err := state.checkContext(); err != nil {
+			return nil, err
+		}
+		if tuple.Relation == relation && tuple.Object == object {
+			matching[tuple] = struct{}{}
+		}
+	}
+	matches := make([]Tuple, 0, len(matching))
+	for tuple := range matching {
+		matches = append(matches, tuple)
 	}
 	sort.Slice(matches, func(i, j int) bool { return matches[i].User < matches[j].User })
 	if err := state.checkContext(); err != nil {
