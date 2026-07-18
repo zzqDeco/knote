@@ -22,15 +22,8 @@ func createPrivateDirectoryTree(path string) error {
 			if !info.IsDir() {
 				return os.ErrInvalid
 			}
-			if err := validateWindowsDirectoryShape(current); err != nil {
+			if err := validateWindowsDirectoryAncestors(current); err != nil {
 				return err
-			}
-			resolved, err := filepath.EvalSymlinks(current)
-			if err != nil {
-				return err
-			}
-			if !sameWindowsPath(current, resolved) {
-				return os.ErrInvalid
 			}
 			break
 		}
@@ -54,7 +47,7 @@ func createPrivateDirectoryTree(path string) error {
 			}
 		}
 	}
-	return nil
+	return validateWindowsDirectoryAncestors(path)
 }
 
 func createPrivateWindowsDirectory(path string) error {
@@ -79,15 +72,8 @@ func createPrivateWindowsDirectory(path string) error {
 	return windows.CreateDirectory(pointer, attributes)
 }
 
-func validatePrivateStoreRootAlias(path, resolved string) error {
-	if !sameWindowsPath(path, resolved) {
-		return os.ErrInvalid
-	}
-	return nil
-}
-
-func sameWindowsPath(left, right string) bool {
-	return strings.EqualFold(filepath.Clean(left), filepath.Clean(right))
+func validatePrivateStoreRootAlias(path, _ string) error {
+	return validateWindowsDirectoryAncestors(path)
 }
 
 func validateWindowsDirectoryShape(path string) error {
@@ -97,6 +83,28 @@ func validateWindowsDirectoryShape(path string) error {
 	}
 	validationErr := validateWindowsIdentityDirectoryHandle(handle)
 	return errors.Join(validationErr, windows.CloseHandle(handle))
+}
+
+func validateWindowsDirectoryAncestors(path string) error {
+	clean := filepath.Clean(path)
+	volume := filepath.VolumeName(clean)
+	if volume == "" {
+		return os.ErrInvalid
+	}
+	current := volume + string(os.PathSeparator)
+	if err := validateWindowsDirectoryShape(current); err != nil {
+		return err
+	}
+	remainder := strings.TrimLeft(strings.TrimPrefix(clean, volume), `\/`)
+	for _, component := range strings.FieldsFunc(remainder, func(value rune) bool {
+		return value == '\\' || value == '/'
+	}) {
+		current = filepath.Join(current, component)
+		if err := validateWindowsDirectoryShape(current); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func directoryPermissionsTooBroad(path string, _ os.FileMode) (bool, error) {
