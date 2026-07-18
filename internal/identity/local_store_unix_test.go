@@ -9,6 +9,10 @@ import (
 	"testing"
 )
 
+func protectTestStoreRoot(path string) error {
+	return os.Chmod(path, 0o700)
+}
+
 func TestOpenLocalStoreCreatesPrivateRootBeforeChildren(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "identity")
 

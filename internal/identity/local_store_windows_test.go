@@ -14,6 +14,10 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+func protectTestStoreRoot(path string) error {
+	return protectPrivateDirectory(path)
+}
+
 func TestOpenLocalStoreCreatesProtectedOwnerOnlyDirectoryACLs(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "identity")
 	if _, err := OpenLocalStore(root); err != nil {

@@ -81,7 +81,7 @@ func testProvider() ProviderSpec {
 func openTestStore(t *testing.T, root string, clock Clock) *LocalStore {
 	t.Helper()
 	if info, err := os.Stat(root); err == nil && info.IsDir() {
-		if err := os.Chmod(root, 0o700); err != nil {
+		if err := protectTestStoreRoot(root); err != nil {
 			t.Fatal(err)
 		}
 	}
