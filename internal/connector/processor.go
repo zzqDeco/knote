@@ -195,14 +195,16 @@ func (p *Processor) Recover(ctx context.Context, ref ConnectorRef, projector Pro
 			return ErrDeadLettered
 		}
 		if durable.entry.Event.Kind == protocol.ConnectorSnapshotComplete {
-			if isNilReconciliationProjector(p.reconciler) {
-				return ErrReconciliationProjectorRequired
+			if durable.reconciliation == nil {
+				if isNilReconciliationProjector(p.reconciler) {
+					return ErrReconciliationProjectorRequired
+				}
+				if err := p.reconcileSnapshotEvent(ctx, ref, durable.entry.Event.Sequence, durable.entry.EventFingerprint); err != nil {
+					results[0] = p.currentResult(ref, durable.entry.Event.Sequence, true, result)
+					return err
+				}
 			}
-			if err := p.reconcileSnapshotEvent(ctx, ref, durable.entry.Event.Sequence, durable.entry.EventFingerprint); err != nil {
-				results[0] = p.currentResult(ref, durable.entry.Event.Sequence, true, result)
-				return err
-			}
-		} else {
+		} else if durable.delivery == nil {
 			if isNilCallback(projector) {
 				return fmt.Errorf("connector projector is required")
 			}
@@ -327,12 +329,17 @@ func (p *Processor) appendEvent(
 		if wouldResurrect(state, event) {
 			return ErrTombstoneResurrection
 		}
-		if _, err := p.store.ensureEventResourceOwnershipLocked(
+		if _, _, err := p.store.prepareEventResourceOwnershipLocked(
 			ref, state.registration, event, fingerprint, appendedAt,
 		); err != nil {
 			return err
 		}
 		if err := p.store.writeJSONOnce(p.store.journalPath(ref, event.Sequence), entry); err != nil {
+			return err
+		}
+		if _, err := p.store.ensureEventResourceOwnershipLocked(
+			ref, state.registration, event, fingerprint, appendedAt,
+		); err != nil {
 			return err
 		}
 		durable = durableEvent{entry: entry, attempts: []durableAttempt{}}
@@ -482,8 +489,8 @@ func (p *Processor) appendSnapshotEvent(
 			current.request.ProjectionBaseSequence != event.Sequence-1 {
 			return ErrJournalConflict
 		}
-		if err := p.store.claimReconciliationResourceOwnershipsLocked(
-			ref, current.registration, current.unownedAuthoritative,
+		if _, err := p.store.prepareReconciliationResourceOwnershipClaimLocked(
+			ref, current.registration, current.request.OwnedResourceIDs,
 			&event, fingerprint, "", createdAt,
 		); err != nil {
 			return err
@@ -493,6 +500,12 @@ func (p *Processor) appendSnapshotEvent(
 			SnapshotReconciliation: &intent, AppendedAt: createdAt,
 		}
 		if err := p.store.writeJSONOnce(p.store.journalPath(ref, event.Sequence), entry); err != nil {
+			return err
+		}
+		if err := p.store.claimReconciliationResourceOwnershipsLocked(
+			ref, current.registration, current.request.OwnedResourceIDs,
+			&event, fingerprint, "", createdAt,
+		); err != nil {
 			return err
 		}
 		durable = durableEvent{entry: entry, attempts: []durableAttempt{}}
@@ -1621,6 +1634,19 @@ func (p *Processor) recoverStandaloneReconciliation(ctx context.Context, ref Con
 			return fmt.Errorf("%w: pending reconciliation: %v", ErrStoreIntegrity, err)
 		}
 		if err := p.requireQuiescentConnectorLocked(ref); err != nil {
+			return err
+		}
+		registration, err := p.store.loadRegistrationLocked(ref)
+		if err != nil {
+			return err
+		}
+		if sourceOwnershipFor(registration) != pending.Request.SourceOwnership {
+			return fmt.Errorf("%w: pending reconciliation source ownership mismatch", ErrStoreIntegrity)
+		}
+		if err := p.store.claimReconciliationResourceOwnershipsLocked(
+			ref, registration, pending.Request.OwnedResourceIDs,
+			nil, "", pending.RequestDigest, pending.CreatedAt,
+		); err != nil {
 			return err
 		}
 		var receipt ReconciliationReservationReceipt

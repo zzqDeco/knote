@@ -388,40 +388,42 @@ func (s *Store) requireReconciliationOwnershipAnchorLocked(ref ConnectorRef, own
 	return fmt.Errorf("%w: resource ownership reconciliation binding has no durable anchor", ErrStoreIntegrity)
 }
 
-func (s *Store) ensureEventResourceOwnershipLocked(
+func (s *Store) prepareEventResourceOwnershipLocked(
 	ref ConnectorRef,
 	registration Registration,
 	event protocol.ConnectorEventEnvelope,
 	fingerprint protocol.ConnectorEventFingerprint,
 	boundAt time.Time,
-) (ResourceOwnership, error) {
+) (ResourceOwnership, bool, error) {
 	if event.Kind == protocol.ConnectorSnapshotComplete {
-		return ResourceOwnership{}, ErrResourceOwnershipRequired
+		return ResourceOwnership{}, false, ErrResourceOwnershipRequired
 	}
 	ownership, err := s.loadResourceOwnershipLocked(ref, event.ResourceID)
 	if err == nil {
 		if err := validateResourceOwnershipForRegistration(ownership, registration); err != nil {
-			return ResourceOwnership{}, err
+			return ResourceOwnership{}, false, err
 		}
 		if ownership.BoundSequence == event.Sequence &&
 			(ownership.BoundEventID != event.EventID || ownership.BoundFingerprint != fingerprint) {
-			return ResourceOwnership{}, ErrJournalConflict
+			return ResourceOwnership{}, false, ErrJournalConflict
 		}
 		if ownership.BoundSequence > event.Sequence {
-			return ResourceOwnership{}, fmt.Errorf("%w: resource ownership is bound to a future sequence", ErrStoreIntegrity)
+			return ResourceOwnership{}, false, fmt.Errorf(
+				"%w: resource ownership is bound to a future sequence", ErrStoreIntegrity,
+			)
 		}
 		if !resourceOwnershipMatchesEvent(ownership, event, fingerprint) {
 			if err := s.requireResourceOwnershipAnchorLocked(ref, ownership); err != nil {
-				return ResourceOwnership{}, err
+				return ResourceOwnership{}, false, err
 			}
 		}
-		return ownership, nil
+		return ownership, false, nil
 	}
 	if !errors.Is(err, ErrResourceOwnershipRequired) {
-		return ResourceOwnership{}, err
+		return ResourceOwnership{}, false, err
 	}
 	if event.Kind != protocol.ConnectorContentUpsert {
-		return ResourceOwnership{}, ErrResourceOwnershipRequired
+		return ResourceOwnership{}, false, ErrResourceOwnershipRequired
 	}
 	ownership = ResourceOwnership{
 		Version: ConnectorCoreVersion, TenantID: registration.Scope.TenantID, ResourceID: event.ResourceID,
@@ -429,7 +431,23 @@ func (s *Store) ensureEventResourceOwnershipLocked(
 		BoundFingerprint: fingerprint, BoundSequence: event.Sequence, BoundAt: boundAt,
 	}
 	if err := ownership.ValidateForEvent(event, sourceOwnershipFor(registration)); err != nil {
-		return ResourceOwnership{}, err
+		return ResourceOwnership{}, false, err
+	}
+	return ownership, true, nil
+}
+
+func (s *Store) ensureEventResourceOwnershipLocked(
+	ref ConnectorRef,
+	registration Registration,
+	event protocol.ConnectorEventEnvelope,
+	fingerprint protocol.ConnectorEventFingerprint,
+	boundAt time.Time,
+) (ResourceOwnership, error) {
+	ownership, needsWrite, err := s.prepareEventResourceOwnershipLocked(
+		ref, registration, event, fingerprint, boundAt,
+	)
+	if err != nil || !needsWrite {
+		return ownership, err
 	}
 	if err := s.writeJSONOnce(s.resourceOwnershipPath(ref, event.ResourceID), ownership); err != nil {
 		if errors.Is(err, ErrJournalConflict) {
@@ -449,12 +467,36 @@ func (s *Store) claimReconciliationResourceOwnershipsLocked(
 	requestDigest protocol.ContentDigest,
 	boundAt time.Time,
 ) error {
+	claim, err := s.prepareReconciliationResourceOwnershipClaimLocked(
+		ref, registration, resourceIDs, event, eventFingerprint, requestDigest, boundAt,
+	)
+	if err != nil || claim == nil {
+		return err
+	}
+	if err := s.writeJSONOnce(s.reconciliationOwnershipClaimPath(ref, *claim), *claim); err != nil {
+		if errors.Is(err, ErrJournalConflict) {
+			return ErrResourceOwnership
+		}
+		return err
+	}
+	return nil
+}
+
+func (s *Store) prepareReconciliationResourceOwnershipClaimLocked(
+	ref ConnectorRef,
+	registration Registration,
+	resourceIDs []protocol.ResourceID,
+	event *protocol.ConnectorEventEnvelope,
+	eventFingerprint protocol.ConnectorEventFingerprint,
+	requestDigest protocol.ContentDigest,
+	boundAt time.Time,
+) (*ReconciliationOwnershipClaim, error) {
 	resources := append([]protocol.ResourceID{}, resourceIDs...)
 	sort.Slice(resources, func(i, j int) bool { return resources[i] < resources[j] })
 	unique := resources[:0]
 	for _, resourceID := range resources {
 		if err := resourceID.Validate(); err != nil {
-			return err
+			return nil, err
 		}
 		if len(unique) == 0 || unique[len(unique)-1] != resourceID {
 			unique = append(unique, resourceID)
@@ -464,11 +506,11 @@ func (s *Store) claimReconciliationResourceOwnershipsLocked(
 	for _, resourceID := range unique {
 		ownership, found, err := s.loadResourceOwnershipOptionalLocked(ref, resourceID)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if found {
 			if err := validateResourceOwnershipForRegistration(ownership, registration); err != nil {
-				return err
+				return nil, err
 			}
 			matchesCurrent := ownership.BoundReconciliationDigest == requestDigest
 			if event != nil {
@@ -476,7 +518,7 @@ func (s *Store) claimReconciliationResourceOwnershipsLocked(
 			}
 			if !matchesCurrent {
 				if err := s.requireResourceOwnershipAnchorLocked(ref, ownership); err != nil {
-					return err
+					return nil, err
 				}
 			}
 			continue
@@ -484,7 +526,7 @@ func (s *Store) claimReconciliationResourceOwnershipsLocked(
 		unowned = append(unowned, resourceID)
 	}
 	if len(unowned) == 0 {
-		return nil
+		return nil, nil
 	}
 	claim := ReconciliationOwnershipClaim{
 		Version: ConnectorCoreVersion, TenantID: registration.Scope.TenantID,
@@ -494,7 +536,7 @@ func (s *Store) claimReconciliationResourceOwnershipsLocked(
 	if event != nil {
 		if event.TenantID != registration.Scope.TenantID || event.ConnectorID != registration.ConnectorID ||
 			event.Kind != protocol.ConnectorSnapshotComplete {
-			return ErrResourceOwnership
+			return nil, ErrResourceOwnership
 		}
 		claim.BoundEventID = event.EventID
 		claim.BoundFingerprint = eventFingerprint
@@ -503,15 +545,9 @@ func (s *Store) claimReconciliationResourceOwnershipsLocked(
 		claim.RequestDigest = requestDigest
 	}
 	if err := claim.Validate(); err != nil {
-		return err
+		return nil, err
 	}
-	if err := s.writeJSONOnce(s.reconciliationOwnershipClaimPath(ref, claim), claim); err != nil {
-		if errors.Is(err, ErrJournalConflict) {
-			return ErrResourceOwnership
-		}
-		return err
-	}
-	return nil
+	return &claim, nil
 }
 
 func (s *Store) requireResourceOwnershipsLocked(
@@ -571,6 +607,11 @@ func (s *Store) loadStateLocked(ref ConnectorRef, repairCursor bool) (durableSta
 	if err != nil {
 		return durableState{}, err
 	}
+	if repairCursor {
+		if err := s.repairJournalOwnershipsLocked(ref, registration, entries); err != nil {
+			return durableState{}, err
+		}
+	}
 	state := durableState{registration: registration, events: make([]durableEvent, len(entries))}
 	for index, entry := range entries {
 		event, err := s.readDurableEventLocked(ref, entry)
@@ -621,6 +662,34 @@ func (s *Store) loadStateLocked(ref ConnectorRef, repairCursor bool) (durableSta
 		return durableState{}, err
 	}
 	return state, nil
+}
+
+func (s *Store) repairJournalOwnershipsLocked(
+	ref ConnectorRef,
+	registration Registration,
+	entries []JournalEntry,
+) error {
+	for _, entry := range entries {
+		if entry.Event.Kind == protocol.ConnectorSnapshotComplete {
+			intent := entry.SnapshotReconciliation
+			if intent == nil || intent.SourceID != registration.SourceID {
+				return fmt.Errorf("%w: snapshot reconciliation source ownership mismatch", ErrStoreIntegrity)
+			}
+			if err := s.claimReconciliationResourceOwnershipsLocked(
+				ref, registration, intent.OwnedResourceIDs,
+				&entry.Event, entry.EventFingerprint, "", entry.AppendedAt,
+			); err != nil {
+				return fmt.Errorf("%w: repair snapshot resource ownership: %v", ErrStoreIntegrity, err)
+			}
+			continue
+		}
+		if _, err := s.ensureEventResourceOwnershipLocked(
+			ref, registration, entry.Event, entry.EventFingerprint, entry.AppendedAt,
+		); err != nil {
+			return fmt.Errorf("%w: repair event resource ownership: %v", ErrStoreIntegrity, err)
+		}
+	}
+	return nil
 }
 
 func (s *Store) readReconciliationReceiptsLocked(

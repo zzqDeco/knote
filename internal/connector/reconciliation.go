@@ -392,6 +392,12 @@ func (p *Processor) Reconcile(
 				}
 				reservation = pending
 				plan = pending.Request.Plan
+				if err := p.store.claimReconciliationResourceOwnershipsLocked(
+					ref, preparation.registration, pending.Request.OwnedResourceIDs,
+					nil, "", pending.RequestDigest, pending.CreatedAt,
+				); err != nil {
+					return err
+				}
 			}
 			var receipt ReconciliationReservationReceipt
 			if found, err := p.store.readOptionalJSON(
@@ -436,13 +442,19 @@ func (p *Processor) Reconcile(
 				if !reconciliationRequestsEqual(current.request, reservation.Request) {
 					return ErrPendingReconciliation
 				}
-				if err := p.store.claimReconciliationResourceOwnershipsLocked(
-					ref, current.registration, current.unownedAuthoritative,
+				if _, err := p.store.prepareReconciliationResourceOwnershipClaimLocked(
+					ref, current.registration, current.request.OwnedResourceIDs,
 					nil, "", reservation.RequestDigest, createdAt,
 				); err != nil {
 					return err
 				}
-				return p.store.writeJSONOnce(p.store.reconciliationPendingPath(ref), reservation)
+				if err := p.store.writeJSONOnce(p.store.reconciliationPendingPath(ref), reservation); err != nil {
+					return err
+				}
+				return p.store.claimReconciliationResourceOwnershipsLocked(
+					ref, current.registration, current.request.OwnedResourceIDs,
+					nil, "", reservation.RequestDigest, createdAt,
+				)
 			}); err != nil {
 				return err
 			}
