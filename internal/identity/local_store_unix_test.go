@@ -13,6 +13,13 @@ func protectTestStoreRoot(path string) error {
 	return os.Chmod(path, 0o700)
 }
 
+func assertPrivateIdentityPath(t *testing.T, path string, info os.FileInfo) {
+	t.Helper()
+	if info.Mode().Perm()&0o077 != 0 {
+		t.Fatalf("identity state %s has permissive mode %o", filepath.Base(path), info.Mode().Perm())
+	}
+}
+
 func TestOpenLocalStoreCreatesPrivateRootBeforeChildren(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "identity")
 

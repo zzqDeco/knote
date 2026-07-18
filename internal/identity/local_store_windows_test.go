@@ -36,6 +36,20 @@ func protectTestStoreRoot(path string) error {
 	return createPrivateDirectoryTree(path)
 }
 
+func assertPrivateIdentityPath(t *testing.T, path string, info os.FileInfo) {
+	t.Helper()
+	if !info.IsDir() {
+		return
+	}
+	tooBroad, err := directoryPermissionsTooBroad(path, info.Mode())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tooBroad {
+		t.Fatalf("identity directory %s has a non-private owner or DACL", filepath.Base(path))
+	}
+}
+
 func TestOpenLocalStoreCreatesProtectedOwnerOnlyDirectoryACLs(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "identity")
 	if _, err := OpenLocalStore(root); err != nil {

@@ -216,9 +216,7 @@ func TestLocalStoreRestartIsDeterministic(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if info.Mode().Perm()&0o077 != 0 {
-			t.Fatalf("identity state %s has permissive mode %o", filepath.Base(path), info.Mode().Perm())
-		}
+		assertPrivateIdentityPath(t, path, info)
 	}
 }
 
