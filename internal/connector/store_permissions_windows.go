@@ -137,9 +137,6 @@ func validateConnectorHandle(handle windows.Handle, directory bool) error {
 	if err != nil {
 		return err
 	}
-	if dacl == nil || dacl.AceCount == 0 {
-		return fmt.Errorf("connector store directory DACL must contain an owner entry")
-	}
 	user, err := windows.GetCurrentProcessToken().GetTokenUser()
 	if err != nil {
 		return err
@@ -151,26 +148,57 @@ func validateConnectorHandle(handle windows.Handle, directory bool) error {
 	if owner == nil || !owner.Equals(user.User.Sid) {
 		return fmt.Errorf("connector store directory must be owned by the current user")
 	}
+	return validateConnectorDACL(dacl, user.User.Sid, directory)
+}
+
+func validateConnectorDACL(dacl *windows.ACL, user *windows.SID, directory bool) error {
+	if dacl == nil || dacl.AceCount == 0 {
+		return fmt.Errorf("connector store directory DACL must contain an owner entry")
+	}
 	wantPermissions := windows.ACCESS_MASK(
 		windows.STANDARD_RIGHTS_REQUIRED | windows.SYNCHRONIZE | 0x1ff,
 	)
-	wantInheritance := uint8(windows.OBJECT_INHERIT_ACE | windows.CONTAINER_INHERIT_ACE)
+	inheritanceMask := uint8(
+		windows.OBJECT_INHERIT_ACE | windows.CONTAINER_INHERIT_ACE |
+			windows.NO_PROPAGATE_INHERIT_ACE | windows.INHERIT_ONLY_ACE | windows.INHERITED_ACE,
+	)
+	var appliesToSelf, inheritsObjects, inheritsContainers bool
 	for index := uint32(0); index < uint32(dacl.AceCount); index++ {
 		var ace *windows.ACCESS_ALLOWED_ACE
 		if err := windows.GetAce(dacl, index, &ace); err != nil {
 			return err
 		}
 		if ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE ||
-			!(*windows.SID)(unsafe.Pointer(&ace.SidStart)).Equals(user.User.Sid) {
+			!(*windows.SID)(unsafe.Pointer(&ace.SidStart)).Equals(user) {
 			return fmt.Errorf("connector store directory DACL is not restricted to the current user")
 		}
 		if ace.Mask != windows.GENERIC_ALL && ace.Mask != wantPermissions {
 			return fmt.Errorf("connector store directory DACL does not grant owner full access")
 		}
-		if ace.Header.AceFlags&windows.INHERITED_ACE != 0 ||
-			ace.Header.AceFlags&(windows.OBJECT_INHERIT_ACE|windows.CONTAINER_INHERIT_ACE) != wantInheritance {
+		flags := ace.Header.AceFlags
+		if flags&windows.INHERITED_ACE != 0 || flags&^inheritanceMask != 0 ||
+			flags&windows.NO_PROPAGATE_INHERIT_ACE != 0 {
 			return fmt.Errorf("connector store directory DACL has invalid inheritance")
 		}
+		if !directory {
+			if flags != 0 {
+				return fmt.Errorf("connector store file DACL has invalid inheritance")
+			}
+			appliesToSelf = true
+			continue
+		}
+		inheritance := flags & (windows.OBJECT_INHERIT_ACE | windows.CONTAINER_INHERIT_ACE)
+		if flags&windows.INHERIT_ONLY_ACE != 0 && inheritance == 0 {
+			return fmt.Errorf("connector store directory DACL has invalid inheritance")
+		}
+		if flags&windows.INHERIT_ONLY_ACE == 0 {
+			appliesToSelf = true
+		}
+		inheritsObjects = inheritsObjects || inheritance&windows.OBJECT_INHERIT_ACE != 0
+		inheritsContainers = inheritsContainers || inheritance&windows.CONTAINER_INHERIT_ACE != 0
+	}
+	if !appliesToSelf || directory && (!inheritsObjects || !inheritsContainers) {
+		return fmt.Errorf("connector store directory DACL has incomplete inheritance coverage")
 	}
 	return nil
 }

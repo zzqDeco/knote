@@ -25,6 +25,58 @@ func TestNewStoreCreatesProtectedOwnerOnlyRoot(t *testing.T) {
 	}
 }
 
+func TestValidateConnectorDACLAcceptsEquivalentNormalizedInheritance(t *testing.T) {
+	user, err := windows.GetCurrentProcessToken().GetTokenUser()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sid := user.User.Sid.String()
+	for _, sddl := range []string{
+		"D:P(A;OICI;GA;;;" + sid + ")",
+		"D:P(A;;GA;;;" + sid + ")(A;OICIIO;GA;;;" + sid + ")",
+		"D:P(A;;GA;;;" + sid + ")(A;OIIO;GA;;;" + sid + ")(A;CIIO;GA;;;" + sid + ")",
+	} {
+		descriptor, err := windows.SecurityDescriptorFromString(sddl)
+		if err != nil {
+			t.Fatal(err)
+		}
+		dacl, _, err := descriptor.DACL()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := validateConnectorDACL(dacl, user.User.Sid, true); err != nil {
+			t.Fatalf("validate normalized DACL %q: %v", sddl, err)
+		}
+	}
+}
+
+func TestValidateConnectorDACLRejectsIncompleteInheritanceCoverage(t *testing.T) {
+	user, err := windows.GetCurrentProcessToken().GetTokenUser()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sid := user.User.Sid.String()
+	for _, sddl := range []string{
+		"D:P(A;;GA;;;" + sid + ")",
+		"D:P(A;OICIIO;GA;;;" + sid + ")",
+		"D:P(A;OI;GA;;;" + sid + ")",
+		"D:P(A;CI;GA;;;" + sid + ")",
+		"D:P(A;OICINP;GA;;;" + sid + ")",
+	} {
+		descriptor, err := windows.SecurityDescriptorFromString(sddl)
+		if err != nil {
+			t.Fatal(err)
+		}
+		dacl, _, err := descriptor.DACL()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := validateConnectorDACL(dacl, user.User.Sid, true); err == nil {
+			t.Fatalf("validateConnectorDACL accepted incomplete DACL %q", sddl)
+		}
+	}
+}
+
 func TestNewStoreRejectsPermissiveExistingRootWithoutMutation(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "shared")
 	if err := os.Mkdir(root, 0o700); err != nil {
