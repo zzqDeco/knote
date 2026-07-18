@@ -313,6 +313,81 @@ func validateResourceOwnershipForRegistration(ownership ResourceOwnership, regis
 	return nil
 }
 
+func resourceOwnershipMatchesEvent(
+	ownership ResourceOwnership,
+	event protocol.ConnectorEventEnvelope,
+	fingerprint protocol.ConnectorEventFingerprint,
+) bool {
+	return ownership.BoundEventID == event.EventID &&
+		ownership.BoundFingerprint == fingerprint &&
+		ownership.BoundSequence == event.Sequence
+}
+
+func (s *Store) requireResourceOwnershipAnchorLocked(ref ConnectorRef, ownership ResourceOwnership) error {
+	if ownership.BoundReconciliationDigest != "" {
+		return s.requireReconciliationOwnershipAnchorLocked(ref, ownership)
+	}
+	return s.requireEventOwnershipAnchorLocked(ref, ownership)
+}
+
+func (s *Store) requireEventOwnershipAnchorLocked(ref ConnectorRef, ownership ResourceOwnership) error {
+	var entry JournalEntry
+	if err := s.readJSON(s.journalPath(ref, ownership.BoundSequence), &entry); err != nil {
+		return fmt.Errorf("%w: resource ownership event anchor: %v", ErrStoreIntegrity, err)
+	}
+	if err := entry.ValidateFor(ref); err != nil ||
+		entry.Event.Sequence != ownership.BoundSequence ||
+		entry.Event.EventID != ownership.BoundEventID ||
+		entry.EventFingerprint != ownership.BoundFingerprint {
+		return fmt.Errorf("%w: resource ownership event anchor does not match its journal entry", ErrStoreIntegrity)
+	}
+	if entry.Event.Kind == protocol.ConnectorSnapshotComplete {
+		if entry.SnapshotReconciliation == nil ||
+			!containsResourceID(entry.SnapshotReconciliation.OwnedResourceIDs, ownership.ResourceID) {
+			return fmt.Errorf("%w: snapshot ownership is not bound by its journal entry", ErrStoreIntegrity)
+		}
+	} else if entry.Event.ResourceID != ownership.ResourceID {
+		return fmt.Errorf("%w: resource ownership is bound to a different journal resource", ErrStoreIntegrity)
+	}
+	return nil
+}
+
+func (s *Store) requireReconciliationOwnershipAnchorLocked(ref ConnectorRef, ownership ResourceOwnership) error {
+	var pending ReconciliationReservation
+	if found, err := s.readOptionalJSON(s.reconciliationPendingPath(ref), &pending); err != nil {
+		return err
+	} else if found {
+		if err := pending.Validate(); err != nil {
+			return fmt.Errorf("%w: pending reconciliation ownership anchor: %v", ErrStoreIntegrity, err)
+		}
+		if pending.RequestDigest == ownership.BoundReconciliationDigest &&
+			pending.Request.SourceOwnership.TenantID == ownership.TenantID &&
+			pending.Request.SourceOwnership.ConnectorID == ownership.ConnectorID &&
+			pending.Request.SourceOwnership.SourceID == ownership.SourceID &&
+			containsResourceID(pending.Request.OwnedResourceIDs, ownership.ResourceID) {
+			return nil
+		}
+	}
+
+	var receipt ReconciliationReservationReceipt
+	if found, err := s.readOptionalJSON(
+		s.reconciliationReservationReceiptPath(ref, ownership.BoundReconciliationDigest), &receipt,
+	); err != nil {
+		return err
+	} else if found {
+		if err := receipt.Validate(); err != nil {
+			return fmt.Errorf("%w: reconciliation receipt ownership anchor: %v", ErrStoreIntegrity, err)
+		}
+		if receipt.RequestDigest == ownership.BoundReconciliationDigest &&
+			receipt.TenantID == ownership.TenantID && receipt.ConnectorID == ownership.ConnectorID &&
+			receipt.SourceID == ownership.SourceID &&
+			containsResourceID(receipt.Request.OwnedResourceIDs, ownership.ResourceID) {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: resource ownership reconciliation binding has no durable anchor", ErrStoreIntegrity)
+}
+
 func (s *Store) ensureEventResourceOwnershipLocked(
 	ref ConnectorRef,
 	registration Registration,
@@ -334,6 +409,11 @@ func (s *Store) ensureEventResourceOwnershipLocked(
 		}
 		if ownership.BoundSequence > event.Sequence {
 			return ResourceOwnership{}, fmt.Errorf("%w: resource ownership is bound to a future sequence", ErrStoreIntegrity)
+		}
+		if !resourceOwnershipMatchesEvent(ownership, event, fingerprint) {
+			if err := s.requireResourceOwnershipAnchorLocked(ref, ownership); err != nil {
+				return ResourceOwnership{}, err
+			}
 		}
 		return ownership, nil
 	}
@@ -389,6 +469,15 @@ func (s *Store) claimReconciliationResourceOwnershipsLocked(
 		if found {
 			if err := validateResourceOwnershipForRegistration(ownership, registration); err != nil {
 				return err
+			}
+			matchesCurrent := ownership.BoundReconciliationDigest == requestDigest
+			if event != nil {
+				matchesCurrent = resourceOwnershipMatchesEvent(ownership, *event, eventFingerprint)
+			}
+			if !matchesCurrent {
+				if err := s.requireResourceOwnershipAnchorLocked(ref, ownership); err != nil {
+					return err
+				}
 			}
 			continue
 		}
@@ -1443,6 +1532,11 @@ func (s *Store) readOptionalJSON(path string, destination any) (bool, error) {
 			return false, nil
 		}
 		return false, err
+	}
+	value := reflect.ValueOf(destination)
+	if value.Kind() == reflect.Pointer && !value.IsNil() &&
+		value.Elem().Kind() == reflect.Pointer && value.Elem().IsNil() {
+		return false, fmt.Errorf("%w: optional connector store record is null", ErrStoreIntegrity)
 	}
 	return true, nil
 }

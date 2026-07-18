@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -14,11 +15,15 @@ import (
 func secureConnectorDirectory(path string) error { return secureConnectorPath(path, true) }
 
 func validateConnectorPathComponent(path string) error {
-	handle, err := openConnectorDirectoryHandle(path, 0)
+	return validateConnectorAncestor(path, isConnectorVolumeRoot(path))
+}
+
+func validateConnectorAncestor(path string, allowVolumeRootChildCreation bool) error {
+	handle, err := openConnectorDirectoryHandle(path, windows.READ_CONTROL)
 	if err != nil {
 		return err
 	}
-	validateErr := validateConnectorHandleType(handle, true)
+	validateErr := validateConnectorAncestorHandle(handle, allowVolumeRootChildCreation)
 	return errors.Join(validateErr, windows.CloseHandle(handle))
 }
 
@@ -32,6 +37,10 @@ func validateConnectorDirectory(path string) error {
 }
 
 func createConnectorDirectory(path string) error {
+	parent := filepath.Dir(filepath.Clean(path))
+	if err := validateConnectorAncestor(parent, false); err != nil {
+		return fmt.Errorf("validate connector store directory parent %s: %w", parent, err)
+	}
 	user, err := windows.GetCurrentProcessToken().GetTokenUser()
 	if err != nil {
 		return err
@@ -149,6 +158,101 @@ func validateConnectorHandle(handle windows.Handle, directory bool) error {
 		return fmt.Errorf("connector store directory must be owned by the current user")
 	}
 	return validateConnectorDACL(dacl, user.User.Sid, directory)
+}
+
+func validateConnectorAncestorHandle(handle windows.Handle, allowVolumeRootChildCreation bool) error {
+	if err := validateConnectorHandleType(handle, true); err != nil {
+		return err
+	}
+	descriptor, err := windows.GetSecurityInfo(
+		handle, windows.SE_FILE_OBJECT,
+		windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION,
+	)
+	if err != nil {
+		return err
+	}
+	user, err := windows.GetCurrentProcessToken().GetTokenUser()
+	if err != nil {
+		return err
+	}
+	owner, _, err := descriptor.Owner()
+	if err != nil {
+		return err
+	}
+	if !trustedConnectorAncestorSID(owner, user.User.Sid) {
+		return fmt.Errorf("connector store path component has an untrusted owner")
+	}
+	dacl, _, err := descriptor.DACL()
+	if err != nil {
+		return err
+	}
+	return validateConnectorAncestorDACL(dacl, user.User.Sid, allowVolumeRootChildCreation)
+}
+
+func validateConnectorAncestorDACL(
+	dacl *windows.ACL,
+	user *windows.SID,
+	allowVolumeRootChildCreation bool,
+) error {
+	if dacl == nil {
+		return fmt.Errorf("connector store path component has a permissive null DACL")
+	}
+	dangerousPermissions := windows.ACCESS_MASK(
+		windows.FILE_WRITE_DATA | windows.FILE_APPEND_DATA |
+			windows.FILE_WRITE_ATTRIBUTES | windows.FILE_WRITE_EA |
+			0x40 | // FILE_DELETE_CHILD
+			windows.DELETE | windows.WRITE_DAC | windows.WRITE_OWNER |
+			windows.MAXIMUM_ALLOWED | windows.GENERIC_WRITE | windows.GENERIC_ALL,
+	)
+	if allowVolumeRootChildCreation {
+		// Windows volume roots commonly allow authenticated users to create a
+		// child, while protecting existing children. The direct-parent check in
+		// createConnectorDirectory applies the strict mask before any creation.
+		dangerousPermissions &^= windows.FILE_WRITE_DATA | windows.FILE_APPEND_DATA
+	}
+	for index := uint32(0); index < uint32(dacl.AceCount); index++ {
+		var ace *windows.ACCESS_ALLOWED_ACE
+		if err := windows.GetAce(dacl, index, &ace); err != nil {
+			return err
+		}
+		if ace.Header.AceType == windows.ACCESS_DENIED_ACE_TYPE {
+			continue
+		}
+		if ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE {
+			return fmt.Errorf("connector store path component DACL contains an unsupported ACE type")
+		}
+		if ace.Header.AceFlags&windows.INHERIT_ONLY_ACE != 0 {
+			continue
+		}
+		aceSID := (*windows.SID)(unsafe.Pointer(&ace.SidStart))
+		if trustedConnectorAncestorSID(aceSID, user) {
+			continue
+		}
+		if ace.Mask&dangerousPermissions != 0 {
+			return fmt.Errorf("connector store path component DACL grants unsafe write access")
+		}
+	}
+	return nil
+}
+
+func trustedConnectorAncestorSID(sid, user *windows.SID) bool {
+	if sid == nil {
+		return false
+	}
+	if sid.Equals(user) || sid.IsWellKnown(windows.WinLocalSystemSid) ||
+		sid.IsWellKnown(windows.WinBuiltinAdministratorsSid) {
+		return true
+	}
+	trustedInstaller, err := windows.StringToSid(
+		"S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464",
+	)
+	return err == nil && sid.Equals(trustedInstaller)
+}
+
+func isConnectorVolumeRoot(path string) bool {
+	path = filepath.Clean(path)
+	root := filepath.Clean(filepath.VolumeName(path) + string(filepath.Separator))
+	return path == root
 }
 
 func validateConnectorDACL(dacl *windows.ACL, user *windows.SID, directory bool) error {

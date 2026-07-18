@@ -98,6 +98,97 @@ func TestNewStoreRejectsPermissiveExistingRootWithoutMutation(t *testing.T) {
 	}
 }
 
+func TestNewStoreRejectsWritableExistingAncestorWithoutMutation(t *testing.T) {
+	ancestor := filepath.Join(t.TempDir(), "shared")
+	if err := os.Mkdir(ancestor, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	setConnectorDirectoryEveryoneACL(t, ancestor)
+	root := filepath.Join(ancestor, "connector", "store")
+
+	if _, err := NewStore(root); err == nil {
+		t.Fatal("NewStore accepted an ancestor writable by Everyone")
+	}
+	if _, err := os.Lstat(filepath.Join(ancestor, "connector")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("NewStore created children under the rejected ancestor: %v", err)
+	}
+	if err := validateConnectorDirectory(ancestor); err == nil {
+		t.Fatal("NewStore replaced the rejected ancestor DACL")
+	}
+}
+
+func TestValidateConnectorAncestorDACL(t *testing.T) {
+	user, err := windows.GetCurrentProcessToken().GetTokenUser()
+	if err != nil {
+		t.Fatal(err)
+	}
+	everyone, err := windows.CreateWellKnownSid(windows.WinWorldSid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name                         string
+		permissions                  windows.ACCESS_MASK
+		inheritance                  uint32
+		allowVolumeRootChildCreation bool
+		wantErr                      bool
+	}{
+		{
+			name:        "read-only access",
+			permissions: windows.GENERIC_READ | windows.GENERIC_EXECUTE,
+		},
+		{
+			name:        "full access",
+			permissions: windows.GENERIC_ALL,
+			wantErr:     true,
+		},
+		{
+			name:        "create child",
+			permissions: windows.FILE_APPEND_DATA,
+			wantErr:     true,
+		},
+		{
+			name:                         "volume root create child compatibility",
+			permissions:                  windows.FILE_APPEND_DATA,
+			allowVolumeRootChildCreation: true,
+		},
+		{
+			name:                         "volume root full access remains unsafe",
+			permissions:                  windows.GENERIC_ALL,
+			allowVolumeRootChildCreation: true,
+			wantErr:                      true,
+		},
+		{
+			name:        "inherit-only full access",
+			permissions: windows.GENERIC_ALL,
+			inheritance: windows.SUB_CONTAINERS_AND_OBJECTS_INHERIT | windows.INHERIT_ONLY,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			acl, err := windows.ACLFromEntries([]windows.EXPLICIT_ACCESS{{
+				AccessPermissions: test.permissions,
+				AccessMode:        windows.GRANT_ACCESS,
+				Inheritance:       test.inheritance,
+				Trustee: windows.TRUSTEE{
+					TrusteeForm:  windows.TRUSTEE_IS_SID,
+					TrusteeType:  windows.TRUSTEE_IS_WELL_KNOWN_GROUP,
+					TrusteeValue: windows.TrusteeValueFromSID(everyone),
+				},
+			}}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = validateConnectorAncestorDACL(
+				acl, user.User.Sid, test.allowVolumeRootChildCreation,
+			)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("validateConnectorAncestorDACL() error = %v, wantErr %t", err, test.wantErr)
+			}
+		})
+	}
+}
+
 func TestNewStoreRejectsExistingRootThroughAncestorJunctionWithoutMutation(t *testing.T) {
 	base := t.TempDir()
 	target := filepath.Join(base, "target")
