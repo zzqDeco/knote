@@ -11,6 +11,9 @@ import (
 
 func TestLocalStoreRejectsSymlinkProcessLock(t *testing.T) {
 	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	target := filepath.Join(t.TempDir(), "lock-target")
 	if err := os.Symlink(target, filepath.Join(root, processLockFileName)); err != nil {
 		t.Fatal(err)
@@ -25,6 +28,9 @@ func TestLocalStoreRejectsSymlinkProcessLock(t *testing.T) {
 
 func TestLocalStoreCanonicalizesRootAliasesForInProcessLocking(t *testing.T) {
 	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	alias := filepath.Join(t.TempDir(), "identity-alias")
 	if err := os.Symlink(root, alias); err != nil {
 		t.Fatal(err)

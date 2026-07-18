@@ -157,6 +157,9 @@ func (s *Service) Query(ctx context.Context, request protocol.QueryRequest) (res
 		if snapshot, ok := s.cache.get(cacheKey); ok {
 			cached, err := s.revalidateCached(queryContext, request, snapshot.result, nil)
 			if err == nil && s.cache.containsRevision(cacheKey, snapshot.revision) {
+				if err := s.runFinalAuthorizationGate(queryContext, request.Authorization); err != nil {
+					return QueryResult{}, err
+				}
 				return cached, nil
 			}
 			s.cache.deleteIfRevision(cacheKey, snapshot.revision)
@@ -276,6 +279,9 @@ func (s *Service) Query(ctx context.Context, request protocol.QueryRequest) (res
 				return QueryResult{}, ErrProtectedContentUnavailable
 			}
 			budget.setCompletePaths(len(cached.Evidence.Items))
+			if err := s.runFinalAuthorizationGate(queryContext, request.Authorization); err != nil {
+				return QueryResult{}, err
+			}
 			return cached, nil
 		}
 	}
@@ -306,10 +312,8 @@ func (s *Service) Query(ctx context.Context, request protocol.QueryRequest) (res
 			return QueryResult{}, err
 		}
 	}
-	if s.finalAuthorizationGate != nil {
-		if err := s.finalAuthorizationGate(queryContext, authorization); err != nil {
-			return QueryResult{}, ErrProtectedContentUnavailable
-		}
+	if err := s.runFinalAuthorizationGate(queryContext, authorization); err != nil {
+		return QueryResult{}, err
 	}
 	generation, err := s.kag.Generate(queryContext, generateRequest)
 	if err != nil {
@@ -331,6 +335,19 @@ func (s *Service) Query(ctx context.Context, request protocol.QueryRequest) (res
 		return QueryResult{}, ErrProtectedContentUnavailable
 	}
 	return result, nil
+}
+
+func (s *Service) runFinalAuthorizationGate(
+	ctx context.Context,
+	authorization protocol.AuthorizationContext,
+) error {
+	if s.finalAuthorizationGate == nil {
+		return nil
+	}
+	if err := s.finalAuthorizationGate(ctx, authorization); err != nil {
+		return ErrProtectedContentUnavailable
+	}
+	return nil
 }
 
 func (s *Service) discoverAuthorizedResources(

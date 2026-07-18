@@ -96,19 +96,16 @@ func OpenLocalStore(root string, options ...LocalStoreOption) (*LocalStore, erro
 			return nil, err
 		}
 	}
+	resolvedRoot, err := preparePrivateStoreRoot(absolute)
+	if err != nil {
+		return nil, err
+	}
+	absolute = resolvedRoot
 	if err := os.MkdirAll(filepath.Join(absolute, tenantDirectory), 0o700); err != nil {
 		return nil, storeFailure("create identity store", err)
 	}
 	if err := os.MkdirAll(filepath.Join(absolute, publicationDirectory), 0o700); err != nil {
 		return nil, storeFailure("create identity publication store", err)
-	}
-	resolvedRoot, err := filepath.EvalSymlinks(absolute)
-	if err != nil {
-		return nil, storeFailure("resolve identity store", err)
-	}
-	absolute = resolvedRoot
-	if err := ensurePrivateDirectory(absolute); err != nil {
-		return nil, err
 	}
 	if err := ensurePrivateDirectory(filepath.Join(absolute, tenantDirectory)); err != nil {
 		return nil, err
@@ -500,12 +497,33 @@ func ensurePrivateDirectory(path string) error {
 	if !info.IsDir() {
 		return fmt.Errorf("%w: identity store is not a directory", ErrStoreUnavailable)
 	}
-	if info.Mode().Perm()&0o077 != 0 {
+	if directoryPermissionsTooBroad(info.Mode()) {
 		if err := os.Chmod(path, 0o700); err != nil {
 			return storeFailure("protect identity store", err)
 		}
 	}
 	return nil
+}
+
+func preparePrivateStoreRoot(path string) (string, error) {
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		return "", storeFailure("create identity store root", err)
+	}
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", storeFailure("resolve identity store", err)
+	}
+	info, err := os.Stat(resolved)
+	if err != nil {
+		return "", storeFailure("inspect identity store root", err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("%w: identity store root is not a directory", ErrStoreUnavailable)
+	}
+	if directoryPermissionsTooBroad(info.Mode()) {
+		return "", fmt.Errorf("%w: identity store root permissions are too broad", ErrStoreUnavailable)
+	}
+	return resolved, nil
 }
 
 func storeFailure(operation string, err error) error {

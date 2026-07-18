@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -240,7 +241,7 @@ type commandIdentityFixture struct {
 func newCommandIdentityFixture(t *testing.T, tenantID string, principalID string) commandIdentityFixture {
 	t.Helper()
 	ctx := context.Background()
-	root := t.TempDir()
+	root := filepath.Join(t.TempDir(), "identity-store")
 	store, err := identity.OpenLocalStore(root)
 	if err != nil {
 		t.Fatal(err)

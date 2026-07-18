@@ -826,6 +826,35 @@ def _openfga_tuple(value: Any) -> tuple[str, str, str]:
     return user, relation, object_name
 
 
+def _identity_publication_fence(value: tuple[str, str, str]) -> tuple[str, int]:
+    user, relation, object_name = value
+    prefix = "identity_control:publication_v1_"
+    require(
+        relation == "claimed" and object_name == "identity_control:membership" and user.startswith(prefix),
+        "openfga",
+        "identity_publication_fence_invalid",
+    )
+    parts = user.removeprefix(prefix).split("_")
+    require(
+        len(parts) == 5
+        and parts[0] in {"a", "p"}
+        and re.fullmatch(r"[0-9]{20}", parts[1]) is not None
+        and re.fullmatch(r"[0-9]{20}", parts[2]) is not None
+        and re.fullmatch(r"[0-9a-f]{32}", parts[3]) is not None
+        and re.fullmatch(r"[0-9a-f]{64}", parts[4]) is not None,
+        "openfga",
+        "identity_publication_fence_invalid",
+    )
+    attempt = int(parts[1])
+    revision = int(parts[2])
+    require(
+        revision > 0 and ((parts[0] == "a" and attempt > 0) or (parts[0] == "p" and attempt == 0)),
+        "openfga",
+        "identity_publication_fence_invalid",
+    )
+    return parts[0], attempt
+
+
 def openfga_handler() -> type[http.server.BaseHTTPRequestHandler]:
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, _format: str, *_args: Any) -> None:
@@ -880,18 +909,16 @@ def openfga_handler() -> type[http.server.BaseHTTPRequestHandler]:
                         require(isinstance(write_tuples, list), "openfga", "write_tuples_invalid")
                     if deletes is not None:
                         require(isinstance(deletes, dict), "openfga", "deletes_invalid")
-                        require(
-                            deletes.get("on_missing") == "ignore",
-                            "openfga",
-                            "missing_delete_policy_invalid",
-                        )
                         delete_tuples = deletes.get("tuple_keys", [])
                         require(isinstance(delete_tuples, list), "openfga", "delete_tuples_invalid")
                     require(write_tuples or delete_tuples, "openfga", "empty_tuple_write")
                     canonical_writes = [_openfga_tuple(item) for item in write_tuples]
                     canonical_deletes = [_openfga_tuple(item) for item in delete_tuples]
-                    control_claim = any(item[2] == "identity_control:membership" for item in canonical_writes)
-                    if control_claim:
+                    fixed_claim = ("identity_control:claim", "claimed", "identity_control:membership")
+                    tenant_binding = (f"identity_tenant:{TENANT_ID}", "tenant", "identity_control:membership")
+                    control_writes = [item for item in canonical_writes if item[2] == "identity_control:membership"]
+                    control_deletes = [item for item in canonical_deletes if item[2] == "identity_control:membership"]
+                    if fixed_claim in canonical_writes:
                         require(not canonical_deletes, "openfga", "control_delete_invalid")
                         require(
                             writes.get("on_duplicate") == "error",
@@ -899,18 +926,54 @@ def openfga_handler() -> type[http.server.BaseHTTPRequestHandler]:
                             "control_duplicate_policy_invalid",
                         )
                         require(
-                            canonical_writes == [
-                                ("identity_control:claim", "claimed", "identity_control:membership"),
-                                (f"identity_tenant:{TENANT_ID}", "tenant", "identity_control:membership"),
-                            ],
+                            len(canonical_writes) == 3
+                            and canonical_writes[:2] == [fixed_claim, tenant_binding],
                             "openfga",
                             "control_claim_invalid",
                         )
+                        state_name, attempt = _identity_publication_fence(canonical_writes[2])
+                        require(state_name == "a" and attempt == 1, "openfga", "control_claim_fence_invalid")
+                    elif control_writes or control_deletes:
+                        require(
+                            len(control_writes) == 1 and len(control_deletes) == 1,
+                            "openfga",
+                            "identity_publication_fence_count_invalid",
+                        )
+                        require(
+                            writes is not None
+                            and writes.get("on_duplicate") == "error"
+                            and deletes is not None
+                            and deletes.get("on_missing") == "error",
+                            "openfga",
+                            "identity_publication_conflict_policy_invalid",
+                        )
+                        _identity_publication_fence(control_deletes[0])
+                        _identity_publication_fence(control_writes[0])
+                        require(
+                            len(canonical_writes) + len(canonical_deletes) <= 100,
+                            "openfga",
+                            "identity_publication_batch_too_large",
+                        )
+                        for user, relation, object_name in canonical_writes + canonical_deletes:
+                            if object_name == "identity_control:membership":
+                                continue
+                            require(
+                                user.startswith("user:")
+                                and relation == "member"
+                                and object_name.startswith("group:"),
+                                "openfga",
+                                "identity_membership_tuple_invalid",
+                            )
                     else:
                         require(
                             writes is None or writes.get("on_duplicate") == "ignore",
                             "openfga",
                             "duplicate_policy_invalid",
+                        )
+                        require(
+                            deletes is None or deletes.get("on_missing") == "ignore",
+                            "openfga",
+                            "missing_delete_policy_invalid",
                         )
                         for user, relation, object_name in canonical_writes + canonical_deletes:
                             require(

@@ -24,6 +24,7 @@ type recordingMembershipWriter struct {
 	mu             sync.Mutex
 	claimed        bool
 	tenantIDs      []string
+	fence          *MembershipPublicationFence
 	members        map[Membership]struct{}
 	requests       []MembershipWriteRequest
 	inspectCalls   int
@@ -53,14 +54,20 @@ func (w *recordingMembershipWriter) InspectMembershipState(
 			return 0
 		}
 	})
-	return MembershipRemoteState{
+	state := MembershipRemoteState{
 		Claimed: w.claimed, TenantIDs: slices.Clone(w.tenantIDs), Members: members,
-	}, nil
+	}
+	if w.fence != nil {
+		fence := *w.fence
+		state.PublicationFence = &fence
+	}
+	return state, nil
 }
 
 func (w *recordingMembershipWriter) ClaimMembershipStore(
 	_ context.Context,
 	target MembershipPublicationTarget,
+	fence MembershipPublicationFence,
 ) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -69,6 +76,7 @@ func (w *recordingMembershipWriter) ClaimMembershipStore(
 	}
 	w.claimed = true
 	w.tenantIDs = []string{target.TenantID}
+	w.fence = &fence
 	return nil
 }
 
@@ -81,6 +89,10 @@ func (w *recordingMembershipWriter) ApplyMembershipChanges(
 	request MembershipWriteRequest,
 ) error {
 	w.mu.Lock()
+	if w.fence == nil || *w.fence != request.ExpectedFence {
+		w.mu.Unlock()
+		return errors.New("remote publication fence changed")
+	}
 	request.Writes = slices.Clone(request.Writes)
 	request.Deletes = slices.Clone(request.Deletes)
 	w.requests = append(w.requests, request)
@@ -89,6 +101,10 @@ func (w *recordingMembershipWriter) ApplyMembershipChanges(
 	}
 	for _, member := range request.Writes {
 		w.members[member] = struct{}{}
+	}
+	w.fence = &MembershipPublicationFence{
+		State: MembershipPublicationFencePublished, IdentityWatermark: request.IdentityWatermark,
+		ProjectionDigest: request.ProjectionDigest,
 	}
 	fail := w.failAfterApply
 	w.failAfterApply = false
@@ -363,6 +379,94 @@ func TestMembershipPublicationUsesRemoteBindingAcrossIndependentRootsAndRepairsJ
 	}
 }
 
+func TestMembershipPublicationRejectsStaleIndependentRootBeforeRemoteMutation(t *testing.T) {
+	ctx := context.Background()
+	clock := newTestClock(time.Date(2026, 7, 17, 11, 18, 0, 0, time.UTC))
+	scope := testScope("tenant-remote-rollback")
+	live := openTestStore(t, t.TempDir(), clock)
+	stale := openTestStore(t, t.TempDir(), clock)
+	setupPublicationIdentity(t, live, scope, true)
+	setupPublicationIdentity(t, stale, scope, true)
+	liveInitial, err := live.latestMembershipProjection(ctx, scope.TenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	staleInitial, err := stale.latestMembershipProjection(ctx, scope.TenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if liveInitial.Watermark != staleInitial.Watermark || !slices.Equal(liveInitial.Members, staleInitial.Members) {
+		t.Fatalf("independent roots did not start from one revision: live=%+v stale=%+v", liveInitial, staleInitial)
+	}
+
+	target := publicationTarget(scope.TenantID)
+	backend := newRecordingMembershipWriter()
+	if _, err := live.PublishMembershipProjection(ctx, target, backend); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := live.UpsertGroup(ctx, scope, GroupUpsert{
+		ProviderID: "provider-main", ExternalID: "group-security",
+		GroupID: "security", DisplayName: "Security", Active: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := live.UpsertMembership(ctx, scope, MembershipUpsert{
+		ProviderID: "provider-main", GroupExternalID: "group-security",
+		UserExternalID: "user-publication", Active: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := live.UpsertMembership(ctx, scope, MembershipUpsert{
+		ProviderID: "provider-main", GroupExternalID: "group-publication",
+		UserExternalID: "user-publication", Active: false,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	current, err := live.PublishMembershipProjection(ctx, target, backend)
+	if err != nil || current.MemberCount != 1 {
+		t.Fatalf("publish newer projection = %+v, %v", current, err)
+	}
+	beforeMembers, beforeRequests := backend.snapshot()
+	if _, err := stale.PublishMembershipProjection(ctx, target, backend); !errors.Is(err, ErrPublicationUnavailable) {
+		t.Fatalf("stale root publication error = %v", err)
+	}
+	afterMembers, afterRequests := backend.snapshot()
+	if !slices.Equal(afterMembers, beforeMembers) || len(afterRequests) != len(beforeRequests) ||
+		len(afterMembers) != 1 || afterMembers[0].GroupID != "security" {
+		t.Fatalf(
+			"stale root changed remote projection: before=%+v after=%+v requests=%d/%d",
+			beforeMembers, afterMembers, len(beforeRequests), len(afterRequests),
+		)
+	}
+
+	for index := range 4 {
+		externalID := "group-divergent-" + formatTestSequence(index+1)
+		if _, _, err := stale.UpsertGroup(ctx, scope, GroupUpsert{
+			ProviderID: "provider-main", ExternalID: externalID,
+			GroupID: externalID, DisplayName: externalID, Active: true,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	diverged, err := stale.latestMembershipProjection(ctx, scope.TenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	remoteRevision, _ := identityWatermarkRevision(current.IdentityWatermark)
+	divergedRevision, _ := identityWatermarkRevision(diverged.Watermark)
+	if divergedRevision <= remoteRevision {
+		t.Fatalf("divergent root revision = %d, want greater than remote %d", divergedRevision, remoteRevision)
+	}
+	if _, err := stale.PublishMembershipProjection(ctx, target, backend); !errors.Is(err, ErrPublicationUnavailable) {
+		t.Fatalf("higher but divergent root publication error = %v", err)
+	}
+	divergedMembers, divergedRequests := backend.snapshot()
+	if !slices.Equal(divergedMembers, beforeMembers) || len(divergedRequests) != len(beforeRequests) {
+		t.Fatalf("higher divergent root changed remote projection: members=%+v requests=%d/%d",
+			divergedMembers, len(beforeRequests), len(divergedRequests))
+	}
+}
+
 func TestMembershipPublicationConcurrentCrossTenantClaimHasOneWinner(t *testing.T) {
 	ctx := context.Background()
 	clock := newTestClock(time.Date(2026, 7, 17, 11, 20, 0, 0, time.UTC))
@@ -475,7 +579,7 @@ func (b *racingClaimBackend) InspectMembershipState(
 }
 
 func TestMembershipPublicationUsesCrossProcessLock(t *testing.T) {
-	root := t.TempDir()
+	root := filepath.Join(t.TempDir(), "identity-store")
 	store, err := OpenLocalStore(root)
 	if err != nil {
 		t.Fatal(err)
@@ -546,9 +650,19 @@ func TestMembershipPublicationProcessHelper(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	projection, err := store.latestMembershipProjection(context.Background(), tenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := publicationTarget(tenantID)
 	writer := &staticMembershipBackend{
+		store: store, target: target,
 		tenantID: tenantID,
 		members:  []Membership{{TenantID: tenantID, PrincipalID: "alice", GroupID: "engineering"}},
+		fence: MembershipPublicationFence{
+			State: MembershipPublicationFenceActive, IdentityWatermark: projection.Watermark,
+			ProjectionDigest: membershipProjectionDigest(tenantID, projection.Members), Attempt: 1,
+		},
 		apply: func(ctx context.Context, _ MembershipWriteRequest) error {
 			if err := os.WriteFile(marker, []byte("writer"), 0o600); err != nil {
 				return err
@@ -570,35 +684,69 @@ func TestMembershipPublicationProcessHelper(t *testing.T) {
 			}
 		},
 	}
-	if _, err := store.PublishMembershipProjection(context.Background(), publicationTarget(tenantID), writer); err != nil {
+	if _, err := store.PublishMembershipProjection(context.Background(), target, writer); err != nil {
 		t.Fatal(err)
 	}
 }
 
 type staticMembershipBackend struct {
-	tenantID string
-	members  []Membership
-	apply    func(context.Context, MembershipWriteRequest) error
+	mu        sync.Mutex
+	store     *LocalStore
+	target    MembershipPublicationTarget
+	tenantID  string
+	members   []Membership
+	fence     MembershipPublicationFence
+	published bool
+	apply     func(context.Context, MembershipWriteRequest) error
 }
 
 func (b *staticMembershipBackend) InspectMembershipState(
 	context.Context,
 	MembershipPublicationTarget,
 ) (MembershipRemoteState, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.published && b.store != nil {
+		if state, err := b.store.loadPublicationState(b.target); err == nil && state.Published != nil &&
+			state.Published.IdentityWatermark == b.fence.IdentityWatermark &&
+			state.Published.ProjectionDigest == b.fence.ProjectionDigest {
+			b.published = true
+			b.fence.State = MembershipPublicationFencePublished
+			b.fence.Attempt = 0
+		}
+	}
+	fence := b.fence
 	return MembershipRemoteState{
-		Claimed: true, TenantIDs: []string{b.tenantID}, Members: slices.Clone(b.members),
+		Claimed: true, TenantIDs: []string{b.tenantID}, PublicationFence: &fence,
+		Members: slices.Clone(b.members),
 	}, nil
 }
 
-func (*staticMembershipBackend) ClaimMembershipStore(context.Context, MembershipPublicationTarget) error {
+func (*staticMembershipBackend) ClaimMembershipStore(
+	context.Context,
+	MembershipPublicationTarget,
+	MembershipPublicationFence,
+) error {
 	return errors.New("unexpected claim")
 }
 
 func (b *staticMembershipBackend) ApplyMembershipChanges(ctx context.Context, request MembershipWriteRequest) error {
-	if b.apply == nil {
-		return nil
+	if b.apply != nil {
+		if err := b.apply(ctx, request); err != nil {
+			return err
+		}
 	}
-	return b.apply(ctx, request)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.fence != request.ExpectedFence {
+		return errors.New("remote publication fence changed")
+	}
+	b.fence = MembershipPublicationFence{
+		State: MembershipPublicationFencePublished, IdentityWatermark: request.IdentityWatermark,
+		ProjectionDigest: request.ProjectionDigest,
+	}
+	b.published = true
+	return nil
 }
 
 func setupPublicationIdentity(t *testing.T, store *LocalStore, scope protocol.TenantScope, member bool) {

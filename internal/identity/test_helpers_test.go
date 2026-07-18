@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -79,6 +80,11 @@ func testProvider() ProviderSpec {
 
 func openTestStore(t *testing.T, root string, clock Clock) *LocalStore {
 	t.Helper()
+	if info, err := os.Stat(root); err == nil && info.IsDir() {
+		if err := os.Chmod(root, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
 	store, err := OpenLocalStore(root, WithClock(clock))
 	if err != nil {
 		t.Fatal(err)

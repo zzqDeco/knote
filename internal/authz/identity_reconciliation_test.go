@@ -3,6 +3,7 @@ package authz
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"slices"
 	"sort"
 	"sync"
@@ -18,6 +19,7 @@ type memoryIdentityBackend struct {
 	mu        sync.Mutex
 	claimed   bool
 	tenantIDs []string
+	fence     *identity.MembershipPublicationFence
 	members   map[identity.Membership]struct{}
 	requests  []identity.MembershipWriteRequest
 }
@@ -42,14 +44,20 @@ func (b *memoryIdentityBackend) InspectMembershipState(
 		}
 		return members[i].PrincipalID < members[j].PrincipalID
 	})
-	return identity.MembershipRemoteState{
+	state := identity.MembershipRemoteState{
 		Claimed: b.claimed, TenantIDs: slices.Clone(b.tenantIDs), Members: members,
-	}, nil
+	}
+	if b.fence != nil {
+		fence := *b.fence
+		state.PublicationFence = &fence
+	}
+	return state, nil
 }
 
 func (b *memoryIdentityBackend) ClaimMembershipStore(
 	_ context.Context,
 	target identity.MembershipPublicationTarget,
+	fence identity.MembershipPublicationFence,
 ) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -58,6 +66,7 @@ func (b *memoryIdentityBackend) ClaimMembershipStore(
 	}
 	b.claimed = true
 	b.tenantIDs = []string{target.TenantID}
+	b.fence = &fence
 	return nil
 }
 
@@ -70,6 +79,9 @@ func (b *memoryIdentityBackend) ApplyMembershipChanges(
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.fence == nil || *b.fence != request.ExpectedFence {
+		return errors.New("remote publication fence changed")
+	}
 	request.Writes = slices.Clone(request.Writes)
 	request.Deletes = slices.Clone(request.Deletes)
 	b.requests = append(b.requests, request)
@@ -78,6 +90,10 @@ func (b *memoryIdentityBackend) ApplyMembershipChanges(
 	}
 	for _, member := range request.Writes {
 		b.members[member] = struct{}{}
+	}
+	b.fence = &identity.MembershipPublicationFence{
+		State: identity.MembershipPublicationFencePublished, IdentityWatermark: request.IdentityWatermark,
+		ProjectionDigest: request.ProjectionDigest,
 	}
 	return nil
 }
@@ -96,7 +112,7 @@ func (b *memoryIdentityBackend) tupleSnapshot() []Tuple {
 
 func TestIdentityMembershipPublisherAddsAndRevokesGroupAuthorization(t *testing.T) {
 	ctx := context.Background()
-	store, err := identity.OpenLocalStore(t.TempDir())
+	store, err := identity.OpenLocalStore(filepath.Join(t.TempDir(), "identity-store"))
 	if err != nil {
 		t.Fatal(err)
 	}

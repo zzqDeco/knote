@@ -214,17 +214,63 @@ func (t MembershipPublicationTarget) Validate() error {
 	return nil
 }
 
+type MembershipPublicationFenceState string
+
+const (
+	MembershipPublicationFenceActive    MembershipPublicationFenceState = "active"
+	MembershipPublicationFencePublished MembershipPublicationFenceState = "published"
+)
+
+// MembershipPublicationFence is the remote-authoritative publication cursor.
+// Active cursors serialize reconciliation batches; published cursors prevent a
+// restored identity root from rolling a newer projection back.
+type MembershipPublicationFence struct {
+	State             MembershipPublicationFenceState
+	IdentityWatermark string
+	ProjectionDigest  string
+	Attempt           uint64
+}
+
+func (f MembershipPublicationFence) Validate() error {
+	if _, err := identityWatermarkRevision(f.IdentityWatermark); err != nil ||
+		validateDigest("projection_digest", f.ProjectionDigest) != nil {
+		return ErrPublicationUnavailable
+	}
+	switch f.State {
+	case MembershipPublicationFenceActive:
+		if f.Attempt == 0 {
+			return ErrPublicationUnavailable
+		}
+	case MembershipPublicationFencePublished:
+		if f.Attempt != 0 {
+			return ErrPublicationUnavailable
+		}
+	default:
+		return ErrPublicationUnavailable
+	}
+	return nil
+}
+
 // MembershipWriteRequest carries only canonical identity control-plane data.
-// Implementations must make duplicate writes and missing deletes idempotent.
+// ExpectedFence must still be present when the backend begins the first
+// transaction; every membership batch advances it atomically.
 type MembershipWriteRequest struct {
 	Target            MembershipPublicationTarget
 	IdentityWatermark string
+	ProjectionDigest  string
+	ExpectedFence     MembershipPublicationFence
 	Writes            []Membership
 	Deletes           []Membership
 }
 
 func (r MembershipWriteRequest) Validate() error {
-	if err := r.Target.Validate(); err != nil || validateCanonicalID("identity_watermark", r.IdentityWatermark) != nil {
+	desiredRevision, watermarkErr := identityWatermarkRevision(r.IdentityWatermark)
+	expectedRevision, expectedErr := identityWatermarkRevision(r.ExpectedFence.IdentityWatermark)
+	if err := r.Target.Validate(); err != nil || watermarkErr != nil || expectedErr != nil ||
+		validateDigest("projection_digest", r.ProjectionDigest) != nil || r.ExpectedFence.Validate() != nil ||
+		expectedRevision > desiredRevision ||
+		expectedRevision == desiredRevision &&
+			(r.ExpectedFence.IdentityWatermark != r.IdentityWatermark || r.ExpectedFence.ProjectionDigest != r.ProjectionDigest) {
 		return fmt.Errorf("%w: membership write request is invalid", ErrInvalidInput)
 	}
 	seen := make(map[Membership]struct{}, len(r.Writes)+len(r.Deletes))
@@ -246,9 +292,10 @@ func (r MembershipWriteRequest) Validate() error {
 // target OpenFGA store with higher consistency. TenantIDs contains every
 // tenant binding attached to the isolated identity control object.
 type MembershipRemoteState struct {
-	Claimed   bool
-	TenantIDs []string
-	Members   []Membership
+	Claimed          bool
+	TenantIDs        []string
+	PublicationFence *MembershipPublicationFence
+	Members          []Membership
 }
 
 func (s MembershipRemoteState) Validate(target MembershipPublicationTarget) error {
@@ -264,16 +311,21 @@ func (s MembershipRemoteState) Validate(target MembershipPublicationTarget) erro
 	if err := validatePublicationMembers(target.TenantID, s.Members); err != nil {
 		return err
 	}
+	if s.PublicationFence != nil {
+		if !s.Claimed || s.PublicationFence.Validate() != nil {
+			return ErrPublicationUnavailable
+		}
+	}
 	return nil
 }
 
 // MembershipPublicationBackend is the remote-authoritative OpenFGA boundary.
 // InspectMembershipState must use higher consistency and consume all pages.
-// ClaimMembershipStore atomically writes the fixed claim tuple and tenant
-// binding, failing on a duplicate fixed claim tuple.
+// ClaimMembershipStore atomically writes the fixed claim tuple, tenant binding,
+// and initial active publication fence, failing on a duplicate fixed claim.
 type MembershipPublicationBackend interface {
 	InspectMembershipState(context.Context, MembershipPublicationTarget) (MembershipRemoteState, error)
-	ClaimMembershipStore(context.Context, MembershipPublicationTarget) error
+	ClaimMembershipStore(context.Context, MembershipPublicationTarget, MembershipPublicationFence) error
 	ApplyMembershipChanges(context.Context, MembershipWriteRequest) error
 }
 

@@ -303,6 +303,115 @@ func TestQueryRunsFinalAuthorizationGateBeforeGeneration(t *testing.T) {
 	}
 }
 
+func TestQueryRunsFinalAuthorizationGateBeforeReturningCachedEvidence(t *testing.T) {
+	t.Run("direct", func(t *testing.T) {
+		document := queryTestDocument(queryTestModelID, "content", "projection-v1")
+		backend := &queryTestKAG{retrieveResult: queryTestRetrieve(document)}
+		authorizer := &queryTestAuthorizer{}
+		loader := &queryTestLoader{items: map[protocol.ResourceID]protocol.EvidenceItem{
+			document.ResourceID: queryTestItem(document),
+		}}
+		cache := mustQueryCache(t, 2)
+		identityValid := true
+		var gated []protocol.AuthorizationContext
+		service, err := New(Options{
+			KAG: backend, Authorizer: authorizer, Loader: loader, Cache: cache,
+			RetrieverVersion: "retriever-v1", PromptVersion: "prompt-v1",
+			RetrieveLimit: 10, EvidenceLimit: 2,
+			Now: func() time.Time { return time.Date(2026, 7, 13, 1, 0, 0, 0, time.UTC) },
+			FinalAuthorizationGate: func(_ context.Context, authorization protocol.AuthorizationContext) error {
+				gated = append(gated, authorization)
+				if !identityValid {
+					return errors.New("live identity is no longer valid")
+				}
+				return nil
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		request := protocol.QueryRequest{
+			Question:      "cached identity-gated question",
+			Authorization: queryTestAuthorization("alice", "request-cache-prime"),
+		}
+		if _, err := service.Query(context.Background(), request); err != nil {
+			t.Fatalf("prime cache: %v", err)
+		}
+		generateCalls := backend.generateCalls
+		identityValid = false
+		request.Authorization.RequestID = "request-cache-invalid-identity"
+
+		result, err := service.Query(context.Background(), request)
+		if err != ErrProtectedContentUnavailable || err.Error() != ErrProtectedContentUnavailable.Error() {
+			t.Fatalf("cache hit error = %v, want exact protected content unavailable", err)
+		}
+		if result.Generation.Answer != "" || len(result.Evidence.Items) != 0 {
+			t.Fatalf("denied cache hit returned protected content: %#v", result)
+		}
+		if backend.generateCalls != generateCalls {
+			t.Fatalf("generate calls = %d, want unchanged %d", backend.generateCalls, generateCalls)
+		}
+		if len(gated) != 2 || gated[1] != request.Authorization {
+			t.Fatalf("final gate authorizations = %+v, want current cache-hit authorization %+v", gated, request.Authorization)
+		}
+	})
+
+	t.Run("traversal", func(t *testing.T) {
+		start := traversalTestResource(73, protocol.ResourceEntity, "a")
+		support := traversalTestResource(74, protocol.ResourceDocument, "parent")
+		backend := &traversalTestBackend{retrieve: traversalTestRetrieve(start)}
+		authorizer := &traversalTestAuthorizer{}
+		loader := &queryTestLoader{items: map[protocol.ResourceID]protocol.EvidenceItem{
+			start.ResourceID: traversalTestEvidence(start, support),
+		}}
+		cache := mustQueryCache(t, 2)
+		identityValid := true
+		var gated []protocol.AuthorizationContext
+		service, err := New(Options{
+			KAG: backend, Authorizer: authorizer, Loader: loader, Cache: cache,
+			RetrieverVersion: "retriever-v1", PromptVersion: "prompt-v1",
+			RetrieveLimit: 64, EvidenceLimit: 64, Traversal: traversalTestConfig(0),
+			Now: func() time.Time { return time.Date(2026, 7, 14, 1, 0, 0, 0, time.UTC) },
+			FinalAuthorizationGate: func(_ context.Context, authorization protocol.AuthorizationContext) error {
+				gated = append(gated, authorization)
+				if !identityValid {
+					return errors.New("live identity is no longer valid")
+				}
+				return nil
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		request := protocol.QueryRequest{
+			Question:      "cached traversal identity-gated question",
+			Authorization: queryTestAuthorization("alice", "request-traversal-cache-prime"),
+		}
+		if _, err := service.Query(context.Background(), request); err != nil {
+			t.Fatalf("prime traversal cache: %v", err)
+		}
+		generateCalls := backend.generateCalls
+		identityValid = false
+		request.Authorization.RequestID = "request-traversal-cache-invalid-identity"
+
+		result, err := service.Query(context.Background(), request)
+		if err != ErrProtectedContentUnavailable || err.Error() != ErrProtectedContentUnavailable.Error() {
+			t.Fatalf("traversal cache hit error = %v, want exact protected content unavailable", err)
+		}
+		if result.Generation.Answer != "" || len(result.Evidence.Items) != 0 {
+			t.Fatalf("denied traversal cache hit returned protected content: %#v", result)
+		}
+		if backend.generateCalls != generateCalls {
+			t.Fatalf("generate calls = %d, want unchanged %d", backend.generateCalls, generateCalls)
+		}
+		if len(gated) != 2 || gated[1] != request.Authorization {
+			t.Fatalf("final gate authorizations = %+v, want current cache-hit authorization %+v", gated, request.Authorization)
+		}
+	})
+}
+
 func TestQueryHidesDeniedResourceExistence(t *testing.T) {
 	document := queryTestDocument(queryTestModelID, "content", "projection-v1")
 	request := protocol.QueryRequest{

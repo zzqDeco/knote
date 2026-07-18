@@ -82,15 +82,44 @@ func (s *LocalStore) PublishMembershipProjection(
 		if err != nil {
 			return MembershipPublicationReceipt{}, publicationFailure(err)
 		}
+		projectionDigest := membershipProjectionDigest(target.TenantID, projection.Members)
+		desiredFence := MembershipPublicationFence{
+			State: MembershipPublicationFencePublished, IdentityWatermark: projection.Watermark,
+			ProjectionDigest: projectionDigest,
+		}
 		if err := rejectPublicationRollback(state, projection.Watermark); err != nil {
 			return MembershipPublicationReceipt{}, err
 		}
-		remote, err := inspectBoundMembershipState(ctx, target, backend)
+		remote, err := inspectBoundMembershipState(ctx, target, backend, MembershipPublicationFence{
+			State: MembershipPublicationFenceActive, IdentityWatermark: projection.Watermark,
+			ProjectionDigest: projectionDigest, Attempt: 1,
+		})
 		if err != nil {
 			return MembershipPublicationReceipt{}, err
 		}
-		if state.Pending == nil && publishedProjectionMatches(state.Published, target, projection) &&
+		if err := s.rejectRemotePublicationRollback(
+			ctx, target.TenantID, remote.PublicationFence, desiredFence,
+		); err != nil {
+			return MembershipPublicationReceipt{}, err
+		}
+		if publicationFenceMatches(remote.PublicationFence, desiredFence) &&
 			slices.Equal(remote.Members, projection.Members) {
+			if state.Pending == nil && publishedProjectionMatches(state.Published, target, projection) {
+				return publicationReceipt(state.Published, target), nil
+			}
+			publishedAt, err := s.now()
+			if err != nil {
+				return MembershipPublicationReceipt{}, publicationFailure(err)
+			}
+			state.Published = &membershipPublicationSnapshot{
+				AuthorizationModelID: target.AuthorizationModelID,
+				IdentityWatermark:    projection.Watermark, ProjectionDigest: projectionDigest,
+				Members: slices.Clone(projection.Members), PublishedAt: publishedAt,
+			}
+			state.Pending = nil
+			if err := s.writePublicationState(target, state); err != nil {
+				return MembershipPublicationReceipt{}, err
+			}
 			return publicationReceipt(state.Published, target), nil
 		}
 
@@ -115,6 +144,7 @@ func (s *LocalStore) PublishMembershipProjection(
 
 		request := MembershipWriteRequest{
 			Target: target, IdentityWatermark: projection.Watermark,
+			ProjectionDigest: projectionDigest, ExpectedFence: *remote.PublicationFence,
 			Writes:  membershipDifference(projection.Members, remote.Members),
 			Deletes: membershipDifference(remote.Members, projection.Members),
 		}
@@ -142,7 +172,8 @@ func (s *LocalStore) PublishMembershipProjection(
 		if err := requireExpectedRemoteBinding(target, remote); err != nil {
 			return MembershipPublicationReceipt{}, err
 		}
-		if !slices.Equal(remote.Members, projection.Members) {
+		if !publicationFenceMatches(remote.PublicationFence, desiredFence) ||
+			!slices.Equal(remote.Members, projection.Members) {
 			continue
 		}
 		publishedAt, err := s.now()
@@ -152,7 +183,7 @@ func (s *LocalStore) PublishMembershipProjection(
 		state.Published = &membershipPublicationSnapshot{
 			AuthorizationModelID: target.AuthorizationModelID,
 			IdentityWatermark:    projection.Watermark,
-			ProjectionDigest:     membershipProjectionDigest(target.TenantID, projection.Members),
+			ProjectionDigest:     projectionDigest,
 			Members:              slices.Clone(projection.Members),
 			PublishedAt:          publishedAt,
 		}
@@ -169,7 +200,11 @@ func inspectBoundMembershipState(
 	ctx context.Context,
 	target MembershipPublicationTarget,
 	backend MembershipPublicationBackend,
+	initialFence MembershipPublicationFence,
 ) (MembershipRemoteState, error) {
+	if initialFence.State != MembershipPublicationFenceActive || initialFence.Validate() != nil {
+		return MembershipRemoteState{}, ErrPublicationUnavailable
+	}
 	remote, err := backend.InspectMembershipState(ctx, target)
 	if err != nil {
 		return MembershipRemoteState{}, publicationFailure(err)
@@ -186,7 +221,7 @@ func inspectBoundMembershipState(
 		}
 		// A duplicate fixed claim tuple is expected when another publisher won
 		// the race. The authoritative reread below decides the outcome.
-		_ = backend.ClaimMembershipStore(ctx, target)
+		_ = backend.ClaimMembershipStore(ctx, target, initialFence)
 		if err := ctx.Err(); err != nil {
 			return MembershipRemoteState{}, err
 		}
@@ -208,10 +243,50 @@ func requireExpectedRemoteBinding(target MembershipPublicationTarget, remote Mem
 	if err := remote.Validate(target); err != nil {
 		return publicationFailure(err)
 	}
-	if !remote.Claimed || len(remote.TenantIDs) != 1 || remote.TenantIDs[0] != target.TenantID {
+	if !remote.Claimed || len(remote.TenantIDs) != 1 || remote.TenantIDs[0] != target.TenantID ||
+		remote.PublicationFence == nil {
 		return ErrPublicationUnavailable
 	}
 	return nil
+}
+
+func (s *LocalStore) rejectRemotePublicationRollback(
+	ctx context.Context,
+	tenantID string,
+	remote *MembershipPublicationFence,
+	desired MembershipPublicationFence,
+) error {
+	if s == nil || ctx == nil || remote == nil || remote.Validate() != nil || desired.Validate() != nil {
+		return ErrPublicationUnavailable
+	}
+	remoteRevision, remoteErr := identityWatermarkRevision(remote.IdentityWatermark)
+	desiredRevision, desiredErr := identityWatermarkRevision(desired.IdentityWatermark)
+	if remoteErr != nil || desiredErr != nil || remoteRevision > desiredRevision ||
+		remoteRevision == desiredRevision &&
+			(remote.IdentityWatermark != desired.IdentityWatermark || remote.ProjectionDigest != desired.ProjectionDigest) {
+		return ErrPublicationUnavailable
+	}
+	if remoteRevision == desiredRevision {
+		return nil
+	}
+	scope, err := s.Tenant(ctx, tenantID)
+	if err != nil {
+		return publicationFailure(err)
+	}
+	state, err := s.readTenant(ctx, scope)
+	if err != nil {
+		return publicationFailure(err)
+	}
+	if remoteRevision > uint64(len(state.Revisions)) || desiredRevision > uint64(len(state.Revisions)) ||
+		state.Revisions[remoteRevision-1].Watermark != remote.IdentityWatermark ||
+		state.Revisions[desiredRevision-1].Watermark != desired.IdentityWatermark {
+		return ErrPublicationUnavailable
+	}
+	return nil
+}
+
+func publicationFenceMatches(remote *MembershipPublicationFence, desired MembershipPublicationFence) bool {
+	return remote != nil && *remote == desired
 }
 
 func (s *LocalStore) latestMembershipProjection(ctx context.Context, tenantID string) (MembershipProjection, error) {
