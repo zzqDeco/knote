@@ -86,19 +86,17 @@ func secureConnectorHandle(handle windows.Handle, directory bool) error {
 	if err != nil {
 		return err
 	}
-	inheritance := uint32(windows.NO_INHERITANCE)
+	inheritance := ""
 	if directory {
-		inheritance = windows.SUB_CONTAINERS_AND_OBJECTS_INHERIT
+		inheritance = "OICI"
 	}
-	acl, err := windows.ACLFromEntries([]windows.EXPLICIT_ACCESS{{
-		AccessPermissions: windows.GENERIC_ALL,
-		AccessMode:        windows.GRANT_ACCESS,
-		Inheritance:       inheritance,
-		Trustee: windows.TRUSTEE{
-			TrusteeForm: windows.TRUSTEE_IS_SID, TrusteeType: windows.TRUSTEE_IS_USER,
-			TrusteeValue: windows.TrusteeValueFromSID(user.User.Sid),
-		},
-	}}, nil)
+	descriptor, err := windows.SecurityDescriptorFromString(
+		"D:P(A;" + inheritance + ";GA;;;" + user.User.Sid.String() + ")",
+	)
+	if err != nil {
+		return err
+	}
+	acl, _, err := descriptor.DACL()
 	if err != nil {
 		return err
 	}
