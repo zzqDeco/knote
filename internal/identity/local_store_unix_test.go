@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 )
 
@@ -81,6 +82,31 @@ func TestOpenLocalStoreRejectsPermissiveSymlinkTargetWithoutMutation(t *testing.
 	if info.Mode()&os.ModeSymlink == 0 {
 		t.Fatalf("identity root alias was replaced: mode=%v", info.Mode())
 	}
+}
+
+func TestIdentityDirectoryOwnerValidationRejectsForeignUID(t *testing.T) {
+	current := identityOwnerFileInfo{
+		system: &syscall.Stat_t{Uid: uint32(os.Geteuid())},
+	}
+	if err := validateIdentityDirectoryOwner(current); err != nil {
+		t.Fatalf("current owner was rejected: %v", err)
+	}
+
+	foreign := identityOwnerFileInfo{
+		system: &syscall.Stat_t{Uid: uint32(os.Geteuid()) ^ 1},
+	}
+	if err := validateIdentityDirectoryOwner(foreign); !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("foreign owner error = %v, want %v", err, os.ErrPermission)
+	}
+}
+
+type identityOwnerFileInfo struct {
+	os.FileInfo
+	system any
+}
+
+func (info identityOwnerFileInfo) Sys() any {
+	return info.system
 }
 
 func assertRejectedStoreRootUnchanged(t *testing.T, root string, wantMode os.FileMode) {

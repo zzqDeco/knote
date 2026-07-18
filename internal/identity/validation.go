@@ -129,7 +129,8 @@ func validateTrustURI(name, value string) error {
 }
 
 func validateUTC(name string, value time.Time) error {
-	if value.IsZero() || value.Location() != time.UTC {
+	_, offset := value.Zone()
+	if value.IsZero() || offset != 0 {
 		return fmt.Errorf("%w: %s must be a non-zero UTC timestamp", ErrInvalidInput, name)
 	}
 	return nil

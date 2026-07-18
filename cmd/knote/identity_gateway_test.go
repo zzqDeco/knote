@@ -79,11 +79,27 @@ func TestPermissionedIdentitySessionDoesNotDiscloseRejectedAssertion(t *testing.
 func TestProductionAuthorizationContextRequiresMatchingMembershipPublication(t *testing.T) {
 	ctx := context.Background()
 	fixture := newCommandIdentityFixture(t, "tenant-command-publication", "alice")
-	session, snapshot, err := newPermissionedIdentitySession(
-		ctx, fixture.root, fixture.publicKey, fixture.assertion,
-	)
+	verifier, err := identity.NewEd25519AssertionVerifier(fixture.publicKey)
 	if err != nil {
 		t.Fatal(err)
+	}
+	claims, err := verifier.Verify(ctx, fixture.assertion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := claims.IssuedAt.Add(time.Minute)
+	gateway, err := identity.NewGateway(fixture.store, verifier, fixture.store, identity.GatewayOptions{
+		Clock: identity.ClockFunc(func() time.Time { return now }),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	authenticated, snapshot, err := gateway.Ingest(ctx, fixture.assertion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := &permissionedIdentitySession{
+		store: fixture.store, gateway: gateway, authenticated: authenticated,
 	}
 	config := permissionedRuntimeConfig{
 		IdentityWatermark: snapshot.Watermark,
@@ -173,6 +189,16 @@ func TestProductionAuthorizationContextRequiresMatchingMembershipPublication(t *
 	if err != nil || after.IdentityWatermark != currentRevision.Watermark || after.Epoch != base.Epoch+1 {
 		t.Fatalf("published revision = %+v, %v", after, err)
 	}
+
+	now = claims.ExpiresAt
+	beforeExpiredCalls := publisher.callCount()
+	if _, err := provider(ctx, "session-command-publication"); !errors.Is(err, authorized.ErrProtectedContentUnavailable) {
+		t.Fatalf("expired identity publication error = %v", err)
+	}
+	if calls := publisher.callCount() - beforeExpiredCalls; calls != 0 {
+		t.Fatalf("expired identity triggered %d membership publications", calls)
+	}
+	assertCommandRevisionUnchanged(t, revisionState, after)
 }
 
 type commandMembershipPublisher struct {

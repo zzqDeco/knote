@@ -291,6 +291,14 @@ func newProductionAuthorizationContextProvider(
 			if err != nil {
 				return protocol.AuthorizationContext{}, authorized.ErrProtectedContentUnavailable
 			}
+			authorization, err := identitySession.authorizationContext(ctx, identity.AuthorizationScope{
+				TenantID: scope.TenantID, KnowledgeBaseID: scope.KnowledgeBaseID,
+				AuthorizationModelID: config.OpenFGA.AuthorizationModelID, ACLWatermark: scope.ACLWatermark,
+				Consistency: config.Consistency,
+			}, sessionID)
+			if err != nil {
+				return protocol.AuthorizationContext{}, authorized.ErrProtectedContentUnavailable
+			}
 			target := identity.MembershipPublicationTarget{
 				TenantID:             scope.TenantID,
 				StoreID:              config.OpenFGA.StoreID,
@@ -299,14 +307,6 @@ func newProductionAuthorizationContextProvider(
 			receipt, err := membershipPublisher.PublishLatest(ctx)
 			if err != nil || receipt.Validate() != nil || receipt.TenantID != target.TenantID ||
 				receipt.StoreID != target.StoreID || receipt.AuthorizationModelID != target.AuthorizationModelID {
-				return protocol.AuthorizationContext{}, authorized.ErrProtectedContentUnavailable
-			}
-			authorization, err := identitySession.authorizationContext(ctx, identity.AuthorizationScope{
-				TenantID: scope.TenantID, KnowledgeBaseID: scope.KnowledgeBaseID,
-				AuthorizationModelID: config.OpenFGA.AuthorizationModelID, ACLWatermark: scope.ACLWatermark,
-				Consistency: config.Consistency,
-			}, sessionID)
-			if err != nil {
 				return protocol.AuthorizationContext{}, authorized.ErrProtectedContentUnavailable
 			}
 			if !receipt.Matches(target, authorization.IdentityWatermark) {
