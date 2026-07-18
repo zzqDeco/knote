@@ -104,7 +104,7 @@ func (w *recordingMembershipWriter) ApplyMembershipChanges(
 	}
 	w.fence = &MembershipPublicationFence{
 		State: MembershipPublicationFencePublished, IdentityWatermark: request.IdentityWatermark,
-		ProjectionDigest: request.ProjectionDigest,
+		ProjectionDigest: request.ProjectionDigest, Attempt: request.ExpectedFence.Attempt + 1,
 	}
 	fail := w.failAfterApply
 	w.failAfterApply = false
@@ -712,7 +712,7 @@ func (b *staticMembershipBackend) InspectMembershipState(
 			state.Published.ProjectionDigest == b.fence.ProjectionDigest {
 			b.published = true
 			b.fence.State = MembershipPublicationFencePublished
-			b.fence.Attempt = 0
+			b.fence.Attempt++
 		}
 	}
 	fence := b.fence
@@ -743,7 +743,7 @@ func (b *staticMembershipBackend) ApplyMembershipChanges(ctx context.Context, re
 	}
 	b.fence = MembershipPublicationFence{
 		State: MembershipPublicationFencePublished, IdentityWatermark: request.IdentityWatermark,
-		ProjectionDigest: request.ProjectionDigest,
+		ProjectionDigest: request.ProjectionDigest, Attempt: request.ExpectedFence.Attempt + 1,
 	}
 	b.published = true
 	return nil

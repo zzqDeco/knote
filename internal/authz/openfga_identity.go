@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -15,15 +16,16 @@ import (
 )
 
 const (
-	identityControlType     = "identity_control"
-	identityTenantType      = "identity_tenant"
-	identityControlObject   = identityControlType + ":membership"
-	identityClaimUser       = identityControlType + ":claim"
-	identityClaimRelation   = "claimed"
-	identityTenantRelation  = "tenant"
-	identityFenceUserPrefix = identityControlType + ":publication_v1_"
-	openFGAIdentityPageSize = int32(100)
-	maxOpenFGAIdentityPages = 10000
+	identityControlType      = "identity_control"
+	identityTenantType       = "identity_tenant"
+	identityControlObject    = identityControlType + ":membership"
+	identityClaimUser        = identityControlType + ":claim"
+	identityClaimRelation    = "claimed"
+	identityTenantRelation   = "tenant"
+	identityFenceUserPrefix  = identityControlType + ":publication_v1_"
+	openFGAIdentityPageSize  = int32(100)
+	maxOpenFGAIdentityPages  = 10000
+	maxIdentitySnapshotReads = 8
 )
 
 var _ identity.MembershipPublicationBackend = (*OpenFGAAuthorizer)(nil)
@@ -41,21 +43,43 @@ func (a *OpenFGAAuthorizer) InspectMembershipState(
 	callContext, cancel := context.WithTimeout(ctx, a.config.Timeout)
 	defer cancel()
 
-	membership, err := a.readAllTuples(callContext, fgaclient.ClientReadRequest{
-		Relation: openfga.PtrString(RelationMember),
-	})
-	if err != nil {
-		return identity.MembershipRemoteState{}, err
+	controlFilter := fgaclient.ClientReadRequest{Object: openfga.PtrString(identityControlObject)}
+	membershipFilter := fgaclient.ClientReadRequest{Relation: openfga.PtrString(RelationMember)}
+	for range maxIdentitySnapshotReads {
+		beforeTuples, err := a.readAllTuples(callContext, controlFilter)
+		if err != nil {
+			return identity.MembershipRemoteState{}, err
+		}
+		before, err := identityControlState(target, beforeTuples)
+		if err != nil {
+			return identity.MembershipRemoteState{}, err
+		}
+		membership, err := a.readAllTuples(callContext, membershipFilter)
+		if err != nil {
+			return identity.MembershipRemoteState{}, err
+		}
+		afterTuples, err := a.readAllTuples(callContext, controlFilter)
+		if err != nil {
+			return identity.MembershipRemoteState{}, err
+		}
+		after, err := identityControlState(target, afterTuples)
+		if err != nil {
+			return identity.MembershipRemoteState{}, err
+		}
+		if !sameIdentityControlState(before, after) {
+			continue
+		}
+		return identityMembershipState(target, after, membership)
 	}
-	// Read the fence last. Any concurrent membership transaction advances the
-	// fence atomically, so a subsequent CAS cannot act on an older tuple view.
-	control, err := a.readAllTuples(callContext, fgaclient.ClientReadRequest{
-		Object: openfga.PtrString(identityControlObject),
-	})
-	if err != nil {
-		return identity.MembershipRemoteState{}, err
-	}
+	return identity.MembershipRemoteState{}, fmt.Errorf(
+		"%w: identity tuple snapshot did not stabilize", ErrUnavailable,
+	)
+}
 
+func identityControlState(
+	target identity.MembershipPublicationTarget,
+	control []openfga.Tuple,
+) (identity.MembershipRemoteState, error) {
 	state := identity.MembershipRemoteState{}
 	for _, tuple := range control {
 		key := tuple.Key
@@ -87,7 +111,31 @@ func (a *OpenFGAAuthorizer) InspectMembershipState(
 			return identity.MembershipRemoteState{}, fmt.Errorf("%w: unknown identity control tuple", ErrMalformedResponse)
 		}
 	}
+	sort.Strings(state.TenantIDs)
+	for index := 1; index < len(state.TenantIDs); index++ {
+		if state.TenantIDs[index] == state.TenantIDs[index-1] {
+			return identity.MembershipRemoteState{}, fmt.Errorf("%w: duplicate tenant binding", ErrMalformedResponse)
+		}
+	}
+	if err := state.Validate(target); err != nil {
+		return identity.MembershipRemoteState{}, fmt.Errorf("%w: invalid remote identity state", ErrMalformedResponse)
+	}
+	return state, nil
+}
 
+func sameIdentityControlState(left, right identity.MembershipRemoteState) bool {
+	if left.Claimed != right.Claimed || !slices.Equal(left.TenantIDs, right.TenantIDs) ||
+		(left.PublicationFence == nil) != (right.PublicationFence == nil) {
+		return false
+	}
+	return left.PublicationFence == nil || *left.PublicationFence == *right.PublicationFence
+}
+
+func identityMembershipState(
+	target identity.MembershipPublicationTarget,
+	state identity.MembershipRemoteState,
+	membership []openfga.Tuple,
+) (identity.MembershipRemoteState, error) {
 	for _, tuple := range membership {
 		key := tuple.Key
 		if key.Relation != RelationMember || !strings.HasPrefix(key.Object, TypeGroup+":") {
@@ -105,12 +153,6 @@ func (a *OpenFGAAuthorizer) InspectMembershipState(
 		state.Members = append(state.Members, identity.Membership{
 			TenantID: target.TenantID, PrincipalID: principalID, GroupID: groupID,
 		})
-	}
-	sort.Strings(state.TenantIDs)
-	for index := 1; index < len(state.TenantIDs); index++ {
-		if state.TenantIDs[index] == state.TenantIDs[index-1] {
-			return identity.MembershipRemoteState{}, fmt.Errorf("%w: duplicate tenant binding", ErrMalformedResponse)
-		}
 	}
 	sort.Slice(state.Members, func(i, j int) bool {
 		if state.Members[i].GroupID != state.Members[j].GroupID {
@@ -231,6 +273,11 @@ func (a *OpenFGAAuthorizer) ApplyMembershipChanges(
 	published := identity.MembershipPublicationFence{
 		State: identity.MembershipPublicationFencePublished, IdentityWatermark: request.IdentityWatermark,
 		ProjectionDigest: request.ProjectionDigest,
+	}
+	var err error
+	published, err = nextIdentityFenceAttempt(current, published)
+	if err != nil {
+		return err
 	}
 	return a.applyIdentityPublicationBatch(callContext, request.Target, current, published, nil, nil)
 }

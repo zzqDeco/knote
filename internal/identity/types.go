@@ -233,18 +233,11 @@ type MembershipPublicationFence struct {
 
 func (f MembershipPublicationFence) Validate() error {
 	if _, err := identityWatermarkRevision(f.IdentityWatermark); err != nil ||
-		validateDigest("projection_digest", f.ProjectionDigest) != nil {
+		validateDigest("projection_digest", f.ProjectionDigest) != nil || f.Attempt == 0 {
 		return ErrPublicationUnavailable
 	}
 	switch f.State {
-	case MembershipPublicationFenceActive:
-		if f.Attempt == 0 {
-			return ErrPublicationUnavailable
-		}
-	case MembershipPublicationFencePublished:
-		if f.Attempt != 0 {
-			return ErrPublicationUnavailable
-		}
+	case MembershipPublicationFenceActive, MembershipPublicationFencePublished:
 	default:
 		return ErrPublicationUnavailable
 	}

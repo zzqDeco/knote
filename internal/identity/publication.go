@@ -85,7 +85,7 @@ func (s *LocalStore) PublishMembershipProjection(
 		projectionDigest := membershipProjectionDigest(target.TenantID, projection.Members)
 		desiredFence := MembershipPublicationFence{
 			State: MembershipPublicationFencePublished, IdentityWatermark: projection.Watermark,
-			ProjectionDigest: projectionDigest,
+			ProjectionDigest: projectionDigest, Attempt: 1,
 		}
 		if err := rejectPublicationRollback(state, projection.Watermark); err != nil {
 			return MembershipPublicationReceipt{}, err
@@ -286,7 +286,9 @@ func (s *LocalStore) rejectRemotePublicationRollback(
 }
 
 func publicationFenceMatches(remote *MembershipPublicationFence, desired MembershipPublicationFence) bool {
-	return remote != nil && *remote == desired
+	return remote != nil && remote.State == desired.State &&
+		remote.IdentityWatermark == desired.IdentityWatermark &&
+		remote.ProjectionDigest == desired.ProjectionDigest
 }
 
 func (s *LocalStore) latestMembershipProjection(ctx context.Context, tenantID string) (MembershipProjection, error) {
@@ -309,7 +311,7 @@ func (s *LocalStore) acquirePublicationLock(ctx context.Context, storeID string)
 		return nil, ErrPublicationUnavailable
 	}
 	directory := filepath.Join(s.root, publicationDirectory)
-	if err := os.MkdirAll(directory, 0o700); err != nil {
+	if err := createPrivateDirectoryTree(directory); err != nil {
 		return nil, err
 	}
 	if err := ensurePrivateDirectory(directory); err != nil {

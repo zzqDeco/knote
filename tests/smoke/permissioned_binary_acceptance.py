@@ -848,7 +848,7 @@ def _identity_publication_fence(value: tuple[str, str, str]) -> tuple[str, int]:
     attempt = int(parts[1])
     revision = int(parts[2])
     require(
-        revision > 0 and ((parts[0] == "a" and attempt > 0) or (parts[0] == "p" and attempt == 0)),
+        revision > 0 and attempt > 0,
         "openfga",
         "identity_publication_fence_invalid",
     )
@@ -947,8 +947,13 @@ def openfga_handler() -> type[http.server.BaseHTTPRequestHandler]:
                             "openfga",
                             "identity_publication_conflict_policy_invalid",
                         )
-                        _identity_publication_fence(control_deletes[0])
-                        _identity_publication_fence(control_writes[0])
+                        _, previous_attempt = _identity_publication_fence(control_deletes[0])
+                        _, next_attempt = _identity_publication_fence(control_writes[0])
+                        require(
+                            next_attempt == previous_attempt + 1,
+                            "openfga",
+                            "identity_publication_fence_not_monotonic",
+                        )
                         require(
                             len(canonical_writes) + len(canonical_deletes) <= 100,
                             "openfga",

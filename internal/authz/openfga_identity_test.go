@@ -22,7 +22,7 @@ func TestOpenFGAIdentityInspectionUsesHigherConsistencyAndCompletePagination(t *
 	var calls atomic.Int32
 	publishedFence := identity.MembershipPublicationFence{
 		State: identity.MembershipPublicationFencePublished, IdentityWatermark: testIdentityWatermark,
-		ProjectionDigest: testProjectionDigest,
+		ProjectionDigest: testProjectionDigest, Attempt: 7,
 	}
 	authorizer := newTestOpenFGA(t, http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if request.URL.Path != "/stores/"+openFGATestStoreID+"/read" {
@@ -81,8 +81,82 @@ func TestOpenFGAIdentityInspectionUsesHigherConsistencyAndCompletePagination(t *
 	}
 	if !state.Claimed || len(state.TenantIDs) != 1 || state.TenantIDs[0] != target.TenantID ||
 		state.PublicationFence == nil || *state.PublicationFence != publishedFence ||
-		!identityMembershipSlicesEqual(state.Members, want) || calls.Load() != 4 {
+		!identityMembershipSlicesEqual(state.Members, want) || calls.Load() != 6 {
 		t.Fatalf("remote state = %+v calls=%d", state, calls.Load())
+	}
+}
+
+func TestOpenFGAIdentityInspectionRejectsPublishedFenceABA(t *testing.T) {
+	var calls atomic.Int32
+	oldFence := identity.MembershipPublicationFence{
+		State: identity.MembershipPublicationFencePublished, IdentityWatermark: testIdentityWatermark,
+		ProjectionDigest: testProjectionDigest, Attempt: 7,
+	}
+	newFence := identity.MembershipPublicationFence{
+		State: identity.MembershipPublicationFencePublished, IdentityWatermark: testIdentityWatermark,
+		ProjectionDigest: testProjectionDigest, Attempt: 9,
+	}
+	control := func(fence identity.MembershipPublicationFence) string {
+		return tupleReadResponse([]Tuple{
+			{User: identityClaimUser, Relation: identityClaimRelation, Object: identityControlObject},
+			{User: "identity_tenant:tenant-http", Relation: identityTenantRelation, Object: identityControlObject},
+			identityFenceTuple(fence),
+		}, "")
+	}
+	authorizer := newTestOpenFGA(t, http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		var body struct {
+			TupleKey struct {
+				Relation string `json:"relation"`
+				Object   string `json:"object"`
+			} `json:"tuple_key"`
+		}
+		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+			t.Errorf("decode read request: %v", err)
+		}
+		call := calls.Add(1)
+		switch call {
+		case 1:
+			if body.TupleKey.Object != identityControlObject {
+				t.Errorf("first read = %+v, want control", body.TupleKey)
+			}
+			writeJSON(t, writer, control(oldFence))
+		case 2:
+			if body.TupleKey.Relation != RelationMember {
+				t.Errorf("second read = %+v, want memberships", body.TupleKey)
+			}
+			writeJSON(t, writer, tupleReadResponse(
+				[]Tuple{{User: "user:stale", Relation: RelationMember, Object: "group:engineering"}}, "",
+			))
+		case 3, 4, 6:
+			if body.TupleKey.Object != identityControlObject {
+				t.Errorf("control read %d = %+v", call, body.TupleKey)
+			}
+			writeJSON(t, writer, control(newFence))
+		case 5:
+			if body.TupleKey.Relation != RelationMember {
+				t.Errorf("retry membership read = %+v", body.TupleKey)
+			}
+			writeJSON(t, writer, tupleReadResponse(
+				[]Tuple{{User: "user:current", Relation: RelationMember, Object: "group:engineering"}}, "",
+			))
+		default:
+			t.Errorf("unexpected read call %d", call)
+			writeJSON(t, writer, `{"tuples":[],"continuation_token":""}`)
+		}
+	}))
+	target := identity.MembershipPublicationTarget{
+		TenantID: "tenant-http", StoreID: openFGATestStoreID, AuthorizationModelID: openFGATestModelID,
+	}
+	state, err := authorizer.InspectMembershipState(context.Background(), target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []identity.Membership{{
+		TenantID: target.TenantID, PrincipalID: "current", GroupID: "engineering",
+	}}
+	if state.PublicationFence == nil || *state.PublicationFence != newFence ||
+		!identityMembershipSlicesEqual(state.Members, want) || calls.Load() != 6 {
+		t.Fatalf("stable remote state = %+v calls=%d", state, calls.Load())
 	}
 }
 
@@ -170,7 +244,7 @@ func TestOpenFGAIdentityClaimIsAtomicAndMembershipWritesRemainBounded(t *testing
 		t.Fatal(err)
 	}
 	if claimCalls.Load() != 1 || publicationCalls.Load() != 4 ||
-		expectedFence.State != identity.MembershipPublicationFencePublished {
+		expectedFence.State != identity.MembershipPublicationFencePublished || expectedFence.Attempt != 5 {
 		t.Fatalf("claim calls=%d publication calls=%d final fence=%+v", claimCalls.Load(), publicationCalls.Load(), expectedFence)
 	}
 }
@@ -183,7 +257,7 @@ func TestIdentityPublicationFenceTupleRoundTrips(t *testing.T) {
 		},
 		{
 			State: identity.MembershipPublicationFencePublished, IdentityWatermark: testIdentityWatermark,
-			ProjectionDigest: testProjectionDigest,
+			ProjectionDigest: testProjectionDigest, Attempt: 43,
 		},
 	} {
 		parsed, err := parseIdentityPublicationFence(identityFenceTuple(fence).User)
@@ -193,7 +267,7 @@ func TestIdentityPublicationFenceTupleRoundTrips(t *testing.T) {
 	}
 	for _, malformed := range []string{
 		identityFenceUserPrefix + "a_00000000000000000000_00000000000000000001_00000000000000000000000000000000_0000000000000000000000000000000000000000000000000000000000000000",
-		identityFenceUserPrefix + "p_00000000000000000001_00000000000000000001_00000000000000000000000000000000_0000000000000000000000000000000000000000000000000000000000000000",
+		identityFenceUserPrefix + "p_00000000000000000000_00000000000000000001_00000000000000000000000000000000_0000000000000000000000000000000000000000000000000000000000000000",
 		identityFenceUserPrefix + "unknown",
 	} {
 		if _, err := parseIdentityPublicationFence(malformed); err == nil {

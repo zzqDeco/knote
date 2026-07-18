@@ -764,6 +764,9 @@ func (s *Service) OpenCitation(
 	if s.cache != nil && s.cache.containsInvalidatedResource(resourceIDs) {
 		return protocol.EvidenceItem{}, ErrCitationUnavailable
 	}
+	if err := s.runFinalAuthorizationGate(ctx, current); err != nil {
+		return protocol.EvidenceItem{}, err
+	}
 	return selected, nil
 }
 

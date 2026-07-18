@@ -93,7 +93,7 @@ func (b *memoryIdentityBackend) ApplyMembershipChanges(
 	}
 	b.fence = &identity.MembershipPublicationFence{
 		State: identity.MembershipPublicationFencePublished, IdentityWatermark: request.IdentityWatermark,
-		ProjectionDigest: request.ProjectionDigest,
+		ProjectionDigest: request.ProjectionDigest, Attempt: request.ExpectedFence.Attempt + 1,
 	}
 	return nil
 }

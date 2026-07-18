@@ -824,6 +824,64 @@ func TestOpenCitationReauthorizesChunkBoundary(t *testing.T) {
 	}
 }
 
+func TestOpenCitationRunsFinalAuthorizationGateBeforeReturningContent(t *testing.T) {
+	document := queryTestDocument(queryTestModelID, "content", "projection-v1")
+	item := queryTestItem(document)
+	events := []string{}
+	backend := &queryTestKAG{events: &events, retrieveResult: queryTestRetrieve(document)}
+	authorizer := &queryTestAuthorizer{events: &events}
+	loader := &queryTestLoader{
+		events: &events,
+		items:  map[protocol.ResourceID]protocol.EvidenceItem{document.ResourceID: item},
+	}
+	identityValid := true
+	var gated []protocol.AuthorizationContext
+	service, err := New(Options{
+		KAG: backend, Authorizer: authorizer, Loader: loader,
+		RetrieveLimit: 10, EvidenceLimit: 2,
+		Now: func() time.Time { return time.Date(2026, 7, 13, 1, 0, 0, 0, time.UTC) },
+		FinalAuthorizationGate: func(_ context.Context, authorization protocol.AuthorizationContext) error {
+			events = append(events, "identity-gate")
+			gated = append(gated, authorization)
+			if !identityValid {
+				return errors.New("live identity is no longer valid")
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	original := queryTestAuthorization("alice", "request-citation-prime")
+	result, err := service.Query(context.Background(), protocol.QueryRequest{
+		Question: "q", Authorization: original,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	identityValid = false
+	events = nil
+	authorizer.calls = nil
+	loader.calls = nil
+	current := original
+	current.RequestID = "request-citation-deprovisioned"
+	opened, err := service.OpenCitation(context.Background(), current, result.Evidence, item.Citation.Handle)
+	if err != ErrProtectedContentUnavailable || err.Error() != ErrProtectedContentUnavailable.Error() {
+		t.Fatalf("open citation error = %v, want exact protected content unavailable", err)
+	}
+	if !reflect.DeepEqual(opened, protocol.EvidenceItem{}) {
+		t.Fatalf("denied citation returned protected content: %#v", opened)
+	}
+	if got, want := events, []string{"authz", "load", "authz", "identity-gate"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("events = %v, want %v", got, want)
+	}
+	if len(gated) != 2 || gated[1] != current {
+		t.Fatalf("final gate authorizations = %+v, want current citation authorization %+v", gated, current)
+	}
+}
+
 func TestOpenCitationFailsClosed(t *testing.T) {
 	document := queryTestDocument(queryTestModelID, "content", "projection-v1")
 	item := queryTestItem(document)
