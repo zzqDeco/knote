@@ -13,17 +13,17 @@ import (
 
 func secureConnectorDirectory(path string) error { return secureConnectorPath(path, true) }
 
-func validateConnectorDirectory(path string) error {
-	pathPointer, err := windows.UTF16PtrFromString(path)
+func validateConnectorPathComponent(path string) error {
+	handle, err := openConnectorDirectoryHandle(path, 0)
 	if err != nil {
 		return err
 	}
-	handle, err := windows.CreateFile(
-		pathPointer, windows.READ_CONTROL,
-		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
-		nil, windows.OPEN_EXISTING,
-		windows.FILE_FLAG_OPEN_REPARSE_POINT|windows.FILE_FLAG_BACKUP_SEMANTICS, 0,
-	)
+	validateErr := validateConnectorHandleType(handle, true)
+	return errors.Join(validateErr, windows.CloseHandle(handle))
+}
+
+func validateConnectorDirectory(path string) error {
+	handle, err := openConnectorDirectoryHandle(path, windows.READ_CONTROL)
 	if err != nil {
 		return err
 	}
@@ -36,7 +36,8 @@ func createConnectorDirectory(path string) error {
 	if err != nil {
 		return err
 	}
-	descriptor, err := windows.SecurityDescriptorFromString("D:P(A;OICI;GA;;;" + user.User.Sid.String() + ")")
+	sid := user.User.Sid.String()
+	descriptor, err := windows.SecurityDescriptorFromString("O:" + sid + "D:P(A;OICI;GA;;;" + sid + ")")
 	if err != nil {
 		return err
 	}
@@ -61,8 +62,12 @@ func secureConnectorPath(path string, directory bool) error {
 	if directory {
 		flags |= windows.FILE_FLAG_BACKUP_SEMANTICS
 	}
+	access := uint32(windows.READ_CONTROL | windows.WRITE_DAC)
+	if directory {
+		access |= windows.WRITE_OWNER
+	}
 	handle, err := windows.CreateFile(
-		pathPointer, windows.READ_CONTROL|windows.WRITE_DAC,
+		pathPointer, access,
 		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
 		nil, windows.OPEN_EXISTING, flags, 0,
 	)
@@ -97,10 +102,18 @@ func secureConnectorHandle(handle windows.Handle, directory bool) error {
 	if err != nil {
 		return err
 	}
+	securityInformation := windows.SECURITY_INFORMATION(
+		windows.DACL_SECURITY_INFORMATION | windows.PROTECTED_DACL_SECURITY_INFORMATION,
+	)
+	var owner *windows.SID
+	if directory {
+		securityInformation |= windows.OWNER_SECURITY_INFORMATION
+		owner = user.User.Sid
+	}
 	return windows.SetSecurityInfo(
 		handle, windows.SE_FILE_OBJECT,
-		windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
-		nil, nil, acl, nil,
+		securityInformation,
+		owner, nil, acl, nil,
 	)
 }
 
@@ -109,7 +122,8 @@ func validateConnectorHandle(handle windows.Handle, directory bool) error {
 		return err
 	}
 	descriptor, err := windows.GetSecurityInfo(
-		handle, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION,
+		handle, windows.SE_FILE_OBJECT,
+		windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION,
 	)
 	if err != nil {
 		return err
@@ -131,6 +145,13 @@ func validateConnectorHandle(handle windows.Handle, directory bool) error {
 	user, err := windows.GetCurrentProcessToken().GetTokenUser()
 	if err != nil {
 		return err
+	}
+	owner, _, err := descriptor.Owner()
+	if err != nil {
+		return err
+	}
+	if owner == nil || !owner.Equals(user.User.Sid) {
+		return fmt.Errorf("connector store directory must be owned by the current user")
 	}
 	wantPermissions := windows.ACCESS_MASK(
 		windows.STANDARD_RIGHTS_REQUIRED | windows.SYNCHRONIZE | 0x1ff,
@@ -154,6 +175,19 @@ func validateConnectorHandle(handle windows.Handle, directory bool) error {
 		}
 	}
 	return nil
+}
+
+func openConnectorDirectoryHandle(path string, access uint32) (windows.Handle, error) {
+	pathPointer, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return 0, err
+	}
+	return windows.CreateFile(
+		pathPointer, access,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
+		nil, windows.OPEN_EXISTING,
+		windows.FILE_FLAG_OPEN_REPARSE_POINT|windows.FILE_FLAG_BACKUP_SEMANTICS, 0,
+	)
 }
 
 func validateConnectorHandleType(handle windows.Handle, directory bool) error {

@@ -253,6 +253,60 @@ func TestStandaloneReconciliationBindsExactSnapshotDigests(t *testing.T) {
 	}
 }
 
+func TestStandaloneReconciliationReplayBindsAndAppliesAuthoritativeState(t *testing.T) {
+	store, processor, ref := newTestProcessor(t, t.TempDir(), nil, RetryPolicy{}, newTestClock())
+	resourceID := reconciliationResourceID(t, ref.Scope.TenantID, "standalone-authoritative")
+	authoritativeResource := reconciliationAuthoritativeResource(resourceID, "standalone-authoritative")
+	authoritative := reconciliationAuthoritativeSnapshot(ref, []AuthoritativeResource{authoritativeResource})
+	projected := reconciliationProjectionSnapshot(ref, 0, []ProjectedResource{}, []ProjectedACL{})
+	var request ReconciliationApplyRequest
+	if _, err := processor.Reconcile(
+		context.Background(), ref, authoritative, projected,
+		ReconciliationProjectorFunc(func(_ context.Context, value ReconciliationApplyRequest) error {
+			request = cloneReconciliationRequest(value)
+			return nil
+		}),
+	); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if err := request.Validate(); err != nil {
+		t.Fatalf("bound request validation: %v", err)
+	}
+	if request.IdempotencyKey == "" ||
+		!reflect.DeepEqual(request.AuthoritativeResources, []AuthoritativeResource{authoritativeResource}) {
+		t.Fatalf("request omitted authoritative replay binding: %+v", request)
+	}
+
+	tamperedKey := cloneReconciliationRequest(request)
+	tamperedKey.IdempotencyKey = protocol.NewContentDigest("different-reconciliation-request")
+	if err := tamperedKey.Validate(); err == nil {
+		t.Fatal("request accepted an idempotency key that did not bind its exact payload")
+	}
+	tamperedResource := cloneReconciliationRequest(request)
+	tamperedResource.AuthoritativeResources[0].ContentDigest = protocol.NewContentDigest("tampered-content")
+	if err := bindReconciliationIdempotencyKey(&tamperedResource); err != nil {
+		t.Fatal(err)
+	}
+	if err := tamperedResource.Validate(); err == nil {
+		t.Fatal("request accepted resources that did not match its authoritative snapshot digest")
+	}
+
+	replay, err := store.Replay(ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(replay.Resources) != 1 {
+		t.Fatalf("standalone replay resources = %+v", replay.Resources)
+	}
+	resource := replay.Resources[0]
+	if resource.ResourceID != resourceID || resource.State != ReplayResourceActive || resource.LastSequence != 0 ||
+		resource.SourceWatermark != authoritativeResource.SourceWatermark ||
+		resource.ACLWatermark != authoritativeResource.ACLWatermark ||
+		resource.ContentDigest != authoritativeResource.ContentDigest || resource.ACLDigest != authoritativeResource.ACLDigest {
+		t.Fatalf("standalone replay omitted authoritative state: %+v", resource)
+	}
+}
+
 func TestStandaloneReconciliationRejectsUnfinishedEventBeforeReservation(t *testing.T) {
 	root := t.TempDir()
 	clock := newTestClock()
@@ -840,8 +894,9 @@ func TestReconciliationOwnershipClaimSurvivesCrashBeforeReservation(t *testing.T
 func TestSnapshotCanAtomicallyClaimResourceMissedByCDC(t *testing.T) {
 	store, processor, ref := newTestProcessor(t, t.TempDir(), nil, RetryPolicy{}, newTestClock())
 	resourceID := reconciliationResourceID(t, ref.Scope.TenantID, "snapshot-missed-cdc")
+	authoritativeResource := reconciliationAuthoritativeResource(resourceID, "snapshot-missed-cdc")
 	authoritative := reconciliationAuthoritativeSnapshot(ref, []AuthoritativeResource{
-		reconciliationAuthoritativeResource(resourceID, "snapshot-missed-cdc"),
+		authoritativeResource,
 	})
 	projected := reconciliationProjectionSnapshot(ref, 0, []ProjectedResource{}, []ProjectedACL{})
 	event := testSnapshotCompletionEvent(t, ref, 1, authoritative)
@@ -855,6 +910,60 @@ func TestSnapshotCanAtomicallyClaimResourceMissedByCDC(t *testing.T) {
 	if ownership.BoundEventID != event.EventID || ownership.BoundSequence != event.Sequence ||
 		ownership.BoundFingerprint == "" || ownership.SourceID != "source-1" {
 		t.Fatalf("snapshot ownership = %+v", ownership)
+	}
+	replay, err := store.Replay(ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(replay.Resources) != 1 || replay.Resources[0].ResourceID != resourceID ||
+		replay.Resources[0].State != ReplayResourceActive || replay.Resources[0].LastSequence != event.Sequence ||
+		replay.Resources[0].SourceWatermark != authoritativeResource.SourceWatermark ||
+		replay.Resources[0].ACLWatermark != authoritativeResource.ACLWatermark ||
+		replay.Resources[0].ContentDigest != authoritativeResource.ContentDigest ||
+		replay.Resources[0].ACLDigest != authoritativeResource.ACLDigest {
+		t.Fatalf("snapshot replay omitted authoritative resource: %+v", replay.Resources)
+	}
+}
+
+func TestSnapshotReplayReplacesChangedResourceWithAuthoritativeMetadata(t *testing.T) {
+	store, processor, ref := newTestProcessor(t, t.TempDir(), nil, RetryPolicy{}, newTestClock())
+	content := testConnectorEvent(t, ref, 1, protocol.ConnectorContentUpsert, "snapshot-changed", "old-content")
+	if _, err := processor.Process(
+		context.Background(), ref, content, successfulTestProjector(t, &atomic.Int32{}),
+	); err != nil {
+		t.Fatalf("seed content: %v", err)
+	}
+	acl := testConnectorEvent(t, ref, 2, protocol.ConnectorACLReplace, "snapshot-changed", "old-acl")
+	if _, err := processor.Process(
+		context.Background(), ref, acl, successfulTestProjector(t, &atomic.Int32{}),
+	); err != nil {
+		t.Fatalf("seed ACL: %v", err)
+	}
+	authoritativeResource := reconciliationAuthoritativeResource(content.ResourceID, "authoritative-v2")
+	authoritative := reconciliationAuthoritativeSnapshot(ref, []AuthoritativeResource{authoritativeResource})
+	projected := reconciliationProjectionSnapshot(
+		ref, 2,
+		[]ProjectedResource{reconciliationProjectedResource(content.ResourceID, "projected-v1")},
+		[]ProjectedACL{reconciliationProjectedACL(content.ResourceID, "projected-v1")},
+	)
+	event := testSnapshotCompletionEvent(t, ref, 3, authoritative)
+	if _, err := processor.ProcessSnapshot(context.Background(), ref, event, authoritative, projected); err != nil {
+		t.Fatalf("ProcessSnapshot changed resource: %v", err)
+	}
+	replay, err := store.Replay(ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(replay.Resources) != 1 {
+		t.Fatalf("replay resources = %+v", replay.Resources)
+	}
+	resource := replay.Resources[0]
+	if resource.ResourceID != content.ResourceID || resource.State != ReplayResourceActive ||
+		resource.LastSequence != event.Sequence || resource.SourceWatermark != authoritativeResource.SourceWatermark ||
+		resource.ACLWatermark != authoritativeResource.ACLWatermark ||
+		resource.ContentDigest != authoritativeResource.ContentDigest || resource.ACLDigest != authoritativeResource.ACLDigest ||
+		resource.Tombstone != nil || resource.ReconciliationTombstone != nil {
+		t.Fatalf("replay retained stale projected metadata: %+v", resource)
 	}
 }
 

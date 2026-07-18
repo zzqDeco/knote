@@ -418,12 +418,18 @@ func (p *Processor) appendSnapshotEvent(
 			SourceID: preparation.registration.SourceID, EventID: event.EventID, EventFingerprint: fingerprint,
 			Sequence: event.Sequence, AuthoritativeSnapshotDigest: authoritativeDigest,
 			AuthoritativeCapturedAt: preparation.request.AuthoritativeCapturedAt,
+			AuthoritativeResources:  append([]AuthoritativeResource{}, request.AuthoritativeResources...),
 			SourceWatermark:         event.SourceWatermark, ACLWatermark: event.ACLWatermark,
 			ProjectionBaseDigest: projectionDigest, ProjectionBaseSequence: projected.ProjectionBaseSequence,
 			PlanDigest:       request.Plan.Digest,
 			OwnedResourceIDs: append([]protocol.ResourceID{}, request.OwnedResourceIDs...),
 			Plan:             cloneReconciliationPlan(request.Plan), CreatedAt: createdAt,
 		}
+		boundRequest := reconciliationRequestForSnapshotIntent(intent)
+		if err := bindReconciliationIdempotencyKey(&boundRequest); err != nil {
+			return SnapshotReconciliationIntent{}, err
+		}
+		intent.IdempotencyKey = boundRequest.IdempotencyKey
 		return intent, intent.ValidateForEvent(event)
 	}
 	intent, err := buildIntent(preparation.request)

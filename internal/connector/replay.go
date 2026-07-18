@@ -71,11 +71,12 @@ func buildReplayReport(ref ConnectorRef, state durableState) (ReplayReport, erro
 	for _, durable := range state.events {
 		for standaloneIndex < len(state.reconciliations) &&
 			state.reconciliations[standaloneIndex].Request.ProjectionBaseSequence < durable.entry.Event.Sequence {
-			applyReconciliationTombstones(
-				resources,
-				state.reconciliations[standaloneIndex].DerivedTombstones,
-				state.reconciliations[standaloneIndex].Request.ProjectionBaseSequence,
-			)
+			receipt := state.reconciliations[standaloneIndex]
+			if err := applyReconciliationState(
+				resources, receipt.Request, receipt.DerivedTombstones, receipt.Request.ProjectionBaseSequence,
+			); err != nil {
+				return ReplayReport{}, err
+			}
 			standaloneIndex++
 		}
 		replayEvent := ReplayEvent{
@@ -135,7 +136,12 @@ func buildReplayReport(ref ConnectorRef, state durableState) (ReplayReport, erro
 
 		if durable.checkpoint == nil {
 			if durable.reconciliation != nil {
-				applyReconciliationTombstones(resources, durable.reconciliation.DerivedTombstones, durable.entry.Event.Sequence)
+				request := reconciliationRequestForSnapshotIntent(*durable.entry.SnapshotReconciliation)
+				if err := applyReconciliationState(
+					resources, request, durable.reconciliation.DerivedTombstones, durable.entry.Event.Sequence,
+				); err != nil {
+					return ReplayReport{}, err
+				}
 			}
 			continue
 		}
@@ -183,12 +189,21 @@ func buildReplayReport(ref ConnectorRef, state durableState) (ReplayReport, erro
 			return ReplayReport{}, fmt.Errorf("%w: unsupported journal event kind %q", ErrStoreIntegrity, event.Kind)
 		}
 		if durable.reconciliation != nil {
-			applyReconciliationTombstones(resources, durable.reconciliation.DerivedTombstones, event.Sequence)
+			request := reconciliationRequestForSnapshotIntent(*durable.entry.SnapshotReconciliation)
+			if err := applyReconciliationState(
+				resources, request, durable.reconciliation.DerivedTombstones, event.Sequence,
+			); err != nil {
+				return ReplayReport{}, err
+			}
 		}
 	}
 	for standaloneIndex < len(state.reconciliations) {
 		receipt := state.reconciliations[standaloneIndex]
-		applyReconciliationTombstones(resources, receipt.DerivedTombstones, receipt.Request.ProjectionBaseSequence)
+		if err := applyReconciliationState(
+			resources, receipt.Request, receipt.DerivedTombstones, receipt.Request.ProjectionBaseSequence,
+		); err != nil {
+			return ReplayReport{}, err
+		}
 		standaloneIndex++
 	}
 
@@ -208,13 +223,49 @@ func buildReplayReport(ref ConnectorRef, state durableState) (ReplayReport, erro
 	return report, nil
 }
 
-func applyReconciliationTombstones(
+func applyReconciliationState(
 	resources map[protocol.ResourceID]ReplayResource,
+	request ReconciliationApplyRequest,
 	tombstones []ReconciliationTombstone,
 	sequence uint64,
-) {
+) error {
+	if err := request.Validate(); err != nil {
+		return fmt.Errorf("%w: reconciliation request: %v", ErrStoreIntegrity, err)
+	}
+	expectedSequence := request.ProjectionBaseSequence
+	if request.Snapshot != nil {
+		expectedSequence = request.Snapshot.Sequence
+	}
+	if sequence != expectedSequence {
+		return fmt.Errorf(
+			"%w: reconciliation state sequence %d does not match request sequence %d",
+			ErrStoreIntegrity, sequence, expectedSequence,
+		)
+	}
+	authoritativeIDs := make(map[protocol.ResourceID]struct{}, len(request.AuthoritativeResources))
+	for _, authoritative := range request.AuthoritativeResources {
+		resource := resources[authoritative.ResourceID]
+		if resource.State == ReplayResourceTombstoned {
+			return fmt.Errorf(
+				"%w: %w: resource %s",
+				ErrStoreIntegrity, ErrTombstoneResurrection, authoritative.ResourceID,
+			)
+		}
+		authoritativeIDs[authoritative.ResourceID] = struct{}{}
+		resources[authoritative.ResourceID] = ReplayResource{
+			ResourceID: authoritative.ResourceID, State: ReplayResourceActive, LastSequence: sequence,
+			SourceWatermark: authoritative.SourceWatermark, ACLWatermark: authoritative.ACLWatermark,
+			ContentDigest: authoritative.ContentDigest, ACLDigest: authoritative.ACLDigest,
+		}
+	}
 	for index := range tombstones {
 		tombstone := tombstones[index]
+		if _, found := authoritativeIDs[tombstone.ResourceID]; found {
+			return fmt.Errorf(
+				"%w: reconciliation resource %s is both authoritative and tombstoned",
+				ErrStoreIntegrity, tombstone.ResourceID,
+			)
+		}
 		resource := resources[tombstone.ResourceID]
 		resource.ResourceID = tombstone.ResourceID
 		resource.State = ReplayResourceTombstoned
@@ -226,6 +277,7 @@ func applyReconciliationTombstones(
 		resource.ReconciliationTombstone = &copy
 		resources[tombstone.ResourceID] = resource
 	}
+	return nil
 }
 
 func replayDigest(report ReplayReport) (protocol.ContentDigest, error) {

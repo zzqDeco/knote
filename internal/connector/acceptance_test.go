@@ -501,8 +501,16 @@ func TestSnapshotReconciliationFaultBoundariesResumeExactly(t *testing.T) {
 			projected := reconciliationProjectionSnapshot(ref, 0, []ProjectedResource{}, []ProjectedACL{})
 			event := testSnapshotCompletionEvent(t, ref, 1, authoritative)
 			var calls atomic.Int32
-			reconciler := ReconciliationProjectorFunc(func(context.Context, ReconciliationApplyRequest) error {
+			var appliedMu sync.Mutex
+			appliedKeys := map[protocol.ContentDigest]struct{}{}
+			reconciler := ReconciliationProjectorFunc(func(_ context.Context, request ReconciliationApplyRequest) error {
+				if err := request.Validate(); err != nil {
+					return err
+				}
 				calls.Add(1)
+				appliedMu.Lock()
+				appliedKeys[request.IdempotencyKey] = struct{}{}
+				appliedMu.Unlock()
 				return nil
 			})
 			processor, err := NewProcessor(store, ProcessorOptions{
@@ -534,6 +542,12 @@ func TestSnapshotReconciliationFaultBoundariesResumeExactly(t *testing.T) {
 			}
 			if result.Reconciliation == nil || result.Publication == nil || calls.Load() != test.callsAfterRecovery {
 				t.Fatalf("snapshot recovery result=%+v calls=%d want=%d", result, calls.Load(), test.callsAfterRecovery)
+			}
+			appliedMu.Lock()
+			uniqueApplications := len(appliedKeys)
+			appliedMu.Unlock()
+			if uniqueApplications != 1 {
+				t.Fatalf("ambiguous reconciliation callbacks used %d idempotency keys, want one", uniqueApplications)
 			}
 		})
 	}

@@ -5,8 +5,10 @@ package connector
 import (
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
@@ -42,6 +44,106 @@ func TestNewStoreRejectsPermissiveExistingRootWithoutMutation(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(root, "tenants")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("NewStore created children in rejected root: %v", err)
 	}
+}
+
+func TestNewStoreRejectsExistingRootThroughAncestorJunctionWithoutMutation(t *testing.T) {
+	base := t.TempDir()
+	target := filepath.Join(base, "target")
+	if err := os.Mkdir(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	realRoot := filepath.Join(target, "store")
+	if err := createConnectorDirectory(realRoot); err != nil {
+		t.Fatal(err)
+	}
+	if err := secureConnectorDirectory(realRoot); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(base, "linked")
+	if output, err := exec.Command("cmd.exe", "/c", "mklink", "/J", link, target).CombinedOutput(); err != nil {
+		t.Skipf("cannot create a junction fixture: %v: %s", err, output)
+	}
+
+	if _, err := NewStore(filepath.Join(link, "store")); err == nil {
+		t.Fatal("NewStore accepted an existing root reached through an ancestor junction")
+	}
+	if _, err := os.Stat(filepath.Join(realRoot, "tenants")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("NewStore created children in the junction target: %v", err)
+	}
+	if err := validateConnectorDirectory(realRoot); err != nil {
+		t.Fatalf("NewStore mutated the junction target: %v", err)
+	}
+}
+
+func TestNewStoreRejectsForeignOwnedExistingRootWithoutMutation(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "foreign")
+	current, err := windows.GetCurrentProcessToken().GetTokenUser()
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreign, err := windows.CreateWellKnownSid(windows.WinBuiltinAdministratorsSid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if foreign.Equals(current.User.Sid) {
+		t.Skip("administrator SID unexpectedly matches the current user SID")
+	}
+	if err := createConnectorDirectoryWithOwner(root, foreign, current.User.Sid); err != nil {
+		t.Skipf("cannot create a foreign-owned fixture: %v", err)
+	}
+	wantOwner := foreign.String()
+
+	if _, err := NewStore(root); err == nil {
+		t.Fatal("NewStore accepted a foreign-owned existing root")
+	}
+	if _, err := os.Stat(filepath.Join(root, "tenants")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("NewStore created children in the foreign-owned root: %v", err)
+	}
+	if got := connectorDirectoryOwnerSID(t, root); got != wantOwner {
+		t.Fatalf("NewStore changed existing root owner to %s", got)
+	}
+}
+
+func createConnectorDirectoryWithOwner(path string, owner, allowed *windows.SID) error {
+	descriptor, err := windows.SecurityDescriptorFromString(
+		"O:" + owner.String() + "D:P(A;OICI;GA;;;" + allowed.String() + ")",
+	)
+	if err != nil {
+		return err
+	}
+	pathPointer, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return err
+	}
+	return windows.CreateDirectory(pathPointer, &windows.SecurityAttributes{
+		Length:             uint32(unsafe.Sizeof(windows.SecurityAttributes{})),
+		SecurityDescriptor: descriptor,
+	})
+}
+
+func connectorDirectoryOwnerSID(t *testing.T, path string) string {
+	t.Helper()
+	handle, err := openConnectorDirectoryHandle(path, windows.READ_CONTROL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	descriptor, queryErr := windows.GetSecurityInfo(
+		handle, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION,
+	)
+	if closeErr := windows.CloseHandle(handle); queryErr == nil {
+		queryErr = closeErr
+	}
+	if queryErr != nil {
+		t.Fatal(queryErr)
+	}
+	owner, _, err := descriptor.Owner()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if owner == nil {
+		t.Fatal("directory has no owner SID")
+	}
+	return owner.String()
 }
 
 func setConnectorDirectoryEveryoneACL(t *testing.T, path string) {

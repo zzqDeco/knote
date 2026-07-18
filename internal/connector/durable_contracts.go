@@ -301,8 +301,10 @@ type SnapshotReconciliationIntent struct {
 	EventID                     string                             `json:"event_id"`
 	EventFingerprint            protocol.ConnectorEventFingerprint `json:"event_fingerprint"`
 	Sequence                    uint64                             `json:"sequence"`
+	IdempotencyKey              protocol.ContentDigest             `json:"idempotency_key"`
 	AuthoritativeSnapshotDigest protocol.ContentDigest             `json:"authoritative_snapshot_digest"`
 	AuthoritativeCapturedAt     time.Time                          `json:"authoritative_captured_at"`
+	AuthoritativeResources      []AuthoritativeResource            `json:"authoritative_resources"`
 	SourceWatermark             string                             `json:"source_watermark"`
 	ACLWatermark                string                             `json:"acl_watermark"`
 	ProjectionBaseDigest        protocol.ContentDigest             `json:"projection_base_digest"`
@@ -356,6 +358,18 @@ func (i SnapshotReconciliationIntent) ValidateForEvent(event protocol.ConnectorE
 	if i.AuthoritativeSnapshotDigest != event.PayloadDigest {
 		return fmt.Errorf("snapshot event payload digest does not match the authoritative snapshot")
 	}
+	authoritative := AuthoritativeSnapshot{
+		Version: ConnectorCoreVersion, TenantID: i.TenantID, ConnectorID: i.ConnectorID,
+		SourceWatermark: i.SourceWatermark, ACLWatermark: i.ACLWatermark,
+		CapturedAt: i.AuthoritativeCapturedAt, Resources: i.AuthoritativeResources,
+	}
+	authoritativeDigest, err := authoritativeSnapshotDigest(authoritative)
+	if err != nil {
+		return err
+	}
+	if authoritativeDigest != i.AuthoritativeSnapshotDigest {
+		return fmt.Errorf("snapshot authoritative resources do not match the authoritative snapshot digest")
+	}
 	if err := i.ProjectionBaseDigest.Validate(); err != nil {
 		return err
 	}
@@ -388,7 +402,10 @@ func (i SnapshotReconciliationIntent) ValidateForEvent(event protocol.ConnectorE
 			return fmt.Errorf("snapshot reconciliation resource %s lacks trusted ownership", resourceID)
 		}
 	}
-	return validateUTC("created_at", i.CreatedAt)
+	if err := validateUTC("created_at", i.CreatedAt); err != nil {
+		return err
+	}
+	return reconciliationRequestForSnapshotIntent(i).Validate()
 }
 
 type SnapshotReconciliationBinding struct {
@@ -422,8 +439,10 @@ func reconciliationRequestForSnapshotIntent(intent SnapshotReconciliationIntent)
 			ConnectorID: intent.ConnectorID, SourceID: intent.SourceID,
 		},
 		OwnedResourceIDs:            append([]protocol.ResourceID{}, intent.OwnedResourceIDs...),
+		IdempotencyKey:              intent.IdempotencyKey,
 		AuthoritativeSnapshotDigest: intent.AuthoritativeSnapshotDigest,
 		AuthoritativeCapturedAt:     intent.AuthoritativeCapturedAt,
+		AuthoritativeResources:      append([]AuthoritativeResource{}, intent.AuthoritativeResources...),
 		ProjectedSnapshotDigest:     intent.ProjectionBaseDigest,
 		ProjectionBaseSequence:      intent.ProjectionBaseSequence,
 		Plan:                        cloneReconciliationPlan(intent.Plan), Snapshot: &binding,
@@ -465,8 +484,10 @@ type ReconciliationApplyRequest struct {
 	Version                     string                         `json:"version"`
 	SourceOwnership             SourceOwnership                `json:"source_ownership"`
 	OwnedResourceIDs            []protocol.ResourceID          `json:"owned_resource_ids"`
+	IdempotencyKey              protocol.ContentDigest         `json:"idempotency_key"`
 	AuthoritativeSnapshotDigest protocol.ContentDigest         `json:"authoritative_snapshot_digest"`
 	AuthoritativeCapturedAt     time.Time                      `json:"authoritative_captured_at"`
+	AuthoritativeResources      []AuthoritativeResource        `json:"authoritative_resources"`
 	ProjectedSnapshotDigest     protocol.ContentDigest         `json:"projected_snapshot_digest"`
 	ProjectionBaseSequence      uint64                         `json:"projection_base_sequence"`
 	Plan                        ReconciliationPlan             `json:"plan"`
@@ -491,6 +512,19 @@ func (r ReconciliationApplyRequest) Validate() error {
 	}
 	if err := validateUTC("authoritative_captured_at", r.AuthoritativeCapturedAt); err != nil {
 		return err
+	}
+	authoritative := AuthoritativeSnapshot{
+		Version:  ConnectorCoreVersion,
+		TenantID: r.SourceOwnership.TenantID, ConnectorID: r.SourceOwnership.ConnectorID,
+		SourceWatermark: r.Plan.SourceWatermark, ACLWatermark: r.Plan.ACLWatermark,
+		CapturedAt: r.AuthoritativeCapturedAt, Resources: r.AuthoritativeResources,
+	}
+	authoritativeDigest, err := authoritativeSnapshotDigest(authoritative)
+	if err != nil {
+		return err
+	}
+	if authoritativeDigest != r.AuthoritativeSnapshotDigest {
+		return fmt.Errorf("reconciliation authoritative resources do not match the authoritative snapshot digest")
 	}
 	if err := r.ProjectedSnapshotDigest.Validate(); err != nil {
 		return err
@@ -523,7 +557,7 @@ func (r ReconciliationApplyRequest) Validate() error {
 			return fmt.Errorf("snapshot reconciliation request digests or base sequence do not match its event")
 		}
 	}
-	return nil
+	return validateReconciliationIdempotencyKey(r)
 }
 
 type SnapshotReconciliationReceipt struct {
@@ -772,6 +806,35 @@ func canonicalContentDigest(value any) (protocol.ContentDigest, error) {
 		return "", err
 	}
 	return protocol.NewContentDigest(string(data)), nil
+}
+
+func bindReconciliationIdempotencyKey(request *ReconciliationApplyRequest) error {
+	if request == nil {
+		return fmt.Errorf("reconciliation apply request is required")
+	}
+	request.IdempotencyKey = ""
+	digest, err := canonicalContentDigest(*request)
+	if err != nil {
+		return err
+	}
+	request.IdempotencyKey = digest
+	return nil
+}
+
+func validateReconciliationIdempotencyKey(request ReconciliationApplyRequest) error {
+	if err := request.IdempotencyKey.Validate(); err != nil {
+		return fmt.Errorf("idempotency_key: %w", err)
+	}
+	actual := request.IdempotencyKey
+	request.IdempotencyKey = ""
+	expected, err := canonicalContentDigest(request)
+	if err != nil {
+		return err
+	}
+	if actual != expected {
+		return fmt.Errorf("reconciliation idempotency key does not bind the exact request")
+	}
+	return nil
 }
 
 func reconciliationPlanResourceIDs(plan ReconciliationPlan) []protocol.ResourceID {

@@ -1228,6 +1228,9 @@ func (s *Store) ensureDir(path string) error {
 
 func createConnectorDirectoriesDurably(path string, syncDir func(string) error) error {
 	path = filepath.Clean(path)
+	if err := validateExistingConnectorPathComponents(path); err != nil {
+		return err
+	}
 	missing := make([]string, 0, 4)
 	current := path
 	for {
@@ -1250,28 +1253,55 @@ func createConnectorDirectoriesDurably(path string, syncDir func(string) error) 
 	}
 	for index := len(missing) - 1; index >= 0; index-- {
 		directory := missing[index]
+		if err := validateExistingConnectorPathComponents(directory); err != nil {
+			return err
+		}
 		created := false
 		if err := createConnectorDirectory(directory); err == nil {
 			created = true
 		} else if !errors.Is(err, os.ErrExist) {
 			return err
 		}
-		info, err := os.Lstat(directory)
-		if err != nil {
+		if err := validateExistingConnectorPathComponents(directory); err != nil {
 			return err
-		}
-		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
-			return fmt.Errorf("connector store directory is not a real directory: %s", directory)
 		}
 		if created {
 			if err := secureConnectorDirectory(directory); err != nil {
 				return err
 			}
-		} else if err := validateConnectorDirectory(directory); err != nil {
+		}
+		if err := validateConnectorDirectory(directory); err != nil {
 			return err
 		}
 		if err := syncDir(filepath.Dir(directory)); err != nil {
 			return fmt.Errorf("sync parent of connector store directory: %w", err)
+		}
+	}
+	return nil
+}
+
+func validateExistingConnectorPathComponents(path string) error {
+	path = filepath.Clean(path)
+	volumeRoot := filepath.VolumeName(path) + string(filepath.Separator)
+	relative, err := filepath.Rel(volumeRoot, path)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("connector store path is not rooted on its volume")
+	}
+
+	current := volumeRoot
+	components := []string{}
+	if relative != "." {
+		components = strings.Split(relative, string(filepath.Separator))
+	}
+	for index := -1; index < len(components); index++ {
+		if index >= 0 {
+			current = filepath.Join(current, components[index])
+		}
+		if err := validateConnectorPathComponent(current); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil
+			}
+			return fmt.Errorf("validate connector store path component %s: %w", current, err)
 		}
 	}
 	return nil

@@ -184,7 +184,9 @@ func (p ReconciliationPlan) Noop() bool {
 
 // ReconciliationProjector is intentionally independent from Catalog and
 // OpenFGA. Implementations translate this content-free plan into a candidate
-// projection; serving publication remains a separate operation.
+// projection; serving publication remains a separate operation. A callback can
+// repeat after an ambiguous crash, so implementations must apply each request
+// idempotently by IdempotencyKey.
 type ReconciliationProjector interface {
 	ApplyReconciliation(context.Context, ReconciliationApplyRequest) error
 }
@@ -589,7 +591,11 @@ func (p *Processor) prepareReconciliationLocked(
 		OwnedResourceIDs:            append([]protocol.ResourceID{}, resourceIDs...),
 		AuthoritativeSnapshotDigest: authoritativeDigest, ProjectedSnapshotDigest: projectedDigest,
 		AuthoritativeCapturedAt: authoritative.CapturedAt,
+		AuthoritativeResources:  append([]AuthoritativeResource{}, authoritative.Resources...),
 		ProjectionBaseSequence:  projected.ProjectionBaseSequence, Plan: plan, Snapshot: snapshot,
+	}
+	if err := bindReconciliationIdempotencyKey(&request); err != nil {
+		return reconciliationPreparation{}, err
 	}
 	if err := request.Validate(); err != nil {
 		return reconciliationPreparation{}, err
@@ -663,6 +669,7 @@ func reconciliationSnapshotResourceIDs(
 func cloneReconciliationRequest(request ReconciliationApplyRequest) ReconciliationApplyRequest {
 	clone := request
 	clone.OwnedResourceIDs = append([]protocol.ResourceID{}, request.OwnedResourceIDs...)
+	clone.AuthoritativeResources = append([]AuthoritativeResource{}, request.AuthoritativeResources...)
 	clone.Plan = cloneReconciliationPlan(request.Plan)
 	if request.Snapshot != nil {
 		snapshot := *request.Snapshot
