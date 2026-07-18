@@ -77,3 +77,6 @@ jobs:
 
       - name: Identity store tests
         run: go test ./internal/identity/...
+
+      - name: Connector store tests
+        run: go test ./internal/connector/...
