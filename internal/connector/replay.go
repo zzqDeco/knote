@@ -135,14 +135,6 @@ func buildReplayReport(ref ConnectorRef, state durableState) (ReplayReport, erro
 		report.Events = append(report.Events, replayEvent)
 
 		if durable.checkpoint == nil {
-			if durable.reconciliation != nil {
-				request := reconciliationRequestForSnapshotIntent(*durable.entry.SnapshotReconciliation)
-				if err := applyReconciliationState(
-					resources, request, durable.reconciliation.DerivedTombstones, durable.entry.Event.Sequence,
-				); err != nil {
-					return ReplayReport{}, err
-				}
-			}
 			continue
 		}
 		event := durable.entry.Event

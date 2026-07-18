@@ -29,7 +29,21 @@ func validateConnectorPathComponent(path string) error {
 	if !info.IsDir() {
 		return fmt.Errorf("connector store path component is not a real directory: %s", path)
 	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("connector store path component owner is unavailable: %s", path)
+	}
+	if !trustedConnectorPathComponent(stat.Uid, info.Mode()) {
+		return fmt.Errorf("connector store path component has an unsafe owner or permissions: %s", path)
+	}
 	return nil
+}
+
+func trustedConnectorPathComponent(uid uint32, mode os.FileMode) bool {
+	if uid != 0 && !connectorDirectoryUIDOwnedByCurrentUser(uid) {
+		return false
+	}
+	return mode.Perm()&0o022 == 0 || mode&os.ModeSticky != 0
 }
 
 func validateConnectorDirectory(path string) error {

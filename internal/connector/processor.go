@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"sort"
 	"time"
 
 	"github.com/zzqDeco/knote/internal/protocol"
@@ -163,9 +164,6 @@ func (p *Processor) Recover(ctx context.Context, ref ConnectorRef, projector Pro
 	if err := ref.Validate(); err != nil {
 		return nil, err
 	}
-	if isNilCallback(projector) {
-		return nil, fmt.Errorf("connector projector is required")
-	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -204,9 +202,14 @@ func (p *Processor) Recover(ctx context.Context, ref ConnectorRef, projector Pro
 				results[0] = p.currentResult(ref, durable.entry.Event.Sequence, true, result)
 				return err
 			}
-		} else if err := p.applyEvent(ctx, ref, durable.entry.Event.Sequence, durable.entry.EventFingerprint, projector); err != nil {
-			results[0] = p.currentResult(ref, durable.entry.Event.Sequence, true, result)
-			return err
+		} else {
+			if isNilCallback(projector) {
+				return fmt.Errorf("connector projector is required")
+			}
+			if err := p.applyEvent(ctx, ref, durable.entry.Event.Sequence, durable.entry.EventFingerprint, projector); err != nil {
+				results[0] = p.currentResult(ref, durable.entry.Event.Sequence, true, result)
+				return err
+			}
 		}
 		if err := p.completeDurableStages(ref, durable.entry.Event.Sequence, durable.entry.EventFingerprint); err != nil {
 			results[0] = p.currentResult(ref, durable.entry.Event.Sequence, true, result)
@@ -573,6 +576,14 @@ func pendingEventWouldResurrect(state durableState, event durableEvent) bool {
 		intent := event.entry.SnapshotReconciliation
 		removed := reconciliationRemovalIDs(intent.Plan)
 		removed = append(removed, intent.Plan.TombstonedResources...)
+		sort.Slice(removed, func(i, j int) bool { return removed[i] < removed[j] })
+		unique := removed[:0]
+		for _, resourceID := range removed {
+			if len(unique) == 0 || unique[len(unique)-1] != resourceID {
+				unique = append(unique, resourceID)
+			}
+		}
+		removed = unique
 		for _, resourceID := range intent.OwnedResourceIDs {
 			if !containsResourceID(removed, resourceID) && containsResourceID(terminalResourceIDs, resourceID) {
 				return true
@@ -1654,9 +1665,6 @@ func (p *Processor) recoverStandaloneReconciliation(ctx context.Context, ref Con
 		RequestDigest: pending.RequestDigest, Request: cloneReconciliationRequest(pending.Request),
 		DerivedTombstones: derivedTombstones, AppliedAt: appliedAt,
 	}
-	if err := receipt.ValidateFor(pending); err != nil {
-		return err
-	}
 	return p.store.withLock(func() error {
 		var current ReconciliationReservation
 		found, err := p.store.readOptionalJSON(p.store.reconciliationPendingPath(ref), &current)
@@ -1666,6 +1674,14 @@ func (p *Processor) recoverStandaloneReconciliation(ctx context.Context, ref Con
 		if !found || current.RequestDigest != pending.RequestDigest ||
 			!reconciliationRequestsEqual(current.Request, pending.Request) {
 			return ErrPendingReconciliation
+		}
+		applicationOrder, err := p.store.nextReconciliationApplicationOrderLocked(ref)
+		if err != nil {
+			return err
+		}
+		receipt.ApplicationOrder = applicationOrder
+		if err := receipt.ValidateFor(pending); err != nil {
+			return err
 		}
 		if err := p.store.writeJSONOnce(
 			p.store.reconciliationReservationReceiptPath(ref, pending.RequestDigest), receipt,
@@ -1678,7 +1694,7 @@ func (p *Processor) recoverStandaloneReconciliation(ctx context.Context, ref Con
 
 func classifyApplyError(err error) (string, bool) {
 	var applyError *ApplyError
-	if errors.As(err, &applyError) {
+	if errors.As(err, &applyError) && applyError != nil {
 		if validationErr := validateErrorCode(applyError.Code); validationErr == nil {
 			return applyError.Code, applyError.Retryable
 		}

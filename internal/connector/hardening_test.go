@@ -1149,9 +1149,10 @@ func persistLegacyStandaloneDeletion(
 	}
 	receipt := ReconciliationReservationReceipt{
 		Version: ConnectorCoreVersion, TenantID: preparation.request.SourceOwnership.TenantID,
-		ConnectorID: preparation.request.SourceOwnership.ConnectorID,
-		SourceID:    preparation.request.SourceOwnership.SourceID,
-		PlanDigest:  preparation.request.Plan.Digest, RequestDigest: requestDigest,
+		ConnectorID:      preparation.request.SourceOwnership.ConnectorID,
+		SourceID:         preparation.request.SourceOwnership.SourceID,
+		ApplicationOrder: 1,
+		PlanDigest:       preparation.request.Plan.Digest, RequestDigest: requestDigest,
 		Request: cloneReconciliationRequest(preparation.request), DerivedTombstones: tombstones, AppliedAt: appliedAt,
 	}
 	if err := receipt.ValidateFor(reservation); err != nil {

@@ -64,7 +64,7 @@ func (s *Store) Register(registration Registration) error {
 			if err := existing.Validate(); err != nil {
 				return fmt.Errorf("%w: persisted registration: %v", ErrStoreIntegrity, err)
 			}
-			if existing != registration {
+			if !registrationsEqual(existing, registration) {
 				return ErrRegistrationConflict
 			}
 		} else if !errors.Is(err, os.ErrNotExist) {
@@ -86,6 +86,12 @@ func (s *Store) Register(registration Registration) error {
 		_, err := s.loadStateLocked(ref, true)
 		return err
 	})
+}
+
+func registrationsEqual(left, right Registration) bool {
+	leftTime, rightTime := left.RegisteredAt, right.RegisteredAt
+	left.RegisteredAt, right.RegisteredAt = time.Time{}, time.Time{}
+	return left == right && leftTime.Equal(rightTime)
 }
 
 func (s *Store) Registration(ref ConnectorRef) (Registration, error) {
@@ -569,12 +575,36 @@ func (s *Store) readReconciliationReceiptsLocked(
 		receipts = append(receipts, receipt)
 	}
 	sort.Slice(receipts, func(i, j int) bool {
-		if receipts[i].Request.ProjectionBaseSequence != receipts[j].Request.ProjectionBaseSequence {
-			return receipts[i].Request.ProjectionBaseSequence < receipts[j].Request.ProjectionBaseSequence
-		}
-		return receipts[i].RequestDigest < receipts[j].RequestDigest
+		return receipts[i].ApplicationOrder < receipts[j].ApplicationOrder
 	})
+	for index := range receipts {
+		if receipts[index].ApplicationOrder != uint64(index+1) {
+			return nil, fmt.Errorf("%w: reconciliation receipt application order is not contiguous", ErrStoreIntegrity)
+		}
+		if index > 0 && receipts[index].Request.ProjectionBaseSequence < receipts[index-1].Request.ProjectionBaseSequence {
+			return nil, fmt.Errorf("%w: reconciliation receipt projection base moves backwards", ErrStoreIntegrity)
+		}
+	}
 	return receipts, nil
+}
+
+func (s *Store) nextReconciliationApplicationOrderLocked(ref ConnectorRef) (uint64, error) {
+	registration, err := s.loadRegistrationLocked(ref)
+	if err != nil {
+		return 0, err
+	}
+	receipts, err := s.readReconciliationReceiptsLocked(ref, registration)
+	if err != nil {
+		return 0, err
+	}
+	if len(receipts) == 0 {
+		return 1, nil
+	}
+	last := receipts[len(receipts)-1].ApplicationOrder
+	if last == ^uint64(0) {
+		return 0, fmt.Errorf("reconciliation receipt application order overflow")
+	}
+	return last + 1, nil
 }
 
 func (s *Store) loadRegistrationLocked(ref ConnectorRef) (Registration, error) {
@@ -754,6 +784,15 @@ func (s *Store) readAttemptsLocked(ref ConnectorRef, entry JournalEntry) ([]dura
 		children, err := os.ReadDir(attemptDirectory)
 		if err != nil {
 			return nil, err
+		}
+		if len(children) == 0 {
+			if err := os.Remove(attemptDirectory); err != nil {
+				return nil, err
+			}
+			if err := s.syncDirectory(directory); err != nil {
+				return nil, err
+			}
+			continue
 		}
 		for _, child := range children {
 			if child.IsDir() || child.Name() != "intent.json" && child.Name() != "failure.json" {

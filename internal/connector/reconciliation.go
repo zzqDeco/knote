@@ -473,9 +473,6 @@ func (p *Processor) Reconcile(
 			RequestDigest: reservation.RequestDigest, Request: cloneReconciliationRequest(reservation.Request),
 			DerivedTombstones: derivedTombstones, AppliedAt: appliedAt,
 		}
-		if err := receipt.ValidateFor(reservation); err != nil {
-			return err
-		}
 		return p.store.withLock(func() error {
 			var pending ReconciliationReservation
 			found, err := p.store.readOptionalJSON(p.store.reconciliationPendingPath(ref), &pending)
@@ -485,6 +482,14 @@ func (p *Processor) Reconcile(
 			if !found || pending.RequestDigest != reservation.RequestDigest ||
 				!reconciliationRequestsEqual(pending.Request, reservation.Request) {
 				return ErrPendingReconciliation
+			}
+			applicationOrder, err := p.store.nextReconciliationApplicationOrderLocked(ref)
+			if err != nil {
+				return err
+			}
+			receipt.ApplicationOrder = applicationOrder
+			if err := receipt.ValidateFor(reservation); err != nil {
+				return err
 			}
 			if err := p.store.writeJSONOnce(
 				p.store.reconciliationReservationReceiptPath(ref, reservation.RequestDigest), receipt,

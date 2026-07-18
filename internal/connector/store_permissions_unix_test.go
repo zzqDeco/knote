@@ -52,6 +52,59 @@ func TestNewStoreCreatesPrivateRoot(t *testing.T) {
 	}
 }
 
+func TestNewStoreRejectsWritableAncestorWithoutMutation(t *testing.T) {
+	ancestor := filepath.Join(t.TempDir(), "shared")
+	if err := os.Mkdir(ancestor, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(ancestor, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(ancestor, "connector", "store")
+
+	if _, err := NewStore(root); err == nil {
+		t.Fatal("NewStore accepted a group/world-writable ancestor without sticky protection")
+	}
+	if _, err := os.Lstat(filepath.Join(ancestor, "connector")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("NewStore created children under the rejected ancestor: %v", err)
+	}
+	info, err := os.Lstat(ancestor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o777 {
+		t.Fatalf("NewStore changed rejected ancestor permissions to %04o", got)
+	}
+}
+
+func TestTrustedConnectorPathComponent(t *testing.T) {
+	currentUID := uint32(os.Geteuid())
+	foreignUID := currentUID + 1
+	tests := []struct {
+		name string
+		uid  uint32
+		mode os.FileMode
+		want bool
+	}{
+		{name: "root-owned system ancestor", uid: 0, mode: 0o755, want: true},
+		{name: "current-user private ancestor", uid: currentUID, mode: 0o700, want: true},
+		{name: "current-user traversable ancestor", uid: currentUID, mode: 0o755, want: true},
+		{name: "root-owned sticky temporary ancestor", uid: 0, mode: 0o777 | os.ModeSticky, want: true},
+		{name: "current-user sticky temporary ancestor", uid: currentUID, mode: 0o777 | os.ModeSticky, want: true},
+		{name: "root-owned writable ancestor", uid: 0, mode: 0o777, want: false},
+		{name: "current-user writable ancestor", uid: currentUID, mode: 0o770, want: false},
+		{name: "foreign read-only ancestor", uid: foreignUID, mode: 0o555, want: false},
+		{name: "foreign sticky ancestor", uid: foreignUID, mode: 0o777 | os.ModeSticky, want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := trustedConnectorPathComponent(test.uid, test.mode); got != test.want {
+				t.Fatalf("trustedConnectorPathComponent(%d, %v) = %t, want %t", test.uid, test.mode, got, test.want)
+			}
+		})
+	}
+}
+
 func TestNewStoreRejectsExistingRootThroughAncestorSymlinkWithoutMutation(t *testing.T) {
 	base := t.TempDir()
 	target := filepath.Join(base, "target")
@@ -161,5 +214,60 @@ func TestNewStoreRejectsForeignOwnedExistingRootWithoutMutation(t *testing.T) {
 	}
 	if got := after.Mode().Perm(); got != 0o700 {
 		t.Fatalf("NewStore changed existing root permissions to %04o", got)
+	}
+}
+
+func TestNewStoreRejectsForeignOwnedAncestorWithoutMutation(t *testing.T) {
+	ancestor := filepath.Join(t.TempDir(), "foreign")
+	if err := os.Mkdir(ancestor, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(ancestor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Fatal("directory owner metadata is unavailable")
+	}
+	currentUID := os.Geteuid()
+	foreignUID := currentUID + 1
+	if err := os.Chown(ancestor, foreignUID, int(stat.Gid)); err != nil {
+		t.Skipf("cannot create a foreign-owned ancestor fixture: %v", err)
+	}
+	defer func() {
+		if err := os.Chown(ancestor, currentUID, int(stat.Gid)); err != nil {
+			t.Errorf("restore fixture owner: %v", err)
+		}
+	}()
+	before, err := os.Lstat(ancestor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeStat, ok := before.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Fatal("directory owner metadata is unavailable before rejection")
+	}
+	root := filepath.Join(ancestor, "connector", "store")
+
+	if _, err := NewStore(root); err == nil {
+		t.Fatal("NewStore accepted a foreign-owned ancestor")
+	}
+	if _, err := os.Lstat(filepath.Join(ancestor, "connector")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("NewStore created children under the foreign-owned ancestor: %v", err)
+	}
+	after, err := os.Lstat(ancestor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterStat, ok := after.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Fatal("directory owner metadata is unavailable after rejection")
+	}
+	if afterStat.Uid != beforeStat.Uid || afterStat.Gid != beforeStat.Gid {
+		t.Fatalf("NewStore changed rejected ancestor ownership from %d:%d to %d:%d", beforeStat.Uid, beforeStat.Gid, afterStat.Uid, afterStat.Gid)
+	}
+	if got, want := after.Mode().Perm(), before.Mode().Perm(); got != want {
+		t.Fatalf("NewStore changed rejected ancestor permissions from %04o to %04o", want, got)
 	}
 }

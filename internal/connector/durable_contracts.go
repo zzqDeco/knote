@@ -643,6 +643,7 @@ type ReconciliationReservationReceipt struct {
 	TenantID          string                     `json:"tenant_id"`
 	ConnectorID       string                     `json:"connector_id"`
 	SourceID          string                     `json:"source_id"`
+	ApplicationOrder  uint64                     `json:"application_order"`
 	PlanDigest        protocol.ContentDigest     `json:"plan_digest"`
 	RequestDigest     protocol.ContentDigest     `json:"request_digest"`
 	Request           ReconciliationApplyRequest `json:"request"`
@@ -653,6 +654,9 @@ type ReconciliationReservationReceipt struct {
 func (r ReconciliationReservationReceipt) ValidateFor(reservation ReconciliationReservation) error {
 	if err := reservation.validateBinding(); err != nil {
 		return err
+	}
+	if r.ApplicationOrder == 0 {
+		return fmt.Errorf("reconciliation receipt application order is required")
 	}
 	source := reservation.Request.SourceOwnership
 	if r.Version != ConnectorCoreVersion || r.TenantID != source.TenantID ||
