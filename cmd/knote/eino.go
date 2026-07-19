@@ -18,8 +18,12 @@ func newEinoRunner(
 	tools []einotool.InvokableTool,
 	authorizationValidator runtimeeino.ToolAuthorizationValidator,
 ) (*runtimeeino.Runner, error) {
+	preparedTools, err := runtimeeino.PrepareModelTools(tools)
+	if err != nil {
+		return nil, err
+	}
 	opts := runtimeeino.Options{
-		Tools:                      tools,
+		Tools:                      preparedTools,
 		ToolAuthorizationValidator: authorizationValidator,
 	}
 	profile, err := selectEinoModelProfile(cfg)
@@ -33,7 +37,7 @@ func newEinoRunner(
 		BaseURLOverride:  firstEnv("KNOTE_EINO_BASE_URL", "OPENAI_BASE_URL"),
 		APIKey:           firstEnv("KNOTE_EINO_API_KEY", "OPENAI_API_KEY"),
 		ReasoningEffort:  firstEnv("KNOTE_EINO_REASONING_EFFORT", "OPENAI_REASONING_EFFORT"),
-		Tools:            tools,
+		Tools:            preparedTools,
 	})
 	if err != nil {
 		return nil, err

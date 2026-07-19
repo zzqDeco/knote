@@ -545,11 +545,11 @@ type ToolInvocationRequest struct {
 	Action           string               `json:"action"`
 	Relation         string               `json:"relation"`
 	SideEffect       bool                 `json:"side_effect"`
-	ReturnObligation ToolReturnObligation `json:"return_obligation"`
+	ReturnObligation ToolReturnObligation `json:"return_obligation,omitempty"`
 }
 
 func (r ToolInvocationRequest) Validate() error {
-	if r.Version != EnterpriseContractVersion {
+	if r.Version != EnterpriseContractVersion && r.Version != ToolAuthorizationContractVersion {
 		return fmt.Errorf("unsupported tool invocation request version %q", r.Version)
 	}
 	if err := validateEnterpriseFields(
@@ -560,6 +560,12 @@ func (r ToolInvocationRequest) Validate() error {
 	}
 	if err := validateAuthorizationName("relation", r.Relation); err != nil {
 		return err
+	}
+	if r.Version == EnterpriseContractVersion {
+		if r.ReturnObligation != "" {
+			return fmt.Errorf("legacy tool invocation request cannot contain a return obligation")
+		}
+		return nil
 	}
 	return r.ReturnObligation.Validate()
 }
@@ -583,14 +589,15 @@ type ToolInvocationAuthorization struct {
 	DelegationWatermark       string                    `json:"delegation_watermark,omitempty"`
 	AgentTaskScopeFingerprint AgentTaskScopeFingerprint `json:"agent_task_scope_fingerprint,omitempty"`
 	SideEffect                bool                      `json:"side_effect"`
-	ReturnObligation          ToolReturnObligation      `json:"return_obligation"`
+	ReturnObligation          ToolReturnObligation      `json:"return_obligation,omitempty"`
 	Outcome                   DecisionOutcome           `json:"outcome"`
 	Consistency               ConsistencyPreference     `json:"consistency"`
 	CheckedAt                 time.Time                 `json:"checked_at"`
 }
 
 func (a ToolInvocationAuthorization) ValidateFor(auth AuthorizationContext, request ToolInvocationRequest) error {
-	if a.Version != EnterpriseContractVersion {
+	if a.Version != request.Version ||
+		(a.Version != EnterpriseContractVersion && a.Version != ToolAuthorizationContractVersion) {
 		return fmt.Errorf("unsupported tool invocation authorization version %q", a.Version)
 	}
 	if err := request.Validate(); err != nil {
@@ -666,7 +673,7 @@ type ToolResultAuthorization struct {
 	Action                    string                    `json:"action"`
 	Relation                  string                    `json:"relation"`
 	SideEffect                bool                      `json:"side_effect"`
-	ReturnObligation          ToolReturnObligation      `json:"return_obligation"`
+	ReturnObligation          ToolReturnObligation      `json:"return_obligation,omitempty"`
 	AuthorizationModelID      string                    `json:"authorization_model_id"`
 	IdentityWatermark         string                    `json:"identity_watermark"`
 	ACLWatermark              string                    `json:"acl_watermark"`
@@ -681,7 +688,8 @@ func (r ToolResultAuthorization) ValidateFor(
 	invocation ToolInvocationAuthorization,
 	request ToolInvocationRequest,
 ) error {
-	if r.Version != EnterpriseContractVersion {
+	if r.Version != invocation.Version || r.Version != request.Version ||
+		(r.Version != EnterpriseContractVersion && r.Version != ToolAuthorizationContractVersion) {
 		return fmt.Errorf("unsupported tool result authorization version %q", r.Version)
 	}
 	if err := invocation.ValidateFor(auth, request); err != nil {
@@ -720,15 +728,21 @@ func (r ToolResultAuthorization) ValidateFor(
 			return fmt.Errorf("tool result authorization %s does not match the authorization context", binding.name)
 		}
 	}
-	if err := r.ReturnObligation.Validate(); err != nil {
-		return err
+	if r.Version == EnterpriseContractVersion {
+		if r.ReturnObligation != "" {
+			return fmt.Errorf("legacy tool result authorization cannot contain a return obligation")
+		}
+	} else {
+		if err := r.ReturnObligation.Validate(); err != nil {
+			return err
+		}
 	}
 	if r.CorrelationID != invocation.CorrelationID || r.ToolName != invocation.ToolName ||
 		r.Action != invocation.Action || r.Relation != invocation.Relation || r.SideEffect != invocation.SideEffect ||
 		r.ReturnObligation != invocation.ReturnObligation {
 		return fmt.Errorf("tool result authorization does not match the authorized invocation")
 	}
-	if r.ReturnObligation == ToolReturnNone {
+	if r.Version == ToolAuthorizationContractVersion && r.ReturnObligation == ToolReturnNone {
 		if len(r.Resources) != 0 || len(r.Decisions) != 0 {
 			return fmt.Errorf("content-free tool result authorization cannot contain resources or decisions")
 		}

@@ -10,6 +10,11 @@ import (
 
 type ToolReturnObligation string
 
+// ToolAuthorizationContractVersion versions the invocation/result records that
+// gained explicit return obligations. Enterprise v1 remains accepted for the
+// legacy record shape without this field.
+const ToolAuthorizationContractVersion = "v2"
+
 const (
 	ToolReturnNone      ToolReturnObligation = "none"
 	ToolReturnEvidence  ToolReturnObligation = "evidence_package"
@@ -37,7 +42,7 @@ type ToolAuthorizationManifest struct {
 }
 
 func (m ToolAuthorizationManifest) Validate() error {
-	if m.Version != EnterpriseContractVersion {
+	if m.Version != ToolAuthorizationContractVersion {
 		return fmt.Errorf("unsupported tool authorization manifest version %q", m.Version)
 	}
 	if err := validateAuthorizationName("tool_name", m.ToolName); err != nil {
@@ -57,7 +62,7 @@ func (m ToolAuthorizationManifest) InvocationRequest() (ToolInvocationRequest, e
 		return ToolInvocationRequest{}, err
 	}
 	return ToolInvocationRequest{
-		Version:          EnterpriseContractVersion,
+		Version:          ToolAuthorizationContractVersion,
 		ToolName:         m.ToolName,
 		Action:           m.Action,
 		Relation:         m.Relation,
@@ -83,7 +88,7 @@ func (e ToolAuthorizationEnvelope) ValidateFor(
 	auth AuthorizationContext,
 	manifest ToolAuthorizationManifest,
 ) error {
-	if e.Version != EnterpriseContractVersion {
+	if e.Version != ToolAuthorizationContractVersion {
 		return fmt.Errorf("unsupported tool authorization envelope version %q", e.Version)
 	}
 	if err := validateToolManifestDigest(e.ManifestDigest); err != nil {

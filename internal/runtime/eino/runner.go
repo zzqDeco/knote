@@ -99,8 +99,21 @@ func (r *Runner) Run(ctx context.Context, input runtime.EinoRunInput) ([]protoco
 	messages := transcriptMessages(input.History)
 	messages = append(messages, schema.UserMessage(text))
 	events := []protocol.Event{protocol.NewEvent(protocol.EventAssistantStart, input.SessionID, "eino runner started", nil)}
-	agentEvents, err := executor.Run(ctx, messages)
 	_, permissionedContext := protocol.AuthorizationContextFrom(ctx)
+	executionContext := ctx
+	var modelAuthorizationState *modelToolAuthorizationState
+	if permissionedContext {
+		var stateErr error
+		executionContext, modelAuthorizationState, stateErr = withModelToolAuthorizationState(
+			ctx, r.toolAuthorizationValidator,
+		)
+		if stateErr != nil {
+			generic := fmt.Errorf("%s", protectedContentUnavailableMessage)
+			events = append(events, protocol.NewEvent(protocol.EventError, input.SessionID, generic.Error(), nil))
+			return events, generic
+		}
+	}
+	agentEvents, err := executor.Run(executionContext, messages)
 	if err != nil && permissionedContext {
 		if errors.Is(err, runtime.ErrSideEffectPending) {
 			return events, runtime.ErrSideEffectPending
@@ -108,7 +121,7 @@ func (r *Runner) Run(ctx context.Context, input runtime.EinoRunInput) ([]protoco
 		return events, fmt.Errorf("%s", protectedContentUnavailableMessage)
 	}
 	binding, permissioned, bindingErr := protectedBindingFromAgentEvents(
-		ctx, agentEvents, r.toolAuthorizationValidator,
+		executionContext, agentEvents, r.toolAuthorizationValidator, modelAuthorizationState,
 	)
 	if bindingErr != nil {
 		generic := fmt.Errorf("%s", protectedContentUnavailableMessage)
@@ -152,6 +165,7 @@ func protectedBindingFromAgentEvents(
 	ctx context.Context,
 	events []*adk.AgentEvent,
 	authorizationValidator ToolAuthorizationValidator,
+	modelAuthorizationState *modelToolAuthorizationState,
 ) (*protocol.ProtectedContentBinding, bool, error) {
 	authorization, authorized := protocol.AuthorizationContextFrom(ctx)
 	var packages []protocol.EvidencePackage
@@ -186,7 +200,10 @@ func protectedBindingFromAgentEvents(
 		if authorizationValidator == nil {
 			return nil, true, errors.New("permissioned tool authorization validator is unavailable")
 		}
-		envelope, err := decodeToolAuthorizationEnvelope(content)
+		if modelAuthorizationState == nil {
+			return nil, true, errors.New("permissioned model authorization state is unavailable")
+		}
+		envelope, err := modelAuthorizationState.consume(toolName, content)
 		if err != nil {
 			return nil, true, err
 		}

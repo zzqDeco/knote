@@ -668,6 +668,23 @@ def model_handler() -> type[http.server.BaseHTTPRequestHandler]:
                 authorized = tool_result and isinstance(content, str) and PROVIDER_ANSWER in content
                 sequence = state.record(authorized, tool_name, tool_result)
                 if tool_result:
+                    tool_payload = json.loads(content)
+                    require(isinstance(tool_payload, dict), "model", "tool_result_not_object")
+                    require("tool_authorization" not in tool_payload, "model", "authorization_envelope_exposed")
+                    require(
+                        "authorization_correlation_id" not in tool_payload
+                        and "authorization_manifest_digest" not in tool_payload,
+                        "model",
+                        "authorization_reference_exposed",
+                    )
+                    authorization_token = tool_payload.get("authorization_result_token")
+                    require(
+                        isinstance(authorization_token, str)
+                        and authorization_token.startswith("tool_result_")
+                        and len(authorization_token) == len("tool_result_") + 64,
+                        "model",
+                        "authorization_token_missing",
+                    )
                     if not authorized:
                         answer = UNBOUND_MODEL_CANARY
                     elif tool_name == "knote_explain":

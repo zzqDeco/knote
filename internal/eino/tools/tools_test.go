@@ -722,7 +722,7 @@ func (g *recordingAuthorizationGate) AuthorizeInvocation(
 		return protocol.ToolInvocationAuthorization{}, errors.New("unregistered tool")
 	}
 	return protocol.ToolInvocationAuthorization{
-		Version:          protocol.EnterpriseContractVersion,
+		Version:          protocol.ToolAuthorizationContractVersion,
 		CorrelationID:    "correlation-" + toolName,
 		ToolName:         toolName,
 		ReturnObligation: obligation,
@@ -769,11 +769,11 @@ func (g *recordingAuthorizationGate) AuthorizeContentFreeResult(
 
 func (g *recordingAuthorizationGate) envelope(invocation protocol.ToolInvocationAuthorization) protocol.ToolAuthorizationEnvelope {
 	return protocol.ToolAuthorizationEnvelope{
-		Version:        protocol.EnterpriseContractVersion,
+		Version:        protocol.ToolAuthorizationContractVersion,
 		ManifestDigest: g.digest,
 		Invocation:     invocation,
 		Result: protocol.ToolResultAuthorization{
-			Version:          protocol.EnterpriseContractVersion,
+			Version:          protocol.ToolAuthorizationContractVersion,
 			CorrelationID:    invocation.CorrelationID,
 			ToolName:         invocation.ToolName,
 			ReturnObligation: invocation.ReturnObligation,

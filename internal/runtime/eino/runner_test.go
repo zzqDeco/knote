@@ -157,7 +157,7 @@ func TestRunnerDiscardsPartialPermissionedEventsOnExecutorError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	runner := NewRunner(Options{Executor: &fakeExecutor{
+	runner := NewRunner(Options{ToolAuthorizationValidator: testEinoToolAuthorizationValidator(t), Executor: &fakeExecutor{
 		events: []*adk.AgentEvent{
 			adk.EventFromMessage(schema.ToolMessage(testPermissionedToolOutput(t, evidencePackage, "PARTIAL_TOOL_CANARY"), "call_1", schema.WithToolName("knote_query")), nil, schema.Tool, "knote_query"),
 			adk.EventFromMessage(schema.AssistantMessage("PARTIAL_ASSISTANT_CANARY", nil), nil, schema.Assistant, ""),
@@ -190,7 +190,7 @@ func TestRunnerPreservesPendingSideEffectSentinelInPermissionedContext(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	runner := NewRunner(Options{Executor: &fakeExecutor{
+	runner := NewRunner(Options{ToolAuthorizationValidator: testEinoToolAuthorizationValidator(t), Executor: &fakeExecutor{
 		events: []*adk.AgentEvent{
 			adk.EventFromMessage(schema.ToolMessage("PARTIAL_TOOL_CANARY", "call_1", schema.WithToolName("knote_diff")), nil, schema.Tool, "knote_diff"),
 			adk.EventFromMessage(schema.AssistantMessage("PARTIAL_ASSISTANT_CANARY", nil), nil, schema.Assistant, ""),
@@ -219,7 +219,7 @@ func TestRunnerPendingSideEffectWaitsForManagerConfirmationWithoutError(t *testi
 	workspace := t.TempDir()
 	authorization := testEinoAuthorization("sess_eino")
 	bridge := runtime.NewSideEffectBridge()
-	runner := NewRunner(Options{Executor: pendingSideEffectExecutor{
+	runner := NewRunner(Options{ToolAuthorizationValidator: testEinoToolAuthorizationValidator(t), Executor: pendingSideEffectExecutor{
 		bridge:    bridge,
 		sessionID: authorization.SessionID,
 	}})
@@ -458,6 +458,53 @@ func TestRunnerBindsAllPermissionedToolOutputsAndAnswerToOneBlock(t *testing.T) 
 	}
 	if bound != 3 {
 		t.Fatalf("permissioned ADK bound events = %d in %+v", bound, events)
+	}
+}
+
+func TestRunnerRevalidatesModelAuthorizationAfterProviderTurn(t *testing.T) {
+	authorization := testEinoAuthorization("sess_model_revalidation")
+	evidence := testEinoEvidencePackage(
+		t, authorization, "sources/revalidation.md", "REVALIDATION_CONTENT_CANARY",
+	)
+	validator := &denyPublicationAuthorizationValidator{
+		delegate: testEinoToolAuthorizationValidator(t),
+	}
+	runner := NewRunner(Options{
+		ToolAuthorizationValidator: validator,
+		Executor: &fakeExecutor{events: []*adk.AgentEvent{
+			adk.EventFromMessage(schema.ToolMessage(
+				testPermissionedToolOutput(t, evidence, "REVALIDATION_TOOL_CANARY"),
+				"call_1", schema.WithToolName("knote_query"),
+			), nil, schema.Tool, "knote_query"),
+			adk.EventFromMessage(schema.AssistantMessage("REVALIDATION_ANSWER_CANARY", nil), nil, schema.Assistant, ""),
+		}},
+	})
+	ctx, err := protocol.WithAuthorizationContext(context.Background(), authorization)
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := runner.Run(ctx, runtime.EinoRunInput{
+		SessionID: authorization.SessionID,
+		Message:   "question",
+	})
+	if err == nil || err.Error() != protectedContentUnavailableMessage {
+		t.Fatalf("publication revalidation error = %v, events=%+v", err, events)
+	}
+	if validator.calls != 2 {
+		t.Fatalf("model authorization validation calls = %d, want 2", validator.calls)
+	}
+	for _, event := range events {
+		for _, canary := range []string{
+			"REVALIDATION_CONTENT_CANARY", "REVALIDATION_TOOL_CANARY", "REVALIDATION_ANSWER_CANARY",
+		} {
+			if strings.Contains(event.Message, canary) {
+				t.Fatalf("publication revalidation leaked %q: %+v", canary, events)
+			}
+		}
+		if event.Type == protocol.EventToolComplete || event.Type == protocol.EventAssistantDone ||
+			event.ProtectedContent != nil {
+			t.Fatalf("publication revalidation retained protected output: %+v", events)
+		}
 	}
 }
 
@@ -884,6 +931,25 @@ type fakeExecutor struct {
 	err      error
 }
 
+type denyPublicationAuthorizationValidator struct {
+	delegate ToolAuthorizationValidator
+	calls    int
+}
+
+func (v *denyPublicationAuthorizationValidator) ValidateProtectedResultEnvelope(
+	ctx context.Context,
+	authorization protocol.AuthorizationContext,
+	toolName string,
+	envelope protocol.ToolAuthorizationEnvelope,
+	binding protocol.ProtectedContentBinding,
+) error {
+	v.calls++
+	if v.calls == 2 {
+		return errors.New("authorization revoked before publication")
+	}
+	return v.delegate.ValidateProtectedResultEnvelope(ctx, authorization, toolName, envelope, binding)
+}
+
 type pendingSideEffectExecutor struct {
 	bridge    *runtime.SideEffectBridge
 	sessionID string
@@ -904,9 +970,50 @@ func (e pendingSideEffectExecutor) Run(ctx context.Context, _ []*schema.Message)
 	}, err
 }
 
-func (e *fakeExecutor) Run(_ context.Context, messages []*schema.Message) ([]*adk.AgentEvent, error) {
+func (e *fakeExecutor) Run(ctx context.Context, messages []*schema.Message) ([]*adk.AgentEvent, error) {
 	e.messages = append([]*schema.Message(nil), messages...)
-	return append([]*adk.AgentEvent(nil), e.events...), e.err
+	events := append([]*adk.AgentEvent(nil), e.events...)
+	if e.err != nil {
+		return events, e.err
+	}
+	return prepareFakeModelToolEvents(ctx, events)
+}
+
+func prepareFakeModelToolEvents(
+	ctx context.Context,
+	events []*adk.AgentEvent,
+) ([]*adk.AgentEvent, error) {
+	if _, ok := modelToolAuthorizationStateFrom(ctx); !ok {
+		return events, nil
+	}
+	for index, event := range events {
+		if event == nil || event.Output == nil || event.Output.MessageOutput == nil ||
+			event.Output.MessageOutput.Role != schema.Tool || event.Output.MessageOutput.Message == nil {
+			continue
+		}
+		message := event.Output.MessageOutput.Message
+		if !strings.Contains(message.Content, `"tool_authorization"`) {
+			continue
+		}
+		toolName := strings.TrimSpace(event.Output.MessageOutput.ToolName)
+		if toolName == "" {
+			toolName = strings.TrimSpace(message.ToolName)
+		}
+		sanitized, err := sanitizeModelToolAuthorizationOutput(ctx, toolName, "", message.Content)
+		if err != nil {
+			return events, err
+		}
+		clonedEvent := *event
+		clonedOutput := *event.Output
+		clonedMessageOutput := *event.Output.MessageOutput
+		clonedMessage := *message
+		clonedMessage.Content = sanitized
+		clonedMessageOutput.Message = &clonedMessage
+		clonedOutput.MessageOutput = &clonedMessageOutput
+		clonedEvent.Output = &clonedOutput
+		events[index] = &clonedEvent
+	}
+	return events, nil
 }
 
 func hasEvent(events []protocol.Event, eventType protocol.EventType) bool {

@@ -60,7 +60,7 @@ func TestToolAuthorizationGateFailsClosedAndAuthorizesRegisteredActions(t *testi
 	}
 
 	malformed := protocol.ToolAuthorizationManifest{
-		Version: protocol.EnterpriseContractVersion, ToolName: "knote_bad", Action: "build",
+		Version: protocol.ToolAuthorizationContractVersion, ToolName: "knote_bad", Action: "build",
 		Relation: RelationCanView, SideEffect: true, ReturnObligation: protocol.ToolReturnNone,
 	}
 	badRegistry, err := protocol.NewToolManifestRegistry([]protocol.ToolAuthorizationManifest{malformed})
@@ -282,15 +282,15 @@ func toolTestRegistry(t *testing.T) *protocol.ToolManifestRegistry {
 	t.Helper()
 	registry, err := protocol.NewToolManifestRegistry([]protocol.ToolAuthorizationManifest{
 		{
-			Version: protocol.EnterpriseContractVersion, ToolName: "knote_query", Action: "query",
+			Version: protocol.ToolAuthorizationContractVersion, ToolName: "knote_query", Action: "query",
 			Relation: RelationCanView, ReturnObligation: protocol.ToolReturnEvidence,
 		},
 		{
-			Version: protocol.EnterpriseContractVersion, ToolName: "knote_resources", Action: "read",
+			Version: protocol.ToolAuthorizationContractVersion, ToolName: "knote_resources", Action: "read",
 			Relation: RelationCanView, ReturnObligation: protocol.ToolReturnResources,
 		},
 		{
-			Version: protocol.EnterpriseContractVersion, ToolName: "knote_build", Action: "build",
+			Version: protocol.ToolAuthorizationContractVersion, ToolName: "knote_build", Action: "build",
 			Relation: RelationCanEdit, SideEffect: true, ReturnObligation: protocol.ToolReturnNone,
 		},
 	})

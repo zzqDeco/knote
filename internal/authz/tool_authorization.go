@@ -141,7 +141,7 @@ func (g *ToolAuthorizationGate) AuthorizeInvocation(
 		return protocol.ToolInvocationAuthorization{}, ErrToolAuthorizationDenied
 	}
 	invocation := protocol.ToolInvocationAuthorization{
-		Version: protocol.EnterpriseContractVersion, CorrelationID: correlationID,
+		Version: protocol.ToolAuthorizationContractVersion, CorrelationID: correlationID,
 		TenantID: authorization.TenantID, KnowledgeBaseID: authorization.KnowledgeBaseID,
 		PrincipalID: authorization.PrincipalID, AgentID: authorization.AgentID, TaskID: authorization.TaskID,
 		SessionID: authorization.SessionID, RequestID: authorization.RequestID,
@@ -310,7 +310,7 @@ func (g *ToolAuthorizationGate) validatedEnvelope(
 	result protocol.ToolResultAuthorization,
 ) (protocol.ToolAuthorizationEnvelope, error) {
 	envelope := protocol.ToolAuthorizationEnvelope{
-		Version: protocol.EnterpriseContractVersion, ManifestDigest: g.registry.Digest(),
+		Version: protocol.ToolAuthorizationContractVersion, ManifestDigest: g.registry.Digest(),
 		Invocation: invocation, Result: result,
 	}
 	if err := g.registry.ValidateEnvelope(authorization, envelope); err != nil {
@@ -368,7 +368,7 @@ func newToolResultAuthorization(
 	decisions []protocol.AuthorizationDecision,
 ) protocol.ToolResultAuthorization {
 	return protocol.ToolResultAuthorization{
-		Version: protocol.EnterpriseContractVersion, CorrelationID: invocation.CorrelationID,
+		Version: protocol.ToolAuthorizationContractVersion, CorrelationID: invocation.CorrelationID,
 		TenantID: authorization.TenantID, KnowledgeBaseID: authorization.KnowledgeBaseID,
 		PrincipalID: authorization.PrincipalID, AgentID: authorization.AgentID, TaskID: authorization.TaskID,
 		SessionID: authorization.SessionID, RequestID: authorization.RequestID,

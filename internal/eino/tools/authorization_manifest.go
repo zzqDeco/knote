@@ -8,27 +8,27 @@ import (
 func PermissionedAuthorizationManifests() []protocol.ToolAuthorizationManifest {
 	return []protocol.ToolAuthorizationManifest{
 		{
-			Version: protocol.EnterpriseContractVersion, ToolName: NameBuild, Action: "build",
+			Version: protocol.ToolAuthorizationContractVersion, ToolName: NameBuild, Action: "build",
 			Relation: authz.RelationCanEdit, SideEffect: true, ReturnObligation: protocol.ToolReturnNone,
 		},
 		{
-			Version: protocol.EnterpriseContractVersion, ToolName: NameCheckout, Action: "checkout",
+			Version: protocol.ToolAuthorizationContractVersion, ToolName: NameCheckout, Action: "checkout",
 			Relation: authz.RelationCanEdit, SideEffect: true, ReturnObligation: protocol.ToolReturnNone,
 		},
 		{
-			Version: protocol.EnterpriseContractVersion, ToolName: NameCommit, Action: "commit",
+			Version: protocol.ToolAuthorizationContractVersion, ToolName: NameCommit, Action: "commit",
 			Relation: authz.RelationCanEdit, SideEffect: true, ReturnObligation: protocol.ToolReturnNone,
 		},
 		{
-			Version: protocol.EnterpriseContractVersion, ToolName: NameExplain, Action: "explain",
+			Version: protocol.ToolAuthorizationContractVersion, ToolName: NameExplain, Action: "explain",
 			Relation: authz.RelationCanView, ReturnObligation: protocol.ToolReturnEvidence,
 		},
 		{
-			Version: protocol.EnterpriseContractVersion, ToolName: NameQuery, Action: "query",
+			Version: protocol.ToolAuthorizationContractVersion, ToolName: NameQuery, Action: "query",
 			Relation: authz.RelationCanView, ReturnObligation: protocol.ToolReturnEvidence,
 		},
 		{
-			Version: protocol.EnterpriseContractVersion, ToolName: NameRelease, Action: "release",
+			Version: protocol.ToolAuthorizationContractVersion, ToolName: NameRelease, Action: "release",
 			Relation: authz.RelationCanEdit, SideEffect: true, ReturnObligation: protocol.ToolReturnNone,
 		},
 	}

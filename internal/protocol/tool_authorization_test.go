@@ -7,11 +7,11 @@ import (
 
 func TestToolManifestRegistryIsDeterministicAndFailClosed(t *testing.T) {
 	query := ToolAuthorizationManifest{
-		Version: EnterpriseContractVersion, ToolName: "knote_query", Action: "query",
+		Version: ToolAuthorizationContractVersion, ToolName: "knote_query", Action: "query",
 		Relation: EvidenceReadRelation, ReturnObligation: ToolReturnEvidence,
 	}
 	build := ToolAuthorizationManifest{
-		Version: EnterpriseContractVersion, ToolName: "knote_build", Action: "build",
+		Version: ToolAuthorizationContractVersion, ToolName: "knote_build", Action: "build",
 		Relation: "can_edit", SideEffect: true, ReturnObligation: ToolReturnNone,
 	}
 	first, err := NewToolManifestRegistry([]ToolAuthorizationManifest{query, build})
@@ -46,7 +46,7 @@ func TestToolManifestRegistryIsDeterministicAndFailClosed(t *testing.T) {
 func TestToolResultAuthorizationAllowsOnlyEmptyContentFreeResult(t *testing.T) {
 	auth := enterpriseTestAuthorization()
 	manifest := ToolAuthorizationManifest{
-		Version: EnterpriseContractVersion, ToolName: "knote_build", Action: "build",
+		Version: ToolAuthorizationContractVersion, ToolName: "knote_build", Action: "build",
 		Relation: "can_edit", SideEffect: true, ReturnObligation: ToolReturnNone,
 	}
 	request, err := manifest.InvocationRequest()
@@ -54,7 +54,7 @@ func TestToolResultAuthorizationAllowsOnlyEmptyContentFreeResult(t *testing.T) {
 		t.Fatalf("InvocationRequest: %v", err)
 	}
 	invocation := ToolInvocationAuthorization{
-		Version: EnterpriseContractVersion, CorrelationID: "tool-build-1",
+		Version: ToolAuthorizationContractVersion, CorrelationID: "tool-build-1",
 		TenantID: auth.TenantID, KnowledgeBaseID: auth.KnowledgeBaseID,
 		PrincipalID: auth.PrincipalID, AgentID: auth.AgentID, TaskID: auth.TaskID,
 		SessionID: auth.SessionID, RequestID: auth.RequestID,
@@ -67,7 +67,7 @@ func TestToolResultAuthorizationAllowsOnlyEmptyContentFreeResult(t *testing.T) {
 		Outcome: DecisionAllow, Consistency: auth.Consistency, CheckedAt: enterpriseTestTime(),
 	}
 	result := ToolResultAuthorization{
-		Version: EnterpriseContractVersion, CorrelationID: invocation.CorrelationID,
+		Version: ToolAuthorizationContractVersion, CorrelationID: invocation.CorrelationID,
 		TenantID: auth.TenantID, KnowledgeBaseID: auth.KnowledgeBaseID,
 		PrincipalID: auth.PrincipalID, AgentID: auth.AgentID, TaskID: auth.TaskID,
 		SessionID: auth.SessionID, RequestID: auth.RequestID,
@@ -86,7 +86,7 @@ func TestToolResultAuthorizationAllowsOnlyEmptyContentFreeResult(t *testing.T) {
 		t.Fatalf("NewToolManifestRegistry: %v", err)
 	}
 	envelope := ToolAuthorizationEnvelope{
-		Version: EnterpriseContractVersion, ManifestDigest: registry.Digest(),
+		Version: ToolAuthorizationContractVersion, ManifestDigest: registry.Digest(),
 		Invocation: invocation, Result: result,
 	}
 	if err := registry.ValidateEnvelope(auth, envelope); err != nil {

@@ -220,6 +220,63 @@ func TestToolExecutorRejectsPermissionedOutputWithoutAuthorizationContext(t *tes
 	}
 }
 
+func TestPreparedModelToolKeepsAuthorizationEnvelopeOffProviderPath(t *testing.T) {
+	authorization := testEinoAuthorization("sess_model_tool_envelope")
+	evidence := testEinoEvidencePackage(
+		t, authorization, "sources/model-tool.md", "MODEL_TOOL_CONTENT_CANARY",
+	)
+	tool := testAuthorizedStaticTool(t, authorization, staticTool{
+		name: einotools.NameQuery,
+		out:  testPermissionedToolOutput(t, evidence, "MODEL_TOOL_ANSWER_CANARY"),
+	}, evidence)
+	prepared, err := PrepareModelTools([]einotool.InvokableTool{tool})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(prepared) != 1 {
+		t.Fatalf("prepared model tools = %d", len(prepared))
+	}
+	ctx, err := protocol.WithAuthorizationContext(context.Background(), authorization)
+	if err != nil {
+		t.Fatal(err)
+	}
+	validator := testEinoToolAuthorizationValidator(t)
+	ctx, state, err := withModelToolAuthorizationState(ctx, validator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, err := prepared[0].InvokableRun(ctx, `{}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{
+		`"tool_authorization"`, `"authorization_correlation_id"`, `"authorization_manifest_digest"`,
+	} {
+		if strings.Contains(output, forbidden) {
+			t.Fatalf("model-visible tool output contains %s: %s", forbidden, output)
+		}
+	}
+	if !strings.Contains(output, `"`+modelToolAuthorizationTokenField+`"`) {
+		t.Fatalf("model-visible tool output has no one-use authorization token: %s", output)
+	}
+	envelope, err := state.consume(einotools.NameQuery, output)
+	if err != nil {
+		t.Fatalf("consume internal authorization envelope: %v", err)
+	}
+	binding, err := protocol.NewProtectedContentBinding(authorization, evidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validator.ValidateProtectedResultEnvelope(
+		ctx, authorization, einotools.NameQuery, envelope, binding,
+	); err != nil {
+		t.Fatalf("validate internal authorization envelope: %v", err)
+	}
+	if _, err := state.consume(einotools.NameQuery, output); err == nil {
+		t.Fatal("model authorization token was replayed")
+	}
+}
+
 func TestToolExecutorRejectsUnwrappedAndUnknownToolsBeforeInvocation(t *testing.T) {
 	authorization := testEinoAuthorization("sess_tool_registration")
 	ctx, err := protocol.WithAuthorizationContext(context.Background(), authorization)
@@ -524,7 +581,7 @@ func testToolOutputWithAuthorization(
 	checkedAt := time.Unix(1, 0).UTC()
 	correlationID := "tool-authorization-" + strings.TrimPrefix(toolName, "knote_")
 	invocation := protocol.ToolInvocationAuthorization{
-		Version: protocol.EnterpriseContractVersion, CorrelationID: correlationID,
+		Version: protocol.ToolAuthorizationContractVersion, CorrelationID: correlationID,
 		TenantID: authorization.TenantID, KnowledgeBaseID: authorization.KnowledgeBaseID,
 		PrincipalID: authorization.PrincipalID, AgentID: authorization.AgentID, TaskID: authorization.TaskID,
 		SessionID: authorization.SessionID, RequestID: authorization.RequestID,
@@ -537,7 +594,7 @@ func testToolOutputWithAuthorization(
 		Outcome: protocol.DecisionAllow, Consistency: authorization.Consistency, CheckedAt: checkedAt,
 	}
 	result := protocol.ToolResultAuthorization{
-		Version: protocol.EnterpriseContractVersion, CorrelationID: correlationID,
+		Version: protocol.ToolAuthorizationContractVersion, CorrelationID: correlationID,
 		TenantID: authorization.TenantID, KnowledgeBaseID: authorization.KnowledgeBaseID,
 		PrincipalID: authorization.PrincipalID, AgentID: authorization.AgentID, TaskID: authorization.TaskID,
 		SessionID: authorization.SessionID, RequestID: authorization.RequestID,
@@ -555,7 +612,7 @@ func testToolOutputWithAuthorization(
 		}
 	}
 	envelope := protocol.ToolAuthorizationEnvelope{
-		Version: protocol.EnterpriseContractVersion, ManifestDigest: testToolManifestDigest,
+		Version: protocol.ToolAuthorizationContractVersion, ManifestDigest: testToolManifestDigest,
 		Invocation: invocation, Result: result,
 	}
 	if err := envelope.ValidateFor(authorization, manifest); err != nil {
@@ -576,7 +633,7 @@ func testToolOutputWithAuthorization(
 func testToolAuthorizationManifest(t *testing.T, toolName string) protocol.ToolAuthorizationManifest {
 	t.Helper()
 	manifest := protocol.ToolAuthorizationManifest{
-		Version:          protocol.EnterpriseContractVersion,
+		Version:          protocol.ToolAuthorizationContractVersion,
 		ToolName:         toolName,
 		Action:           strings.TrimPrefix(toolName, "knote_"),
 		Relation:         "can_view",
