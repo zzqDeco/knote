@@ -491,7 +491,13 @@ func (t authorizedStaticTool) ToolAuthorizationManifestDigest() string {
 	return t.manifestDigest
 }
 
-const testToolManifestDigest = "tool_manifest_00000000000000000000000000000001"
+var testToolManifestDigest = func() string {
+	registry, err := einotools.NewPermissionedAuthorizationManifestRegistry()
+	if err != nil {
+		panic(err)
+	}
+	return registry.Digest()
+}()
 
 func testAuthorizedStaticTool(
 	t *testing.T,

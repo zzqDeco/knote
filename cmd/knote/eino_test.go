@@ -58,7 +58,7 @@ func TestNewEinoRunnerFailsFastForDefaultLocalProfile(t *testing.T) {
 		Models: map[string]repository.ModelProfile{
 			"default": {Provider: "local", Model: "deterministic"},
 		},
-	}, nil)
+	}, nil, nil)
 	if err == nil || !strings.Contains(err.Error(), "openai or openai-compatible") {
 		t.Fatalf("expected provider error, got runner=%v err=%v", runner, err)
 	}
@@ -73,7 +73,7 @@ func TestNewEinoRunnerUsesOpenAIEnvironmentOverrides(t *testing.T) {
 		Models: map[string]repository.ModelProfile{
 			"default": {Provider: "local", Model: "deterministic"},
 		},
-	}, nil)
+	}, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -104,6 +104,7 @@ func newRuntime(ctx context.Context, workspacePath string, resumeID string) (run
 	}
 	var authorizationProvider runtime.AuthorizationContextProvider
 	var toolAuthorizationGate einotools.AuthorizationGate
+	var modelToolAuthorizationValidator runtimeeino.ToolAuthorizationValidator
 	var permissionedQuery einotools.PermissionedQuery
 	var protectedContentAuthorizer runtime.ProtectedContentAuthorizer
 	var permissionedScopeRefresh func(context.Context) error
@@ -111,7 +112,9 @@ func newRuntime(ctx context.Context, workspacePath string, resumeID string) (run
 	var rt *runtime.Manager
 	if permissionedApplication != nil {
 		authorizationProvider = permissionedApplication.AuthorizationContextProvider()
-		toolAuthorizationGate = permissionedApplication.ToolAuthorizationGate()
+		permissionedToolAuthorizationGate := permissionedApplication.ToolAuthorizationGate()
+		toolAuthorizationGate = permissionedToolAuthorizationGate
+		modelToolAuthorizationValidator = permissionedToolAuthorizationGate
 		permissionedQuery = func(ctx context.Context, request protocol.QueryRequest) (einotools.PermissionedQueryResult, error) {
 			result, err := permissionedApplication.Query(ctx, request)
 			if err != nil {
@@ -171,7 +174,7 @@ func newRuntime(ctx context.Context, workspacePath string, resumeID string) (run
 	slashTools := permissionedSlashTools(allEinoTools, permissionedConfig.Enabled)
 	modelTools := permissionedModelTools(allEinoTools, permissionedConfig.Enabled)
 	toolExecutor := runtimeeino.NewToolExecutor(slashTools)
-	einoRunner, err := newEinoRunner(ctx, repoCfg, modelTools)
+	einoRunner, err := newEinoRunner(ctx, repoCfg, modelTools, modelToolAuthorizationValidator)
 	if err != nil {
 		return nil, nil, err
 	}

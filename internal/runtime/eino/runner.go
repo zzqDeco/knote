@@ -15,34 +15,47 @@ import (
 )
 
 type Options struct {
-	Tools           []einotool.InvokableTool
-	Agent           adk.Agent
-	Executor        QueryExecutor
-	EnableStreaming bool
-	CheckPointStore adk.CheckPointStore
+	Tools                      []einotool.InvokableTool
+	Agent                      adk.Agent
+	Executor                   QueryExecutor
+	ToolAuthorizationValidator ToolAuthorizationValidator
+	EnableStreaming            bool
+	CheckPointStore            adk.CheckPointStore
 }
 
 type Runner struct {
-	tools           []einotool.InvokableTool
-	agent           adk.Agent
-	executor        QueryExecutor
-	enableStreaming bool
-	checkPointStore adk.CheckPointStore
+	tools                      []einotool.InvokableTool
+	agent                      adk.Agent
+	executor                   QueryExecutor
+	toolAuthorizationValidator ToolAuthorizationValidator
+	enableStreaming            bool
+	checkPointStore            adk.CheckPointStore
 }
 
 type QueryExecutor interface {
 	Run(ctx context.Context, messages []*schema.Message) ([]*adk.AgentEvent, error)
 }
 
+type ToolAuthorizationValidator interface {
+	ValidateProtectedResultEnvelope(
+		context.Context,
+		protocol.AuthorizationContext,
+		string,
+		protocol.ToolAuthorizationEnvelope,
+		protocol.ProtectedContentBinding,
+	) error
+}
+
 var _ runtime.EinoRunner = (*Runner)(nil)
 
 func NewRunner(opts Options) *Runner {
 	return &Runner{
-		tools:           append([]einotool.InvokableTool(nil), opts.Tools...),
-		agent:           opts.Agent,
-		executor:        opts.Executor,
-		enableStreaming: opts.EnableStreaming,
-		checkPointStore: opts.CheckPointStore,
+		tools:                      append([]einotool.InvokableTool(nil), opts.Tools...),
+		agent:                      opts.Agent,
+		executor:                   opts.Executor,
+		toolAuthorizationValidator: opts.ToolAuthorizationValidator,
+		enableStreaming:            opts.EnableStreaming,
+		checkPointStore:            opts.CheckPointStore,
 	}
 }
 
@@ -94,7 +107,9 @@ func (r *Runner) Run(ctx context.Context, input runtime.EinoRunInput) ([]protoco
 		}
 		return events, fmt.Errorf("%s", protectedContentUnavailableMessage)
 	}
-	binding, permissioned, bindingErr := protectedBindingFromAgentEvents(ctx, agentEvents)
+	binding, permissioned, bindingErr := protectedBindingFromAgentEvents(
+		ctx, agentEvents, r.toolAuthorizationValidator,
+	)
 	if bindingErr != nil {
 		generic := fmt.Errorf("%s", protectedContentUnavailableMessage)
 		events = append(events, protocol.NewEvent(protocol.EventError, input.SessionID, generic.Error(), nil))
@@ -136,6 +151,7 @@ func (r *Runner) Run(ctx context.Context, input runtime.EinoRunInput) ([]protoco
 func protectedBindingFromAgentEvents(
 	ctx context.Context,
 	events []*adk.AgentEvent,
+	authorizationValidator ToolAuthorizationValidator,
 ) (*protocol.ProtectedContentBinding, bool, error) {
 	authorization, authorized := protocol.AuthorizationContextFrom(ctx)
 	var packages []protocol.EvidencePackage
@@ -167,8 +183,24 @@ func protectedBindingFromAgentEvents(
 		if !authorized {
 			return nil, true, errors.New("permissioned tool output requires authorization")
 		}
+		if authorizationValidator == nil {
+			return nil, true, errors.New("permissioned tool authorization validator is unavailable")
+		}
+		envelope, err := decodeToolAuthorizationEnvelope(content)
+		if err != nil {
+			return nil, true, err
+		}
 		evidencePackage, err := decodeEvidencePackage(content)
 		if err != nil {
+			return nil, true, err
+		}
+		resultBinding, err := protocol.NewProtectedContentBinding(authorization, evidencePackage)
+		if err != nil {
+			return nil, true, err
+		}
+		if err := authorizationValidator.ValidateProtectedResultEnvelope(
+			ctx, authorization, toolName, envelope, resultBinding,
+		); err != nil {
 			return nil, true, err
 		}
 		packages = append(packages, evidencePackage)

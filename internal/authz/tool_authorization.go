@@ -211,6 +211,50 @@ func (g *ToolAuthorizationGate) AuthorizeContentFreeResult(
 	return g.validatedEnvelope(authorization, invocation, result)
 }
 
+// ValidateProtectedResultEnvelope independently reauthorizes a protected tool
+// result at the event publication boundary. The received envelope is treated as
+// untrusted transport data; current invocation and per-resource checks are run
+// again against the trusted manifest registry before protected content is used.
+func (g *ToolAuthorizationGate) ValidateProtectedResultEnvelope(
+	ctx context.Context,
+	authorization protocol.AuthorizationContext,
+	toolName string,
+	envelope protocol.ToolAuthorizationEnvelope,
+	binding protocol.ProtectedContentBinding,
+) error {
+	manifest, _, ok := g.registeredRequest(toolName)
+	if !ok || manifest.ReturnObligation == protocol.ToolReturnNone ||
+		envelope.Invocation.ToolName != toolName ||
+		g.registry.ValidateEnvelope(authorization, envelope) != nil ||
+		binding.ValidateFor(authorization) != nil {
+		return ErrToolAuthorizationDenied
+	}
+
+	invocation, err := g.AuthorizeInvocation(ctx, authorization, toolName)
+	if err != nil {
+		return ErrToolAuthorizationDenied
+	}
+	current, err := g.authorizeProtectedResult(
+		ctx, authorization, invocation, manifest.ReturnObligation, binding,
+	)
+	if err != nil || !sameToolResultResources(envelope.Result.Resources, current.Result.Resources) {
+		return ErrToolAuthorizationDenied
+	}
+	return nil
+}
+
+func sameToolResultResources(left, right []protocol.ResourceHandle) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
 func (g *ToolAuthorizationGate) authorizeProtectedResult(
 	ctx context.Context,
 	authorization protocol.AuthorizationContext,

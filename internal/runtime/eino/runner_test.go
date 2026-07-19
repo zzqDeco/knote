@@ -421,8 +421,8 @@ func TestRunnerBindsAllPermissionedToolOutputsAndAnswerToOneBlock(t *testing.T) 
 	authorization := testEinoAuthorization("sess_eino")
 	first := testEinoEvidencePackage(t, authorization, "sources/first.md", "FIRST_CONTENT_CANARY")
 	second := testEinoEvidencePackage(t, authorization, "sources/second.md", "SECOND_CONTENT_CANARY")
-	runner := NewRunner(Options{Executor: &fakeExecutor{events: []*adk.AgentEvent{
-		adk.EventFromMessage(schema.ToolMessage(testPermissionedToolOutput(t, second, "second"), "call_2", schema.WithToolName("knote_explain")), nil, schema.Tool, "knote_explain"),
+	runner := NewRunner(Options{ToolAuthorizationValidator: testEinoToolAuthorizationValidator(t), Executor: &fakeExecutor{events: []*adk.AgentEvent{
+		adk.EventFromMessage(schema.ToolMessage(testPermissionedToolOutput(t, second, "second", "knote_explain"), "call_2", schema.WithToolName("knote_explain")), nil, schema.Tool, "knote_explain"),
 		adk.EventFromMessage(schema.ToolMessage(testPermissionedToolOutput(t, first, "first"), "call_1", schema.WithToolName("knote_query")), nil, schema.Tool, "knote_query"),
 		adk.EventFromMessage(schema.AssistantMessage("AUTHORIZED_ANSWER_CANARY", nil), nil, schema.Assistant, ""),
 	}}})
@@ -465,7 +465,7 @@ func TestRunnerRedactsPermissionedToolOutputBeforeSessionPersistence(t *testing.
 	workspace := t.TempDir()
 	authorization := testEinoAuthorization("sess_redacted_tool_output")
 	evidencePackage := testEinoEvidencePackage(t, authorization, "sources/private.md", "PRIVATE_EVIDENCE_CONTENT_CANARY")
-	runner := NewRunner(Options{Executor: &fakeExecutor{events: []*adk.AgentEvent{
+	runner := NewRunner(Options{ToolAuthorizationValidator: testEinoToolAuthorizationValidator(t), Executor: &fakeExecutor{events: []*adk.AgentEvent{
 		adk.EventFromMessage(schema.ToolMessage(testPermissionedToolOutput(t, evidencePackage, "PRIVATE_TOOL_ANSWER_CANARY"), "call_1", schema.WithToolName("knote_query")), nil, schema.Tool, "knote_query"),
 		adk.EventFromMessage(schema.AssistantMessage("AUTHORIZED_FINAL_ANSWER_CANARY", nil), nil, schema.Assistant, ""),
 	}}})
@@ -520,7 +520,7 @@ func TestRunnerBindsPermissionedInterruptForRevocationReplay(t *testing.T) {
 	workspace := t.TempDir()
 	authorization := testEinoAuthorization("sess_eino")
 	evidencePackage := testEinoEvidencePackage(t, authorization, "sources/approval.md", "APPROVAL_CONTENT_CANARY")
-	runner := NewRunner(Options{Executor: &fakeExecutor{events: []*adk.AgentEvent{
+	runner := NewRunner(Options{ToolAuthorizationValidator: testEinoToolAuthorizationValidator(t), Executor: &fakeExecutor{events: []*adk.AgentEvent{
 		adk.EventFromMessage(schema.ToolMessage(testPermissionedToolOutput(t, evidencePackage, "answer"), "call_1", schema.WithToolName("knote_query")), nil, schema.Tool, "knote_query"),
 		{
 			Action: &adk.AgentAction{Interrupted: &adk.InterruptInfo{InterruptContexts: []*adk.InterruptCtx{
@@ -595,7 +595,7 @@ func TestRunnerBindsPermissionedStatusForRevocationReplay(t *testing.T) {
 	workspace := t.TempDir()
 	authorization := testEinoAuthorization("sess_eino")
 	evidencePackage := testEinoEvidencePackage(t, authorization, "sources/status.md", "STATUS_EVIDENCE_CANARY")
-	runner := NewRunner(Options{Executor: &fakeExecutor{events: []*adk.AgentEvent{
+	runner := NewRunner(Options{ToolAuthorizationValidator: testEinoToolAuthorizationValidator(t), Executor: &fakeExecutor{events: []*adk.AgentEvent{
 		adk.EventFromMessage(schema.ToolMessage(testPermissionedToolOutput(t, evidencePackage, "answer"), "call_1", schema.WithToolName("knote_query")), nil, schema.Tool, "knote_query"),
 		adk.EventFromMessage(schema.SystemMessage("PERMISSIONED_STATUS_CANARY"), nil, schema.System, ""),
 	}}})
@@ -688,6 +688,15 @@ func TestRunnerFailsPermissionedOutputClosedAndSanitizesErrors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	missingEnvelopeEvidence := testEinoEvidencePackage(
+		t, authorization, "sources/missing-envelope.md", "MISSING_ENVELOPE_CONTENT_CANARY",
+	)
+	envelopeEvidence := testEinoEvidencePackage(
+		t, authorization, "sources/envelope.md", "ENVELOPE_RESOURCE_CONTENT_CANARY",
+	)
+	mismatchedEvidence := testEinoEvidencePackage(
+		t, authorization, "sources/mismatch.md", "MISMATCHED_RESOURCE_CONTENT_CANARY",
+	)
 	for _, test := range []struct {
 		name     string
 		executor *fakeExecutor
@@ -696,6 +705,26 @@ func TestRunnerFailsPermissionedOutputClosedAndSanitizesErrors(t *testing.T) {
 			name: "missing evidence",
 			executor: &fakeExecutor{events: []*adk.AgentEvent{
 				adk.EventFromMessage(schema.ToolMessage(`{"answer":"MALFORMED_OUTPUT_CANARY"}`, "call_1", schema.WithToolName("knote_query")), nil, schema.Tool, "knote_query"),
+			}},
+		},
+		{
+			name: "missing authorization envelope",
+			executor: &fakeExecutor{events: []*adk.AgentEvent{
+				adk.EventFromMessage(schema.ToolMessage(
+					testPermissionedToolOutputWithoutAuthorization(t, missingEnvelopeEvidence, "MISSING_ENVELOPE_ANSWER_CANARY"),
+					"call_1", schema.WithToolName("knote_query"),
+				), nil, schema.Tool, "knote_query"),
+			}},
+		},
+		{
+			name: "authorization resources do not match evidence",
+			executor: &fakeExecutor{events: []*adk.AgentEvent{
+				adk.EventFromMessage(schema.ToolMessage(
+					testPermissionedToolOutputWithAuthorizationEvidence(
+						t, mismatchedEvidence, envelopeEvidence, "MISMATCHED_ENVELOPE_ANSWER_CANARY",
+					),
+					"call_1", schema.WithToolName("knote_query"),
+				), nil, schema.Tool, "knote_query"),
 			}},
 		},
 		{
@@ -743,7 +772,10 @@ func TestRunnerFailsPermissionedOutputClosedAndSanitizesErrors(t *testing.T) {
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			runner := NewRunner(Options{Executor: test.executor})
+			runner := NewRunner(Options{
+				Executor:                   test.executor,
+				ToolAuthorizationValidator: testEinoToolAuthorizationValidator(t),
+			})
 			events, err := runner.Run(ctx, runtime.EinoRunInput{SessionID: authorization.SessionID, Message: "question"})
 			if err == nil || err.Error() != protectedContentUnavailableMessage {
 				t.Fatalf("permissioned ADK error = %v, events=%+v", err, events)
@@ -753,6 +785,10 @@ func TestRunnerFailsPermissionedOutputClosedAndSanitizesErrors(t *testing.T) {
 					t.Fatalf("failed permissioned flow received a safe replay class: %+v", events)
 				}
 				if strings.Contains(event.Message, "MALFORMED_OUTPUT_CANARY") ||
+					strings.Contains(event.Message, "MISSING_ENVELOPE_CONTENT_CANARY") ||
+					strings.Contains(event.Message, "MISSING_ENVELOPE_ANSWER_CANARY") ||
+					strings.Contains(event.Message, "MISMATCHED_RESOURCE_CONTENT_CANARY") ||
+					strings.Contains(event.Message, "MISMATCHED_ENVELOPE_ANSWER_CANARY") ||
 					strings.Contains(event.Message, "SAFE_TOOL_BEFORE_MALFORMED_CANARY") ||
 					strings.Contains(event.Message, "MIXED_UNBOUND_ANSWER_CANARY") ||
 					strings.Contains(event.Message, "ATTEMPTED_QUERY_UNBOUND_ANSWER_CANARY") ||

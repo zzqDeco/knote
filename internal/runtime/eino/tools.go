@@ -196,25 +196,8 @@ func validateAndSanitizeToolAuthorizationOutput(
 	manifestDigest string,
 	authorization protocol.AuthorizationContext,
 ) (any, toolAuthorizationReferences, error) {
-	var rawFields map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &rawFields); err != nil || rawFields == nil {
-		return nil, toolAuthorizationReferences{}, errors.New("permissioned tool result must be a JSON object")
-	}
-	rawEnvelope, ok := rawFields["tool_authorization"]
-	if !ok || len(rawEnvelope) == 0 || bytes.Equal(bytes.TrimSpace(rawEnvelope), []byte("null")) {
-		return nil, toolAuthorizationReferences{}, errors.New("permissioned tool result has no authorization envelope")
-	}
-	var envelope protocol.ToolAuthorizationEnvelope
-	decoder := json.NewDecoder(bytes.NewReader(rawEnvelope))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&envelope); err != nil {
-		return nil, toolAuthorizationReferences{}, err
-	}
-	var trailing any
-	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-		if err == nil {
-			return nil, toolAuthorizationReferences{}, errors.New("tool authorization envelope has trailing JSON")
-		}
+	rawFields, envelope, err := decodeToolAuthorizationOutput(out)
+	if err != nil {
 		return nil, toolAuthorizationReferences{}, err
 	}
 	if envelope.ManifestDigest != manifestDigest || envelope.Invocation.ToolName != toolName {
@@ -247,6 +230,38 @@ func validateAndSanitizeToolAuthorizationOutput(
 	sanitized["authorization_correlation_id"] = references.correlationID
 	sanitized["authorization_manifest_digest"] = references.manifestDigest
 	return sanitized, references, nil
+}
+
+func decodeToolAuthorizationEnvelope(out string) (protocol.ToolAuthorizationEnvelope, error) {
+	_, envelope, err := decodeToolAuthorizationOutput(out)
+	return envelope, err
+}
+
+func decodeToolAuthorizationOutput(
+	out string,
+) (map[string]json.RawMessage, protocol.ToolAuthorizationEnvelope, error) {
+	var rawFields map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &rawFields); err != nil || rawFields == nil {
+		return nil, protocol.ToolAuthorizationEnvelope{}, errors.New("permissioned tool result must be a JSON object")
+	}
+	rawEnvelope, ok := rawFields["tool_authorization"]
+	if !ok || len(rawEnvelope) == 0 || bytes.Equal(bytes.TrimSpace(rawEnvelope), []byte("null")) {
+		return nil, protocol.ToolAuthorizationEnvelope{}, errors.New("permissioned tool result has no authorization envelope")
+	}
+	var envelope protocol.ToolAuthorizationEnvelope
+	decoder := json.NewDecoder(bytes.NewReader(rawEnvelope))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&envelope); err != nil {
+		return nil, protocol.ToolAuthorizationEnvelope{}, err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return nil, protocol.ToolAuthorizationEnvelope{}, errors.New("tool authorization envelope has trailing JSON")
+		}
+		return nil, protocol.ToolAuthorizationEnvelope{}, err
+	}
+	return rawFields, envelope, nil
 }
 
 func protectedBindingFromToolOutput(

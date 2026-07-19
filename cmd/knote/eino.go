@@ -12,8 +12,16 @@ import (
 	runtimeeino "github.com/zzqDeco/knote/internal/runtime/eino"
 )
 
-func newEinoRunner(ctx context.Context, cfg repository.Config, tools []einotool.InvokableTool) (*runtimeeino.Runner, error) {
-	opts := runtimeeino.Options{Tools: tools}
+func newEinoRunner(
+	ctx context.Context,
+	cfg repository.Config,
+	tools []einotool.InvokableTool,
+	authorizationValidator runtimeeino.ToolAuthorizationValidator,
+) (*runtimeeino.Runner, error) {
+	opts := runtimeeino.Options{
+		Tools:                      tools,
+		ToolAuthorizationValidator: authorizationValidator,
+	}
 	profile, err := selectEinoModelProfile(cfg)
 	if err != nil {
 		return nil, err

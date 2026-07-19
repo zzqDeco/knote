@@ -159,6 +159,80 @@ func TestToolAuthorizationGateAuthorizesReturnedResourcesAtomically(t *testing.T
 	}
 }
 
+func TestToolAuthorizationGateRevalidatesReceivedEnvelopeAtPublicationBoundary(t *testing.T) {
+	revoked := false
+	gate, err := NewToolAuthorizationGate(ToolAuthorizationGateOptions{
+		Authorizer: toolTestAuthorizer(t), Registry: toolTestRegistry(t),
+		FinalAuthorizationGate: func(context.Context, protocol.AuthorizationContext) error {
+			if revoked {
+				return errors.New("authorization revoked")
+			}
+			return nil
+		},
+		ResultGate: func(context.Context, protocol.AuthorizationContext, protocol.ProtectedContentBinding) error {
+			if revoked {
+				return errors.New("authorization revoked")
+			}
+			return nil
+		},
+		Now:              func() time.Time { return time.Unix(25, 0).UTC() },
+		NewCorrelationID: func() (string, error) { return "tool-test-publication", nil },
+	})
+	if err != nil {
+		t.Fatalf("NewToolAuthorizationGate: %v", err)
+	}
+	authorization := toolTestAuthorization("alice")
+	invocation, err := gate.AuthorizeInvocation(context.Background(), authorization, "knote_resources")
+	if err != nil {
+		t.Fatalf("authorize resource tool: %v", err)
+	}
+	first := toolTestResource(t, authorization, "publication-first")
+	second := toolTestResource(t, authorization, "publication-second")
+	firstBinding, err := protocol.NewProtectedContentBindingFromResourcesForAuthorization(
+		authorization,
+		[]protocol.ProtectedResourceBinding{{Resource: first, AuthorizationResource: first}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondBinding, err := protocol.NewProtectedContentBindingFromResourcesForAuthorization(
+		authorization,
+		[]protocol.ProtectedResourceBinding{{Resource: second, AuthorizationResource: second}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelope, err := gate.AuthorizeResourceResult(
+		context.Background(), authorization, invocation, firstBinding.Resources,
+	)
+	if err != nil {
+		t.Fatalf("authorize first result: %v", err)
+	}
+	if err := gate.ValidateProtectedResultEnvelope(
+		context.Background(), authorization, "knote_resources", envelope, firstBinding,
+	); err != nil {
+		t.Fatalf("validate current result envelope: %v", err)
+	}
+	if err := gate.ValidateProtectedResultEnvelope(
+		context.Background(), authorization, "knote_resources", envelope, secondBinding,
+	); !errors.Is(err, ErrToolAuthorizationDenied) {
+		t.Fatalf("mismatched result binding error = %v", err)
+	}
+	tampered := envelope
+	tampered.ManifestDigest = "tool_manifest_00000000000000000000000000000000"
+	if err := gate.ValidateProtectedResultEnvelope(
+		context.Background(), authorization, "knote_resources", tampered, firstBinding,
+	); !errors.Is(err, ErrToolAuthorizationDenied) {
+		t.Fatalf("untrusted manifest error = %v", err)
+	}
+	revoked = true
+	if err := gate.ValidateProtectedResultEnvelope(
+		context.Background(), authorization, "knote_resources", envelope, firstBinding,
+	); !errors.Is(err, ErrToolAuthorizationDenied) {
+		t.Fatalf("revoked publication error = %v", err)
+	}
+}
+
 func TestToolAuthorizationGateRevalidatesDelegationForInvocationAndReturn(t *testing.T) {
 	registry := toolTestRegistry(t)
 	authorizer := toolTestAuthorizer(t)
