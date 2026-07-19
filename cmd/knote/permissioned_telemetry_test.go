@@ -46,6 +46,7 @@ func TestPermissionedToolInvocationDeniedHandlerEmitsContentFreeQueryTelemetry(t
 }
 
 func TestPermissionedToolInvocationDeniedHandlerSupportsAuditWithoutTelemetry(t *testing.T) {
+	t.Setenv(permissionedAuditPathEnv, filepath.Join(t.TempDir(), "audit"))
 	boundary, err := newPermissionedResidencyBoundary()
 	if err != nil {
 		t.Fatal(err)

@@ -86,6 +86,30 @@ func TestPermissionedResidencyBoundaryRejectsDisallowedConnectorAndBackupDestina
 	})
 }
 
+func TestPermissionedResidencyBoundaryAllowsDenyAllEgressPolicy(t *testing.T) {
+	t.Setenv(residencyEgressRegionsEnv, "none")
+	boundary, err := newPermissionedResidencyBoundary()
+	if err != nil {
+		t.Fatalf("initialize deny-all egress policy: %v", err)
+	}
+	authorization := fixture.Authorization(fixture.Alice, "session-residency-deny-all-egress")
+	ctx, err := protocol.WithAuthorizationContext(context.Background(), authorization)
+	if err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	err = boundary.WithConnectorEgress(ctx, "connector-denied", func() error {
+		called = true
+		return nil
+	})
+	if !errors.Is(err, residency.ErrDenied) {
+		t.Fatalf("connector egress error = %v, want %v", err, residency.ErrDenied)
+	}
+	if called {
+		t.Fatal("connector egress callback ran under deny-all policy")
+	}
+}
+
 func TestPermissionedResidencyBoundaryChecksBeforeConnectorOrBackupBytes(t *testing.T) {
 	boundary, err := newPermissionedResidencyBoundary()
 	if err != nil {

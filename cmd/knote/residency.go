@@ -77,16 +77,23 @@ func newPermissionedResidencyBoundary() (*permissionedResidencyBoundary, error) 
 	if err := boundary.policy.ValidateFor(validationScope); err != nil {
 		return nil, fmt.Errorf("initialize residency policy: %w", err)
 	}
-	for name, destination := range map[string]struct {
+	type configuredDestination struct {
 		operation protocol.ResidencyOperationKind
 		region    string
-	}{
-		"KAG":              {operation: protocol.ResidencyProcess, region: boundary.kagRegion},
-		"telemetry":        {operation: protocol.ResidencyStore, region: boundary.telemetryRegion},
-		"audit":            {operation: protocol.ResidencyStore, region: boundary.auditRegion},
-		"connector egress": {operation: protocol.ResidencyEgress, region: boundary.connectorEgressRegion},
-		"backup":           {operation: protocol.ResidencyStore, region: boundary.backupRegion},
-	} {
+	}
+	destinations := map[string]configuredDestination{
+		"KAG":       {operation: protocol.ResidencyProcess, region: boundary.kagRegion},
+		"telemetry": {operation: protocol.ResidencyStore, region: boundary.telemetryRegion},
+		"audit":     {operation: protocol.ResidencyStore, region: boundary.auditRegion},
+		"backup":    {operation: protocol.ResidencyStore, region: boundary.backupRegion},
+	}
+	if len(egress) > 0 {
+		destinations["connector egress"] = configuredDestination{
+			operation: protocol.ResidencyEgress,
+			region:    boundary.connectorEgressRegion,
+		}
+	}
+	for name, destination := range destinations {
 		if !boundary.regionAllowed(destination.operation, destination.region) {
 			return nil, fmt.Errorf("initialize residency policy: %s destination region %q is not allowed", name, destination.region)
 		}

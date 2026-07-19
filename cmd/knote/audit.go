@@ -15,7 +15,10 @@ import (
 	"github.com/zzqDeco/knote/internal/protocol"
 )
 
-const permissionedAuditPathEnv = "KNOTE_PERMISSIONED_AUDIT_PATH"
+const (
+	permissionedAuditPathEnv         = "KNOTE_PERMISSIONED_AUDIT_PATH"
+	permissionedAuditWorkspaceDomain = "knote.audit.workspace.v1"
+)
 
 type permissionedAuditRecorder struct {
 	store     *audit.Store
@@ -31,11 +34,9 @@ func newPermissionedAuditRecorder(
 	if residencyBoundary == nil {
 		return nil, fmt.Errorf("initialize audit: residency boundary is required")
 	}
-	root := strings.TrimSpace(os.Getenv(permissionedAuditPathEnv))
-	if root == "" {
-		root = filepath.Join(workspace, ".knote", "audit")
-	} else if !filepath.IsAbs(root) {
-		return nil, fmt.Errorf("%s must be an absolute path", permissionedAuditPathEnv)
+	root, err := permissionedAuditRoot(workspace)
+	if err != nil {
+		return nil, err
 	}
 	store, err := audit.OpenStore(root, residencyBoundary.AuthorizeAuditStore)
 	if err != nil {
@@ -44,6 +45,55 @@ func newPermissionedAuditRecorder(
 	return &permissionedAuditRecorder{
 		store: store, residency: residencyBoundary, now: func() time.Time { return time.Now().UTC() },
 	}, nil
+}
+
+func permissionedAuditRoot(workspace string) (string, error) {
+	configured := strings.TrimSpace(os.Getenv(permissionedAuditPathEnv))
+	if configured != "" {
+		if !filepath.IsAbs(configured) {
+			return "", fmt.Errorf("%s must be an absolute path", permissionedAuditPathEnv)
+		}
+		return filepath.Clean(configured), nil
+	}
+
+	workspaceRoot, err := filepath.Abs(workspace)
+	if err != nil {
+		return "", fmt.Errorf("resolve workspace for audit store: %w", err)
+	}
+	workspaceRoot, err = filepath.EvalSymlinks(workspaceRoot)
+	if err != nil {
+		return "", fmt.Errorf("resolve workspace for audit store: %w", err)
+	}
+	configRoot, err := os.UserConfigDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve user config directory for audit store: %w", err)
+	}
+	digest := sha256.Sum256([]byte(permissionedAuditWorkspaceDomain + "\x00" + workspaceRoot))
+	root := filepath.Join(configRoot, "knote", "audit", hex.EncodeToString(digest[:16]))
+	insideWorkspace, err := pathWithinDirectory(workspaceRoot, root)
+	if err != nil {
+		return "", fmt.Errorf("validate audit store path: %w", err)
+	}
+	if insideWorkspace {
+		return "", fmt.Errorf("default audit store must be outside workspace %q", workspaceRoot)
+	}
+	return root, nil
+}
+
+func pathWithinDirectory(directory, path string) (bool, error) {
+	directory, err := filepath.Abs(directory)
+	if err != nil {
+		return false, err
+	}
+	path, err = filepath.Abs(path)
+	if err != nil {
+		return false, err
+	}
+	relative, err := filepath.Rel(directory, path)
+	if err != nil {
+		return false, err
+	}
+	return relative == "." || (relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))), nil
 }
 
 func (r *permissionedAuditRecorder) Record(

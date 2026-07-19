@@ -1488,7 +1488,7 @@ func TestCommitIncludesDeletedKnowledgePaths(t *testing.T) {
 	}
 }
 
-func TestStatusDirtyIgnoresRuntimeSessionFiles(t *testing.T) {
+func TestStatusDirtyIgnoresRuntimeFiles(t *testing.T) {
 	ctx := context.Background()
 	workspace := initRepo(t)
 	store := New(workspace)
@@ -1497,12 +1497,13 @@ func TestStatusDirtyIgnoresRuntimeSessionFiles(t *testing.T) {
 	runGit(t, workspace, "commit", "-m", "initial")
 
 	mustWrite(t, filepath.Join(workspace, ".knote", "sessions", "sess.jsonl"), "{}\n")
+	mustWrite(t, filepath.Join(workspace, ".knote", "audit", "tenant", "entries.jsonl"), "{}\n")
 	status, err := store.Status(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if status.Dirty {
-		t.Fatal("runtime session files should not make the knowledge workspace dirty")
+		t.Fatal("runtime files should not make the knowledge workspace dirty")
 	}
 	mustWrite(t, filepath.Join(workspace, "sources", "intro.md"), "dirty\n")
 	status, err = store.Status(ctx)
