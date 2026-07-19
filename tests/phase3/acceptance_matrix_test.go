@@ -54,6 +54,7 @@ type testAnchor struct {
 type expectedInvariant struct {
 	ID          string
 	Requirement string
+	SampleCount int
 }
 
 type expectedBudget struct {
@@ -68,50 +69,67 @@ var expectedInvariants = []expectedInvariant{
 	{
 		ID:          "audit-content-free-tamper-evident",
 		Requirement: "Audit remains content free and tamper evidence is detected.",
+		SampleCount: 2,
 	},
 	{
 		ID:          "connector-acl-failure-never-serves",
 		Requirement: "Connector content plus ACL failure never serves.",
+		SampleCount: 2,
 	},
 	{
 		ID:          "durable-connector-convergence",
 		Requirement: "Duplicate and reordered events, crashes, DLQ replay, tombstones, and full reconciliation converge correctly.",
+		SampleCount: 7,
 	},
 	{
 		ID:          "false-allow-zero",
 		Requirement: "False allow equals zero across the complete matrix.",
+		SampleCount: 14,
 	},
 	{
 		ID:          "identity-fail-closed-replay-safe",
 		Requirement: "SSO assertion and SCIM provisioning and deprovisioning behavior is fail closed and replay safe.",
+		SampleCount: 4,
 	},
 	{
 		ID:          "operational-latency-budgets",
 		Requirement: "BatchCheck, connector lag, replay, reconciliation, revocation, and governance latency budgets are documented and met.",
+		SampleCount: phase3contract.BatchCheckSampleCount +
+			phase3contract.ConnectorLagSampleCount +
+			phase3contract.GovernanceSampleCount +
+			phase3contract.ReconciliationSampleCount +
+			phase3contract.ReplaySampleCount +
+			phase3contract.RevocationSampleCount,
 	},
 	{
 		ID:          "residency-blocks-storage-egress",
 		Requirement: "Residency violations block storage and egress.",
+		SampleCount: 2,
 	},
 	{
 		ID:          "simulation-read-only-oracle-parity",
 		Requirement: "Simulation is non-mutating and impact results match the policy oracle.",
+		SampleCount: 14,
 	},
 	{
 		ID:          "tenant-collision-isolation",
 		Requirement: "Two tenants with colliding external IDs cannot observe each other.",
+		SampleCount: 2,
 	},
 	{
 		ID:          "tool-invocation-and-results-authorized",
 		Requirement: "Tool invocation and every returned resource are authorized.",
+		SampleCount: 4,
 	},
 	{
 		ID:          "unauthorized-observability-hidden",
 		Requirement: "Unauthorized existence, count, pagination, errors, traces, telemetry, and governance views do not leak.",
+		SampleCount: 5,
 	},
 	{
 		ID:          "user-agent-task-intersection",
 		Requirement: "User, agent, and task intersection is enforced on retrieval, traversal, generation, cache, citation, and session replay.",
+		SampleCount: 4,
 	},
 }
 
@@ -162,8 +180,8 @@ func TestPhase3AcceptanceMatrix(t *testing.T) {
 			if invariant.Requirement != expected.Requirement {
 				t.Fatalf("invariant %q requirement = %q, want %q", invariant.ID, invariant.Requirement, expected.Requirement)
 			}
-			if invariant.SampleCount <= 0 {
-				t.Fatalf("invariant %q sample_count = %d, want a positive cohort", invariant.ID, invariant.SampleCount)
+			if invariant.SampleCount != expected.SampleCount {
+				t.Fatalf("invariant %q sample_count = %d, want %d", invariant.ID, invariant.SampleCount, expected.SampleCount)
 			}
 			if len(invariant.Anchors) == 0 {
 				t.Fatalf("invariant %q has no test anchors", invariant.ID)

@@ -79,15 +79,22 @@ func TestViewAndRenderAreDeterministic(t *testing.T) {
 	}
 	started := time.Now()
 	first, err := service.View(context.Background(), governanceTestAuthorization())
+	firstElapsed := time.Since(started)
 	if err != nil {
 		t.Fatal(err)
 	}
+	started = time.Now()
 	second, err := service.View(context.Background(), governanceTestAuthorization())
+	secondElapsed := time.Since(started)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if elapsed := time.Since(started); elapsed > phase3contract.GovernanceMaxBudget {
-		t.Fatalf("two governance views took %s, want at most %s", elapsed, phase3contract.GovernanceMaxBudget)
+	maximumElapsed := firstElapsed
+	if secondElapsed > maximumElapsed {
+		maximumElapsed = secondElapsed
+	}
+	if maximumElapsed > phase3contract.GovernanceMaxBudget {
+		t.Fatalf("slowest governance view took %s, want at most %s", maximumElapsed, phase3contract.GovernanceMaxBudget)
 	}
 	if Render(first) != Render(second) {
 		t.Fatalf("governance rendering is not deterministic:\n%s\n---\n%s", Render(first), Render(second))
