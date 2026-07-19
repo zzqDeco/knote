@@ -540,11 +540,12 @@ func (f AgentTaskScopeFingerprint) Validate() error {
 }
 
 type ToolInvocationRequest struct {
-	Version    string `json:"version"`
-	ToolName   string `json:"tool_name"`
-	Action     string `json:"action"`
-	Relation   string `json:"relation"`
-	SideEffect bool   `json:"side_effect"`
+	Version          string               `json:"version"`
+	ToolName         string               `json:"tool_name"`
+	Action           string               `json:"action"`
+	Relation         string               `json:"relation"`
+	SideEffect       bool                 `json:"side_effect"`
+	ReturnObligation ToolReturnObligation `json:"return_obligation"`
 }
 
 func (r ToolInvocationRequest) Validate() error {
@@ -557,7 +558,10 @@ func (r ToolInvocationRequest) Validate() error {
 	); err != nil {
 		return err
 	}
-	return validateAuthorizationName("relation", r.Relation)
+	if err := validateAuthorizationName("relation", r.Relation); err != nil {
+		return err
+	}
+	return r.ReturnObligation.Validate()
 }
 
 type ToolInvocationAuthorization struct {
@@ -579,6 +583,7 @@ type ToolInvocationAuthorization struct {
 	DelegationWatermark       string                    `json:"delegation_watermark,omitempty"`
 	AgentTaskScopeFingerprint AgentTaskScopeFingerprint `json:"agent_task_scope_fingerprint,omitempty"`
 	SideEffect                bool                      `json:"side_effect"`
+	ReturnObligation          ToolReturnObligation      `json:"return_obligation"`
 	Outcome                   DecisionOutcome           `json:"outcome"`
 	Consistency               ConsistencyPreference     `json:"consistency"`
 	CheckedAt                 time.Time                 `json:"checked_at"`
@@ -637,7 +642,8 @@ func (a ToolInvocationAuthorization) ValidateFor(auth AuthorizationContext, requ
 			return fmt.Errorf("tool invocation authorization %s does not match the authorization context", binding.name)
 		}
 	}
-	if a.ToolName != request.ToolName || a.Action != request.Action || a.Relation != request.Relation || a.SideEffect != request.SideEffect {
+	if a.ToolName != request.ToolName || a.Action != request.Action || a.Relation != request.Relation ||
+		a.SideEffect != request.SideEffect || a.ReturnObligation != request.ReturnObligation {
 		return fmt.Errorf("tool invocation authorization does not match the requested invocation")
 	}
 	return nil
@@ -660,6 +666,7 @@ type ToolResultAuthorization struct {
 	Action                    string                    `json:"action"`
 	Relation                  string                    `json:"relation"`
 	SideEffect                bool                      `json:"side_effect"`
+	ReturnObligation          ToolReturnObligation      `json:"return_obligation"`
 	AuthorizationModelID      string                    `json:"authorization_model_id"`
 	IdentityWatermark         string                    `json:"identity_watermark"`
 	ACLWatermark              string                    `json:"acl_watermark"`
@@ -713,9 +720,19 @@ func (r ToolResultAuthorization) ValidateFor(
 			return fmt.Errorf("tool result authorization %s does not match the authorization context", binding.name)
 		}
 	}
+	if err := r.ReturnObligation.Validate(); err != nil {
+		return err
+	}
 	if r.CorrelationID != invocation.CorrelationID || r.ToolName != invocation.ToolName ||
-		r.Action != invocation.Action || r.Relation != invocation.Relation || r.SideEffect != invocation.SideEffect {
+		r.Action != invocation.Action || r.Relation != invocation.Relation || r.SideEffect != invocation.SideEffect ||
+		r.ReturnObligation != invocation.ReturnObligation {
 		return fmt.Errorf("tool result authorization does not match the authorized invocation")
+	}
+	if r.ReturnObligation == ToolReturnNone {
+		if len(r.Resources) != 0 || len(r.Decisions) != 0 {
+			return fmt.Errorf("content-free tool result authorization cannot contain resources or decisions")
+		}
+		return nil
 	}
 	if len(r.Resources) == 0 {
 		return fmt.Errorf("tool result authorization requires at least one resource")

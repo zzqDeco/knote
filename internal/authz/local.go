@@ -549,6 +549,8 @@ func (a *LocalAuthorizer) evaluateKnowledgeBaseLocked(user, relation, object str
 		return a.memberOfRelatedObjectsLocked(user, RelationActiveTask, relationValidAssignee, object, state)
 	case RelationCanViewInTask:
 		return a.allComputedRelationsLocked(user, object, state, RelationCanView, relationTaskAssignee)
+	case RelationCanEditInTask:
+		return a.allComputedRelationsLocked(user, object, state, RelationCanEdit, relationTaskAssignee)
 	default:
 		return false, unsupportedRelation(TypeKnowledgeBase, relation)
 	}
@@ -592,6 +594,8 @@ func (a *LocalAuthorizer) evaluateDocumentLocked(user, relation, object string, 
 		return a.memberOfRelatedObjectsLocked(user, RelationActiveTask, relationValidAssignee, object, state)
 	case RelationCanViewInTask:
 		return a.allComputedRelationsLocked(user, object, state, RelationCanView, relationTaskAssignee)
+	case RelationCanEditInTask:
+		return a.allComputedRelationsLocked(user, object, state, RelationCanEdit, relationTaskAssignee)
 	default:
 		return false, unsupportedRelation(TypeDocument, relation)
 	}
@@ -623,6 +627,8 @@ func (a *LocalAuthorizer) evaluateEntityLocked(user, relation, object string, st
 		return a.memberOfRelatedObjectsLocked(user, RelationActiveTask, relationValidAssignee, object, state)
 	case RelationCanViewInTask:
 		return a.allComputedRelationsLocked(user, object, state, RelationCanView, relationTaskAssignee)
+	case RelationCanEditInTask:
+		return a.allComputedRelationsLocked(user, object, state, RelationCanEdit, relationTaskAssignee)
 	default:
 		return false, unsupportedRelation(TypeEntity, relation)
 	}
@@ -681,6 +687,8 @@ func (a *LocalAuthorizer) evaluateClaimLocked(user, relation, object string, sta
 		return a.memberOfRelatedObjectsLocked(user, RelationActiveTask, relationValidAssignee, object, state)
 	case RelationCanViewInTask:
 		return a.allComputedRelationsLocked(user, object, state, RelationCanView, relationTaskAssignee)
+	case RelationCanEditInTask:
+		return a.allComputedRelationsLocked(user, object, state, RelationCanEdit, relationTaskAssignee)
 	default:
 		return false, unsupportedRelation(TypeClaim, relation)
 	}

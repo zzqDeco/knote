@@ -160,8 +160,54 @@ func TestPermissionedApplicationOnlyWiresCachedRevocationPathInFakeMode(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	if application == nil || application.fixture == nil || application.service == nil || application.AuthorizationContextProvider() == nil {
+	if application == nil || application.fixture == nil || application.service == nil ||
+		application.AuthorizationContextProvider() == nil || application.ToolAuthorizationGate() == nil {
 		t.Fatalf("fake-mode permissioned application was not fully wired: %#v", application)
+	}
+}
+
+func TestFakeBuildAuthorizationRequiresFixtureEditor(t *testing.T) {
+	workspace := t.TempDir()
+	store := local.New(workspace)
+	application, err := newPermissionedApplication(context.Background(), permissionedRuntimeConfig{
+		Enabled: true, Fake: true, Principal: "alice",
+	}, kag.Client{Fake: true}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	aliceProvider, err := fakeBuildAuthorizationProvider(workspace, store, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	alice, err := aliceProvider(context.Background(), "sess_fake_build_alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := application.PrepareFakeBuildAuthorization(alice); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := application.ToolAuthorizationGate().AuthorizeInvocation(
+		context.Background(), alice, einotools.NameBuild,
+	); err != nil {
+		t.Fatalf("fixture editor build authorization: %v", err)
+	}
+
+	bobProvider, err := fakeBuildAuthorizationProvider(workspace, store, "bob")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bob, err := bobProvider(context.Background(), "sess_fake_build_bob")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := application.PrepareFakeBuildAuthorization(bob); err == nil {
+		t.Fatal("fixture viewer received a build editor grant")
+	}
+	if _, err := application.ToolAuthorizationGate().AuthorizeInvocation(
+		context.Background(), bob, einotools.NameBuild,
+	); err == nil {
+		t.Fatal("fixture viewer received build invocation authorization")
 	}
 }
 

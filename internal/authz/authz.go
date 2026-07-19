@@ -37,6 +37,7 @@ const (
 	RelationAssignee       = "assignee"
 	RelationAgent          = "agent"
 	RelationActiveTask     = "active_task"
+	RelationCanEditInTask  = "can_edit_in_task"
 	RelationCanViewInTask  = "can_view_in_task"
 	RelationOrganization   = "organization"
 	RelationParent         = "parent"

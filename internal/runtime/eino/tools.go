@@ -1,10 +1,12 @@
 package eino
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 
 	einotool "github.com/cloudwego/eino/components/tool"
@@ -21,6 +23,15 @@ const (
 
 type ToolExecutor struct {
 	tools map[string]einotool.InvokableTool
+}
+
+type toolAuthorizationManifestDigester interface {
+	ToolAuthorizationManifestDigest() string
+}
+
+type toolAuthorizationReferences struct {
+	correlationID  string
+	manifestDigest string
 }
 
 func NewToolExecutor(tools []einotool.InvokableTool) ToolExecutor {
@@ -51,29 +62,40 @@ func (e ToolExecutor) Invoke(ctx context.Context, sessionID string, toolName str
 func invokeTool(ctx context.Context, tools map[string]einotool.InvokableTool, sessionID string, toolName string, argumentsInJSON string) ([]protocol.Event, error) {
 	sessionID = strings.TrimSpace(sessionID)
 	toolName = strings.TrimSpace(toolName)
-	_, authorized := protocol.AuthorizationContextFrom(ctx)
+	authorization, authorized := protocol.AuthorizationContextFrom(ctx)
 	permissionedSideEffect := authorized && sideEffectToolName(toolName)
 	tool, ok := tools[toolName]
 	if !ok || tool == nil {
-		if permissionedSideEffect {
-			return permissionedSideEffectFailure(sessionID, toolName, nil)
+		if authorized {
+			return permissionedToolAuthorizationFailure(sessionID, toolName, permissionedSideEffect)
 		}
 		err := fmt.Errorf("Eino tool %q is not registered", toolName)
 		return []protocol.Event{protocol.NewEvent(protocol.EventError, sessionID, err.Error(), map[string]string{"tool": toolName})}, err
+	}
+	manifestDigest := ""
+	if authorized {
+		marker, marked := tool.(toolAuthorizationManifestDigester)
+		if !marked {
+			return permissionedToolAuthorizationFailure(sessionID, toolName, permissionedSideEffect)
+		}
+		manifestDigest = marker.ToolAuthorizationManifestDigest()
+		if strings.TrimSpace(manifestDigest) == "" {
+			return permissionedToolAuthorizationFailure(sessionID, toolName, permissionedSideEffect)
+		}
 	}
 	args := strings.TrimSpace(argumentsInJSON)
 	if args == "" {
 		args = "{}"
 	}
-	events := []protocol.Event{protocol.NewEvent(protocol.EventToolStart, sessionID, toolName, map[string]string{"tool": toolName})}
 	out, err := tool.InvokableRun(ctx, args)
 	if errors.Is(err, runtime.ErrSideEffectPending) {
 		return nil, err
 	}
 	if err != nil {
-		if permissionedSideEffect {
-			return permissionedSideEffectFailure(sessionID, toolName, events)
+		if authorized {
+			return permissionedToolAuthorizationFailure(sessionID, toolName, permissionedSideEffect)
 		}
+		events := []protocol.Event{protocol.NewEvent(protocol.EventToolStart, sessionID, toolName, map[string]string{"tool": toolName})}
 		if isPermissionedToolCall(toolName) {
 			generic := errors.New(protectedContentUnavailableMessage)
 			events = append(events, protocol.NewEvent(protocol.EventToolError, sessionID, generic.Error(), map[string]string{"tool": toolName}))
@@ -82,24 +104,38 @@ func invokeTool(ctx context.Context, tools map[string]einotool.InvokableTool, se
 		events = append(events, protocol.NewEvent(protocol.EventToolError, sessionID, err.Error(), map[string]string{"tool": toolName}))
 		return events, err
 	}
+	decoded := decodeToolResult(out)
+	references := toolAuthorizationReferences{}
+	if authorized {
+		decoded, references, err = validateAndSanitizeToolAuthorizationOutput(out, toolName, manifestDigest, authorization)
+		if err != nil {
+			return permissionedToolAuthorizationFailure(sessionID, toolName, permissionedSideEffect)
+		}
+	}
+	startPayload := map[string]string{"tool": toolName}
+	if authorized {
+		startPayload = permissionedToolReferencePayload(toolName, references)
+	}
+	events := []protocol.Event{protocol.NewEvent(protocol.EventToolStart, sessionID, toolName, startPayload)}
 	binding, permissioned, err := protectedBindingFromToolOutput(ctx, toolName, out)
 	if err != nil {
-		generic := errors.New(protectedContentUnavailableMessage)
-		events = append(events, protocol.NewEvent(protocol.EventToolError, sessionID, generic.Error(), map[string]string{"tool": toolName}))
-		return events, generic
+		return permissionedToolAuthorizationFailure(sessionID, toolName, permissionedSideEffect)
 	}
 	if permissioned {
 		events[0].ProtectedContent = binding
 	}
-	decoded := decodeToolResult(out)
 	payload := map[string]any{"tool": toolName, "result": decoded}
+	if authorized {
+		payload["authorization_correlation_id"] = references.correlationID
+		payload["authorization_manifest_digest"] = references.manifestDigest
+	}
 	if failure := adapterFailureMessage(toolName, decoded); failure != "" {
 		if permissionedSideEffect {
-			return permissionedSideEffectFailure(sessionID, toolName, events)
+			return permissionedSideEffectFailure(sessionID, toolName, nil)
 		}
 		if permissioned {
 			generic := errors.New(protectedContentUnavailableMessage)
-			errorPayload := map[string]string{"tool": toolName}
+			errorPayload := permissionedToolReferencePayload(toolName, references)
 			toolError := protocol.NewEvent(protocol.EventToolError, sessionID, generic.Error(), errorPayload)
 			toolError.ProtectedContent = binding
 			genericError := protocol.NewEvent(protocol.EventError, sessionID, generic.Error(), errorPayload)
@@ -112,7 +148,7 @@ func invokeTool(ctx context.Context, tools map[string]einotool.InvokableTool, se
 		return events, fmt.Errorf("%s", failure)
 	}
 	if permissionedSideEffect {
-		events = append(events, permissionedSideEffectSuccess(sessionID, toolName)...)
+		events = append(events, permissionedSideEffectSuccess(sessionID, toolName, references)...)
 		return events, nil
 	}
 	complete := protocol.NewEvent(protocol.EventToolComplete, sessionID, toolName+" complete", payload)
@@ -142,12 +178,75 @@ func invokeTool(ctx context.Context, tools map[string]einotool.InvokableTool, se
 	if toolName == einotools.NameEval {
 		return events, nil
 	}
-	answer := protocol.NewEvent(protocol.EventAssistantDone, sessionID, "Eino tool result\n"+prettyToolResult(decoded), map[string]string{"tool": toolName})
+	answerPayload := map[string]string{"tool": toolName}
+	if authorized {
+		answerPayload = permissionedToolReferencePayload(toolName, references)
+	}
+	answer := protocol.NewEvent(protocol.EventAssistantDone, sessionID, "Eino tool result\n"+prettyToolResult(decoded), answerPayload)
 	if permissioned {
 		answer.ProtectedContent = binding
 	}
 	events = append(events, answer)
 	return events, nil
+}
+
+func validateAndSanitizeToolAuthorizationOutput(
+	out string,
+	toolName string,
+	manifestDigest string,
+	authorization protocol.AuthorizationContext,
+) (any, toolAuthorizationReferences, error) {
+	var rawFields map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &rawFields); err != nil || rawFields == nil {
+		return nil, toolAuthorizationReferences{}, errors.New("permissioned tool result must be a JSON object")
+	}
+	rawEnvelope, ok := rawFields["tool_authorization"]
+	if !ok || len(rawEnvelope) == 0 || bytes.Equal(bytes.TrimSpace(rawEnvelope), []byte("null")) {
+		return nil, toolAuthorizationReferences{}, errors.New("permissioned tool result has no authorization envelope")
+	}
+	var envelope protocol.ToolAuthorizationEnvelope
+	decoder := json.NewDecoder(bytes.NewReader(rawEnvelope))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&envelope); err != nil {
+		return nil, toolAuthorizationReferences{}, err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return nil, toolAuthorizationReferences{}, errors.New("tool authorization envelope has trailing JSON")
+		}
+		return nil, toolAuthorizationReferences{}, err
+	}
+	if envelope.ManifestDigest != manifestDigest || envelope.Invocation.ToolName != toolName {
+		return nil, toolAuthorizationReferences{}, errors.New("tool authorization envelope does not match the selected tool")
+	}
+	manifest := protocol.ToolAuthorizationManifest{
+		Version:          envelope.Invocation.Version,
+		ToolName:         envelope.Invocation.ToolName,
+		Action:           envelope.Invocation.Action,
+		Relation:         envelope.Invocation.Relation,
+		SideEffect:       envelope.Invocation.SideEffect,
+		ReturnObligation: envelope.Invocation.ReturnObligation,
+	}
+	if err := envelope.ValidateFor(authorization, manifest); err != nil {
+		return nil, toolAuthorizationReferences{}, err
+	}
+	delete(rawFields, "tool_authorization")
+	sanitizedJSON, err := json.Marshal(rawFields)
+	if err != nil {
+		return nil, toolAuthorizationReferences{}, err
+	}
+	var sanitized map[string]any
+	if err := json.Unmarshal(sanitizedJSON, &sanitized); err != nil {
+		return nil, toolAuthorizationReferences{}, err
+	}
+	references := toolAuthorizationReferences{
+		correlationID:  envelope.Invocation.CorrelationID,
+		manifestDigest: envelope.ManifestDigest,
+	}
+	sanitized["authorization_correlation_id"] = references.correlationID
+	sanitized["authorization_manifest_digest"] = references.manifestDigest
+	return sanitized, references, nil
 }
 
 func protectedBindingFromToolOutput(
@@ -208,6 +307,18 @@ func sideEffectToolName(toolName string) bool {
 	}
 }
 
+func permissionedToolAuthorizationFailure(sessionID string, toolName string, sideEffect bool) ([]protocol.Event, error) {
+	if sideEffect {
+		return permissionedSideEffectFailure(sessionID, toolName, nil)
+	}
+	payload := map[string]string{"tool": toolName}
+	events := []protocol.Event{
+		protocol.NewEvent(protocol.EventToolStart, sessionID, toolName, payload),
+		protocol.NewEvent(protocol.EventToolError, sessionID, protectedContentUnavailableMessage, payload),
+	}
+	return events, errors.New(protectedContentUnavailableMessage)
+}
+
 func permissionedSideEffectFailure(sessionID string, toolName string, events []protocol.Event) ([]protocol.Event, error) {
 	payload := map[string]string{"tool": toolName}
 	if len(events) == 0 {
@@ -220,8 +331,8 @@ func permissionedSideEffectFailure(sessionID string, toolName string, events []p
 	return events, errors.New(permissionedSideEffectFailureMessage)
 }
 
-func permissionedSideEffectSuccess(sessionID string, toolName string) []protocol.Event {
-	payload := map[string]string{"tool": toolName}
+func permissionedSideEffectSuccess(sessionID string, toolName string, references toolAuthorizationReferences) []protocol.Event {
+	payload := permissionedToolReferencePayload(toolName, references)
 	events := []protocol.Event{
 		protocol.NewEvent(protocol.EventToolComplete, sessionID, "side effect complete", payload),
 	}
@@ -236,6 +347,14 @@ func permissionedSideEffectSuccess(sessionID string, toolName string) []protocol
 		events = append(events, protocol.NewEvent(protocol.EventVersionChanged, sessionID, "Checkout complete", payload))
 	}
 	return events
+}
+
+func permissionedToolReferencePayload(toolName string, references toolAuthorizationReferences) map[string]string {
+	return map[string]string{
+		"tool":                          toolName,
+		"authorization_correlation_id":  references.correlationID,
+		"authorization_manifest_digest": references.manifestDigest,
+	}
 }
 
 func eventToolName(payload any) string {

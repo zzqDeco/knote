@@ -62,6 +62,7 @@ type permissionedApplication struct {
 	service               *authorized.Service
 	fixture               *fixture.Application
 	authorizationProvider runtime.AuthorizationContextProvider
+	toolAuthorizationGate *authz.ToolAuthorizationGate
 	revisionState         *permissionedRevisionState
 	identity              *permissionedIdentitySession
 }
@@ -183,7 +184,7 @@ func newPermissionedApplication(
 		if err != nil {
 			return nil, err
 		}
-		return &permissionedApplication{
+		result := &permissionedApplication{
 			service: application.Service, fixture: application,
 			authorizationProvider: func(ctx context.Context, sessionID string) (protocol.AuthorizationContext, error) {
 				if err := ctx.Err(); err != nil {
@@ -191,7 +192,14 @@ func newPermissionedApplication(
 				}
 				return fixture.Authorization(config.Principal, sessionID), nil
 			},
-		}, nil
+		}
+		result.toolAuthorizationGate, err = newPermissionedToolAuthorizationGate(
+			application.Authorizer(), nil, result.AuthorizeProtectedContent,
+		)
+		if err != nil {
+			return nil, err
+		}
+		return result, nil
 	}
 
 	loader, err := authorized.NewBundleEvidenceLoader(reader)
@@ -260,9 +268,35 @@ func newPermissionedApplication(
 	if _, err := provider(ctx, "session_permissioned_startup"); err != nil {
 		return nil, fmt.Errorf("validate permissioned authorization context: %w", err)
 	}
-	return &permissionedApplication{
+	result := &permissionedApplication{
 		service: service, authorizationProvider: provider, revisionState: revisionState, identity: identitySession,
-	}, nil
+	}
+	result.toolAuthorizationGate, err = newPermissionedToolAuthorizationGate(
+		authorizer, result.validateIdentityAuthorization, result.AuthorizeProtectedContent,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func newPermissionedToolAuthorizationGate(
+	authorizer authz.Authorizer,
+	finalGate func(context.Context, protocol.AuthorizationContext) error,
+	resultGate authz.ToolResultGate,
+) (*authz.ToolAuthorizationGate, error) {
+	registry, err := einotools.NewPermissionedAuthorizationManifestRegistry()
+	if err != nil {
+		return nil, fmt.Errorf("initialize permissioned tool manifest: %w", err)
+	}
+	gate, err := authz.NewToolAuthorizationGate(authz.ToolAuthorizationGateOptions{
+		Authorizer: authorizer, Registry: registry,
+		FinalAuthorizationGate: finalGate, ResultGate: resultGate,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("initialize permissioned tool authorization: %w", err)
+	}
+	return gate, nil
 }
 
 func newProductionAuthorizationContextProvider(
@@ -390,6 +424,23 @@ func (a *permissionedApplication) AuthorizationContextProvider() runtime.Authori
 		return nil
 	}
 	return a.authorizationProvider
+}
+
+func (a *permissionedApplication) ToolAuthorizationGate() *authz.ToolAuthorizationGate {
+	if a == nil {
+		return nil
+	}
+	return a.toolAuthorizationGate
+}
+
+func (a *permissionedApplication) PrepareFakeBuildAuthorization(authorization protocol.AuthorizationContext) error {
+	if a == nil || a.fixture == nil {
+		return fmt.Errorf("fake build authorization is unavailable")
+	}
+	if err := a.fixture.EnsureBuildKnowledgeBaseEditor(authorization); err != nil {
+		return fmt.Errorf("fake build authorization denied")
+	}
+	return nil
 }
 
 func (a *permissionedApplication) RefreshAuthorizationScope(ctx context.Context) error {

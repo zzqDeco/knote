@@ -63,6 +63,43 @@ func TestOpenFGAScopedCheckUsesPinnedModelAndContextualTuples(t *testing.T) {
 	}
 }
 
+func TestOpenFGAScopedEditUsesEditIntersection(t *testing.T) {
+	authorizer := newTestOpenFGA(t, http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		var body struct {
+			TupleKey struct {
+				Relation string `json:"relation"`
+			} `json:"tuple_key"`
+			ContextualTuples struct {
+				TupleKeys []Tuple `json:"tuple_keys"`
+			} `json:"contextual_tuples"`
+		}
+		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		if body.TupleKey.Relation != RelationCanEditInTask {
+			t.Errorf("relation = %q, want %q", body.TupleKey.Relation, RelationCanEditInTask)
+		}
+		if len(body.ContextualTuples.TupleKeys) != 4 {
+			t.Errorf("contextual tuples = %d, want 4", len(body.ContextualTuples.TupleKeys))
+		}
+		writeJSON(t, writer, `{"allowed":true}`)
+	}))
+
+	decision, err := authorizer.Check(context.Background(), CheckRequest{
+		User:                 "user:alice",
+		Relation:             RelationCanEdit,
+		Object:               "document:welcome",
+		AuthorizationModelID: openFGATestModelID,
+		AgentTaskScope:       completeAgentTaskScope("user:alice", openFGATestModelID),
+	})
+	if err != nil {
+		t.Fatalf("scoped edit check: %v", err)
+	}
+	if !decision.Allowed {
+		t.Fatal("scoped edit was denied")
+	}
+}
+
 func TestOpenFGAScopedBatchUsesPerItemContextWithoutDowngrade(t *testing.T) {
 	authorizer := newTestOpenFGA(t, http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		var body struct {

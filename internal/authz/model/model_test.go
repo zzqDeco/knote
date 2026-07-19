@@ -109,8 +109,11 @@ func TestAuthorizationModelTruthTable(t *testing.T) {
 				for _, relation := range relations {
 					requestRelation := relation
 					var requestScope *authz.AgentTaskScope
-					if agentTaskScope != nil && relation == authz.RelationCanViewInTask {
+					if agentTaskScope != nil && (relation == authz.RelationCanViewInTask || relation == authz.RelationCanEditInTask) {
 						requestRelation = authz.RelationCanView
+						if relation == authz.RelationCanEditInTask {
+							requestRelation = authz.RelationCanEdit
+						}
 						scope := *agentTaskScope
 						requestScope = &scope
 					}

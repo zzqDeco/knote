@@ -218,7 +218,7 @@ func TestToolContractsAuthorizeInvocationAndSortedReturnedHandles(t *testing.T) 
 	auth := enterpriseTestAuthorization()
 	request := ToolInvocationRequest{
 		Version: EnterpriseContractVersion, ToolName: "knote-query", Action: "invoke",
-		Relation: EvidenceReadRelation, SideEffect: false,
+		Relation: EvidenceReadRelation, SideEffect: false, ReturnObligation: ToolReturnEvidence,
 	}
 	invocation := ToolInvocationAuthorization{
 		Version: EnterpriseContractVersion, CorrelationID: "tool-invocation-1",
@@ -228,8 +228,9 @@ func TestToolContractsAuthorizeInvocationAndSortedReturnedHandles(t *testing.T) 
 		Action: request.Action, Relation: request.Relation, AuthorizationModelID: auth.AuthorizationModelID,
 		IdentityWatermark: auth.IdentityWatermark, ACLWatermark: auth.ACLWatermark,
 		DelegationWatermark: auth.DelegationWatermark, AgentTaskScopeFingerprint: auth.AgentTaskScopeFingerprint,
-		SideEffect: false,
-		Outcome:    DecisionAllow, Consistency: auth.Consistency, CheckedAt: enterpriseTestTime(),
+		SideEffect:       false,
+		ReturnObligation: ToolReturnEvidence,
+		Outcome:          DecisionAllow, Consistency: auth.Consistency, CheckedAt: enterpriseTestTime(),
 	}
 	if err := invocation.ValidateFor(auth, request); err != nil {
 		t.Fatalf("invocation ValidateFor: %v", err)
@@ -299,6 +300,7 @@ func TestToolContractsAuthorizeInvocationAndSortedReturnedHandles(t *testing.T) 
 		PrincipalID: auth.PrincipalID, AgentID: auth.AgentID, TaskID: auth.TaskID,
 		SessionID: auth.SessionID, RequestID: auth.RequestID, ToolName: invocation.ToolName,
 		Action: invocation.Action, Relation: EvidenceReadRelation, SideEffect: invocation.SideEffect,
+		ReturnObligation:     invocation.ReturnObligation,
 		AuthorizationModelID: auth.AuthorizationModelID,
 		IdentityWatermark:    auth.IdentityWatermark, ACLWatermark: auth.ACLWatermark,
 		DelegationWatermark: auth.DelegationWatermark, AgentTaskScopeFingerprint: auth.AgentTaskScopeFingerprint,

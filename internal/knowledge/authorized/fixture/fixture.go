@@ -104,6 +104,37 @@ func (a *Application) RemoveTuple(tuple authz.Tuple) error {
 	return a.authorizer.RemoveTuple(tuple)
 }
 
+func (a *Application) Authorizer() authz.Authorizer {
+	if a == nil {
+		return nil
+	}
+	return a.authorizer
+}
+
+// EnsureBuildKnowledgeBaseEditor keeps the fake build fixture aligned with the
+// workspace-derived materialization scope. Only the fixture editor may receive
+// this deterministic test-only grant.
+func (a *Application) EnsureBuildKnowledgeBaseEditor(authorization protocol.AuthorizationContext) error {
+	if a == nil || a.authorizer == nil || authorization.PrincipalID != Alice {
+		return fmt.Errorf("fixture build editor is unavailable")
+	}
+	if err := authorization.Validate(); err != nil {
+		return err
+	}
+	organization := "organization:" + authorization.TenantID
+	knowledgeBase := "knowledge_base:" + authorization.KnowledgeBaseID
+	for _, tuple := range []authz.Tuple{
+		{User: "user:" + authorization.PrincipalID, Relation: authz.RelationMember, Object: organization},
+		{User: organization, Relation: authz.RelationOrganization, Object: knowledgeBase},
+		{User: "user:" + authorization.PrincipalID, Relation: authz.RelationEditor, Object: knowledgeBase},
+	} {
+		if err := a.authorizer.AddTuple(tuple); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func newService(
 	backend kag.PrimitiveBackend,
 	options ApplicationOptions,
@@ -162,6 +193,9 @@ func fixtureTuples() []authz.Tuple {
 		{User: "user:" + Bob, Relation: authz.RelationMember, Object: fakeSharedReaders},
 		{User: fakePrivateReaders + "#" + authz.RelationMember, Relation: authz.RelationMember, Object: fakeOrganization},
 		{User: fakeSharedReaders + "#" + authz.RelationMember, Relation: authz.RelationMember, Object: fakeOrganization},
+		{User: fakeOrganization, Relation: authz.RelationOrganization, Object: "knowledge_base:" + KnowledgeBaseID},
+		{User: "user:" + Alice, Relation: authz.RelationEditor, Object: "knowledge_base:" + KnowledgeBaseID},
+		{User: "user:" + Bob, Relation: authz.RelationViewer, Object: "knowledge_base:" + KnowledgeBaseID},
 		{User: fakeOrganization, Relation: authz.RelationOrganization, Object: intro},
 		{User: fakePrivateReaders + "#" + authz.RelationMember, Relation: authz.RelationViewer, Object: intro},
 		{User: fakeOrganization, Relation: authz.RelationOrganization, Object: canary},
