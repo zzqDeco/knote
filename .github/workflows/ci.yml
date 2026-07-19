@@ -36,6 +36,7 @@ jobs:
       - name: Go race tests
         run: |
           for package in \
+            ./cmd/knote \
             ./internal/audit \
             ./internal/authz \
             ./internal/catalog \
@@ -44,7 +45,8 @@ jobs:
             ./internal/identity \
             ./internal/policysim \
             ./internal/residency \
-            ./internal/runtime
+            ./internal/runtime \
+            ./internal/runtime/eino
           do
             KNOTE_KAG_FAKE=1 go test -race -count=1 "${package}"
           done
@@ -82,6 +84,7 @@ jobs:
 
   openfga-live:
     name: Phase 3 OpenFGA live smoke
+    needs: test
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:

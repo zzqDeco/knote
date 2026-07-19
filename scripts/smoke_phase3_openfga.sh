@@ -28,6 +28,9 @@ cleanup() {
     printf '%s\n' 'phase3 OpenFGA smoke failed: cleanup' >&2
     status=1
   fi
+  if [[ "${status}" == "0" ]]; then
+    printf '%s\n' 'phase3 OpenFGA smoke passed'
+  fi
   exit "${status}"
 }
 trap cleanup EXIT
@@ -98,5 +101,3 @@ KNOTE_OPENFGA_STORE_ID="${STORE_ID}" \
 KNOTE_OPENFGA_MODEL_ID="${MODEL_ID}" \
 KNOTE_OPENFGA_API_TOKEN="${API_TOKEN}" \
   go test -count=1 -run '^TestPhase3OpenFGALiveSmoke$' ./internal/authz
-
-printf '%s\n' 'phase3 OpenFGA smoke passed'

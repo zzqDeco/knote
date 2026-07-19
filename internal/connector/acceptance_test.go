@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/zzqDeco/knote/internal/protocol"
+	phase3contract "github.com/zzqDeco/knote/tests/phase3/contract"
 )
 
 func TestSnapshotCompletionRequiresExactDurableReconciliationBeforeProgress(t *testing.T) {
@@ -837,6 +838,9 @@ func TestResourceOwnershipRejectsCrossConnectorMutationAndPersists(t *testing.T)
 }
 
 func TestSlowConnectorCallbackDoesNotBlockAnotherTenantAndCanReadStore(t *testing.T) {
+	if phase3contract.ConnectorLagSampleCount != 1 {
+		t.Fatalf("connector lag test supports exactly one sample, contract requires %d", phase3contract.ConnectorLagSampleCount)
+	}
 	store, processor, tenantA := newTestProcessor(t, t.TempDir(), nil, RetryPolicy{}, newTestClock())
 	registration := Registration{
 		Version: ConnectorCoreVersion,
@@ -885,11 +889,11 @@ func TestSlowConnectorCallbackDoesNotBlockAnotherTenantAndCanReadStore(t *testin
 			close(release)
 			t.Fatalf("tenant B Process: %v", err)
 		}
-		if elapsed := time.Since(startedB); elapsed > 2*time.Second {
+		if elapsed := time.Since(startedB); elapsed > phase3contract.ConnectorLagMaxBudget {
 			close(release)
-			t.Fatalf("tenant B connector apply lag = %s, want at most 2s", elapsed)
+			t.Fatalf("tenant B connector apply lag = %s, want at most %s", elapsed, phase3contract.ConnectorLagMaxBudget)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(phase3contract.ConnectorLagMaxBudget):
 		close(release)
 		t.Fatal("tenant B was blocked by tenant A external callback")
 	}

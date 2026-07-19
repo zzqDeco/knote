@@ -32,7 +32,9 @@ go test -race \
   ./internal/knowledge/authorized \
   ./internal/policysim \
   ./internal/residency \
-  ./internal/runtime
+  ./internal/runtime \
+  ./internal/runtime/eino \
+  ./cmd/knote
 go vet ./...
 
 GOOS=linux GOARCH=amd64 CGO_ENABLED=0 \

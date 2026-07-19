@@ -9,6 +9,7 @@ import (
 
 	"github.com/zzqDeco/knote/internal/authz"
 	"github.com/zzqDeco/knote/internal/protocol"
+	phase3contract "github.com/zzqDeco/knote/tests/phase3/contract"
 )
 
 func TestViewDenialDoesNotReadSource(t *testing.T) {
@@ -60,6 +61,9 @@ func TestViewProjectsAuthorizedSectionsWithoutZeroSideChannels(t *testing.T) {
 }
 
 func TestViewAndRenderAreDeterministic(t *testing.T) {
+	if phase3contract.GovernanceSampleCount != 2 {
+		t.Fatalf("governance test executes two views, contract requires %d", phase3contract.GovernanceSampleCount)
+	}
 	raw := governanceTestRawSnapshot()
 	visibility := Visibility{
 		TenantStatus: true, ConnectorSummary: true, ConnectorDetails: true,
@@ -82,8 +86,8 @@ func TestViewAndRenderAreDeterministic(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if elapsed := time.Since(started); elapsed > time.Second {
-		t.Fatalf("two governance views took %s, want at most 1s", elapsed)
+	if elapsed := time.Since(started); elapsed > phase3contract.GovernanceMaxBudget {
+		t.Fatalf("two governance views took %s, want at most %s", elapsed, phase3contract.GovernanceMaxBudget)
 	}
 	if Render(first) != Render(second) {
 		t.Fatalf("governance rendering is not deterministic:\n%s\n---\n%s", Render(first), Render(second))

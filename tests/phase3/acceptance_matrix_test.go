@@ -13,6 +13,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	phase3contract "github.com/zzqDeco/knote/tests/phase3/contract"
 )
 
 const (
@@ -55,9 +57,11 @@ type expectedInvariant struct {
 }
 
 type expectedBudget struct {
-	ID         string
-	Metric     string
-	Percentile string
+	ID                 string
+	Metric             string
+	Percentile         string
+	SampleCount        int
+	BudgetMilliseconds int
 }
 
 var expectedInvariants = []expectedInvariant{
@@ -112,12 +116,12 @@ var expectedInvariants = []expectedInvariant{
 }
 
 var expectedBudgets = []expectedBudget{
-	{ID: "batch-check-latency", Metric: "openfga_batch_check", Percentile: "p99"},
-	{ID: "connector-lag", Metric: "connector_apply_lag", Percentile: "max"},
-	{ID: "governance-latency", Metric: "governance_view", Percentile: "max"},
-	{ID: "reconciliation-latency", Metric: "full_reconciliation", Percentile: "max"},
-	{ID: "replay-latency", Metric: "session_replay", Percentile: "max"},
-	{ID: "revocation-latency", Metric: "revocation_propagation", Percentile: "p99"},
+	{ID: "batch-check-latency", Metric: "openfga_batch_check", Percentile: "p99", SampleCount: phase3contract.BatchCheckSampleCount, BudgetMilliseconds: phase3contract.BatchCheckBudgetMilliseconds},
+	{ID: "connector-lag", Metric: "connector_apply_lag", Percentile: "max", SampleCount: phase3contract.ConnectorLagSampleCount, BudgetMilliseconds: phase3contract.ConnectorLagBudgetMilliseconds},
+	{ID: "governance-latency", Metric: "governance_view", Percentile: "max", SampleCount: phase3contract.GovernanceSampleCount, BudgetMilliseconds: phase3contract.GovernanceBudgetMilliseconds},
+	{ID: "reconciliation-latency", Metric: "full_reconciliation", Percentile: "max", SampleCount: phase3contract.ReconciliationSampleCount, BudgetMilliseconds: phase3contract.ReconciliationBudgetMilliseconds},
+	{ID: "replay-latency", Metric: "session_replay", Percentile: "max", SampleCount: phase3contract.ReplaySampleCount, BudgetMilliseconds: phase3contract.ReplayBudgetMilliseconds},
+	{ID: "revocation-latency", Metric: "revocation_propagation", Percentile: "p99", SampleCount: phase3contract.RevocationSampleCount, BudgetMilliseconds: phase3contract.RevocationP99BudgetMilliseconds},
 }
 
 func TestPhase3AcceptanceMatrix(t *testing.T) {
@@ -182,11 +186,12 @@ func TestPhase3AcceptanceMatrix(t *testing.T) {
 					index, budget.ID, budget.Metric, budget.Percentile,
 					expected.ID, expected.Metric, expected.Percentile)
 			}
-			if budget.SampleCount <= 0 {
-				t.Fatalf("budget %q sample_count = %d, want a positive cohort", budget.ID, budget.SampleCount)
+			if budget.SampleCount != expected.SampleCount {
+				t.Fatalf("budget %q sample_count = %d, want contract value %d", budget.ID, budget.SampleCount, expected.SampleCount)
 			}
-			if budget.BudgetMilliseconds <= 0 {
-				t.Fatalf("budget %q budget_milliseconds = %d, want a positive limit", budget.ID, budget.BudgetMilliseconds)
+			if budget.BudgetMilliseconds != expected.BudgetMilliseconds {
+				t.Fatalf("budget %q budget_milliseconds = %d, want contract value %d",
+					budget.ID, budget.BudgetMilliseconds, expected.BudgetMilliseconds)
 			}
 			if len(budget.Anchors) == 0 {
 				t.Fatalf("budget %q has no test anchors", budget.ID)
