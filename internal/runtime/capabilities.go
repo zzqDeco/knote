@@ -39,7 +39,7 @@ func (p SessionCapabilityProfile) AllowsSlashCommand(command string) bool {
 	command = strings.TrimPrefix(command, "/")
 	switch command {
 	case "build", "commit", "release", "checkout",
-		"tasks", "clear", "new", "resume", "help", "exit":
+		"tasks", "governance", "clear", "new", "resume", "help", "exit":
 		return true
 	default:
 		return false

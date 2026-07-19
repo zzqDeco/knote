@@ -21,7 +21,7 @@ type gitClient struct {
 }
 
 var knowledgePaths = []string{".knote/config.yaml", "sources", "artifacts", "evals"}
-var runtimeOnlyPaths = []string{".knote/sessions", ".knote/cache", ".knote/checkpoints", ".knote/kag-runtime", ".knote/projections"}
+var runtimeOnlyPaths = []string{".knote/sessions", ".knote/cache", ".knote/checkpoints", ".knote/kag-runtime", ".knote/projections", ".knote/audit"}
 
 func (c gitClient) Branch(ctx context.Context) string {
 	out, err := c.git(ctx, "branch", "--show-current")

@@ -85,6 +85,16 @@ func newRuntime(ctx context.Context, workspacePath string, resumeID string) (run
 	if err != nil {
 		return nil, nil, err
 	}
+	if permissionedConfig.Enabled {
+		permissionedConfig.residency, err = newPermissionedResidencyBoundary()
+		if err != nil {
+			return nil, nil, err
+		}
+		permissionedConfig.audit, err = newPermissionedAuditRecorder(workspace, permissionedConfig.residency)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
 	kagClient := kag.Client{
 		AdapterPath:          repoCfg.KAG.AdapterPath,
 		Workspace:            workspace,
@@ -97,6 +107,9 @@ func newRuntime(ctx context.Context, workspacePath string, resumeID string) (run
 		RuntimeDir:           repoCfg.KAG.RuntimeDir,
 		PermissionedProvider: permissionedConfig.Provider,
 	}
+	if permissionedConfig.residency != nil {
+		kagClient.ProcessingResidency = permissionedConfig.residency.AuthorizeKAGProcessing
+	}
 	knowledgeService := versioned.New(versioned.Options{Workspace: workspace, Repo: repo, Versions: repo, Backend: kagClient, Mode: knowledgeMode})
 	permissionedApplication, err := newPermissionedApplication(ctx, permissionedConfig, kagClient, repo)
 	if err != nil {
@@ -107,6 +120,7 @@ func newRuntime(ctx context.Context, workspacePath string, resumeID string) (run
 	var modelToolAuthorizationValidator runtimeeino.ToolAuthorizationValidator
 	var permissionedQuery einotools.PermissionedQuery
 	var protectedContentAuthorizer runtime.ProtectedContentAuthorizer
+	var governanceProvider runtime.GovernanceProvider
 	var permissionedScopeRefresh func(context.Context) error
 	var permissionedSessionRebind func(context.Context, string) error
 	var rt *runtime.Manager
@@ -127,6 +141,10 @@ func newRuntime(ctx context.Context, workspacePath string, resumeID string) (run
 			}, nil
 		}
 		protectedContentAuthorizer = permissionedApplication.AuthorizeProtectedContent
+		governanceProvider, err = newGovernanceProvider(permissionedApplication)
+		if err != nil {
+			return nil, nil, err
+		}
 		if !permissionedConfig.Fake {
 			permissionedScopeRefresh = permissionedApplication.RefreshAuthorizationScope
 			permissionedSessionRebind = func(ctx context.Context, sessionID string) error {
@@ -194,6 +212,7 @@ func newRuntime(ctx context.Context, workspacePath string, resumeID string) (run
 		EinoRunner:                   einoRunner,
 		AuthorizationContextProvider: authorizationProvider,
 		ProtectedContentAuthorizer:   protectedContentAuthorizer,
+		Governance:                   governanceProvider,
 		SideEffects:                  sideEffects,
 		ToolExecutor:                 toolExecutor,
 		NewSessionID:                 local.NewSessionID,

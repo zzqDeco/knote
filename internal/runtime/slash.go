@@ -75,6 +75,8 @@ func (m *Manager) routeSlash(ctx context.Context, sessionID string, cmd string, 
 		return m.status(sessionID, ctx)
 	case "tasks":
 		return []protocol.Event{protocol.NewEvent(protocol.EventTaskProgress, sessionID, "tasks", []protocol.Task{})}
+	case "governance":
+		return m.governanceView(ctx, sessionID)
 	case "clear":
 		return []protocol.Event{protocol.NewEvent(protocol.EventViewClear, sessionID, "view cleared", nil)}
 	case "details":
@@ -539,6 +541,7 @@ var slashHelpEntries = []slashHelpEntry{
 	{command: "release", description: "tag a release version"},
 	{command: "checkout", description: "checkout a version or branch"},
 	{command: "tasks", description: "show runtime tasks"},
+	{command: "governance", description: "show authorized governance status"},
 	{command: "status", description: "show git status"},
 	{command: "clear", description: "clear the current TUI transcript view"},
 	{command: "new", description: "start a new session"},

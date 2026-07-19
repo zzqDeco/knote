@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/zzqDeco/knote/internal/governance"
 	"github.com/zzqDeco/knote/internal/knowledge/versioned"
 	"github.com/zzqDeco/knote/internal/protocol"
 	"github.com/zzqDeco/knote/internal/repository"
@@ -43,6 +44,7 @@ type Dependencies struct {
 	ProtectedContentAuthorizer   ProtectedContentAuthorizer
 	SideEffects                  *SideEffectBridge
 	ToolExecutor                 ToolExecutor
+	Governance                   GovernanceProvider
 	NewSessionID                 func() string
 }
 
@@ -84,6 +86,10 @@ type RunnerToolInfo struct {
 
 type ToolExecutor interface {
 	Invoke(ctx context.Context, sessionID string, toolName string, argumentsInJSON string) ([]protocol.Event, error)
+}
+
+type GovernanceProvider interface {
+	View(context.Context, protocol.AuthorizationContext) (governance.Snapshot, error)
 }
 
 type EventSubscriber func([]protocol.Event)

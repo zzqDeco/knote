@@ -3,6 +3,7 @@ bin/
 dist/
 coverage.out
 .knote/cache/
+.knote/audit/
 .knote/checkpoints/
 .knote/kag-runtime/
 .knote/projections/

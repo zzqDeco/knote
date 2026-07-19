@@ -56,15 +56,20 @@ type permissionedRuntimeConfig struct {
 	Consistency         protocol.ConsistencyPreference
 	identity            *permissionedIdentitySession
 	membershipPublisher permissionedMembershipPublisher
+	residency           *permissionedResidencyBoundary
+	audit               *permissionedAuditRecorder
 }
 
 type permissionedApplication struct {
 	service               *authorized.Service
 	fixture               *fixture.Application
+	authorizer            authz.Authorizer
 	authorizationProvider runtime.AuthorizationContextProvider
 	toolAuthorizationGate *authz.ToolAuthorizationGate
 	revisionState         *permissionedRevisionState
 	identity              *permissionedIdentitySession
+	residency             *permissionedResidencyBoundary
+	audit                 *permissionedAuditRecorder
 }
 
 func loadPermissionedRuntimeConfig(fake bool) (permissionedRuntimeConfig, error) {
@@ -171,11 +176,23 @@ func newPermissionedApplication(
 	if !config.Enabled {
 		return nil, nil
 	}
+	residencyBoundary := config.residency
+	if residencyBoundary == nil {
+		var err error
+		residencyBoundary, err = newPermissionedResidencyBoundary()
+		if err != nil {
+			return nil, err
+		}
+		config.residency = residencyBoundary
+	}
 	cache, err := authorized.NewQueryCache(permissionedQueryCacheSize)
 	if err != nil {
 		return nil, err
 	}
-	telemetrySink := newPermissionedTelemetrySink(config.TelemetryPath)
+	telemetrySink := newPermissionedTelemetrySinkWithResidency(
+		config.TelemetryPath,
+		residencyBoundary.AuthorizeTelemetryStore,
+	)
 	if config.Fake {
 		application, err := fixture.NewApplication(backend, fixture.ApplicationOptions{
 			Cache: cache, RetrieverVersion: permissionedRetrieverVersion, PromptVersion: permissionedPromptVersion,
@@ -185,7 +202,8 @@ func newPermissionedApplication(
 			return nil, err
 		}
 		result := &permissionedApplication{
-			service: application.Service, fixture: application,
+			service: application.Service, fixture: application, authorizer: application.Authorizer(),
+			residency: residencyBoundary, audit: config.audit,
 			authorizationProvider: func(ctx context.Context, sessionID string) (protocol.AuthorizationContext, error) {
 				if err := ctx.Err(); err != nil {
 					return protocol.AuthorizationContext{}, err
@@ -195,7 +213,7 @@ func newPermissionedApplication(
 		}
 		result.toolAuthorizationGate, err = newPermissionedToolAuthorizationGate(
 			application.Authorizer(), nil, result.AuthorizeProtectedContent,
-			newPermissionedToolInvocationDeniedHandler(telemetrySink),
+			newPermissionedToolInvocationDeniedHandlerWithAudit(telemetrySink, config.audit),
 		)
 		if err != nil {
 			return nil, err
@@ -270,11 +288,12 @@ func newPermissionedApplication(
 		return nil, fmt.Errorf("validate permissioned authorization context: %w", err)
 	}
 	result := &permissionedApplication{
-		service: service, authorizationProvider: provider, revisionState: revisionState, identity: identitySession,
+		service: service, authorizer: authorizer, authorizationProvider: provider, revisionState: revisionState,
+		identity: identitySession, residency: residencyBoundary, audit: config.audit,
 	}
 	result.toolAuthorizationGate, err = newPermissionedToolAuthorizationGate(
 		authorizer, result.validateIdentityAuthorization, result.AuthorizeProtectedContent,
-		newPermissionedToolInvocationDeniedHandler(telemetrySink),
+		newPermissionedToolInvocationDeniedHandlerWithAudit(telemetrySink, config.audit),
 	)
 	if err != nil {
 		return nil, err
@@ -434,6 +453,13 @@ func (a *permissionedApplication) ToolAuthorizationGate() *authz.ToolAuthorizati
 		return nil
 	}
 	return a.toolAuthorizationGate
+}
+
+func (a *permissionedApplication) GovernanceAuthorizer() authz.Authorizer {
+	if a == nil {
+		return nil
+	}
+	return a.authorizer
 }
 
 func (a *permissionedApplication) PrepareFakeBuildAuthorization(authorization protocol.AuthorizationContext) error {

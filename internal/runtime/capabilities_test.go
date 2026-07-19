@@ -23,6 +23,7 @@ func TestSessionCapabilityProfiles(t *testing.T) {
 		{command: "release", permissionedAllowed: true},
 		{command: "checkout", permissionedAllowed: true},
 		{command: "tasks", permissionedAllowed: true},
+		{command: "governance", permissionedAllowed: true},
 		{command: "clear", permissionedAllowed: true},
 		{command: "new", permissionedAllowed: true},
 		{command: "resume", permissionedAllowed: true},

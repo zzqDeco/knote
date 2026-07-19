@@ -28,6 +28,7 @@ type Client struct {
 	Language             string
 	RuntimeDir           string
 	PermissionedProvider string
+	ProcessingResidency  func(context.Context, string) error
 }
 
 type Request struct {
@@ -193,6 +194,11 @@ func (c Client) params(extra map[string]any) map[string]any {
 }
 
 func (c Client) call(ctx context.Context, method string, params map[string]any) (Response, error) {
+	if method != "kag.health" && c.ProcessingResidency != nil {
+		if err := c.ProcessingResidency(ctx, method); err != nil {
+			return Response{}, fmt.Errorf("kag processing residency denied: %w", err)
+		}
+	}
 	path := c.resolveAdapterPath()
 	req := Request{
 		ID:     fmt.Sprintf("req_%d", time.Now().UnixNano()),
