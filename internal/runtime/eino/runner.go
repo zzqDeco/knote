@@ -15,34 +15,47 @@ import (
 )
 
 type Options struct {
-	Tools           []einotool.InvokableTool
-	Agent           adk.Agent
-	Executor        QueryExecutor
-	EnableStreaming bool
-	CheckPointStore adk.CheckPointStore
+	Tools                      []einotool.InvokableTool
+	Agent                      adk.Agent
+	Executor                   QueryExecutor
+	ToolAuthorizationValidator ToolAuthorizationValidator
+	EnableStreaming            bool
+	CheckPointStore            adk.CheckPointStore
 }
 
 type Runner struct {
-	tools           []einotool.InvokableTool
-	agent           adk.Agent
-	executor        QueryExecutor
-	enableStreaming bool
-	checkPointStore adk.CheckPointStore
+	tools                      []einotool.InvokableTool
+	agent                      adk.Agent
+	executor                   QueryExecutor
+	toolAuthorizationValidator ToolAuthorizationValidator
+	enableStreaming            bool
+	checkPointStore            adk.CheckPointStore
 }
 
 type QueryExecutor interface {
 	Run(ctx context.Context, messages []*schema.Message) ([]*adk.AgentEvent, error)
 }
 
+type ToolAuthorizationValidator interface {
+	ValidateProtectedResultEnvelope(
+		context.Context,
+		protocol.AuthorizationContext,
+		string,
+		protocol.ToolAuthorizationEnvelope,
+		protocol.ProtectedContentBinding,
+	) error
+}
+
 var _ runtime.EinoRunner = (*Runner)(nil)
 
 func NewRunner(opts Options) *Runner {
 	return &Runner{
-		tools:           append([]einotool.InvokableTool(nil), opts.Tools...),
-		agent:           opts.Agent,
-		executor:        opts.Executor,
-		enableStreaming: opts.EnableStreaming,
-		checkPointStore: opts.CheckPointStore,
+		tools:                      append([]einotool.InvokableTool(nil), opts.Tools...),
+		agent:                      opts.Agent,
+		executor:                   opts.Executor,
+		toolAuthorizationValidator: opts.ToolAuthorizationValidator,
+		enableStreaming:            opts.EnableStreaming,
+		checkPointStore:            opts.CheckPointStore,
 	}
 }
 
@@ -86,15 +99,30 @@ func (r *Runner) Run(ctx context.Context, input runtime.EinoRunInput) ([]protoco
 	messages := transcriptMessages(input.History)
 	messages = append(messages, schema.UserMessage(text))
 	events := []protocol.Event{protocol.NewEvent(protocol.EventAssistantStart, input.SessionID, "eino runner started", nil)}
-	agentEvents, err := executor.Run(ctx, messages)
 	_, permissionedContext := protocol.AuthorizationContextFrom(ctx)
+	executionContext := ctx
+	var modelAuthorizationState *modelToolAuthorizationState
+	if permissionedContext {
+		var stateErr error
+		executionContext, modelAuthorizationState, stateErr = withModelToolAuthorizationState(
+			ctx, r.toolAuthorizationValidator,
+		)
+		if stateErr != nil {
+			generic := fmt.Errorf("%s", protectedContentUnavailableMessage)
+			events = append(events, protocol.NewEvent(protocol.EventError, input.SessionID, generic.Error(), nil))
+			return events, generic
+		}
+	}
+	agentEvents, err := executor.Run(executionContext, messages)
 	if err != nil && permissionedContext {
 		if errors.Is(err, runtime.ErrSideEffectPending) {
 			return events, runtime.ErrSideEffectPending
 		}
 		return events, fmt.Errorf("%s", protectedContentUnavailableMessage)
 	}
-	binding, permissioned, bindingErr := protectedBindingFromAgentEvents(ctx, agentEvents)
+	binding, permissioned, bindingErr := protectedBindingFromAgentEvents(
+		executionContext, agentEvents, r.toolAuthorizationValidator, modelAuthorizationState,
+	)
 	if bindingErr != nil {
 		generic := fmt.Errorf("%s", protectedContentUnavailableMessage)
 		events = append(events, protocol.NewEvent(protocol.EventError, input.SessionID, generic.Error(), nil))
@@ -136,6 +164,8 @@ func (r *Runner) Run(ctx context.Context, input runtime.EinoRunInput) ([]protoco
 func protectedBindingFromAgentEvents(
 	ctx context.Context,
 	events []*adk.AgentEvent,
+	authorizationValidator ToolAuthorizationValidator,
+	modelAuthorizationState *modelToolAuthorizationState,
 ) (*protocol.ProtectedContentBinding, bool, error) {
 	authorization, authorized := protocol.AuthorizationContextFrom(ctx)
 	var packages []protocol.EvidencePackage
@@ -167,8 +197,27 @@ func protectedBindingFromAgentEvents(
 		if !authorized {
 			return nil, true, errors.New("permissioned tool output requires authorization")
 		}
+		if authorizationValidator == nil {
+			return nil, true, errors.New("permissioned tool authorization validator is unavailable")
+		}
+		if modelAuthorizationState == nil {
+			return nil, true, errors.New("permissioned model authorization state is unavailable")
+		}
+		envelope, err := modelAuthorizationState.consume(toolName, content)
+		if err != nil {
+			return nil, true, err
+		}
 		evidencePackage, err := decodeEvidencePackage(content)
 		if err != nil {
+			return nil, true, err
+		}
+		resultBinding, err := protocol.NewProtectedContentBinding(authorization, evidencePackage)
+		if err != nil {
+			return nil, true, err
+		}
+		if err := authorizationValidator.ValidateProtectedResultEnvelope(
+			ctx, authorization, toolName, envelope, resultBinding,
+		); err != nil {
 			return nil, true, err
 		}
 		packages = append(packages, evidencePackage)

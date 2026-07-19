@@ -12,8 +12,20 @@ import (
 	runtimeeino "github.com/zzqDeco/knote/internal/runtime/eino"
 )
 
-func newEinoRunner(ctx context.Context, cfg repository.Config, tools []einotool.InvokableTool) (*runtimeeino.Runner, error) {
-	opts := runtimeeino.Options{Tools: tools}
+func newEinoRunner(
+	ctx context.Context,
+	cfg repository.Config,
+	tools []einotool.InvokableTool,
+	authorizationValidator runtimeeino.ToolAuthorizationValidator,
+) (*runtimeeino.Runner, error) {
+	preparedTools, err := runtimeeino.PrepareModelTools(tools)
+	if err != nil {
+		return nil, err
+	}
+	opts := runtimeeino.Options{
+		Tools:                      preparedTools,
+		ToolAuthorizationValidator: authorizationValidator,
+	}
 	profile, err := selectEinoModelProfile(cfg)
 	if err != nil {
 		return nil, err
@@ -25,7 +37,7 @@ func newEinoRunner(ctx context.Context, cfg repository.Config, tools []einotool.
 		BaseURLOverride:  firstEnv("KNOTE_EINO_BASE_URL", "OPENAI_BASE_URL"),
 		APIKey:           firstEnv("KNOTE_EINO_API_KEY", "OPENAI_API_KEY"),
 		ReasoningEffort:  firstEnv("KNOTE_EINO_REASONING_EFFORT", "OPENAI_REASONING_EFFORT"),
-		Tools:            tools,
+		Tools:            preparedTools,
 	})
 	if err != nil {
 		return nil, err

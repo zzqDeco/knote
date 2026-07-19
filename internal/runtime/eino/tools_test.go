@@ -2,10 +2,12 @@ package eino
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	einotool "github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/schema"
@@ -108,7 +110,10 @@ func TestToolExecutorBindsPermissionedEvidenceAndAnswerToOneBlock(t *testing.T) 
 	authorization := testEinoAuthorization("sess_eino")
 	evidencePackage := testEinoEvidencePackage(t, authorization, "sources/allowed.md", "AUTHORIZED_CONTENT_CANARY")
 	executor := NewToolExecutor([]einotool.InvokableTool{
-		staticTool{name: einotools.NameQuery, out: testPermissionedToolOutput(t, evidencePackage, "AUTHORIZED_ANSWER_CANARY")},
+		testAuthorizedStaticTool(t, authorization, staticTool{
+			name: einotools.NameQuery,
+			out:  testPermissionedToolOutput(t, evidencePackage, "AUTHORIZED_ANSWER_CANARY"),
+		}, evidencePackage),
 	})
 	ctx, err := protocol.WithAuthorizationContext(context.Background(), authorization)
 	if err != nil {
@@ -137,31 +142,54 @@ func TestToolExecutorBindsPermissionedEvidenceAndAnswerToOneBlock(t *testing.T) 
 	if bound != 3 || len(events[1].ProtectedContent.Resources) != 1 {
 		t.Fatalf("permissioned bound events = %d in %+v", bound, events)
 	}
+	encodedEvents, err := json.Marshal(events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encodedEvents), `"tool_authorization"`) {
+		t.Fatalf("permissioned events leaked the full tool authorization envelope: %s", encodedEvents)
+	}
 }
 
 func TestToolExecutorFailsPermissionedCallsClosedWithoutLeakingBackendDetails(t *testing.T) {
 	authorization := testEinoAuthorization("sess_eino")
+	evidencePackage := testEinoEvidencePackage(t, authorization, "sources/authorization.md", "AUTHORIZATION_CONTENT_CANARY")
 	ctx, err := protocol.WithAuthorizationContext(context.Background(), authorization)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, test := range []struct {
-		name string
-		tool staticTool
+		name     string
+		tool     einotool.InvokableTool
+		toolName string
 	}{
-		{name: "missing evidence", tool: staticTool{name: einotools.NameQuery, out: `{"answer":"MALFORMED_OUTPUT_CANARY"}`}},
-		{name: "backend error", tool: staticTool{name: einotools.NameExplain, err: errors.New("BACKEND_ERROR_CANARY")}},
 		{
-			name: "adapter error with evidence",
-			tool: staticTool{
+			name:     "missing evidence",
+			toolName: einotools.NameQuery,
+			tool: testAuthorizedStaticTool(t, authorization, staticTool{
+				name: einotools.NameQuery, out: `{"answer":"MALFORMED_OUTPUT_CANARY"}`,
+			}, evidencePackage),
+		},
+		{
+			name:     "backend error",
+			toolName: einotools.NameExplain,
+			tool: authorizedStaticTool{
+				staticTool:     staticTool{name: einotools.NameExplain, err: errors.New("BACKEND_ERROR_CANARY")},
+				manifestDigest: testToolManifestDigest,
+			},
+		},
+		{
+			name:     "adapter error with evidence",
+			toolName: einotools.NameQuery,
+			tool: testAuthorizedStaticTool(t, authorization, staticTool{
 				name: einotools.NameQuery,
 				out:  testPermissionedToolFailureOutput(t, testEinoEvidencePackage(t, authorization, "sources/adapter-error.md", "ADAPTER_CONTENT_CANARY"), "ADAPTER_ERROR_CANARY"),
-			},
+			}, testEinoEvidencePackage(t, authorization, "sources/adapter-error.md", "ADAPTER_CONTENT_CANARY")),
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			executor := NewToolExecutor([]einotool.InvokableTool{test.tool})
-			events, err := executor.Invoke(ctx, authorization.SessionID, test.tool.name, `{}`)
+			events, err := executor.Invoke(ctx, authorization.SessionID, test.toolName, `{}`)
 			if err == nil || err.Error() != protectedContentUnavailableMessage {
 				t.Fatalf("permissioned tool error = %v, events=%+v", err, events)
 			}
@@ -192,6 +220,117 @@ func TestToolExecutorRejectsPermissionedOutputWithoutAuthorizationContext(t *tes
 	}
 }
 
+func TestPreparedModelToolKeepsAuthorizationEnvelopeOffProviderPath(t *testing.T) {
+	authorization := testEinoAuthorization("sess_model_tool_envelope")
+	evidence := testEinoEvidencePackage(
+		t, authorization, "sources/model-tool.md", "MODEL_TOOL_CONTENT_CANARY",
+	)
+	tool := testAuthorizedStaticTool(t, authorization, staticTool{
+		name: einotools.NameQuery,
+		out:  testPermissionedToolOutput(t, evidence, "MODEL_TOOL_ANSWER_CANARY"),
+	}, evidence)
+	prepared, err := PrepareModelTools([]einotool.InvokableTool{tool})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(prepared) != 1 {
+		t.Fatalf("prepared model tools = %d", len(prepared))
+	}
+	ctx, err := protocol.WithAuthorizationContext(context.Background(), authorization)
+	if err != nil {
+		t.Fatal(err)
+	}
+	validator := testEinoToolAuthorizationValidator(t)
+	ctx, state, err := withModelToolAuthorizationState(ctx, validator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, err := prepared[0].InvokableRun(ctx, `{}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{
+		`"tool_authorization"`, `"authorization_correlation_id"`, `"authorization_manifest_digest"`,
+	} {
+		if strings.Contains(output, forbidden) {
+			t.Fatalf("model-visible tool output contains %s: %s", forbidden, output)
+		}
+	}
+	if !strings.Contains(output, `"`+modelToolAuthorizationTokenField+`"`) {
+		t.Fatalf("model-visible tool output has no one-use authorization token: %s", output)
+	}
+	envelope, err := state.consume(einotools.NameQuery, output)
+	if err != nil {
+		t.Fatalf("consume internal authorization envelope: %v", err)
+	}
+	binding, err := protocol.NewProtectedContentBinding(authorization, evidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validator.ValidateProtectedResultEnvelope(
+		ctx, authorization, einotools.NameQuery, envelope, binding,
+	); err != nil {
+		t.Fatalf("validate internal authorization envelope: %v", err)
+	}
+	if _, err := state.consume(einotools.NameQuery, output); err == nil {
+		t.Fatal("model authorization token was replayed")
+	}
+}
+
+func TestToolExecutorRejectsUnwrappedAndUnknownToolsBeforeInvocation(t *testing.T) {
+	authorization := testEinoAuthorization("sess_tool_registration")
+	ctx, err := protocol.WithAuthorizationContext(context.Background(), authorization)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runs := 0
+	executor := NewToolExecutor([]einotool.InvokableTool{
+		staticTool{
+			name: einotools.NameQuery,
+			out:  `{"answer":"UNWRAPPED_RESULT_CANARY"}`,
+			runs: &runs,
+		},
+	})
+
+	for _, toolName := range []string{einotools.NameQuery, "knote_unknown"} {
+		events, err := executor.Invoke(ctx, authorization.SessionID, toolName, `{}`)
+		if err == nil || err.Error() != protectedContentUnavailableMessage {
+			t.Fatalf("%s authorization error = %v, events=%+v", toolName, err, events)
+		}
+		if strings.Contains(fmt.Sprint(events), "CANARY") {
+			t.Fatalf("%s leaked unwrapped tool output: %+v", toolName, events)
+		}
+	}
+	if runs != 0 {
+		t.Fatalf("unwrapped protected tool ran %d times", runs)
+	}
+}
+
+func TestToolExecutorSuppressesStaleAuthorizationEnvelope(t *testing.T) {
+	stale := testEinoAuthorization("sess_stale_tool_authorization")
+	evidencePackage := testEinoEvidencePackage(t, stale, "sources/stale.md", "STALE_CONTENT_CANARY")
+	tool := testAuthorizedStaticTool(t, stale, staticTool{
+		name: einotools.NameQuery,
+		out:  testPermissionedToolOutput(t, evidencePackage, "STALE_ANSWER_CANARY"),
+	}, evidencePackage)
+	current := stale
+	current.RequestID = "request-2"
+	ctx, err := protocol.WithAuthorizationContext(context.Background(), current)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	events, err := NewToolExecutor([]einotool.InvokableTool{tool}).Invoke(
+		ctx, current.SessionID, einotools.NameQuery, `{}`,
+	)
+	if err == nil || err.Error() != protectedContentUnavailableMessage {
+		t.Fatalf("stale authorization error = %v, events=%+v", err, events)
+	}
+	if strings.Contains(fmt.Sprint(events), "CANARY") {
+		t.Fatalf("stale authorization leaked protected output: %+v", events)
+	}
+}
+
 func TestPermissionedSideEffectOutputsHaveFixedShapes(t *testing.T) {
 	authorization := testEinoAuthorization("sess_side_effect_shapes")
 	ctx, err := protocol.WithAuthorizationContext(context.Background(), authorization)
@@ -217,7 +356,7 @@ func TestPermissionedSideEffectOutputsHaveFixedShapes(t *testing.T) {
 	}
 	for _, test := range successes {
 		t.Run(test.tool, func(t *testing.T) {
-			executor := NewToolExecutor([]einotool.InvokableTool{staticTool{name: test.tool, out: test.output}})
+			executor := NewToolExecutor([]einotool.InvokableTool{testAuthorizedStaticTool(t, authorization, staticTool{name: test.tool, out: test.output})})
 			events, err := executor.Invoke(ctx, authorization.SessionID, test.tool, `{}`)
 			if err != nil {
 				t.Fatal(err)
@@ -239,7 +378,8 @@ func TestPermissionedSideEffectOutputsHaveFixedShapes(t *testing.T) {
 		{name: "adapter error", tool: staticTool{name: einotools.NameBuild, out: `{"adapter_error":"ADAPTER_KAG_CANARY","manifest":{"path":"PRIVATE_PATH_CANARY"}}`}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			executor := NewToolExecutor([]einotool.InvokableTool{test.tool})
+			tool := testAuthorizedStaticTool(t, authorization, test.tool)
+			executor := NewToolExecutor([]einotool.InvokableTool{tool})
 			events, err := executor.Invoke(ctx, authorization.SessionID, test.tool.name, `{}`)
 			if err == nil || err.Error() != permissionedSideEffectFailureMessage {
 				t.Fatalf("permissioned side-effect failure = %v, events=%+v", err, events)
@@ -278,7 +418,8 @@ func TestPermissionedSlashBuildConfirmationKeepsSideEffectResultsFixed(t *testin
 			workspace := t.TempDir()
 			store := local.New(workspace)
 			bridge := runtime.NewSideEffectBridge()
-			executor := NewToolExecutor([]einotool.InvokableTool{test.tool})
+			tool := testAuthorizedStaticTool(t, testEinoAuthorization("sess_permissioned_slash_build"), test.tool)
+			executor := NewToolExecutor([]einotool.InvokableTool{tool})
 			providerCalls := 0
 			manager := runtime.New(runtime.Dependencies{
 				Workspace:    workspace,
@@ -344,14 +485,22 @@ func assertFixedPermissionedSideEffectEvents(t *testing.T, events []protocol.Eve
 	if len(events) != len(eventTypes) {
 		t.Fatalf("permissioned side-effect event count = %d, want %d: %+v", len(events), len(eventTypes), events)
 	}
+	wantReferences := len(eventTypes) > 0 && eventTypes[len(eventTypes)-1] != protocol.EventError
 	for index, eventType := range eventTypes {
 		event := events[index]
 		if event.Type != eventType {
 			t.Fatalf("permissioned side-effect event[%d] = %s, want %s: %+v", index, event.Type, eventType, events)
 		}
 		payload, ok := event.Payload.(map[string]string)
-		if !ok || len(payload) != 1 || payload["tool"] != toolName {
+		if !ok || payload["tool"] != toolName {
 			t.Fatalf("permissioned side-effect payload[%d] = %#v", index, event.Payload)
+		}
+		if wantReferences && (len(payload) != 3 || payload["authorization_correlation_id"] == "" ||
+			payload["authorization_manifest_digest"] != testToolManifestDigest) {
+			t.Fatalf("permissioned side-effect reference payload[%d] = %#v", index, event.Payload)
+		}
+		if !wantReferences && len(payload) != 1 {
+			t.Fatalf("permissioned side-effect failure payload[%d] = %#v", index, event.Payload)
 		}
 	}
 }
@@ -376,6 +525,7 @@ type staticTool struct {
 	name string
 	out  string
 	err  error
+	runs *int
 }
 
 func (t staticTool) Info(context.Context) (*schema.ToolInfo, error) {
@@ -383,7 +533,121 @@ func (t staticTool) Info(context.Context) (*schema.ToolInfo, error) {
 }
 
 func (t staticTool) InvokableRun(context.Context, string, ...einotool.Option) (string, error) {
+	if t.runs != nil {
+		*t.runs++
+	}
 	return t.out, t.err
+}
+
+type authorizedStaticTool struct {
+	staticTool
+	manifestDigest string
+}
+
+func (t authorizedStaticTool) ToolAuthorizationManifestDigest() string {
+	return t.manifestDigest
+}
+
+var testToolManifestDigest = func() string {
+	registry, err := einotools.NewPermissionedAuthorizationManifestRegistry()
+	if err != nil {
+		panic(err)
+	}
+	return registry.Digest()
+}()
+
+func testAuthorizedStaticTool(
+	t *testing.T,
+	authorization protocol.AuthorizationContext,
+	tool staticTool,
+	authorizationEvidence ...protocol.EvidencePackage,
+) authorizedStaticTool {
+	t.Helper()
+	if tool.err == nil {
+		tool.out = testToolOutputWithAuthorization(t, authorization, tool.name, tool.out, authorizationEvidence...)
+	}
+	return authorizedStaticTool{staticTool: tool, manifestDigest: testToolManifestDigest}
+}
+
+func testToolOutputWithAuthorization(
+	t *testing.T,
+	authorization protocol.AuthorizationContext,
+	toolName string,
+	output string,
+	authorizationEvidence ...protocol.EvidencePackage,
+) string {
+	t.Helper()
+	manifest := testToolAuthorizationManifest(t, toolName)
+	checkedAt := time.Unix(1, 0).UTC()
+	correlationID := "tool-authorization-" + strings.TrimPrefix(toolName, "knote_")
+	invocation := protocol.ToolInvocationAuthorization{
+		Version: protocol.ToolAuthorizationContractVersion, CorrelationID: correlationID,
+		TenantID: authorization.TenantID, KnowledgeBaseID: authorization.KnowledgeBaseID,
+		PrincipalID: authorization.PrincipalID, AgentID: authorization.AgentID, TaskID: authorization.TaskID,
+		SessionID: authorization.SessionID, RequestID: authorization.RequestID,
+		ToolName: manifest.ToolName, Action: manifest.Action, Relation: manifest.Relation,
+		AuthorizationModelID: authorization.AuthorizationModelID,
+		IdentityWatermark:    authorization.IdentityWatermark, ACLWatermark: authorization.ACLWatermark,
+		DelegationWatermark:       authorization.DelegationWatermark,
+		AgentTaskScopeFingerprint: authorization.AgentTaskScopeFingerprint,
+		SideEffect:                manifest.SideEffect, ReturnObligation: manifest.ReturnObligation,
+		Outcome: protocol.DecisionAllow, Consistency: authorization.Consistency, CheckedAt: checkedAt,
+	}
+	result := protocol.ToolResultAuthorization{
+		Version: protocol.ToolAuthorizationContractVersion, CorrelationID: correlationID,
+		TenantID: authorization.TenantID, KnowledgeBaseID: authorization.KnowledgeBaseID,
+		PrincipalID: authorization.PrincipalID, AgentID: authorization.AgentID, TaskID: authorization.TaskID,
+		SessionID: authorization.SessionID, RequestID: authorization.RequestID,
+		ToolName: manifest.ToolName, Action: manifest.Action, Relation: manifest.Relation,
+		SideEffect: manifest.SideEffect, ReturnObligation: manifest.ReturnObligation,
+		AuthorizationModelID: authorization.AuthorizationModelID,
+		IdentityWatermark:    authorization.IdentityWatermark, ACLWatermark: authorization.ACLWatermark,
+		DelegationWatermark:       authorization.DelegationWatermark,
+		AgentTaskScopeFingerprint: authorization.AgentTaskScopeFingerprint,
+	}
+	for _, evidencePackage := range authorizationEvidence {
+		for _, decision := range evidencePackage.Decisions {
+			result.Resources = append(result.Resources, decision.Resource)
+			result.Decisions = append(result.Decisions, decision)
+		}
+	}
+	envelope := protocol.ToolAuthorizationEnvelope{
+		Version: protocol.ToolAuthorizationContractVersion, ManifestDigest: testToolManifestDigest,
+		Invocation: invocation, Result: result,
+	}
+	if err := envelope.ValidateFor(authorization, manifest); err != nil {
+		t.Fatalf("test tool authorization envelope is invalid: %v", err)
+	}
+	fields := map[string]any{}
+	if err := json.Unmarshal([]byte(output), &fields); err != nil {
+		t.Fatalf("decode test tool output: %v", err)
+	}
+	fields["tool_authorization"] = envelope
+	encoded, err := json.Marshal(fields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(encoded)
+}
+
+func testToolAuthorizationManifest(t *testing.T, toolName string) protocol.ToolAuthorizationManifest {
+	t.Helper()
+	manifest := protocol.ToolAuthorizationManifest{
+		Version:          protocol.ToolAuthorizationContractVersion,
+		ToolName:         toolName,
+		Action:           strings.TrimPrefix(toolName, "knote_"),
+		Relation:         "can_view",
+		ReturnObligation: protocol.ToolReturnEvidence,
+	}
+	if sideEffectToolName(toolName) {
+		manifest.Relation = "can_edit"
+		manifest.SideEffect = true
+		manifest.ReturnObligation = protocol.ToolReturnNone
+	}
+	if err := manifest.Validate(); err != nil {
+		t.Fatalf("test tool authorization manifest is invalid: %v", err)
+	}
+	return manifest
 }
 
 func hasToolEvent(events []protocol.Event, eventType protocol.EventType) bool {

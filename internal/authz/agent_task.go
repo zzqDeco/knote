@@ -21,13 +21,18 @@ type AgentTaskScope struct {
 
 func validateAgentTaskScope(user, relation, object, modelID string, scope *AgentTaskScope) error {
 	if scope == nil {
-		if relation == RelationCanViewInTask {
-			return fmt.Errorf("%w: %s is internal to scoped authorization requests", ErrInvalidRequest, RelationCanViewInTask)
+		if relation == RelationCanViewInTask || relation == RelationCanEditInTask {
+			return fmt.Errorf("%w: %s is internal to scoped authorization requests", ErrInvalidRequest, relation)
 		}
 		return nil
 	}
-	if relation != RelationCanView {
-		return fmt.Errorf("%w: agent/task scope requires relation %q", ErrInvalidRequest, RelationCanView)
+	if relation != RelationCanView && relation != RelationCanEdit {
+		return fmt.Errorf(
+			"%w: agent/task scope requires relation %q or %q",
+			ErrInvalidRequest,
+			RelationCanView,
+			RelationCanEdit,
+		)
 	}
 	objectRef, err := parseReference("scoped object", object, false)
 	if err != nil {
@@ -102,7 +107,13 @@ func isProtectedResourceType(typeName string) bool {
 }
 
 func effectiveRelation(relation string, scope *AgentTaskScope) string {
-	if scope != nil {
+	if scope == nil {
+		return relation
+	}
+	if relation == RelationCanEdit {
+		return RelationCanEditInTask
+	}
+	if relation == RelationCanView {
 		return RelationCanViewInTask
 	}
 	return relation

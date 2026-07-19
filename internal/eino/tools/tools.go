@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -44,10 +45,37 @@ type PermissionedQueryResult struct {
 
 type PermissionedQuery func(ctx context.Context, req protocol.QueryRequest) (PermissionedQueryResult, error)
 
+type AuthorizationGate interface {
+	ManifestDigest() string
+	AuthorizeInvocation(
+		context.Context,
+		protocol.AuthorizationContext,
+		string,
+	) (protocol.ToolInvocationAuthorization, error)
+	AuthorizeEvidenceResult(
+		context.Context,
+		protocol.AuthorizationContext,
+		protocol.ToolInvocationAuthorization,
+		protocol.EvidencePackage,
+	) (protocol.ToolAuthorizationEnvelope, error)
+	AuthorizeResourceResult(
+		context.Context,
+		protocol.AuthorizationContext,
+		protocol.ToolInvocationAuthorization,
+		[]protocol.ProtectedResourceBinding,
+	) (protocol.ToolAuthorizationEnvelope, error)
+	AuthorizeContentFreeResult(
+		context.Context,
+		protocol.AuthorizationContext,
+		protocol.ToolInvocationAuthorization,
+	) (protocol.ToolAuthorizationEnvelope, error)
+}
+
 type Options struct {
 	Service           versioned.Service
 	PermissionedQuery PermissionedQuery
 	SideEffectGate    SideEffectGate
+	AuthorizationGate AuthorizationGate
 }
 
 func New(svc versioned.Service) []einotool.InvokableTool {
@@ -55,7 +83,7 @@ func New(svc versioned.Service) []einotool.InvokableTool {
 }
 
 func NewWithOptions(opts Options) []einotool.InvokableTool {
-	return []einotool.InvokableTool{
+	tools := []einotool.InvokableTool{
 		buildTool(opts),
 		queryTool(opts),
 		explainTool(opts),
@@ -66,6 +94,22 @@ func NewWithOptions(opts Options) []einotool.InvokableTool {
 		releaseTool(opts),
 		checkoutTool(opts),
 	}
+	if opts.AuthorizationGate == nil {
+		return tools
+	}
+	for index, candidate := range tools {
+		info, err := candidate.Info(context.Background())
+		toolName := ""
+		if err == nil && info != nil {
+			toolName = info.Name
+		}
+		tools[index] = &authorizationDecoratedTool{
+			tool:     candidate,
+			toolName: toolName,
+			gate:     opts.AuthorizationGate,
+		}
+	}
+	return tools
 }
 
 func ByName(svc versioned.Service) map[string]einotool.InvokableTool {
@@ -107,6 +151,99 @@ func (t *invokable) InvokableRun(ctx context.Context, argumentsInJSON string, _ 
 		return "", fmt.Errorf("encode tool result: %w", err)
 	}
 	return string(data), nil
+}
+
+var errToolAuthorizationDenied = errors.New("tool authorization denied")
+
+type authorizationDecoratedTool struct {
+	tool     einotool.InvokableTool
+	toolName string
+	gate     AuthorizationGate
+}
+
+var _ einotool.InvokableTool = (*authorizationDecoratedTool)(nil)
+
+func (t *authorizationDecoratedTool) Info(ctx context.Context) (*schema.ToolInfo, error) {
+	return t.tool.Info(ctx)
+}
+
+func (t *authorizationDecoratedTool) ToolAuthorizationManifestDigest() string {
+	return t.gate.ManifestDigest()
+}
+
+func (t *authorizationDecoratedTool) InvokableRun(
+	ctx context.Context,
+	argumentsInJSON string,
+	options ...einotool.Option,
+) (string, error) {
+	authorization, ok := protocol.AuthorizationContextFrom(ctx)
+	if !ok {
+		return "", errToolAuthorizationDenied
+	}
+	invocation, err := t.gate.AuthorizeInvocation(ctx, authorization, t.toolName)
+	if err != nil {
+		return "", errToolAuthorizationDenied
+	}
+
+	output, err := t.tool.InvokableRun(ctx, argumentsInJSON, options...)
+	if err != nil {
+		return "", err
+	}
+	return t.authorizeResult(ctx, authorization, invocation, output)
+}
+
+func (t *authorizationDecoratedTool) authorizeResult(
+	ctx context.Context,
+	authorization protocol.AuthorizationContext,
+	invocation protocol.ToolInvocationAuthorization,
+	output string,
+) (string, error) {
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(output), &object); err != nil || object == nil {
+		return "", errToolAuthorizationDenied
+	}
+	if _, exists := object["tool_authorization"]; exists {
+		return "", errToolAuthorizationDenied
+	}
+
+	var (
+		envelope protocol.ToolAuthorizationEnvelope
+		err      error
+	)
+	switch invocation.ReturnObligation {
+	case protocol.ToolReturnEvidence:
+		var evidence protocol.EvidencePackage
+		raw, ok := object[string(protocol.ToolReturnEvidence)]
+		if !ok || decodeArgs(string(raw), &evidence) != nil {
+			return "", errToolAuthorizationDenied
+		}
+		envelope, err = t.gate.AuthorizeEvidenceResult(ctx, authorization, invocation, evidence)
+	case protocol.ToolReturnResources:
+		var resources []protocol.ProtectedResourceBinding
+		raw, ok := object[string(protocol.ToolReturnResources)]
+		if !ok || decodeArgs(string(raw), &resources) != nil {
+			return "", errToolAuthorizationDenied
+		}
+		envelope, err = t.gate.AuthorizeResourceResult(ctx, authorization, invocation, resources)
+	case protocol.ToolReturnNone:
+		envelope, err = t.gate.AuthorizeContentFreeResult(ctx, authorization, invocation)
+	default:
+		return "", errToolAuthorizationDenied
+	}
+	if err != nil {
+		return "", errToolAuthorizationDenied
+	}
+
+	envelopeJSON, err := json.Marshal(envelope)
+	if err != nil {
+		return "", errToolAuthorizationDenied
+	}
+	object["tool_authorization"] = envelopeJSON
+	authorizedOutput, err := json.Marshal(object)
+	if err != nil {
+		return "", errToolAuthorizationDenied
+	}
+	return string(authorizedOutput), nil
 }
 
 func buildTool(opts Options) einotool.InvokableTool {

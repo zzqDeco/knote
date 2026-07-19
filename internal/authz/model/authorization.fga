@@ -42,6 +42,7 @@ type knowledge_base
     define can_edit: member from organization and editor
     define task_assignee: valid_assignee from active_task
     define can_view_in_task: can_view and task_assignee
+    define can_edit_in_task: can_edit and task_assignee
 
 type document
   relations
@@ -59,6 +60,7 @@ type document
     define can_edit: member from organization and unscoped_editor
     define task_assignee: valid_assignee from active_task
     define can_view_in_task: can_view and task_assignee
+    define can_edit_in_task: can_edit and task_assignee
 
 type entity
   relations
@@ -76,6 +78,7 @@ type entity
     define can_edit: member from organization and unscoped_editor
     define task_assignee: valid_assignee from active_task
     define can_view_in_task: can_view and task_assignee
+    define can_edit_in_task: can_edit and task_assignee
 
 type claim
   relations
@@ -105,3 +108,4 @@ type claim
     define can_edit: member from organization and unscoped_editor
     define task_assignee: valid_assignee from active_task
     define can_view_in_task: can_view and task_assignee
+    define can_edit_in_task: can_edit and task_assignee

@@ -444,7 +444,7 @@ tests:
         relation: organization
         object: document:scoped
       - user: user:alice
-        relation: viewer
+        relation: editor
         object: document:scoped
       - user: user:alice
         relation: delegate
@@ -464,3 +464,5 @@ tests:
         assertions:
           can_view: true
           can_view_in_task: true
+          can_edit: true
+          can_edit_in_task: true

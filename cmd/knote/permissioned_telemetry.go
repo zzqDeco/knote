@@ -8,6 +8,9 @@ import (
 	"os"
 	"time"
 
+	"github.com/zzqDeco/knote/internal/authz"
+	einotools "github.com/zzqDeco/knote/internal/eino/tools"
+	"github.com/zzqDeco/knote/internal/protocol"
 	"github.com/zzqDeco/knote/internal/telemetry"
 )
 
@@ -31,6 +34,33 @@ func newPermissionedTelemetrySink(path string) telemetry.Sink {
 		path:         path,
 		gate:         gate,
 		appendRecord: appendPermissionedTelemetryRecord,
+	}
+}
+
+func newPermissionedToolInvocationDeniedHandler(sink telemetry.Sink) authz.ToolInvocationDeniedHandler {
+	if sink == nil {
+		return nil
+	}
+	return func(ctx context.Context, manifest protocol.ToolAuthorizationManifest) {
+		switch manifest.ToolName {
+		case einotools.NameQuery, einotools.NameExplain:
+			_ = sink.Emit(ctx, permissionedToolInvocationDeniedTelemetryRecord())
+		}
+	}
+}
+
+func permissionedToolInvocationDeniedTelemetryRecord() telemetry.Record {
+	// Preserve the established permissioned-query event shape while reporting no content traversal.
+	return telemetry.Record{
+		ContractVersion: telemetry.ContractVersion1,
+		MetricScope:     telemetry.MetricScopeOperational,
+		Event:           telemetry.EventPermissionedQuery,
+		Stage:           telemetry.StageTraversal,
+		Outcome:         telemetry.OutcomeDenied,
+		Budget: telemetry.Budget{
+			Name: telemetry.BudgetLocalHardLatency, Result: telemetry.BudgetPass,
+		},
+		Counts: telemetry.Counts{Samples: 1},
 	}
 }
 

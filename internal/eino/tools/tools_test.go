@@ -10,10 +10,13 @@ import (
 
 	einotool "github.com/cloudwego/eino/components/tool"
 
+	"github.com/zzqDeco/knote/internal/authz"
 	"github.com/zzqDeco/knote/internal/knowledge/versioned"
 	"github.com/zzqDeco/knote/internal/protocol"
 	"github.com/zzqDeco/knote/internal/repository"
 )
+
+var _ AuthorizationGate = (*authz.ToolAuthorizationGate)(nil)
 
 func TestNewExposesExpectedInvokableTools(t *testing.T) {
 	svc := &fakeService{}
@@ -242,6 +245,253 @@ func TestQueryAndExplainUsePermissionedCallback(t *testing.T) {
 	}
 }
 
+func TestAuthorizationDecoratorGatesQueryAndExplainResults(t *testing.T) {
+	svc := &fakeService{}
+	authorization := toolTestAuthorization()
+	ctx, err := protocol.WithAuthorizationContext(context.Background(), authorization)
+	if err != nil {
+		t.Fatalf("bind authorization context: %v", err)
+	}
+	gate := &recordingAuthorizationGate{
+		digest: "tool_manifest_00000000000000000000000000000001",
+		obligations: map[string]protocol.ToolReturnObligation{
+			NameQuery:   protocol.ToolReturnEvidence,
+			NameExplain: protocol.ToolReturnEvidence,
+		},
+	}
+	evidence := protocol.EvidencePackage{
+		Version:         protocol.SecurityContractVersion,
+		TenantID:        authorization.TenantID,
+		KnowledgeBaseID: authorization.KnowledgeBaseID,
+		PrincipalID:     authorization.PrincipalID,
+		RequestID:       authorization.RequestID,
+	}
+	registry := ByNameWithOptions(Options{
+		Service:           svc,
+		AuthorizationGate: gate,
+		PermissionedQuery: func(_ context.Context, req protocol.QueryRequest) (PermissionedQueryResult, error) {
+			return PermissionedQueryResult{
+				Answer:          "permissioned: " + req.Question,
+				Mode:            "authorized",
+				EvidencePackage: evidence,
+			}, nil
+		},
+	})
+
+	for _, tc := range []struct {
+		name     string
+		question string
+	}{
+		{name: NameQuery, question: "what is knote?"},
+		{name: NameExplain, question: "why?"},
+	} {
+		result := runJSONWithContext(t, ctx, registry[tc.name], `{"question":"`+tc.question+`"}`)
+		if result["answer"] != "permissioned: "+tc.question {
+			t.Fatalf("unexpected %s result: %+v", tc.name, result)
+		}
+		authorizationJSON, ok := result["tool_authorization"].(map[string]any)
+		if !ok || authorizationJSON["manifest_digest"] != gate.digest {
+			t.Fatalf("%s result lacks the authorization envelope: %+v", tc.name, result)
+		}
+		invocationJSON, ok := authorizationJSON["invocation"].(map[string]any)
+		if !ok || invocationJSON["tool_name"] != tc.name {
+			t.Fatalf("%s envelope does not identify the invocation: %+v", tc.name, authorizationJSON)
+		}
+	}
+	if got, want := strings.Join(gate.invocationCalls, ","), NameQuery+","+NameExplain; got != want {
+		t.Fatalf("invocation gate calls = %q, want %q", got, want)
+	}
+	if len(gate.evidenceCalls) != 2 {
+		t.Fatalf("evidence result gate calls = %d, want 2", len(gate.evidenceCalls))
+	}
+	for _, result := range gate.evidenceCalls {
+		if result.TenantID != authorization.TenantID || result.RequestID != authorization.RequestID {
+			t.Fatalf("result gate received the wrong evidence package: %+v", result)
+		}
+	}
+}
+
+func TestAuthorizationDecoratorExposesManifestDigest(t *testing.T) {
+	const digest = "tool_manifest_00000000000000000000000000000002"
+	gate := &recordingAuthorizationGate{digest: digest}
+	for name, tool := range ByNameWithOptions(Options{Service: &fakeService{}, AuthorizationGate: gate}) {
+		marker, ok := tool.(interface {
+			ToolAuthorizationManifestDigest() string
+		})
+		if !ok {
+			t.Fatalf("%s is missing the tool authorization marker", name)
+		}
+		if got := marker.ToolAuthorizationManifestDigest(); got != digest {
+			t.Fatalf("%s manifest digest = %q, want %q", name, got, digest)
+		}
+	}
+	if _, ok := ByName(&fakeService{})[NameQuery].(interface {
+		ToolAuthorizationManifestDigest() string
+	}); ok {
+		t.Fatal("tool without an authorization gate was unexpectedly decorated")
+	}
+}
+
+func TestAuthorizationDecoratorRequiresTrustedContext(t *testing.T) {
+	svc := &fakeService{}
+	gate := &recordingAuthorizationGate{
+		digest: "tool_manifest_00000000000000000000000000000003",
+		obligations: map[string]protocol.ToolReturnObligation{
+			NameQuery: protocol.ToolReturnEvidence,
+		},
+	}
+	tool := ByNameWithOptions(Options{Service: svc, AuthorizationGate: gate})[NameQuery]
+
+	output, err := tool.InvokableRun(context.Background(), `{"question":"restricted"}`)
+	if output != "" || err == nil || err.Error() != "tool authorization denied" {
+		t.Fatalf("missing trusted context output=%q err=%v", output, err)
+	}
+	if len(gate.invocationCalls) != 0 || svc.queryCalls != 0 {
+		t.Fatalf("missing trusted context reached authorization or content: gate=%d query=%d", len(gate.invocationCalls), svc.queryCalls)
+	}
+}
+
+func TestAuthorizationDecoratorPreGatesBuildAndGitSideEffects(t *testing.T) {
+	ctx, err := protocol.WithAuthorizationContext(context.Background(), toolTestAuthorization())
+	if err != nil {
+		t.Fatalf("bind authorization context: %v", err)
+	}
+	for _, tc := range []struct {
+		name string
+		args string
+	}{
+		{name: NameBuild, args: `{}`},
+		{name: NameCommit, args: `{"message":"restricted update"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := &fakeService{}
+			confirmationCalls := 0
+			gate := &recordingAuthorizationGate{
+				digest:          "tool_manifest_00000000000000000000000000000004",
+				denyInvocations: map[string]bool{tc.name: true},
+			}
+			tool := ByNameWithOptions(Options{
+				Service:           svc,
+				AuthorizationGate: gate,
+				SideEffectGate: func(context.Context, SideEffectRequest) error {
+					confirmationCalls++
+					return nil
+				},
+			})[tc.name]
+
+			output, err := tool.InvokableRun(ctx, tc.args)
+			if output != "" || err == nil || err.Error() != "tool authorization denied" {
+				t.Fatalf("denied side effect output=%q err=%v", output, err)
+			}
+			if confirmationCalls != 0 {
+				t.Fatalf("authorization denial reached confirmation %d times", confirmationCalls)
+			}
+			if svc.buildCalled || svc.commitMessage != "" {
+				t.Fatalf("authorization denial reached side effects: %+v", svc)
+			}
+			if got := strings.Join(gate.invocationCalls, ","); got != tc.name {
+				t.Fatalf("invocation gate calls = %q, want %q", got, tc.name)
+			}
+		})
+	}
+}
+
+func TestAuthorizationDecoratorPreservesSideEffectPendingError(t *testing.T) {
+	wantErr := errors.New("side effect pending")
+	svc := &fakeService{}
+	gate := &recordingAuthorizationGate{
+		digest: "tool_manifest_00000000000000000000000000000005",
+		obligations: map[string]protocol.ToolReturnObligation{
+			NameBuild: protocol.ToolReturnNone,
+		},
+	}
+	ctx, err := protocol.WithAuthorizationContext(context.Background(), toolTestAuthorization())
+	if err != nil {
+		t.Fatalf("bind authorization context: %v", err)
+	}
+	tool := ByNameWithOptions(Options{
+		Service:           svc,
+		AuthorizationGate: gate,
+		SideEffectGate: func(context.Context, SideEffectRequest) error {
+			return wantErr
+		},
+	})[NameBuild]
+
+	output, err := tool.InvokableRun(ctx, `{}`)
+	if output != "" || !errors.Is(err, wantErr) {
+		t.Fatalf("pending side effect output=%q err=%v, want %v", output, err, wantErr)
+	}
+	if svc.buildCalled || len(gate.contentFreeCalls) != 0 {
+		t.Fatalf("pending side effect reached action or result gate: service=%+v result_calls=%d", svc, len(gate.contentFreeCalls))
+	}
+}
+
+func TestAuthorizationDecoratorSuppressesDeniedResultPayload(t *testing.T) {
+	const secret = "private result payload"
+	authorization := toolTestAuthorization()
+	ctx, err := protocol.WithAuthorizationContext(context.Background(), authorization)
+	if err != nil {
+		t.Fatalf("bind authorization context: %v", err)
+	}
+	gate := &recordingAuthorizationGate{
+		digest:     "tool_manifest_00000000000000000000000000000006",
+		denyResult: true,
+		obligations: map[string]protocol.ToolReturnObligation{
+			NameQuery: protocol.ToolReturnEvidence,
+		},
+	}
+	callbackCalls := 0
+	tool := ByNameWithOptions(Options{
+		Service:           &fakeService{},
+		AuthorizationGate: gate,
+		PermissionedQuery: func(context.Context, protocol.QueryRequest) (PermissionedQueryResult, error) {
+			callbackCalls++
+			return PermissionedQueryResult{
+				Answer: secret,
+				EvidencePackage: protocol.EvidencePackage{
+					Version: protocol.SecurityContractVersion, TenantID: authorization.TenantID,
+					KnowledgeBaseID: authorization.KnowledgeBaseID, PrincipalID: authorization.PrincipalID,
+					RequestID: authorization.RequestID,
+				},
+			}, nil
+		},
+	})[NameQuery]
+
+	output, err := tool.InvokableRun(ctx, `{"question":"restricted"}`)
+	if output != "" || err == nil || err.Error() != "tool authorization denied" {
+		t.Fatalf("denied result output=%q err=%v", output, err)
+	}
+	if strings.Contains(err.Error(), "private") || strings.Contains(err.Error(), secret) {
+		t.Fatalf("denied result leaked protected payload: %v", err)
+	}
+	if callbackCalls != 1 || len(gate.evidenceCalls) != 1 {
+		t.Fatalf("result path calls callback=%d result_gate=%d", callbackCalls, len(gate.evidenceCalls))
+	}
+}
+
+func TestAuthorizationDecoratorFailsClosedForMalformedResourceOutput(t *testing.T) {
+	svc := &fakeService{}
+	gate := &recordingAuthorizationGate{
+		digest: "tool_manifest_00000000000000000000000000000007",
+		obligations: map[string]protocol.ToolReturnObligation{
+			NameQuery: protocol.ToolReturnResources,
+		},
+	}
+	ctx, err := protocol.WithAuthorizationContext(context.Background(), toolTestAuthorization())
+	if err != nil {
+		t.Fatalf("bind authorization context: %v", err)
+	}
+	tool := ByNameWithOptions(Options{Service: svc, AuthorizationGate: gate})[NameQuery]
+
+	output, err := tool.InvokableRun(ctx, `{"question":"where are the resources?"}`)
+	if output != "" || err == nil || err.Error() != "tool authorization denied" {
+		t.Fatalf("malformed resource result output=%q err=%v", output, err)
+	}
+	if svc.queryCalls != 1 || len(gate.resourceCalls) != 0 {
+		t.Fatalf("malformed typed result calls query=%d resource_gate=%d", svc.queryCalls, len(gate.resourceCalls))
+	}
+}
+
 func TestPermissionedCallbackErrorsDoNotFallBackToLegacyService(t *testing.T) {
 	svc := &fakeService{}
 	ctx, err := protocol.WithAuthorizationContext(context.Background(), toolTestAuthorization())
@@ -440,5 +690,93 @@ func toolTestAuthorization() protocol.AuthorizationContext {
 		IdentityWatermark:         "identity-v1",
 		ACLWatermark:              "acl-v1",
 		Consistency:               protocol.ConsistencyHigherConsistency,
+	}
+}
+
+type recordingAuthorizationGate struct {
+	digest           string
+	obligations      map[string]protocol.ToolReturnObligation
+	denyInvocations  map[string]bool
+	denyResult       bool
+	invocationCalls  []string
+	evidenceCalls    []protocol.EvidencePackage
+	resourceCalls    [][]protocol.ProtectedResourceBinding
+	contentFreeCalls []string
+}
+
+func (g *recordingAuthorizationGate) ManifestDigest() string {
+	return g.digest
+}
+
+func (g *recordingAuthorizationGate) AuthorizeInvocation(
+	_ context.Context,
+	_ protocol.AuthorizationContext,
+	toolName string,
+) (protocol.ToolInvocationAuthorization, error) {
+	g.invocationCalls = append(g.invocationCalls, toolName)
+	if g.denyInvocations[toolName] {
+		return protocol.ToolInvocationAuthorization{}, errors.New("private invocation denial")
+	}
+	obligation, ok := g.obligations[toolName]
+	if !ok {
+		return protocol.ToolInvocationAuthorization{}, errors.New("unregistered tool")
+	}
+	return protocol.ToolInvocationAuthorization{
+		Version:          protocol.ToolAuthorizationContractVersion,
+		CorrelationID:    "correlation-" + toolName,
+		ToolName:         toolName,
+		ReturnObligation: obligation,
+	}, nil
+}
+
+func (g *recordingAuthorizationGate) AuthorizeEvidenceResult(
+	_ context.Context,
+	_ protocol.AuthorizationContext,
+	invocation protocol.ToolInvocationAuthorization,
+	evidence protocol.EvidencePackage,
+) (protocol.ToolAuthorizationEnvelope, error) {
+	g.evidenceCalls = append(g.evidenceCalls, evidence)
+	if g.denyResult {
+		return protocol.ToolAuthorizationEnvelope{}, errors.New("private result denial")
+	}
+	return g.envelope(invocation), nil
+}
+
+func (g *recordingAuthorizationGate) AuthorizeResourceResult(
+	_ context.Context,
+	_ protocol.AuthorizationContext,
+	invocation protocol.ToolInvocationAuthorization,
+	resources []protocol.ProtectedResourceBinding,
+) (protocol.ToolAuthorizationEnvelope, error) {
+	g.resourceCalls = append(g.resourceCalls, append([]protocol.ProtectedResourceBinding(nil), resources...))
+	if g.denyResult {
+		return protocol.ToolAuthorizationEnvelope{}, errors.New("private resource denial")
+	}
+	return g.envelope(invocation), nil
+}
+
+func (g *recordingAuthorizationGate) AuthorizeContentFreeResult(
+	_ context.Context,
+	_ protocol.AuthorizationContext,
+	invocation protocol.ToolInvocationAuthorization,
+) (protocol.ToolAuthorizationEnvelope, error) {
+	g.contentFreeCalls = append(g.contentFreeCalls, invocation.ToolName)
+	if g.denyResult {
+		return protocol.ToolAuthorizationEnvelope{}, errors.New("private content-free denial")
+	}
+	return g.envelope(invocation), nil
+}
+
+func (g *recordingAuthorizationGate) envelope(invocation protocol.ToolInvocationAuthorization) protocol.ToolAuthorizationEnvelope {
+	return protocol.ToolAuthorizationEnvelope{
+		Version:        protocol.ToolAuthorizationContractVersion,
+		ManifestDigest: g.digest,
+		Invocation:     invocation,
+		Result: protocol.ToolResultAuthorization{
+			Version:          protocol.ToolAuthorizationContractVersion,
+			CorrelationID:    invocation.CorrelationID,
+			ToolName:         invocation.ToolName,
+			ReturnObligation: invocation.ReturnObligation,
+		},
 	}
 }

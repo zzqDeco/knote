@@ -107,6 +107,37 @@ func TestLocalAgentTaskIntersectionCoversEveryProtectedType(t *testing.T) {
 	}
 }
 
+func TestLocalAgentTaskIntersectionAuthorizesEditWithoutDowngrade(t *testing.T) {
+	authorizer := newLocalTestAuthorizer(t)
+	decision, err := authorizer.Check(context.Background(), CheckRequest{
+		User:                 "user:erin",
+		Relation:             RelationCanEdit,
+		Object:               "document:welcome",
+		AuthorizationModelID: localTestModelID,
+		AgentTaskScope:       completeAgentTaskScope("user:erin", localTestModelID),
+	})
+	if err != nil {
+		t.Fatalf("scoped edit check: %v", err)
+	}
+	if !decision.Allowed {
+		t.Fatal("complete edit permission and user/agent/task intersection denied")
+	}
+
+	decision, err = authorizer.Check(context.Background(), CheckRequest{
+		User:                 "user:alice",
+		Relation:             RelationCanEdit,
+		Object:               "document:welcome",
+		AuthorizationModelID: localTestModelID,
+		AgentTaskScope:       completeAgentTaskScope("user:alice", localTestModelID),
+	})
+	if err != nil {
+		t.Fatalf("scoped denied edit check: %v", err)
+	}
+	if decision.Allowed {
+		t.Fatal("agent/task scope upgraded read-only user to editor")
+	}
+}
+
 func TestAgentTaskScopeRejectsMismatchAndMalformedContext(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -145,7 +176,7 @@ func TestAgentTaskScopeRejectsMismatchAndMalformedContext(t *testing.T) {
 		},
 		{
 			name:    "relation mismatch",
-			mutate:  func(request *CheckRequest) { request.Relation = RelationCanEdit },
+			mutate:  func(request *CheckRequest) { request.Relation = RelationViewer },
 			wantErr: ErrInvalidRequest,
 		},
 		{
@@ -203,14 +234,16 @@ func TestAgentTaskScopeRejectsMismatchAndMalformedContext(t *testing.T) {
 		})
 	}
 
-	decision, err := authorizer.Check(context.Background(), CheckRequest{
-		User:                 "user:alice",
-		Relation:             RelationCanViewInTask,
-		Object:               "document:welcome",
-		AuthorizationModelID: localTestModelID,
-	})
-	if !errors.Is(err, ErrInvalidRequest) || decision.Allowed {
-		t.Fatalf("direct internal relation decision=%#v error=%v", decision, err)
+	for _, relation := range []string{RelationCanViewInTask, RelationCanEditInTask} {
+		decision, err := authorizer.Check(context.Background(), CheckRequest{
+			User:                 "user:alice",
+			Relation:             relation,
+			Object:               "document:welcome",
+			AuthorizationModelID: localTestModelID,
+		})
+		if !errors.Is(err, ErrInvalidRequest) || decision.Allowed {
+			t.Fatalf("direct internal relation %s decision=%#v error=%v", relation, decision, err)
+		}
 	}
 }
 

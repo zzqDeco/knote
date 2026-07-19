@@ -103,6 +103,8 @@ func newRuntime(ctx context.Context, workspacePath string, resumeID string) (run
 		return nil, nil, err
 	}
 	var authorizationProvider runtime.AuthorizationContextProvider
+	var toolAuthorizationGate einotools.AuthorizationGate
+	var modelToolAuthorizationValidator runtimeeino.ToolAuthorizationValidator
 	var permissionedQuery einotools.PermissionedQuery
 	var protectedContentAuthorizer runtime.ProtectedContentAuthorizer
 	var permissionedScopeRefresh func(context.Context) error
@@ -110,6 +112,9 @@ func newRuntime(ctx context.Context, workspacePath string, resumeID string) (run
 	var rt *runtime.Manager
 	if permissionedApplication != nil {
 		authorizationProvider = permissionedApplication.AuthorizationContextProvider()
+		permissionedToolAuthorizationGate := permissionedApplication.ToolAuthorizationGate()
+		toolAuthorizationGate = permissionedToolAuthorizationGate
+		modelToolAuthorizationValidator = permissionedToolAuthorizationGate
 		permissionedQuery = func(ctx context.Context, request protocol.QueryRequest) (einotools.PermissionedQueryResult, error) {
 			result, err := permissionedApplication.Query(ctx, request)
 			if err != nil {
@@ -137,6 +142,7 @@ func newRuntime(ctx context.Context, workspacePath string, resumeID string) (run
 		Service:           knowledgeService,
 		PermissionedQuery: permissionedQuery,
 		SideEffectGate:    func(context.Context, einotools.SideEffectRequest) error { return nil },
+		AuthorizationGate: toolAuthorizationGate,
 	})
 	approvedEinoTools = permissionedSideEffectToolMap(approvedEinoTools, permissionedConfig.Enabled)
 	var fakeBuildAuthorization runtime.AuthorizationContextProvider
@@ -145,10 +151,22 @@ func newRuntime(ctx context.Context, workspacePath string, resumeID string) (run
 		if err != nil {
 			return nil, nil, err
 		}
+		baseFakeBuildAuthorization := fakeBuildAuthorization
+		fakeBuildAuthorization = func(ctx context.Context, sessionID string) (protocol.AuthorizationContext, error) {
+			authorization, err := baseFakeBuildAuthorization(ctx, sessionID)
+			if err != nil {
+				return protocol.AuthorizationContext{}, err
+			}
+			if err := permissionedApplication.PrepareFakeBuildAuthorization(authorization); err != nil {
+				return protocol.AuthorizationContext{}, err
+			}
+			return authorization, nil
+		}
 	}
 	allEinoTools := einotools.NewWithOptions(einotools.Options{
 		Service:           knowledgeService,
 		PermissionedQuery: permissionedQuery,
+		AuthorizationGate: toolAuthorizationGate,
 		SideEffectGate: newEinoSideEffectGate(
 			sideEffects, approvedEinoTools, fakeBuildAuthorization, permissionedScopeRefresh, permissionedSessionRebind,
 		),
@@ -156,7 +174,7 @@ func newRuntime(ctx context.Context, workspacePath string, resumeID string) (run
 	slashTools := permissionedSlashTools(allEinoTools, permissionedConfig.Enabled)
 	modelTools := permissionedModelTools(allEinoTools, permissionedConfig.Enabled)
 	toolExecutor := runtimeeino.NewToolExecutor(slashTools)
-	einoRunner, err := newEinoRunner(ctx, repoCfg, modelTools)
+	einoRunner, err := newEinoRunner(ctx, repoCfg, modelTools, modelToolAuthorizationValidator)
 	if err != nil {
 		return nil, nil, err
 	}

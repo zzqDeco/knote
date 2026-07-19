@@ -1,10 +1,13 @@
 package eino
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
 	"time"
 
+	"github.com/zzqDeco/knote/internal/authz"
+	einotools "github.com/zzqDeco/knote/internal/eino/tools"
 	"github.com/zzqDeco/knote/internal/protocol"
 )
 
@@ -74,13 +77,24 @@ func testEinoEvidencePackage(t *testing.T, authorization protocol.AuthorizationC
 	return result
 }
 
-func testPermissionedToolOutput(t *testing.T, evidencePackage protocol.EvidencePackage, answer string) string {
+func testPermissionedToolOutput(
+	t *testing.T,
+	evidencePackage protocol.EvidencePackage,
+	answer string,
+	toolNames ...string,
+) string {
 	t.Helper()
 	encoded, err := json.Marshal(map[string]any{"answer": answer, "evidence_package": evidencePackage})
 	if err != nil {
 		t.Fatal(err)
 	}
-	return string(encoded)
+	toolName := einotools.NameQuery
+	if len(toolNames) != 0 {
+		toolName = toolNames[0]
+	}
+	return testToolOutputWithAuthorization(
+		t, testEinoAuthorizationFromEvidence(evidencePackage), toolName, string(encoded), evidencePackage,
+	)
 }
 
 func testPermissionedToolFailureOutput(t *testing.T, evidencePackage protocol.EvidencePackage, failure string) string {
@@ -91,5 +105,108 @@ func testPermissionedToolFailureOutput(t *testing.T, evidencePackage protocol.Ev
 	if err != nil {
 		t.Fatal(err)
 	}
+	return testToolOutputWithAuthorization(
+		t, testEinoAuthorizationFromEvidence(evidencePackage), einotools.NameQuery, string(encoded), evidencePackage,
+	)
+}
+
+func testPermissionedToolOutputWithoutAuthorization(
+	t *testing.T,
+	evidencePackage protocol.EvidencePackage,
+	answer string,
+) string {
+	t.Helper()
+	encoded, err := json.Marshal(map[string]any{"answer": answer, "evidence_package": evidencePackage})
+	if err != nil {
+		t.Fatal(err)
+	}
 	return string(encoded)
+}
+
+func testPermissionedToolOutputWithAuthorizationEvidence(
+	t *testing.T,
+	evidencePackage protocol.EvidencePackage,
+	authorizationEvidence protocol.EvidencePackage,
+	answer string,
+) string {
+	t.Helper()
+	raw := testPermissionedToolOutputWithoutAuthorization(t, evidencePackage, answer)
+	return testToolOutputWithAuthorization(
+		t,
+		testEinoAuthorizationFromEvidence(evidencePackage),
+		einotools.NameQuery,
+		raw,
+		authorizationEvidence,
+	)
+}
+
+func testEinoAuthorizationFromEvidence(evidence protocol.EvidencePackage) protocol.AuthorizationContext {
+	return protocol.AuthorizationContext{
+		Version:                   protocol.SecurityContractVersion,
+		TenantID:                  evidence.TenantID,
+		KnowledgeBaseID:           evidence.KnowledgeBaseID,
+		PrincipalID:               evidence.PrincipalID,
+		AgentID:                   evidence.AgentID,
+		TaskID:                    evidence.TaskID,
+		SessionID:                 evidence.SessionID,
+		RequestID:                 evidence.RequestID,
+		AuthorizationModelID:      evidence.AuthorizationModelID,
+		IdentityWatermark:         evidence.IdentityWatermark,
+		ACLWatermark:              evidence.ACLWatermark,
+		DelegationWatermark:       evidence.DelegationWatermark,
+		AgentTaskScopeFingerprint: evidence.AgentTaskScopeFingerprint,
+		Consistency:               evidence.Consistency,
+	}
+}
+
+func testEinoToolAuthorizationValidator(t *testing.T) *authz.ToolAuthorizationGate {
+	t.Helper()
+	registry, err := einotools.NewPermissionedAuthorizationManifestRegistry()
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate, err := authz.NewToolAuthorizationGate(authz.ToolAuthorizationGateOptions{
+		Authorizer: testEinoAllowAuthorizer{},
+		Registry:   registry,
+		FinalAuthorizationGate: func(context.Context, protocol.AuthorizationContext) error {
+			return nil
+		},
+		ResultGate: func(context.Context, protocol.AuthorizationContext, protocol.ProtectedContentBinding) error {
+			return nil
+		},
+		Now:              func() time.Time { return time.Unix(2, 0).UTC() },
+		NewCorrelationID: func() (string, error) { return "tool-model-current", nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return gate
+}
+
+type testEinoAllowAuthorizer struct{}
+
+func (testEinoAllowAuthorizer) Check(
+	_ context.Context,
+	request authz.CheckRequest,
+) (authz.Decision, error) {
+	return authz.Decision{
+		CorrelationID:        "model-check",
+		Allowed:              true,
+		AuthorizationModelID: request.AuthorizationModelID,
+	}, nil
+}
+
+func (testEinoAllowAuthorizer) BatchCheck(
+	_ context.Context,
+	request authz.BatchCheckRequest,
+) ([]authz.Decision, error) {
+	decisions := make([]authz.Decision, len(request.Checks))
+	for index, check := range request.Checks {
+		decisions[index] = authz.Decision{
+			CorrelationID:        check.CorrelationID,
+			Allowed:              true,
+			AuthorizationModelID: request.AuthorizationModelID,
+		}
+	}
+	return decisions, nil
 }
