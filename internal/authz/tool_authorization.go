@@ -21,11 +21,14 @@ type ToolResultGate func(
 	protocol.ProtectedContentBinding,
 ) error
 
+type ToolInvocationDeniedHandler func(context.Context, protocol.ToolAuthorizationManifest)
+
 type ToolAuthorizationGateOptions struct {
 	Authorizer             Authorizer
 	Registry               *protocol.ToolManifestRegistry
 	FinalAuthorizationGate func(context.Context, protocol.AuthorizationContext) error
 	ResultGate             ToolResultGate
+	InvocationDenied       ToolInvocationDeniedHandler
 	Now                    func() time.Time
 	NewCorrelationID       func() (string, error)
 }
@@ -35,6 +38,7 @@ type ToolAuthorizationGate struct {
 	registry               *protocol.ToolManifestRegistry
 	finalAuthorizationGate func(context.Context, protocol.AuthorizationContext) error
 	resultGate             ToolResultGate
+	invocationDenied       ToolInvocationDeniedHandler
 	now                    func() time.Time
 	newCorrelationID       func() (string, error)
 }
@@ -72,6 +76,7 @@ func NewToolAuthorizationGate(options ToolAuthorizationGateOptions) (*ToolAuthor
 		registry:               options.Registry,
 		finalAuthorizationGate: options.FinalAuthorizationGate,
 		resultGate:             options.ResultGate,
+		invocationDenied:       options.InvocationDenied,
 		now:                    options.Now,
 		newCorrelationID:       options.NewCorrelationID,
 	}, nil
@@ -105,7 +110,11 @@ func (g *ToolAuthorizationGate) AuthorizeInvocation(
 	toolName string,
 ) (protocol.ToolInvocationAuthorization, error) {
 	manifest, request, ok := g.registeredRequest(toolName)
-	if !ok || g.validateCurrent(ctx, authorization) != nil {
+	if !ok || ctx == nil || ctx.Err() != nil || authorization.Validate() != nil {
+		return protocol.ToolInvocationAuthorization{}, ErrToolAuthorizationDenied
+	}
+	if g.validateCurrent(ctx, authorization) != nil {
+		g.reportInvocationDenied(ctx, manifest)
 		return protocol.ToolInvocationAuthorization{}, ErrToolAuthorizationDenied
 	}
 	consistency, err := toolConsistency(authorization.Consistency)
@@ -120,7 +129,11 @@ func (g *ToolAuthorizationGate) AuthorizeInvocation(
 		Consistency:          consistency,
 		AgentTaskScope:       toolAgentTaskScope(authorization),
 	})
-	if err != nil || !decision.Allowed || decision.AuthorizationModelID != authorization.AuthorizationModelID {
+	if err != nil || decision.AuthorizationModelID != authorization.AuthorizationModelID {
+		return protocol.ToolInvocationAuthorization{}, ErrToolAuthorizationDenied
+	}
+	if !decision.Allowed {
+		g.reportInvocationDenied(ctx, manifest)
 		return protocol.ToolInvocationAuthorization{}, ErrToolAuthorizationDenied
 	}
 	correlationID, err := g.newCorrelationID()
@@ -147,6 +160,15 @@ func (g *ToolAuthorizationGate) AuthorizeInvocation(
 		return protocol.ToolInvocationAuthorization{}, ErrToolAuthorizationDenied
 	}
 	return invocation, nil
+}
+
+func (g *ToolAuthorizationGate) reportInvocationDenied(
+	ctx context.Context,
+	manifest protocol.ToolAuthorizationManifest,
+) {
+	if g != nil && g.invocationDenied != nil {
+		g.invocationDenied(ctx, manifest)
+	}
 }
 
 func (g *ToolAuthorizationGate) AuthorizeEvidenceResult(

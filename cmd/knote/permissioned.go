@@ -195,6 +195,7 @@ func newPermissionedApplication(
 		}
 		result.toolAuthorizationGate, err = newPermissionedToolAuthorizationGate(
 			application.Authorizer(), nil, result.AuthorizeProtectedContent,
+			newPermissionedToolInvocationDeniedHandler(telemetrySink),
 		)
 		if err != nil {
 			return nil, err
@@ -273,6 +274,7 @@ func newPermissionedApplication(
 	}
 	result.toolAuthorizationGate, err = newPermissionedToolAuthorizationGate(
 		authorizer, result.validateIdentityAuthorization, result.AuthorizeProtectedContent,
+		newPermissionedToolInvocationDeniedHandler(telemetrySink),
 	)
 	if err != nil {
 		return nil, err
@@ -284,6 +286,7 @@ func newPermissionedToolAuthorizationGate(
 	authorizer authz.Authorizer,
 	finalGate func(context.Context, protocol.AuthorizationContext) error,
 	resultGate authz.ToolResultGate,
+	invocationDenied authz.ToolInvocationDeniedHandler,
 ) (*authz.ToolAuthorizationGate, error) {
 	registry, err := einotools.NewPermissionedAuthorizationManifestRegistry()
 	if err != nil {
@@ -291,7 +294,7 @@ func newPermissionedToolAuthorizationGate(
 	}
 	gate, err := authz.NewToolAuthorizationGate(authz.ToolAuthorizationGateOptions{
 		Authorizer: authorizer, Registry: registry,
-		FinalAuthorizationGate: finalGate, ResultGate: resultGate,
+		FinalAuthorizationGate: finalGate, ResultGate: resultGate, InvocationDenied: invocationDenied,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("initialize permissioned tool authorization: %w", err)

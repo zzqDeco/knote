@@ -13,10 +13,14 @@ import (
 func TestToolAuthorizationGateFailsClosedAndAuthorizesRegisteredActions(t *testing.T) {
 	registry := toolTestRegistry(t)
 	authorizer := toolTestAuthorizer(t)
+	var denied []string
 	gate, err := NewToolAuthorizationGate(ToolAuthorizationGateOptions{
 		Authorizer: authorizer, Registry: registry,
 		ResultGate: func(context.Context, protocol.AuthorizationContext, protocol.ProtectedContentBinding) error {
 			return nil
+		},
+		InvocationDenied: func(_ context.Context, manifest protocol.ToolAuthorizationManifest) {
+			denied = append(denied, manifest.ToolName)
 		},
 		Now:              func() time.Time { return time.Unix(10, 0).UTC() },
 		NewCorrelationID: func() (string, error) { return "tool-test-1", nil },
@@ -43,8 +47,16 @@ func TestToolAuthorizationGateFailsClosedAndAuthorizesRegisteredActions(t *testi
 	if _, err := gate.AuthorizeInvocation(context.Background(), authorization, "knote_unknown"); !errors.Is(err, ErrToolAuthorizationDenied) {
 		t.Fatalf("unknown tool error = %v", err)
 	}
+	malformedAuthorization := authorization
+	malformedAuthorization.RequestID = ""
+	if _, err := gate.AuthorizeInvocation(context.Background(), malformedAuthorization, "knote_query"); !errors.Is(err, ErrToolAuthorizationDenied) {
+		t.Fatalf("malformed authorization error = %v", err)
+	}
 	if _, err := gate.AuthorizeInvocation(context.Background(), toolTestAuthorization("mallory"), "knote_query"); !errors.Is(err, ErrToolAuthorizationDenied) {
 		t.Fatalf("unauthorized principal error = %v", err)
+	}
+	if got := strings.Join(denied, ","); got != "knote_query" {
+		t.Fatalf("reported invocation denials = %q, want %q", got, "knote_query")
 	}
 
 	malformed := protocol.ToolAuthorizationManifest{
@@ -62,6 +74,30 @@ func TestToolAuthorizationGateFailsClosedAndAuthorizesRegisteredActions(t *testi
 		},
 	}); err == nil {
 		t.Fatal("side-effecting read manifest was accepted")
+	}
+}
+
+func TestToolAuthorizationGateDoesNotReportBackendFailureAsExplicitDenial(t *testing.T) {
+	reported := 0
+	gate, err := NewToolAuthorizationGate(ToolAuthorizationGateOptions{
+		Authorizer: toolFailingAuthorizer{}, Registry: toolTestRegistry(t),
+		ResultGate: func(context.Context, protocol.AuthorizationContext, protocol.ProtectedContentBinding) error {
+			return nil
+		},
+		InvocationDenied: func(context.Context, protocol.ToolAuthorizationManifest) {
+			reported++
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewToolAuthorizationGate: %v", err)
+	}
+	if _, err := gate.AuthorizeInvocation(
+		context.Background(), toolTestAuthorization("alice"), "knote_query",
+	); !errors.Is(err, ErrToolAuthorizationDenied) {
+		t.Fatalf("backend failure error = %v", err)
+	}
+	if reported != 0 {
+		t.Fatalf("backend failure reported as %d explicit denials", reported)
 	}
 }
 
@@ -232,4 +268,14 @@ func toolTestResource(t *testing.T, authorization protocol.AuthorizationContext,
 		},
 		ServingState: protocol.ServingActive,
 	}
+}
+
+type toolFailingAuthorizer struct{}
+
+func (toolFailingAuthorizer) Check(context.Context, CheckRequest) (Decision, error) {
+	return Decision{}, errors.New("authorization backend unavailable")
+}
+
+func (toolFailingAuthorizer) BatchCheck(context.Context, BatchCheckRequest) ([]Decision, error) {
+	return nil, errors.New("authorization backend unavailable")
 }

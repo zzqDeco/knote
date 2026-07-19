@@ -11,8 +11,38 @@ import (
 	"testing"
 	"time"
 
+	einotools "github.com/zzqDeco/knote/internal/eino/tools"
+	"github.com/zzqDeco/knote/internal/protocol"
 	"github.com/zzqDeco/knote/internal/telemetry"
 )
+
+func TestPermissionedToolInvocationDeniedHandlerEmitsContentFreeQueryTelemetry(t *testing.T) {
+	sink := &recordingPermissionedTelemetrySink{}
+	handler := newPermissionedToolInvocationDeniedHandler(sink)
+	handler(context.Background(), protocol.ToolAuthorizationManifest{ToolName: einotools.NameBuild})
+	handler(context.Background(), protocol.ToolAuthorizationManifest{})
+	if len(sink.records) != 0 {
+		t.Fatalf("non-query denial records = %d, want 0", len(sink.records))
+	}
+
+	handler(context.Background(), protocol.ToolAuthorizationManifest{ToolName: einotools.NameQuery})
+	if len(sink.records) != 1 {
+		t.Fatalf("query denial records = %d, want 1", len(sink.records))
+	}
+	record := sink.records[0]
+	if err := record.Validate(); err != nil {
+		t.Fatalf("denied query telemetry: %v", err)
+	}
+	if want := permissionedToolInvocationDeniedTelemetryRecord(); record != want {
+		t.Fatalf("denied query telemetry = %+v, want %+v", record, want)
+	}
+
+	failing := &recordingPermissionedTelemetrySink{err: errors.New("telemetry unavailable")}
+	newPermissionedToolInvocationDeniedHandler(failing)(context.Background(), protocol.ToolAuthorizationManifest{ToolName: einotools.NameExplain})
+	if len(failing.records) != 1 {
+		t.Fatalf("telemetry failure changed denial observation, records=%d", len(failing.records))
+	}
+}
 
 func TestPermissionedTelemetryFileSinkAppendsCanonicalRecordsConcurrently(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "permissioned.jsonl")
@@ -112,4 +142,14 @@ func permissionedTelemetryTestRecord() telemetry.Record {
 		},
 		Counts: telemetry.Counts{Samples: 1, Candidates: 1, Allowed: 1},
 	}
+}
+
+type recordingPermissionedTelemetrySink struct {
+	err     error
+	records []telemetry.Record
+}
+
+func (s *recordingPermissionedTelemetrySink) Emit(_ context.Context, record telemetry.Record) error {
+	s.records = append(s.records, record)
+	return s.err
 }
