@@ -73,6 +73,7 @@ func TestViewAndRenderAreDeterministic(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	started := time.Now()
 	first, err := service.View(context.Background(), governanceTestAuthorization())
 	if err != nil {
 		t.Fatal(err)
@@ -80,6 +81,9 @@ func TestViewAndRenderAreDeterministic(t *testing.T) {
 	second, err := service.View(context.Background(), governanceTestAuthorization())
 	if err != nil {
 		t.Fatal(err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("two governance views took %s, want at most 1s", elapsed)
 	}
 	if Render(first) != Render(second) {
 		t.Fatalf("governance rendering is not deterministic:\n%s\n---\n%s", Render(first), Render(second))

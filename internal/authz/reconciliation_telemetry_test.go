@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/zzqDeco/knote/internal/telemetry"
 )
@@ -48,9 +49,13 @@ func TestTupleReconcilerTelemetryFailureDoesNotChangePublishedResult(t *testing.
 		t.Fatal(err)
 	}
 
+	started := time.Now()
 	report, err := reconciler.Reconcile(context.Background(), plan)
 	if err != nil {
 		t.Fatalf("reconciliation inherited telemetry failure: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("full reconciliation took %s, want at most 1s", elapsed)
 	}
 	if report.Outcome != ReconciliationSucceeded || !report.RevisionPublished {
 		t.Fatalf("reconciliation report changed after telemetry failure: %+v", report)

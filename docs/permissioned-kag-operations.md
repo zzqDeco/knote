@@ -1,9 +1,13 @@
 # Permissioned KAG Operations
 
 This guide applies to the opt-in real permissioned composition on `dev`. It
-documents the operator and security contract exercised by issue #78; it is not
-a GitHub Release announcement. Deterministic fixture mode remains available for
-tests, but it is not the production composition described here.
+documents the Phase 3 operator and security contract validated by issue #97,
+including identity, connector, agent/task, tool, governance, audit, and
+residency boundaries. Deterministic fixture mode remains available for tests,
+but it is not the production composition described here.
+
+This guide targets `dev` only. Following it does not modify `main`, create a
+release branch or tag, publish a binary, or create a GitHub Release.
 
 ## Operator prerequisites
 
@@ -140,6 +144,33 @@ whitespace.
 | `KNOTE_OPENFGA_CONSISTENCY` | Optional `higher_consistency` (default) or `minimize_latency`. |
 | `KNOTE_PERMISSIONED_TELEMETRY_PATH` | Optional path for the content-free JSONL telemetry sink described below. |
 
+### Phase 3 governance, audit, and residency configuration
+
+The permissioned application constructs the residency boundary before KAG,
+telemetry, audit, or governance. Invalid or contradictory settings fail startup
+closed. Region lists are canonical comma-separated values with no empty or
+duplicate member; their in-memory order is sorted.
+
+| Variable | Requirement and default |
+|---|---|
+| `KNOTE_GOVERNANCE_REGION` | Optional canonical home region; default `local`. It becomes the trusted tenant-scope region for the process. |
+| `KNOTE_GOVERNANCE_CONNECTOR_WATERMARK` | Optional content-free connector status watermark; default `connector-unconfigured-v1`. It is a governance status input, not authority to advance a connector checkpoint. |
+| `KNOTE_GOVERNANCE_RESIDENCY_WATERMARK` | Optional residency-policy watermark; default `residency-local-v1`. A changed watermark invalidates stale residency checks. |
+| `KNOTE_RESIDENCY_STORAGE_REGIONS` | Optional comma-separated storage allowlist; default is the home region. It covers telemetry, audit, and backup destinations. |
+| `KNOTE_RESIDENCY_PROCESSING_REGIONS` | Optional comma-separated processing allowlist; default is the home region. It covers KAG processing. |
+| `KNOTE_RESIDENCY_EGRESS_REGIONS` | Optional comma-separated connector-egress allowlist; default is the home region. Literal `none` creates a valid deny-all egress policy: startup succeeds, but every connector-egress callback is denied before bytes leave. |
+| `KNOTE_RESIDENCY_KAG_REGION` | Optional KAG destination; default is the home region and it must be in the processing allowlist. |
+| `KNOTE_RESIDENCY_TELEMETRY_REGION` | Optional telemetry destination; default is the home region and it must be in the storage allowlist. |
+| `KNOTE_RESIDENCY_AUDIT_REGION` | Optional audit destination; default is the home region and it must be in the storage allowlist. |
+| `KNOTE_RESIDENCY_CONNECTOR_EGRESS_REGION` | Optional connector egress destination; default is the home region. A nonempty egress allowlist must contain it; a deny-all egress policy denies its use at operation time. |
+| `KNOTE_RESIDENCY_BACKUP_REGION` | Optional backup destination; default is the home region and it must be in the storage allowlist. |
+| `KNOTE_PERMISSIONED_AUDIT_PATH` | Optional absolute audit root. If unset, knote uses `os.UserConfigDir()/knote/audit/<workspace-digest>`, outside the workspace and stable for the canonical workspace path. Prefer the default or an operator-owned restricted path outside Git. |
+
+An explicit audit path inside the workspace is supported only as an operator
+override and is excluded from runtime dirty-state accounting. It is still a
+poor deployment choice: audit storage should use a private, backed-up,
+tenant-appropriate filesystem outside the source repository.
+
 `KNOTE_KAG_FAKE=1` and `KNOTE_PERMISSIONED=1` are mutually exclusive. A
 workspace with `kag.fake: true` is also not a real permissioned deployment. A
 working Python interpreter, selected by `KNOTE_PYTHON` or the runtime default,
@@ -253,7 +284,7 @@ an authorization-aware projection remains hidden or unavailable.
 
 ## Content-free telemetry sink
 
-Issue #78 defines `KNOTE_PERMISSIONED_TELEMETRY_PATH` as the opt-in sink for one
+Phase 3 retains `KNOTE_PERMISSIONED_TELEMETRY_PATH` as the opt-in sink for one
 JSON object per line. Leaving it unset disables the sink. Use a restricted
 absolute path managed by the operator; telemetry is operational evidence, not a
 session log or audit record of protected content. The runtime validates that a
@@ -279,7 +310,7 @@ The sink is best effort and non-authoritative. Open, encode, append, flush, or
 close failures never allow or deny a resource, change an authorization or
 revocation result, alter returned evidence, or fail an otherwise valid request.
 Telemetry records and sink errors never become TUI events, model messages, or
-`.knote/sessions/*.jsonl` history. Issue #78 acceptance must cover both the
+`.knote/sessions/*.jsonl` history. Issue #97 acceptance covers both the
 allowlisted schema and a failing sink.
 
 `metric_scope=operational` identifies per-query or reconciliation observations.
@@ -288,6 +319,87 @@ unauthorized path/generator participation, and P95/P99 fields are neutral zero
 placeholders and must not be treated as measured values. Those cohort metrics
 are produced by the deterministic acceptance suite, not by joining runtime
 telemetry to protected session or evidence data.
+
+## Governance, audit, and residency operator evidence
+
+Generate release evidence only from the exact `dev` candidate. Start with the
+authoritative deterministic entrypoint:
+
+```sh
+scripts/verify_phase3_acceptance.sh
+```
+
+It must finish with `Phase 3 deterministic acceptance passed.` The command is
+the local release-evidence gate; running only one package below is useful for
+diagnosis but is not a substitute.
+
+### Governance evidence
+
+In a disposable synthetic permissioned workspace, launch the exact candidate
+binary with the identity, OpenFGA, KAG, model, governance, audit, and residency
+settings documented above. An identity with direct knowledge-base editor access
+may enter:
+
+```text
+/governance
+```
+
+Record only the fixed section names, aggregate counts, watermarks, states, and
+audit/residency references. Do not capture the terminal if any unrelated user
+content is visible. The evidence must establish:
+
+- authorization uses higher consistency and denial occurs before the source is
+  read;
+- an unauthorized section is omitted, not rendered with a revealing zero;
+- connector and simulation lists are canonical and deterministic;
+- rendered output contains no protected body, credential, path, prompt, or
+  provider diagnostic;
+- a successful view appends a content-free `governance.view` audit reference.
+  Because the snapshot is loaded before its own audit append, a second view may
+  be needed to observe the first view's reference.
+
+The reproducible non-interactive evidence is:
+
+```sh
+go test -count=1 ./internal/governance ./internal/runtime ./cmd/knote \
+  -run 'Governance|governance'
+```
+
+### Audit evidence
+
+Opening the permissioned application verifies every existing tenant ledger and
+durable head. Append occurs only after residency authorization. A tampered,
+truncated, reordered, cross-tenant, copied, duplicate-ID, or protected-field
+ledger fails closed; crash recovery applies only to an exact marked
+transaction.
+
+```sh
+go test -count=1 ./internal/audit ./cmd/knote -run 'Audit|audit'
+go test -race -count=1 ./internal/audit
+```
+
+Do not tamper with a deployment ledger to prove this behavior. Use the
+temporary stores created by the tests. Release evidence records only test
+status and the candidate SHA, never ledger bytes or tenant partitions.
+
+### Residency evidence
+
+Residency must be checked before persistence, network access, subprocess start,
+or callback invocation. The deny-all connector policy is a required operator
+case:
+
+```sh
+KNOTE_RESIDENCY_EGRESS_REGIONS=none \
+  go test -count=1 ./cmd/knote \
+  -run 'TestPermissionedResidencyBoundaryAllowsDenyAllEgressPolicy|TestPermissionedResidencyBoundaryChecksBeforeConnectorOrBackupBytes'
+
+go test -count=1 ./internal/residency ./internal/knowledge/kag ./cmd/knote \
+  -run 'Residency|residency'
+```
+
+Required evidence is callback count `0` and persisted/egressed byte count `0`
+for denied operations. Governance may expose only fixed content-free violation
+references; it must not expose the denied payload or destination credentials.
 
 ## Troubleshooting without disclosure
 
@@ -315,5 +427,5 @@ telemetry to protected session or evidence data.
 Never troubleshoot permissioned mode with `set -x`, an environment dump, raw
 OpenFGA requests/responses, provider stdout/stderr, source/artifact bodies, model
 prompts, or session files. Use fixed error classes, aggregate counts, and the
-deterministic issue #78 acceptance paths in
+deterministic issue #97 acceptance paths in
 `docs/permissioned-kag-acceptance.md`.

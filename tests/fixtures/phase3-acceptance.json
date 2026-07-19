@@ -1,0 +1,339 @@
+{
+  "version": "phase3-acceptance.v1",
+  "issue": 97,
+  "false_allow": 0,
+  "invariants": [
+    {
+      "id": "audit-content-free-tamper-evident",
+      "requirement": "Audit remains content free and tamper evidence is detected.",
+      "sample_count": 2,
+      "anchors": [
+        {
+          "file": "internal/audit/corruption_test.go",
+          "test": "TestStoreFailsClosedOnRecordTamper"
+        },
+        {
+          "file": "internal/audit/store_test.go",
+          "test": "TestStoreAppendsCanonicalContentFreeChainAndVerifiesOnReopen"
+        }
+      ]
+    },
+    {
+      "id": "connector-acl-failure-never-serves",
+      "requirement": "Connector content plus ACL failure never serves.",
+      "sample_count": 2,
+      "anchors": [
+        {
+          "file": "internal/connector/acceptance_test.go",
+          "test": "TestNilPublisherCannotClaimServingAndRecoveryPublishes"
+        },
+        {
+          "file": "internal/connector/processor_test.go",
+          "test": "TestProcessorIncompleteProjectionFailsClosed"
+        }
+      ]
+    },
+    {
+      "id": "durable-connector-convergence",
+      "requirement": "Duplicate and reordered events, crashes, DLQ replay, tombstones, and full reconciliation converge correctly.",
+      "sample_count": 7,
+      "anchors": [
+        {
+          "file": "internal/authz/permissioned_acceptance_test.go",
+          "test": "TestPermissionedAcceptanceReconciliationRemovesStaleTuples"
+        },
+        {
+          "file": "internal/connector/acceptance_test.go",
+          "test": "TestSnapshotReconciliationFaultBoundariesResumeExactly"
+        },
+        {
+          "file": "internal/connector/core_test.go",
+          "test": "TestConnectorReplayAndPersistedJSONAreByteDeterministic"
+        },
+        {
+          "file": "internal/connector/processor_test.go",
+          "test": "TestProcessorCrashRecoveryAtEveryStageBoundary"
+        },
+        {
+          "file": "internal/connector/processor_test.go",
+          "test": "TestProcessorDeadLettersBoundedRetryWithoutAdvancingWatermarks"
+        },
+        {
+          "file": "internal/connector/processor_test.go",
+          "test": "TestProcessorRejectsReorderConflictsAndIdentifierReuse"
+        },
+        {
+          "file": "internal/connector/processor_test.go",
+          "test": "TestProcessorTombstoneReplayIsIdempotentAndCannotResurrect"
+        }
+      ]
+    },
+    {
+      "id": "false-allow-zero",
+      "requirement": "False allow equals zero across the complete matrix.",
+      "sample_count": 14,
+      "anchors": [
+        {
+          "file": "internal/knowledge/authorized/permissioned_acceptance_test.go",
+          "test": "TestPermissionedAcceptancePolicyOracleAndRetrievalMetrics"
+        },
+        {
+          "file": "internal/knowledge/authorized/phase2_permissioned_graph_acceptance_test.go",
+          "test": "TestPhase2PermissionedGraphPolicyOracleAcceptanceMetrics"
+        }
+      ]
+    },
+    {
+      "id": "identity-fail-closed-replay-safe",
+      "requirement": "SSO assertion and SCIM provisioning and deprovisioning behavior is fail closed and replay safe.",
+      "sample_count": 4,
+      "anchors": [
+        {
+          "file": "internal/identity/gateway_test.go",
+          "test": "TestGatewayBuildsTrustedAuthorizationAndFailsClosedOnIdentityChange"
+        },
+        {
+          "file": "internal/identity/gateway_test.go",
+          "test": "TestGatewayRejectsInvalidAssertionsWithoutDisclosure"
+        },
+        {
+          "file": "internal/identity/publication_test.go",
+          "test": "TestMembershipPublicationRestartRetriesUncertainWriteIdempotently"
+        },
+        {
+          "file": "internal/identity/store_test.go",
+          "test": "TestLocalStoreSCIMIsIdempotentAndTenantScoped"
+        }
+      ]
+    },
+    {
+      "id": "operational-latency-budgets",
+      "requirement": "BatchCheck, connector lag, replay, reconciliation, revocation, and governance latency budgets are documented and met.",
+      "sample_count": 145,
+      "anchors": [
+        {
+          "file": "internal/authz/reconciliation_telemetry_test.go",
+          "test": "TestTupleReconcilerTelemetryFailureDoesNotChangePublishedResult"
+        },
+        {
+          "file": "internal/connector/acceptance_test.go",
+          "test": "TestSlowConnectorCallbackDoesNotBlockAnotherTenantAndCanReadStore"
+        },
+        {
+          "file": "internal/governance/service_test.go",
+          "test": "TestViewAndRenderAreDeterministic"
+        },
+        {
+          "file": "internal/knowledge/authorized/phase2_permissioned_graph_acceptance_test.go",
+          "test": "TestPhase2PermissionedGraphPolicyOracleAcceptanceMetrics"
+        },
+        {
+          "file": "internal/runtime/permissioned_acceptance_test.go",
+          "test": "TestPermissionedAcceptanceRevocationPropagationPercentiles"
+        },
+        {
+          "file": "internal/runtime/phase2_graph_replay_acceptance_test.go",
+          "test": "TestPhase2GraphReplayAcceptanceRevocationClosesTraversalCacheCitationAndSession"
+        }
+      ]
+    },
+    {
+      "id": "residency-blocks-storage-egress",
+      "requirement": "Residency violations block storage and egress.",
+      "sample_count": 2,
+      "anchors": [
+        {
+          "file": "cmd/knote/permissioned_telemetry_test.go",
+          "test": "TestPermissionedTelemetryResidencyDenialPrecedesFilesystemWrite"
+        },
+        {
+          "file": "internal/residency/gate_test.go",
+          "test": "TestOperationWrappersDenyBeforeWriteNetworkAndSubprocess"
+        }
+      ]
+    },
+    {
+      "id": "simulation-read-only-oracle-parity",
+      "requirement": "Simulation is non-mutating and impact results match the policy oracle.",
+      "sample_count": 14,
+      "anchors": [
+        {
+          "file": "internal/policysim/engine_test.go",
+          "test": "TestEngineCanonicalizesAllTargetKindsWithoutMutatingInput"
+        },
+        {
+          "file": "internal/policysim/engine_test.go",
+          "test": "TestEngineClassifiesIndependentEvaluationsWithStableReasons"
+        }
+      ]
+    },
+    {
+      "id": "tenant-collision-isolation",
+      "requirement": "Two tenants with colliding external IDs cannot observe each other.",
+      "sample_count": 2,
+      "anchors": [
+        {
+          "file": "internal/connector/core_test.go",
+          "test": "TestConnectorTenantAndOwnerIsolation"
+        },
+        {
+          "file": "internal/identity/store_test.go",
+          "test": "TestLocalStoreSCIMIsIdempotentAndTenantScoped"
+        }
+      ]
+    },
+    {
+      "id": "tool-invocation-and-results-authorized",
+      "requirement": "Tool invocation and every returned resource are authorized.",
+      "sample_count": 4,
+      "anchors": [
+        {
+          "file": "internal/authz/tool_authorization_test.go",
+          "test": "TestToolAuthorizationGateAuthorizesReturnedResourcesAtomically"
+        },
+        {
+          "file": "internal/authz/tool_authorization_test.go",
+          "test": "TestToolAuthorizationGateRevalidatesDelegationForInvocationAndReturn"
+        },
+        {
+          "file": "internal/eino/tools/tools_test.go",
+          "test": "TestAuthorizationDecoratorPreGatesBuildAndGitSideEffects"
+        },
+        {
+          "file": "internal/runtime/phase3_permissioned_acceptance_test.go",
+          "test": "TestPhase3PermissionedAcceptanceIntersectionGuardsInvocationAndResults"
+        }
+      ]
+    },
+    {
+      "id": "unauthorized-observability-hidden",
+      "requirement": "Unauthorized existence, count, pagination, errors, traces, telemetry, and governance views do not leak.",
+      "sample_count": 5,
+      "anchors": [
+        {
+          "file": "cmd/knote/permissioned_telemetry_test.go",
+          "test": "TestPermissionedToolInvocationDeniedHandlerEmitsContentFreeQueryTelemetry"
+        },
+        {
+          "file": "internal/governance/service_test.go",
+          "test": "TestViewDenialDoesNotReadSource"
+        },
+        {
+          "file": "internal/governance/service_test.go",
+          "test": "TestViewProjectsAuthorizedSectionsWithoutZeroSideChannels"
+        },
+        {
+          "file": "internal/runtime/permissioned_acceptance_test.go",
+          "test": "TestPermissionedAcceptanceSideChannelSurfacesHideCanaries"
+        },
+        {
+          "file": "internal/runtime/phase3_permissioned_acceptance_test.go",
+          "test": "TestPhase3PermissionedAcceptanceIntersectionGuardsReplayWithoutSideChannels"
+        }
+      ]
+    },
+    {
+      "id": "user-agent-task-intersection",
+      "requirement": "User, agent, and task intersection is enforced on retrieval, traversal, generation, cache, citation, and session replay.",
+      "sample_count": 4,
+      "anchors": [
+        {
+          "file": "internal/authz/agent_task_test.go",
+          "test": "TestLocalAgentTaskIntersectionCoversEveryProtectedType"
+        },
+        {
+          "file": "internal/knowledge/authorized/service_test.go",
+          "test": "TestDelegatedQueryRevalidatesCurrentScopeBeforeAuthorizationAndReuse"
+        },
+        {
+          "file": "internal/runtime/eino/runner_test.go",
+          "test": "TestRunnerBindsPermissionedInterruptForRevocationReplay"
+        },
+        {
+          "file": "internal/runtime/phase3_permissioned_acceptance_test.go",
+          "test": "TestPhase3PermissionedAcceptanceIntersectionGuardsInvocationAndResults"
+        }
+      ]
+    }
+  ],
+  "budgets": [
+    {
+      "id": "batch-check-latency",
+      "metric": "openfga_batch_check",
+      "percentile": "p99",
+      "sample_count": 12,
+      "budget_milliseconds": 100,
+      "anchors": [
+        {
+          "file": "internal/knowledge/authorized/phase2_permissioned_graph_acceptance_test.go",
+          "test": "TestPhase2PermissionedGraphPolicyOracleAcceptanceMetrics"
+        }
+      ]
+    },
+    {
+      "id": "connector-lag",
+      "metric": "connector_apply_lag",
+      "percentile": "max",
+      "sample_count": 1,
+      "budget_milliseconds": 2000,
+      "anchors": [
+        {
+          "file": "internal/connector/acceptance_test.go",
+          "test": "TestSlowConnectorCallbackDoesNotBlockAnotherTenantAndCanReadStore"
+        }
+      ]
+    },
+    {
+      "id": "governance-latency",
+      "metric": "governance_view",
+      "percentile": "max",
+      "sample_count": 2,
+      "budget_milliseconds": 1000,
+      "anchors": [
+        {
+          "file": "internal/governance/service_test.go",
+          "test": "TestViewAndRenderAreDeterministic"
+        }
+      ]
+    },
+    {
+      "id": "reconciliation-latency",
+      "metric": "full_reconciliation",
+      "percentile": "max",
+      "sample_count": 1,
+      "budget_milliseconds": 1000,
+      "anchors": [
+        {
+          "file": "internal/authz/reconciliation_telemetry_test.go",
+          "test": "TestTupleReconcilerTelemetryFailureDoesNotChangePublishedResult"
+        }
+      ]
+    },
+    {
+      "id": "replay-latency",
+      "metric": "session_replay",
+      "percentile": "max",
+      "sample_count": 1,
+      "budget_milliseconds": 3000,
+      "anchors": [
+        {
+          "file": "internal/runtime/phase2_graph_replay_acceptance_test.go",
+          "test": "TestPhase2GraphReplayAcceptanceRevocationClosesTraversalCacheCitationAndSession"
+        }
+      ]
+    },
+    {
+      "id": "revocation-latency",
+      "metric": "revocation_propagation",
+      "percentile": "p99",
+      "sample_count": 128,
+      "budget_milliseconds": 100,
+      "anchors": [
+        {
+          "file": "internal/runtime/permissioned_acceptance_test.go",
+          "test": "TestPermissionedAcceptanceRevocationPropagationPercentiles"
+        }
+      ]
+    }
+  ]
+}

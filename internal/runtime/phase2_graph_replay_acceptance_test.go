@@ -173,9 +173,13 @@ func TestPhase2GraphReplayAcceptanceRevocationClosesTraversalCacheCitationAndSes
 		AuthorizationContextProvider: provider,
 		ProtectedContentAuthorizer:   phase2GraphProtectedContentAuthorizer(service),
 	})
+	replayStarted := time.Now()
 	replayed, err := replayManager.Start(context.Background(), StartOptions{ResumeID: phase2GraphRuntimeSession})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if elapsed := time.Since(replayStarted); elapsed > 3*time.Second {
+		t.Fatalf("permissioned session replay took %s, want at most 3s", elapsed)
 	}
 	if !permissionedAcceptanceHasSafeSlash(replayed) ||
 		!strings.Contains(permissionedAcceptanceEventText(replayed), safeLocalMessage) {

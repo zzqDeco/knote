@@ -869,6 +869,7 @@ func TestSlowConnectorCallbackDoesNotBlockAnotherTenantAndCanReadStore(t *testin
 		doneA <- err
 	}()
 	<-entered
+	startedB := time.Now()
 	doneB := make(chan error, 1)
 	go func() {
 		_, err := processor.Process(
@@ -883,6 +884,10 @@ func TestSlowConnectorCallbackDoesNotBlockAnotherTenantAndCanReadStore(t *testin
 		if err != nil {
 			close(release)
 			t.Fatalf("tenant B Process: %v", err)
+		}
+		if elapsed := time.Since(startedB); elapsed > 2*time.Second {
+			close(release)
+			t.Fatalf("tenant B connector apply lag = %s, want at most 2s", elapsed)
 		}
 	case <-time.After(2 * time.Second):
 		close(release)
