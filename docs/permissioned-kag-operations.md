@@ -166,10 +166,13 @@ duplicate member; their in-memory order is sorted.
 | `KNOTE_RESIDENCY_BACKUP_REGION` | Optional backup destination; default is the home region and it must be in the storage allowlist. |
 | `KNOTE_PERMISSIONED_AUDIT_PATH` | Optional absolute audit root. If unset, knote uses `os.UserConfigDir()/knote/audit/<workspace-digest>`, outside the workspace and stable for the canonical workspace path. Prefer the default or an operator-owned restricted path outside Git. |
 
-An explicit audit path inside the workspace is supported only as an operator
-override and is excluded from runtime dirty-state accounting. It is still a
-poor deployment choice: audit storage should use a private, backed-up,
-tenant-appropriate filesystem outside the source repository.
+If an in-workspace override is unavoidable, use only the absolute
+`<workspace>/.knote/audit` path or one of its descendants. That fixed runtime
+path is excluded from dirty-state accounting and `/commit`; other in-workspace
+locations, including `sources`, `artifacts`, and `evals`, are committable and
+must not contain audit data. Any in-workspace audit storage remains a poor
+deployment choice: prefer a private, backed-up, tenant-appropriate filesystem
+outside the source repository.
 
 `KNOTE_KAG_FAKE=1` and `KNOTE_PERMISSIONED=1` are mutually exclusive. A
 workspace with `kag.fake: true` is also not a real permissioned deployment. A

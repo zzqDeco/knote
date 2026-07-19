@@ -41,5 +41,11 @@ GOOS=linux GOARCH=amd64 CGO_ENABLED=0 \
   go build -trimpath -o "${TEMP_ROOT}/knote-linux-amd64" ./cmd/knote
 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 \
   go build -trimpath -o "${TEMP_ROOT}/knote-windows-amd64.exe" ./cmd/knote
+GOOS=windows GOARCH=amd64 CGO_ENABLED=0 \
+  go test -c -o "${TEMP_ROOT}/knote-identity-windows.test.exe" ./internal/identity
+GOOS=windows GOARCH=amd64 CGO_ENABLED=0 \
+  go test -c -o "${TEMP_ROOT}/knote-connector-windows.test.exe" ./internal/connector
+GOOS=windows GOARCH=amd64 CGO_ENABLED=0 \
+  go test -c -o "${TEMP_ROOT}/knote-audit-windows.test.exe" ./internal/audit
 
 printf '%s\n' 'Phase 3 deterministic acceptance passed.'
