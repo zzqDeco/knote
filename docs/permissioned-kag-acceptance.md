@@ -1,250 +1,257 @@
-# Permissioned KAG Acceptance
+# Phase 3 Permissioned KAG Acceptance
 
-This document defines the Phase 2 acceptance contract for issue #78 on `dev`.
-It builds on the deterministic authorization, graph, reconciliation, and
-protected-surface suites from issues #41 and #61, plus the real operator
-composition and protected surfaces now on `dev`. The legacy
-`kag.query`/`kag.explain` solver and the fake MVP TUI smoke are compatibility
-surfaces, not Phase 2 production-composition evidence.
+This document is the acceptance contract for issue #97 on `dev`. It proves the
+Phase 3 enterprise control and data plane delivered by issues #91 through #96
+without weakening the inherited Phase 0-2 authorization, projection, graph,
+revocation, and session contracts.
 
-Passing this contract is evidence for the reviewed development branch. It does
-not create a tag, publish artifacts, or claim a GitHub Release.
+Passing this contract approves only the reviewed `dev` commit. It does not
+merge or modify `main`, create a tag, publish an artifact, or create a GitHub
+Release.
 
-## Gate levels
+## Evidence rules
 
-| Gate | Required | Network or credentials | Purpose |
-|---|---|---|---|
-| Deterministic baseline | yes | none | Go/Python contracts, policy model, graph/revocation invariants, protected surfaces, and allowlist parity |
-| Deterministic built binary | yes | no external network or credentials; loopback deterministic doubles only | Prove the built `cmd/knote` artifact crosses the real permissioned startup and request boundaries |
-| Live OpenFGA + OpenSPG/KAG smoke | no | disposable local services | Check pinned external-service compatibility without replacing deterministic acceptance |
+- Every result is bound to one full Git commit SHA and the `dev` target branch.
+- The canonical top-level `false_allow` value must be exactly `0`; no
+  percentile or retry allowance
+  applies to a false allow.
+- Hidden, absent, cross-tenant, stale, malformed, and backend-failure fixtures
+  must remain indistinguishable on protected surfaces.
+- Performance percentiles use nearest rank over the complete declared cohort:
+  sort all samples and select `ceil(percentile * sample_count) - 1`. A missing,
+  discarded, timed-out, or malformed sample fails the cohort.
+- Evidence contains fixed scenario names, counts, durations, digests, versions,
+  and pass/fail values only. It must not contain tenant, principal, connector,
+  resource, prompt, answer, path, credential, assertion, or provider-output
+  values.
+- Every named path must exist at the exact candidate commit. Canonical fixture
+  anchors must name exact `TestXxx(*testing.T)` declarations.
 
-The baseline commands are:
+The deterministic local release-evidence entrypoint introduced by #97 is
+`scripts/verify_phase3_acceptance.sh`. It runs the baseline, Python adapter and
+real-adapter self-test, built-binary acceptance, OpenFGA model tests, race tests,
+vet, and Linux/Windows builds as one fail-fast command. The live OpenFGA
+entrypoint introduced by #97 is `scripts/smoke_phase3_openfga.sh`.
+
+The machine-readable contract is
+`tests/fixtures/phase3-acceptance.json`. The validator in
+`tests/phase3/acceptance_matrix_test.go` requires canonical JSON, issue `97`,
+false allow `0`, the complete invariant and budget sets, positive cohorts,
+sorted anchors, and exact existing Go test functions.
+
+## Required gate sequence
+
+Run all commands from the repository root on the exact candidate commit.
+
+### 1. Authoritative deterministic entrypoint
 
 ```sh
-KNOTE_KAG_FAKE=1 go test ./...
-/usr/bin/python3 -m unittest discover -s adapters/kag -p '*test*.py'
-/usr/bin/python3 tests/smoke/permissioned_graph_real_smoke.py --self-test
-GOTOOLCHAIN=go1.25.12 go run github.com/openfga/cli/cmd/fga@v0.7.17 model test \
-  --tests internal/authz/model/authorization.fga.yaml
+scripts/verify_phase3_acceptance.sh
 ```
 
-Use Python 3.11 for the Python gates to match CI. No production OpenFGA, KAG,
-model-provider, or workspace credential is permitted in deterministic
-acceptance.
+The script takes no arguments. It creates and removes its own temporary
+directory and finishes with `Phase 3 deterministic acceptance passed.` only
+after every constituent command succeeds. The sections below expose those
+commands for diagnosis; running a subset is not equivalent to this entrypoint.
 
-## Mandatory built-binary gate
+### 2. Baseline constituents
 
-Run the issue #78 deterministic entrypoint from the repository root:
+```sh
+KNOTE_KAG_FAKE=1 go test -count=1 ./...
+/usr/bin/python3 -m unittest discover -s adapters/kag -p '*test*.py'
+CGO_ENABLED=0 go build -o /tmp/knote-check ./cmd/knote
+go vet ./...
+
+go test -count=1 ./tests/phase3 -run '^TestPhase3AcceptanceMatrix$'
+```
+
+### 3. Phase 3 component and race diagnosis
+
+```sh
+go test -count=1 \
+  ./internal/identity \
+  ./internal/connector \
+  ./internal/authz \
+  ./internal/policysim \
+  ./internal/audit \
+  ./internal/residency \
+  ./internal/governance \
+  ./internal/knowledge/authorized \
+  ./internal/knowledge/kag \
+  ./internal/runtime \
+  ./internal/runtime/eino \
+  ./cmd/knote
+
+go test -race -count=1 \
+  ./internal/identity \
+  ./internal/connector \
+  ./internal/authz \
+  ./internal/policysim \
+  ./internal/audit \
+  ./internal/residency \
+  ./internal/governance \
+  ./internal/runtime \
+  ./internal/runtime/eino \
+  ./cmd/knote
+```
+
+The inherited deterministic built-binary and real-adapter self-tests remain
+mandatory defense in depth:
 
 ```sh
 scripts/smoke_permissioned_binary.sh
+/usr/bin/python3 tests/smoke/permissioned_graph_real_smoke.py --self-test
 ```
 
-This entrypoint is mandatory locally and in CI. After building `bin/knote`, CI
-invokes `scripts/smoke_permissioned_binary.sh --bin bin/knote` so the gate
-exercises the exact artifact produced by the preceding build step.
+### 4. OpenFGA model and platform constituents
 
-The entrypoint rejects `KNOTE_KAG_FAKE` even when it is set to an empty value,
-builds `cmd/knote` once with `go build -trimpath`, verifies that artifact with
-`--version`, and invokes the exact artifact for every scenario. To exercise an
-already-built artifact, pass `--bin /absolute/path/to/knote`; the harness does
-not rebuild it.
+```sh
+GOTOOLCHAIN=go1.25.12 go run github.com/openfga/cli/cmd/fga@v0.7.17 model test \
+  --tests internal/authz/model/authorization.fga.yaml
 
-The deterministic harness:
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 \
+  go build -o /tmp/knote-linux-amd64 ./cmd/knote
+GOOS=windows GOARCH=amd64 CGO_ENABLED=0 \
+  go build -o /tmp/knote-windows-amd64.exe ./cmd/knote
 
-1. invokes the exact built artifact, with no `go run` and no direct construction
-   of the Go service under test;
-2. sets `KNOTE_PERMISSIONED=1`, keeps `KNOTE_KAG_FAKE` absent, and supplies the
-   complete real-mode operator configuration;
-3. uses only checked-in synthetic data, a local deterministic
-   OpenFGA-compatible endpoint, an allowlisted local provider, and a
-   deterministic model endpoint;
-4. exercises `authorized_query`, `authorized_resume`,
-   `permission_bound_resume`, `denied_query`, `revoked_resume`,
-   `provider_failure`, and `backend_failure`;
-5. proves authorization and replay rechecks, provider non-invocation after deny
-   or backend failure, and no generation after provider retrieval failure;
-6. asserts that denied/secret canaries and provider diagnostics never reach
-   public errors, TUI events, or session history;
-7. emits one sorted metadata-only JSON result. Running
-   `scripts/smoke_permissioned_binary.sh --self-test` materializes the fixture
-   twice and requires byte-identical artifact files and manifest digests.
+GOOS=windows GOARCH=amd64 CGO_ENABLED=0 \
+  go test -c -o /tmp/knote-identity-windows.test.exe ./internal/identity
+GOOS=windows GOARCH=amd64 CGO_ENABLED=0 \
+  go test -c -o /tmp/knote-connector-windows.test.exe ./internal/connector
+GOOS=windows GOARCH=amd64 CGO_ENABLED=0 \
+  go test -c -o /tmp/knote-audit-windows.test.exe ./internal/audit
+```
 
-The shell entrypoint delegates to
-`tests/smoke/permissioned_binary_acceptance.py` and uses
-`tests/fixtures/permissioned-binary/permissioned_binary_provider.py`. A
-build-only step, `scripts/smoke_fake_mvp.sh`, the Python adapter self-test, or
-the optional live smoke cannot stand in for this gate.
+The compiled Windows test binaries prove build coverage only. Windows file and
+DACL semantics must still run on a Windows CI worker before #97 can pass.
 
-## Fixture oracle
+### 5. Phase 3 real OpenFGA gate
 
-Quality metrics use `K = 4`. Compute every rate per principal/fixture first;
-aggregate reporting must not hide a principal-specific failure. Each positive
-fixture has at least one authorized relevant oracle result, and each negative
-control has none.
+After deterministic acceptance passes, run the #97 live entrypoint:
 
-| Principal | Authorized relevant results | Expected result |
-|---|---:|---|
-| Alice | `2` | both relevant results returned |
-| Bob | `1` | the relevant result returned |
-| Unknown principal | `0` | empty negative control |
+```sh
+scripts/smoke_phase3_openfga.sh
+```
 
-| Metric | Definition | Required result |
-|---|---|---:|
-| Positive Recall@4 | authorized oracle-relevant results returned in the first four / all authorized oracle-relevant results | `1.00` for Alice and Bob |
-| Positive Precision@4 | authorized oracle-relevant results returned in the first four / all results returned in the first four | `1.00` for Alice and Bob |
-| Positive empty-result rate | positive fixtures returning no evidence / all positive fixtures | `0` |
-| Negative-control empty-result rate | negative controls returning no evidence / all negative controls | `1` |
-| Policy-oracle false allows | denied oracle resources observed as allowed or returned | `0` |
-| Unauthorized path participation | unauthorized resources participating in any completed or partial graph path | `0` |
-| Unauthorized generator participation | unauthorized evidence or path resources passed to generation | `0` |
+The script takes no arguments. It starts the repository-pinned OpenFGA image on
+a random loopback port, creates an in-memory synthetic store and model, runs
+`TestPhase3OpenFGALiveSmoke`, removes the container and temporary credentials,
+and prints `phase3 OpenFGA smoke passed` only on success. Exact prerequisites
+and cleanup rules are in `docs/permissioned-kag-real-smoke.md`.
 
-A positive fixture with a missing sample, zero denominator, empty result, or
-extra non-relevant result in the first four fails instead of being omitted.
-Negative-control emptiness is reported separately and is never averaged into
-positive emptiness.
+## Full #97 invariant-to-test matrix
 
-Discovery and result order is significant. Trusted discovery returns a complete,
-deterministic, body-free catalog. Authorization filters it before relevance
-ranking, and retrieve accepts only exact authorized handles. Tests compare those
-handles, projection and authorization revisions, and generator, citation, trace,
-cache, and session references. A body-free candidate with the wrong tenant,
-knowledge base, authorization boundary, digest, projection, ACL revision, or
-serving state is a contract failure, not an ordinary retrieval miss.
+| #97 invariant | Canonical fixture row | Required result | Exact canonical anchors |
+|---|---|---|---|
+| Two tenants with colliding external IDs cannot observe each other | `tenant-collision-isolation`, samples `2` | Cross-tenant observations `0` | `internal/connector/core_test.go#TestConnectorTenantAndOwnerIsolation`; `internal/identity/store_test.go#TestLocalStoreSCIMIsIdempotentAndTenantScoped` |
+| SSO assertion and SCIM provisioning/deprovisioning are fail closed and replay safe | `identity-fail-closed-replay-safe`, samples `4` | Invalid/replayed/stale/deprovisioned accepts `0` | `internal/identity/gateway_test.go#TestGatewayBuildsTrustedAuthorizationAndFailsClosedOnIdentityChange`; `internal/identity/gateway_test.go#TestGatewayRejectsInvalidAssertionsWithoutDisclosure`; `internal/identity/publication_test.go#TestMembershipPublicationRestartRetriesUncertainWriteIdempotently`; `internal/identity/store_test.go#TestLocalStoreSCIMIsIdempotentAndTenantScoped` |
+| Connector content plus ACL failure never serves | `connector-acl-failure-never-serves`, samples `2` | Partial-serving transitions `0` | `internal/connector/acceptance_test.go#TestNilPublisherCannotClaimServingAndRecoveryPublishes`; `internal/connector/processor_test.go#TestProcessorIncompleteProjectionFailsClosed` |
+| Duplicate/reordered events, crashes, DLQ replay, tombstones, and full reconciliation converge | `durable-connector-convergence`, samples `7` | Replay is byte deterministic; DLQ does not advance serving; tombstones do not resurrect; residual tuple diff `0` | `internal/authz/permissioned_acceptance_test.go#TestPermissionedAcceptanceReconciliationRemovesStaleTuples`; `internal/connector/acceptance_test.go#TestSnapshotReconciliationFaultBoundariesResumeExactly`; `internal/connector/core_test.go#TestConnectorReplayAndPersistedJSONAreByteDeterministic`; `internal/connector/processor_test.go#TestProcessorCrashRecoveryAtEveryStageBoundary`; `internal/connector/processor_test.go#TestProcessorDeadLettersBoundedRetryWithoutAdvancingWatermarks`; `internal/connector/processor_test.go#TestProcessorRejectsReorderConflictsAndIdentifierReuse`; `internal/connector/processor_test.go#TestProcessorTombstoneReplayIsIdempotentAndCannotResurrect` |
+| `user ∩ agent ∩ task` covers retrieval, traversal, generation, cache, citation, and session replay | `user-agent-task-intersection`, samples `4` | Incomplete-scope allows and stale protected replay `0` | `internal/authz/agent_task_test.go#TestLocalAgentTaskIntersectionCoversEveryProtectedType`; `internal/knowledge/authorized/service_test.go#TestDelegatedQueryRevalidatesCurrentScopeBeforeAuthorizationAndReuse`; `internal/runtime/eino/runner_test.go#TestRunnerBindsPermissionedInterruptForRevocationReplay`; `internal/runtime/phase3_permissioned_acceptance_test.go#TestPhase3PermissionedAcceptanceIntersectionGuardsInvocationAndResults` |
+| Tool invocation and every returned resource are authorized | `tool-invocation-and-results-authorized`, samples `4` | Unauthorized callbacks and published results `0`; side effects remain separately confirmed | `internal/authz/tool_authorization_test.go#TestToolAuthorizationGateAuthorizesReturnedResourcesAtomically`; `internal/authz/tool_authorization_test.go#TestToolAuthorizationGateRevalidatesDelegationForInvocationAndReturn`; `internal/eino/tools/tools_test.go#TestAuthorizationDecoratorPreGatesBuildAndGitSideEffects`; `internal/runtime/phase3_permissioned_acceptance_test.go#TestPhase3PermissionedAcceptanceIntersectionGuardsInvocationAndResults` |
+| Simulation is non-mutating and matches the policy oracle | `simulation-read-only-oracle-parity`, samples `14` | Before/after input is equal and every impact category matches the oracle | `internal/policysim/engine_test.go#TestEngineCanonicalizesAllTargetKindsWithoutMutatingInput`; `internal/policysim/engine_test.go#TestEngineClassifiesIndependentEvaluationsWithStableReasons` |
+| Audit remains content free and detects tampering | `audit-content-free-tamper-evident`, samples `2` | Forbidden fields `0`; canonical chain verifies; tamper fails closed | `internal/audit/corruption_test.go#TestStoreFailsClosedOnRecordTamper`; `internal/audit/store_test.go#TestStoreAppendsCanonicalContentFreeChainAndVerifiesOnReopen` |
+| Residency violations block storage and egress | `residency-blocks-storage-egress`, samples `2` | Denied callbacks and bytes `0` | `cmd/knote/permissioned_telemetry_test.go#TestPermissionedTelemetryResidencyDenialPrecedesFilesystemWrite`; `internal/residency/gate_test.go#TestOperationWrappersDenyBeforeWriteNetworkAndSubprocess` |
+| Unauthorized existence, count, pagination, errors, traces, telemetry, and governance views do not leak | `unauthorized-observability-hidden`, samples `5` | Canary and unauthorized-section observations `0`; denied source calls `0` | `cmd/knote/permissioned_telemetry_test.go#TestPermissionedToolInvocationDeniedHandlerEmitsContentFreeQueryTelemetry`; `internal/governance/service_test.go#TestViewDenialDoesNotReadSource`; `internal/governance/service_test.go#TestViewProjectsAuthorizedSectionsWithoutZeroSideChannels`; `internal/runtime/permissioned_acceptance_test.go#TestPermissionedAcceptanceSideChannelSurfacesHideCanaries`; `internal/runtime/phase3_permissioned_acceptance_test.go#TestPhase3PermissionedAcceptanceIntersectionGuardsReplayWithoutSideChannels` |
+| False allow is zero across the complete matrix | `false-allow-zero`, samples `14`; top-level `false_allow: 0` | Any nonzero value blocks merge | `internal/knowledge/authorized/permissioned_acceptance_test.go#TestPermissionedAcceptancePolicyOracleAndRetrievalMetrics`; `internal/knowledge/authorized/phase2_permissioned_graph_acceptance_test.go#TestPhase2PermissionedGraphPolicyOracleAcceptanceMetrics` |
+| BatchCheck, connector lag, replay, reconciliation, revocation, and governance budgets are met | `operational-latency-budgets`, samples `145` | Every canonical budget below passes | The six exact budget anchors in `tests/fixtures/phase3-acceptance.json` |
 
-## Drop accounting
+Inherited files whose names contain `phase2` remain valid regression anchors;
+their filenames do not make them Phase 3 aggregate evidence by themselves.
 
-Per-hop authorization drops are a deterministic fixture diagnostic, not a
-relevance-quality metric. For each hop, report candidate, allowed, and dropped
-counts and require `candidates = allowed + dropped`. Across one Alice/Bob/unknown
-round, the fixture requires `40` candidates, `24` allows, and `16` drops, so
-`hop_authorization_drop_rate = 0.40`; over the four deterministic rounds those
-counts are `160`, `96`, and `64`. These values detect fixture or authorization
-stage drift and must not be generalized as a production quality threshold.
+## Phase 3 performance budgets
 
-Track the final post-filter independently through
-`final_filter_candidate_count`, `final_filter_allowed_count`, and
-`final_filter_dropped_count`; aggregate acceptance may also report
-`post_filter_drop_rate = dropped / candidates`. The policy-oracle fixture
-requires `3` candidates, `3` allows, and `0` drops per round (`12/12/0` across
-four rounds), with `post_filter_drop_rate = 0`. Do not fold these values into
-per-hop drops, Recall@4, Precision@4, or empty-result rates. A final drop can
-demonstrate the last revocation/authorization barrier; regardless of its count,
-no dropped resource may reach evidence, citations, generation, cache, replay, or
-protected output.
+The canonical values below come directly from
+`tests/fixtures/phase3-acceptance.json`. Percentile cohorts use nearest rank;
+`max` cohorts require every sample to stay within the threshold. The real
+OpenFGA smoke is authoritative for the `openfga_batch_check` cohort; its total
+wall-clock duration and all other live-service timing remain diagnostic. The
+other five budgets are deterministic test cohorts.
 
-## Latency and revocation budgets
+| Canonical budget ID | Metric | Cohort | Limit | Exact anchor |
+|---|---|---:|---:|---|
+| `batch-check-latency` | `openfga_batch_check`, P99 | `12` | `100ms` | `internal/authz/phase3_openfga_live_test.go#TestPhase3OpenFGALiveSmoke` |
+| `connector-lag` | `connector_apply_lag`, max | `1` | `2000ms` | `internal/connector/acceptance_test.go#TestSlowConnectorCallbackDoesNotBlockAnotherTenantAndCanReadStore` |
+| `governance-latency` | `governance_view`, max | `2` | `1000ms` | `internal/governance/service_test.go#TestViewAndRenderAreDeterministic` |
+| `reconciliation-latency` | `full_reconciliation`, max | `1` | `1000ms` | `internal/authz/reconciliation_telemetry_test.go#TestTupleReconcilerTelemetryFailureDoesNotChangePublishedResult` |
+| `replay-latency` | `session_replay`, max | `1` | `3000ms` | `internal/runtime/phase2_graph_replay_acceptance_test.go#TestPhase2GraphReplayAcceptanceRevocationClosesTraversalCacheCitationAndSession` |
+| `revocation-latency` | `revocation_propagation`, P99 | `128` | `100ms` | `internal/runtime/permissioned_acceptance_test.go#TestPermissionedAcceptanceRevocationPropagationPercentiles` |
 
-Percentiles use nearest rank: sort the complete sample set and select
-`ceil(percentile * sample_count) - 1`. Missing samples fail the cohort. Report
-sample count with every percentile.
+BatchCheck also has a hard physical request limit of `50`; missing, duplicate,
+extra, malformed, or per-item error responses fail closed. The revocation anchor
+additionally requires P95 `<= 25ms`. Connector, replay, and reconciliation must
+retain their zero-lag, byte-determinism, no-resurrection, and zero-residual-diff
+security invariants regardless of the latency result.
 
-| Metric | Sample boundary | Required result |
-|---|---|---:|
-| Local hard latency | every local deterministic authorization, retrieval, graph, and authorized-query sample | each sample `<= 1s` |
-| Synthetic P99 | deterministic synthetic end-to-end query samples with fixed injected stage durations | `P99 <= 100ms` |
-| Revocation propagation P95 | declared revocation through observed cache/replay protection | `P95 <= 25ms` |
-| Revocation propagation P99 | same sample set | `P99 <= 100ms` |
+Run the existing functional and budget anchors directly with:
 
-The 1-second ceiling catches hangs and accidental external I/O; it does not
-replace the 100-millisecond synthetic P99. Synthetic latency uses fixed clocks or
-durations so scheduler noise cannot make it nondeterministic. Revocation uses at
-least the existing 128 no-sleep samples and includes every attempt. Retries,
-timeouts, malformed responses, and failures are not hidden from counts.
+```sh
+scripts/smoke_phase3_openfga.sh
 
-Physical OpenFGA `BatchCheck` requests remain bounded to
-`authz.MaxBatchChecks` (`50`). Batch size, RPC count, and latency are reported as
-diagnostics and must match the exact authorization stages exercised by the
-fixture. A batch timeout, missing decision, duplicate correlation, wrong model,
-or partial response fails closed.
+go test -count=1 ./internal/authz \
+  -run '^TestTupleReconcilerTelemetryFailureDoesNotChangePublishedResult$'
 
-## Hard security invariants
+go test -count=1 ./internal/connector \
+  -run '^TestSlowConnectorCallbackDoesNotBlockAnotherTenantAndCanReadStore$'
 
-These are acceptance blockers for the code change and are never percentile
-allowances:
+go test -count=1 ./internal/governance \
+  -run '^TestViewAndRenderAreDeterministic$'
 
-| Invariant | Required result |
-|---|---:|
-| False allows | `0` |
-| Unauthorized resources presented to relevance | `0` |
-| Unauthorized evidence items or citations | `0` |
-| Unauthorized generator/solver inputs | `0` |
-| Unauthorized graph-path participation | `0` |
-| Unauthorized trace/debug/audit/session participation | `0` |
-| Cross-tenant candidates reaching authorization, load, expand, or generate | `0` |
-| Serving projections with incomplete or failed ACL state | `0` |
-| Stale cache, citation, derived-artifact, or session reads after revocation observation | `0` |
+go test -count=1 ./internal/runtime \
+  -run '^(TestPermissionedAcceptanceRevocationPropagationPercentiles|TestPhase2GraphReplayAcceptanceRevocationClosesTraversalCacheCitationAndSession)$'
 
-Every negative fixture includes protected body, title, path, prompt, identifier,
-and secret canaries. All canaries must be absent from public errors, traces,
-debug values, telemetry fields, generated output, persisted events, and captured
-adapter output.
+go test -count=1 ./tests/phase3 -run '^TestPhase3AcceptanceMatrix$'
+```
 
-## Telemetry acceptance
+The matrix test proves that the fixture is canonical, complete, sorted, and
+bound to exact test declarations. `scripts/verify_phase3_acceptance.sh` runs the
+matrix and every deterministic anchor through `go test -count=1 ./...`;
+`scripts/smoke_phase3_openfga.sh` runs the real OpenFGA budget anchor. Final
+measured values and the fixture digest are recorded in the PR and issue
+completion comments using the schema in `docs/phase3-release-evidence.md`.
 
-`KNOTE_PERMISSIONED_TELEMETRY_PATH` is optional. Its tests must prove:
+## Quality and no-leak metrics
 
-- unset means no sink and no telemetry file;
-- each non-empty line is exactly one valid JSON object in the closed telemetry
-  schema;
-- only fixed metric-scope/event/stage/outcome/budget enums, aggregate integer
-  counts, durations, rates, and percentiles are accepted;
-- unknown fields, free-form diagnostics or errors, content, paths, identifiers,
-  endpoints, provider output, and secrets are absent;
-- `metric_scope=operational` records contain only per-operation observations;
-  cohort-only Recall@4, Precision@4, positive/negative empty-result rates,
-  unauthorized path/generator participation, and latency/revocation percentiles
-  remain zero and must not be interpreted as measurements;
-- the deterministic acceptance cohort computes those quality and percentile
-  metrics independently without joining telemetry to session or evidence data;
-- open, append, encode, flush, and close failures do not change an allow, deny,
-  revocation, evidence, or generated result;
-- neither telemetry records nor sink failures appear as TUI/model events or in
-  `.knote/sessions/*.jsonl`.
+The inherited public-synthetic policy oracle uses `K = 4`. Positive Recall@4
+and Precision@4 must each be `1.00` per principal, positive empty-result rate
+must be `0`, and negative-control empty-result rate must be `1.00`. Aggregate
+averages cannot hide a principal-specific failure.
 
-Telemetry is best-effort operational evidence. It is not an authorization input,
-an audit record for content access, or a reason to retry a protected operation.
-Issue #78 implements this contract in `internal/telemetry` and verifies the
-runtime file sink through both writable and blocked/failing paths. The built
-binary harness validates allowed and denied operational records without treating
-cohort-only zero placeholders as measured values.
+Every negative fixture carries protected body, title, path, identifier, prompt,
+credential, and provider-diagnostic canaries. Canaries must be absent from:
 
-## Invariant-to-test map
-
-| Scenario | Status | Direct anchor |
-|---|---|---|
-| Real opt-in configuration, selected-bundle loader, exact mode tools, startup context | existing | `cmd/knote/eino_test.go`; `cmd/knote/permissioned_revision_test.go`; `internal/knowledge/authorized/bundle_loader_test.go` |
-| Recall@4/Precision@4, positive/negative empty controls, path participation, hop/final drops, synthetic query P99 | implemented by #78 | `internal/knowledge/authorized/phase2_permissioned_graph_acceptance_test.go: TestPhase2PermissionedGraphPolicyOracleAcceptanceMetrics`; `internal/knowledge/authorized/traversal.go: TraversalReport` |
-| Hidden Claim, denied intermediate, alternate support, derivation and traversal limits | existing | `internal/knowledge/authorized/phase2_permissioned_graph_acceptance_test.go: TestPhase2PermissionedGraphDerivationBudgetsAndFailures` |
-| Revocation closes traversal, cache, citation, and replay within P95/P99 | existing | `internal/knowledge/authorized/phase2_permissioned_graph_acceptance_test.go: TestPhase2PermissionedGraphCacheCitationRevocationAndSessionReplay`, `TestPhase2PermissionedGraphRevocationLatencyBudget`; `internal/runtime/phase2_graph_replay_acceptance_test.go` |
-| Mixed-visibility count/exists/autocomplete/pagination/error/trace/debug/audit surfaces | existing | `internal/runtime/permissioned_acceptance_test.go: TestPermissionedAcceptanceSideChannelSurfacesHideCanaries`; `internal/runtime/phase2_protected_surfaces_acceptance_test.go` |
-| Cross-tenant input stops before search, graph, or generation | existing | `internal/runtime/phase2_protected_surfaces_acceptance_test.go: TestPhase2ProtectedSurfacesAcceptanceCrossTenantStopsBeforeSearchGraphAndGenerate` |
-| Full replacement removes stale content, bindings, Claims, and tuples | existing | `internal/catalog/phase2_full_reconciliation_acceptance_test.go`; `internal/authz/phase2_full_reconciliation_acceptance_test.go` |
-| Go/Python predicate and resource-kind allowlists stay identical | added by #78 | `tests/fixtures/permissioned-plan-contract.json`; `internal/protocol/permissioned_plan_contract_parity_test.go`; `adapters/kag/test_permissioned_plan_contract_parity.py` |
-| Content-free telemetry schema and sink-failure isolation | implemented by #78 | `internal/telemetry`; `cmd/knote/permissioned_telemetry.go`; `internal/knowledge/authorized/phase2_permissioned_graph_telemetry_test.go`; `internal/authz/reconciliation_telemetry_test.go`; built-binary coverage |
-| Real composition through allow, explain, deny, empty result, revocation-aware replay, telemetry sink failure, provider failure, and backend failure | implemented by #78 and invoked by CI | `.github/workflows/ci.yml`; `scripts/smoke_permissioned_binary.sh`; `tests/smoke/permissioned_binary_acceptance.py`; `tests/fixtures/permissioned-binary/permissioned_binary_provider.py` |
-
-Component tests remain defense in depth; all implemented rows name concrete
-paths and the built-binary gate remains authoritative over its runtime scenarios.
+- relevance input, graph frontier, generator input, answer, citation, and cache;
+- tool arguments, returned-resource envelopes, TUI/runtime events, and sessions;
+- errors, traces, telemetry, governance output, audit records, and smoke output;
+- persisted connector, identity, audit, and release-evidence metadata.
 
 ## Failure diagnostics
 
-Acceptance output identifies only a fixed invariant slug, scenario/stage class,
-sample number, aggregate expected/actual value, and duration/budget class. Lists
-and records are deterministic and sorted. Public authorization timeout,
-unavailable, malformed, stale-revision, and provider failures remain generic.
+Failure output is limited to a fixed invariant slug, scenario/stage class,
+sample number, expected/actual aggregate value, duration/budget class, and
+content-free evidence digest. Lists are deterministic and sorted.
 
 Do not use `set -x`, print environment variables, dump OpenFGA requests or
-responses, expose provider stdout/stderr, or include source/artifact/session
-bodies in a failure report. A telemetry sink problem is diagnosed through file
-existence, ownership, permissions, and free space outside the TUI; it never
-changes the protected test oracle.
+responses, expose provider stdout/stderr, or attach source, artifact, assertion,
+connector, audit-ledger, or session bodies. A failed live smoke never justifies
+weakening authorization, widening residency, skipping confirmation, or falling
+back to a legacy non-permissioned path.
 
-## Optional live counterpart
+## Final merge gate
 
-After both mandatory deterministic gates pass, an operator may run the pinned
-public-synthetic OpenFGA + OpenSPG/KAG procedure in
-`docs/permissioned-kag-real-smoke.md`. Its service compatibility evidence is
-useful, but a skip or unavailable Docker environment does not weaken the
-deterministic security gate, and a live pass does not compensate for a missing
-built-binary pass.
+Issue #97 is complete only when:
+
+1. every command required above passes at the final PR head;
+2. `scripts/verify_phase3_acceptance.sh` and
+   `scripts/smoke_phase3_openfga.sh` both pass and their exact-head evidence is
+   recorded; the digest of `tests/fixtures/phase3-acceptance.json` is recorded;
+3. every matrix row is `pass`, every budget is met, and false allow is `0`;
+4. hosted CI is green on the same head;
+5. a completed current-head Codex review has no verified P1/P2 finding; and
+6. the PR is squash-merged to `dev`.
+
+The durable evidence schema is maintained in
+`docs/phase3-release-evidence.md`; exact-head results live in the PR and issue
+completion comments. Closing #97 and epic #90 records completion of Phase 3 on
+`dev`; it still does not create or publish a tag, binary release, release branch,
+or GitHub Release.

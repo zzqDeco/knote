@@ -31,7 +31,29 @@ jobs:
           python-version: "3.11"
 
       - name: Go tests
-        run: KNOTE_KAG_FAKE=1 go test ./...
+        run: KNOTE_KAG_FAKE=1 go test -count=1 ./...
+
+      - name: Go race tests
+        run: |
+          for package in \
+            ./cmd/knote \
+            ./internal/audit \
+            ./internal/authz \
+            ./internal/catalog \
+            ./internal/connector \
+            ./internal/governance \
+            ./internal/identity \
+            ./internal/knowledge/authorized \
+            ./internal/policysim \
+            ./internal/residency \
+            ./internal/runtime \
+            ./internal/runtime/eino
+          do
+            KNOTE_KAG_FAKE=1 go test -race -count=1 "${package}"
+          done
+
+      - name: Go vet
+        run: go vet ./...
 
       - name: OpenFGA authorization model tests
         run: GOTOOLCHAIN=go1.25.12 go run github.com/openfga/cli/cmd/fga@v0.7.17 model test --tests internal/authz/model/authorization.fga.yaml
@@ -61,6 +83,28 @@ jobs:
           fi
           scripts/smoke_fake_mvp.sh
 
+  openfga-live:
+    name: Phase 3 OpenFGA live smoke
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Run disposable OpenFGA smoke
+        run: scripts/smoke_phase3_openfga.sh
+
   windows-catalog:
     runs-on: windows-latest
     steps:
@@ -80,3 +124,6 @@ jobs:
 
       - name: Connector store tests
         run: go test ./internal/connector/...
+
+      - name: Audit durable-store tests
+        run: go test ./internal/audit/...

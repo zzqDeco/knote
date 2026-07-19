@@ -79,7 +79,6 @@ func TestPhase2PermissionedGraphPolicyOracleAcceptanceMetrics(t *testing.T) {
 			},
 		},
 	}
-
 	var (
 		truePositives                 int
 		authorizedRelevant            int

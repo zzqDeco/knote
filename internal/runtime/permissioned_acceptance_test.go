@@ -17,6 +17,7 @@ import (
 	"github.com/zzqDeco/knote/internal/knowledge/kag"
 	"github.com/zzqDeco/knote/internal/protocol"
 	"github.com/zzqDeco/knote/internal/repository/local"
+	phase3contract "github.com/zzqDeco/knote/tests/phase3/contract"
 )
 
 const (
@@ -31,10 +32,6 @@ const (
 	permissionedAcceptanceDeniedContent                      = "DENIED CANARY BODY must never cross the authorization boundary"
 	permissionedAcceptanceDeniedCitation                     = "cite_denied_canary"
 	permissionedAcceptancePrivateReaders                     = "group:fixture-private-readers"
-
-	permissionedAcceptancePropagationSamples = 128
-	permissionedAcceptanceP95SLO             = 25 * time.Millisecond
-	permissionedAcceptanceP99SLO             = 100 * time.Millisecond
 )
 
 var permissionedAcceptanceHiddenCanaries = []string{
@@ -311,8 +308,8 @@ func TestPermissionedAcceptanceRevocationPropagationPercentiles(t *testing.T) {
 		"fixture query failed while creating latency binding: %+v", events)
 	protected := prime.runner.snapshot()
 
-	samples := make([]time.Duration, 0, permissionedAcceptancePropagationSamples)
-	for index := 0; index < permissionedAcceptancePropagationSamples; index++ {
+	samples := make([]time.Duration, 0, phase3contract.RevocationSampleCount)
+	for index := 0; index < phase3contract.RevocationSampleCount; index++ {
 		cache, cacheErr := authorized.NewQueryCache(4)
 		permissionedAcceptanceNoError(t, invariant, cacheErr)
 		application, applicationErr := fixture.NewApplication(prime.probe, fixture.ApplicationOptions{
@@ -345,14 +342,14 @@ func TestPermissionedAcceptanceRevocationPropagationPercentiles(t *testing.T) {
 
 	p95 := permissionedAcceptancePercentile(samples, 95)
 	p99 := permissionedAcceptancePercentile(samples, 99)
-	permissionedAcceptanceRequire(t, invariant, p95 <= permissionedAcceptanceP95SLO,
+	permissionedAcceptanceRequire(t, invariant, p95 <= phase3contract.RevocationP95Budget,
 		"P95 propagation %s exceeds %s across %d no-sleep samples",
-		p95, permissionedAcceptanceP95SLO, len(samples))
-	permissionedAcceptanceRequire(t, invariant, p99 <= permissionedAcceptanceP99SLO,
+		p95, phase3contract.RevocationP95Budget, len(samples))
+	permissionedAcceptanceRequire(t, invariant, p99 <= phase3contract.RevocationP99Budget,
 		"P99 propagation %s exceeds %s across %d no-sleep samples",
-		p99, permissionedAcceptanceP99SLO, len(samples))
+		p99, phase3contract.RevocationP99Budget, len(samples))
 	t.Logf("revocation samples=%d p95=%s/%s p99=%s/%s projection=%s authz=%s",
-		len(samples), p95, permissionedAcceptanceP95SLO, p99, permissionedAcceptanceP99SLO,
+		len(samples), p95, phase3contract.RevocationP95Budget, p99, phase3contract.RevocationP99Budget,
 		permissionedAcceptanceProjectionVersion, fixture.AuthorizationModelID)
 }
 

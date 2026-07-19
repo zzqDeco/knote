@@ -5,11 +5,16 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/zzqDeco/knote/internal/telemetry"
+	phase3contract "github.com/zzqDeco/knote/tests/phase3/contract"
 )
 
 func TestTupleReconcilerTelemetryFailureDoesNotChangePublishedResult(t *testing.T) {
+	if phase3contract.ReconciliationSampleCount != 1 {
+		t.Fatalf("reconciliation test supports exactly one sample, contract requires %d", phase3contract.ReconciliationSampleCount)
+	}
 	resourceID := testClaimResourceID(t, "telemetry")
 	current := testTupleProjection(t, "projection-telemetry-v1", nil)
 	desired := testTupleProjection(t, "projection-telemetry-v2", []testClaimTupleSpec{{
@@ -48,9 +53,13 @@ func TestTupleReconcilerTelemetryFailureDoesNotChangePublishedResult(t *testing.
 		t.Fatal(err)
 	}
 
+	started := time.Now()
 	report, err := reconciler.Reconcile(context.Background(), plan)
 	if err != nil {
 		t.Fatalf("reconciliation inherited telemetry failure: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > phase3contract.ReconciliationMaxBudget {
+		t.Fatalf("full reconciliation took %s, want at most %s", elapsed, phase3contract.ReconciliationMaxBudget)
 	}
 	if report.Outcome != ReconciliationSucceeded || !report.RevisionPublished {
 		t.Fatalf("reconciliation report changed after telemetry failure: %+v", report)

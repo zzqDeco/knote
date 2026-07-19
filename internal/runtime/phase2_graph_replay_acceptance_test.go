@@ -14,6 +14,7 @@ import (
 	"github.com/zzqDeco/knote/internal/knowledge/kag"
 	"github.com/zzqDeco/knote/internal/protocol"
 	"github.com/zzqDeco/knote/internal/repository/local"
+	phase3contract "github.com/zzqDeco/knote/tests/phase3/contract"
 )
 
 const (
@@ -29,6 +30,9 @@ const (
 )
 
 func TestPhase2GraphReplayAcceptanceRevocationClosesTraversalCacheCitationAndSession(t *testing.T) {
+	if phase3contract.ReplaySampleCount != 1 {
+		t.Fatalf("replay test supports exactly one sample, contract requires %d", phase3contract.ReplaySampleCount)
+	}
 	fixture := newPhase2GraphFixture(t)
 	backend := newPhase2GraphBackend(fixture)
 	authorizer := &phase2GraphAuthorizer{}
@@ -173,9 +177,13 @@ func TestPhase2GraphReplayAcceptanceRevocationClosesTraversalCacheCitationAndSes
 		AuthorizationContextProvider: provider,
 		ProtectedContentAuthorizer:   phase2GraphProtectedContentAuthorizer(service),
 	})
+	replayStarted := time.Now()
 	replayed, err := replayManager.Start(context.Background(), StartOptions{ResumeID: phase2GraphRuntimeSession})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if elapsed := time.Since(replayStarted); elapsed > phase3contract.ReplayMaxBudget {
+		t.Fatalf("permissioned session replay took %s, want at most %s", elapsed, phase3contract.ReplayMaxBudget)
 	}
 	if !permissionedAcceptanceHasSafeSlash(replayed) ||
 		!strings.Contains(permissionedAcceptanceEventText(replayed), safeLocalMessage) {

@@ -1109,7 +1109,7 @@ def build_environment(
         "KNOTE_OPENFGA_ENDPOINT": openfga_url,
         "KNOTE_OPENFGA_STORE_ID": STORE_ID,
         "KNOTE_OPENFGA_MODEL_ID": MODEL_ID,
-        "KNOTE_OPENFGA_TIMEOUT": "1s",
+        "KNOTE_OPENFGA_TIMEOUT": "5s",
         "KNOTE_OPENFGA_CONSISTENCY": "higher_consistency",
         "KNOTE_OPENFGA_API_TOKEN": OPENFGA_API_TOKEN,
         "KNOTE_EINO_PROVIDER": "openai-compatible",
