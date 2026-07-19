@@ -124,7 +124,7 @@ func TestPermissionedSlashHelpListsOnlyAvailableCommands(t *testing.T) {
 			help = event.Message
 		}
 	}
-	for _, command := range []string{"build", "commit", "release", "checkout", "tasks", "clear", "new", "resume", "help", "exit"} {
+	for _, command := range []string{"build", "commit", "release", "checkout", "tasks", "governance", "clear", "new", "resume", "help", "exit"} {
 		if !strings.Contains(help, "/"+command) {
 			t.Fatalf("permissioned help omitted /%s: %q", command, help)
 		}

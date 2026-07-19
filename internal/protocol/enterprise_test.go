@@ -522,6 +522,75 @@ func TestPolicyAuditAndResidencyContractsArePinnedAndNonMutating(t *testing.T) {
 	}
 }
 
+func TestGovernanceV2PinsCompleteSnapshotsAndClassifiesFailures(t *testing.T) {
+	now := enterpriseTestTime()
+	scope := enterpriseTestTenantScope()
+	request := PolicySimulationRequest{
+		Version: GovernanceContractVersion, TenantID: scope.TenantID, SimulationID: "simulation-v2",
+		RequestID: "request-v2", ActorID: "operator-v2", Mode: PolicySimulationReadOnly,
+		AgentID: "agent-v2", TaskID: "task-v2",
+		BaseAuthorizationModelID: "model-v1", ProposedAuthorizationModelID: "model-v2",
+		BaseIdentityWatermark: "identity-v1", ProposedIdentityWatermark: "identity-v2",
+		BaseACLWatermark: "acl-v1", ProposedACLWatermark: "acl-v2",
+		BaseDelegationWatermark: "delegation-v1", ProposedDelegationWatermark: "delegation-v2",
+		BaseAgentTaskScope:     "scope_0123456789abcdef0123456789abcdef",
+		ProposedAgentTaskScope: "scope_fedcba9876543210fedcba9876543210",
+		BaseConnectorWatermark: "connector-v1", ProposedConnectorWatermark: "connector-v2",
+		BaseResidencyWatermark: "residency-v1", ProposedResidencyWatermark: "residency-v2",
+		RequestedAt: now,
+	}
+	if err := request.ValidateFor(scope); err != nil {
+		t.Fatalf("governance v2 request: %v", err)
+	}
+	missingPin := request
+	missingPin.ProposedConnectorWatermark = ""
+	if err := missingPin.ValidateFor(scope); err == nil {
+		t.Fatal("governance v2 request without proposed connector watermark was accepted")
+	}
+	legacyWithV2Binding := request
+	legacyWithV2Binding.Version = EnterpriseContractVersion
+	if err := legacyWithV2Binding.ValidateFor(scope); err == nil {
+		t.Fatal("legacy simulation request with v2 bindings was accepted")
+	}
+
+	report := PolicyImpactReport{
+		Version: GovernanceContractVersion, TenantID: scope.TenantID,
+		SimulationID: request.SimulationID, GeneratedAt: now.Add(time.Minute),
+		Entries: []PolicyImpactEntry{
+			{
+				CorrelationID: "impact-v2-1", TargetKind: PolicyTargetAuthorizationTuple,
+				TargetID: "target-v2-1", SubjectID: "user:alice", Relation: "can_view",
+				Object: "document:doc-a", Kind: PolicyImpactGrant,
+				Before: DecisionDeny, After: DecisionAllow, ReasonCode: "tuple-added",
+			},
+			{
+				CorrelationID: "impact-v2-2", TargetKind: PolicyTargetConnectorState,
+				TargetID: "target-v2-2", Kind: PolicyImpactFailure,
+				Before: DecisionIndeterminate, After: DecisionIndeterminate, ReasonCode: "backend-unavailable",
+			},
+		},
+	}
+	if err := report.ValidateFor(request, scope); err != nil {
+		t.Fatalf("governance v2 report: %v", err)
+	}
+	empty := report
+	empty.Entries = nil
+	if err := empty.ValidateFor(request, scope); err != nil {
+		t.Fatalf("zero-impact governance report: %v", err)
+	}
+	conflated := report
+	conflated.Entries = append([]PolicyImpactEntry(nil), report.Entries...)
+	conflated.Entries[1].Kind = PolicyImpactIndeterminate
+	if err := conflated.ValidateFor(request, scope); err == nil {
+		t.Fatal("governance v2 report conflating failure with indeterminate was accepted")
+	}
+	wrongVersion := report
+	wrongVersion.Version = EnterpriseContractVersion
+	if err := wrongVersion.ValidateFor(request, scope); err == nil {
+		t.Fatal("impact report with a mismatched contract version was accepted")
+	}
+}
+
 func TestEnterpriseContractsSerializeDeterministicallyWithoutPayloads(t *testing.T) {
 	event := ConnectorEventEnvelope{
 		Version: EnterpriseContractVersion, TenantID: "tenant-a", ConnectorID: "connector-1",

@@ -18,14 +18,15 @@ import (
 type overlayMode string
 
 const (
-	overlayNone     overlayMode = ""
-	overlayConfirm  overlayMode = "confirm"
-	overlayTasks    overlayMode = "tasks"
-	overlayVersions overlayMode = "versions"
-	overlayDiff     overlayMode = "diff"
-	overlayDetails  overlayMode = "details"
-	overlaySettings overlayMode = "settings"
-	overlayHelp     overlayMode = "help"
+	overlayNone       overlayMode = ""
+	overlayConfirm    overlayMode = "confirm"
+	overlayTasks      overlayMode = "tasks"
+	overlayVersions   overlayMode = "versions"
+	overlayDiff       overlayMode = "diff"
+	overlayDetails    overlayMode = "details"
+	overlaySettings   overlayMode = "settings"
+	overlayGovernance overlayMode = "governance"
+	overlayHelp       overlayMode = "help"
 )
 
 type Model struct {
@@ -49,7 +50,7 @@ type Model struct {
 
 func New(rt runtime.Runtime, initial []protocol.Event) Model {
 	composer := textinput.New()
-	composer.Placeholder = "Ask, /build, /diff, /versions, /tasks, /help"
+	composer.Placeholder = "Ask, /build, /governance, /tasks, /help"
 	composer.Prompt = "> "
 	composer.Focus()
 	composer.CharLimit = 4096
@@ -386,6 +387,8 @@ func overlayFromEvents(events []protocol.Event) (overlayMode, string) {
 			return overlayConfirm, "approval\n" + string(data)
 		case protocol.EventAssistantDone:
 			switch eventOverlay(event.Payload) {
+			case "governance":
+				return overlayGovernance, event.Message
 			case "details":
 				return overlayDetails, event.Message
 			case "settings":

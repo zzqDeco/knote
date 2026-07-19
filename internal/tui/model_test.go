@@ -121,6 +121,28 @@ func TestOverlaySwitchAndEsc(t *testing.T) {
 	}
 }
 
+func TestGovernanceOverlayScrollsAndCloses(t *testing.T) {
+	model := newTestModel(t)
+	model.applyEvents([]protocol.Event{protocol.NewEvent(
+		protocol.EventAssistantDone,
+		model.runtime.SessionID(),
+		"governance\ntenant\n  id: local\nconnectors\n  total: 0",
+		map[string]any{"overlay": "governance"},
+	)})
+	if model.overlayMode != overlayGovernance || !strings.Contains(model.overlay, "connectors") {
+		t.Fatalf("governance overlay = mode %s content %q", model.overlayMode, model.overlay)
+	}
+	updateModel(t, &model, tea.WindowSizeMsg{Width: 48, Height: 16})
+	if model.overlayViewport.Width <= 0 || model.overlayViewport.Height <= 0 {
+		t.Fatalf("governance overlay did not resize: %+v", model.overlayViewport)
+	}
+	updateModel(t, &model, tea.KeyMsg{Type: tea.KeyPgDown})
+	updateModel(t, &model, tea.KeyMsg{Type: tea.KeyEsc})
+	if model.overlayMode != overlayNone || strings.TrimSpace(model.overlay) != "" {
+		t.Fatalf("governance overlay did not close: mode=%s overlay=%q", model.overlayMode, model.overlay)
+	}
+}
+
 func TestClearProjectsTranscriptWithoutDeletingSession(t *testing.T) {
 	model := newTestModel(t)
 	store := local.New(model.runtime.Workspace())

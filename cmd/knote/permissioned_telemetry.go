@@ -21,10 +21,18 @@ var errPermissionedTelemetryTimeout = errors.New("permissioned telemetry emit ti
 type permissionedTelemetryFileSink struct {
 	path         string
 	gate         chan struct{}
+	residency    func(context.Context) error
 	appendRecord func(string, []byte) error
 }
 
 func newPermissionedTelemetrySink(path string) telemetry.Sink {
+	return newPermissionedTelemetrySinkWithResidency(path, nil)
+}
+
+func newPermissionedTelemetrySinkWithResidency(
+	path string,
+	residency func(context.Context) error,
+) telemetry.Sink {
 	if path == "" {
 		return telemetry.NopSink{}
 	}
@@ -33,18 +41,31 @@ func newPermissionedTelemetrySink(path string) telemetry.Sink {
 	return &permissionedTelemetryFileSink{
 		path:         path,
 		gate:         gate,
+		residency:    residency,
 		appendRecord: appendPermissionedTelemetryRecord,
 	}
 }
 
 func newPermissionedToolInvocationDeniedHandler(sink telemetry.Sink) authz.ToolInvocationDeniedHandler {
-	if sink == nil {
+	return newPermissionedToolInvocationDeniedHandlerWithAudit(sink, nil)
+}
+
+func newPermissionedToolInvocationDeniedHandlerWithAudit(
+	sink telemetry.Sink,
+	auditRecorder *permissionedAuditRecorder,
+) authz.ToolInvocationDeniedHandler {
+	if sink == nil && auditRecorder == nil {
 		return nil
 	}
 	return func(ctx context.Context, manifest protocol.ToolAuthorizationManifest) {
-		switch manifest.ToolName {
-		case einotools.NameQuery, einotools.NameExplain:
-			_ = sink.Emit(ctx, permissionedToolInvocationDeniedTelemetryRecord())
+		if auditRecorder != nil {
+			_, _ = auditRecorder.Record(ctx, "tool."+manifest.Action, protocol.DecisionDeny)
+		}
+		if sink != nil {
+			switch manifest.ToolName {
+			case einotools.NameQuery, einotools.NameExplain:
+				_ = sink.Emit(ctx, permissionedToolInvocationDeniedTelemetryRecord())
+			}
 		}
 	}
 }
@@ -67,6 +88,11 @@ func permissionedToolInvocationDeniedTelemetryRecord() telemetry.Record {
 func (s *permissionedTelemetryFileSink) Emit(ctx context.Context, record telemetry.Record) error {
 	if ctx == nil {
 		return telemetry.ErrInvalidRecord
+	}
+	if s.residency != nil {
+		if err := s.residency(ctx); err != nil {
+			return err
+		}
 	}
 	var encoded bytes.Buffer
 	if err := telemetry.NewJSONLSink(&encoded).Emit(ctx, record); err != nil {

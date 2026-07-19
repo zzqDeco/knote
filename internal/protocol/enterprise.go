@@ -788,24 +788,38 @@ type PolicySimulationMode string
 
 const PolicySimulationReadOnly PolicySimulationMode = "read_only"
 
+// GovernanceContractVersion adds the complete Phase 3 policy snapshot binding
+// while preserving the original enterprise v1 records for replay.
+const GovernanceContractVersion = "v2"
+
 type PolicySimulationRequest struct {
-	Version                      string               `json:"version"`
-	TenantID                     string               `json:"tenant_id"`
-	SimulationID                 string               `json:"simulation_id"`
-	RequestID                    string               `json:"request_id"`
-	ActorID                      string               `json:"actor_id"`
-	Mode                         PolicySimulationMode `json:"mode"`
-	BaseAuthorizationModelID     string               `json:"base_authorization_model_id"`
-	ProposedAuthorizationModelID string               `json:"proposed_authorization_model_id"`
-	BaseIdentityWatermark        string               `json:"base_identity_watermark"`
-	ProposedIdentityWatermark    string               `json:"proposed_identity_watermark"`
-	BaseACLWatermark             string               `json:"base_acl_watermark"`
-	ProposedACLWatermark         string               `json:"proposed_acl_watermark"`
-	RequestedAt                  time.Time            `json:"requested_at"`
+	Version                      string                    `json:"version"`
+	TenantID                     string                    `json:"tenant_id"`
+	SimulationID                 string                    `json:"simulation_id"`
+	RequestID                    string                    `json:"request_id"`
+	ActorID                      string                    `json:"actor_id"`
+	Mode                         PolicySimulationMode      `json:"mode"`
+	AgentID                      string                    `json:"agent_id,omitempty"`
+	TaskID                       string                    `json:"task_id,omitempty"`
+	BaseAuthorizationModelID     string                    `json:"base_authorization_model_id"`
+	ProposedAuthorizationModelID string                    `json:"proposed_authorization_model_id"`
+	BaseIdentityWatermark        string                    `json:"base_identity_watermark"`
+	ProposedIdentityWatermark    string                    `json:"proposed_identity_watermark"`
+	BaseACLWatermark             string                    `json:"base_acl_watermark"`
+	ProposedACLWatermark         string                    `json:"proposed_acl_watermark"`
+	BaseDelegationWatermark      string                    `json:"base_delegation_watermark,omitempty"`
+	ProposedDelegationWatermark  string                    `json:"proposed_delegation_watermark,omitempty"`
+	BaseAgentTaskScope           AgentTaskScopeFingerprint `json:"base_agent_task_scope_fingerprint,omitempty"`
+	ProposedAgentTaskScope       AgentTaskScopeFingerprint `json:"proposed_agent_task_scope_fingerprint,omitempty"`
+	BaseConnectorWatermark       string                    `json:"base_connector_watermark,omitempty"`
+	ProposedConnectorWatermark   string                    `json:"proposed_connector_watermark,omitempty"`
+	BaseResidencyWatermark       string                    `json:"base_residency_policy_watermark,omitempty"`
+	ProposedResidencyWatermark   string                    `json:"proposed_residency_policy_watermark,omitempty"`
+	RequestedAt                  time.Time                 `json:"requested_at"`
 }
 
 func (r PolicySimulationRequest) ValidateFor(scope TenantScope) error {
-	if r.Version != EnterpriseContractVersion {
+	if r.Version != EnterpriseContractVersion && r.Version != GovernanceContractVersion {
 		return fmt.Errorf("unsupported policy simulation request version %q", r.Version)
 	}
 	if err := scope.Validate(); err != nil {
@@ -831,6 +845,34 @@ func (r PolicySimulationRequest) ValidateFor(scope TenantScope) error {
 	if r.Mode != PolicySimulationReadOnly {
 		return fmt.Errorf("policy simulation mode must be read_only")
 	}
+	if r.Version == EnterpriseContractVersion {
+		if r.AgentID != "" || r.TaskID != "" || r.BaseDelegationWatermark != "" ||
+			r.ProposedDelegationWatermark != "" || r.BaseAgentTaskScope != "" ||
+			r.ProposedAgentTaskScope != "" || r.BaseConnectorWatermark != "" ||
+			r.ProposedConnectorWatermark != "" || r.BaseResidencyWatermark != "" ||
+			r.ProposedResidencyWatermark != "" {
+			return fmt.Errorf("legacy policy simulation request cannot contain governance v2 bindings")
+		}
+		return validateUTC("requested_at", r.RequestedAt)
+	}
+	if err := validateEnterpriseFields(
+		"agent_id", r.AgentID,
+		"task_id", r.TaskID,
+		"base_delegation_watermark", r.BaseDelegationWatermark,
+		"proposed_delegation_watermark", r.ProposedDelegationWatermark,
+		"base_connector_watermark", r.BaseConnectorWatermark,
+		"proposed_connector_watermark", r.ProposedConnectorWatermark,
+		"base_residency_policy_watermark", r.BaseResidencyWatermark,
+		"proposed_residency_policy_watermark", r.ProposedResidencyWatermark,
+	); err != nil {
+		return err
+	}
+	if err := r.BaseAgentTaskScope.Validate(); err != nil {
+		return fmt.Errorf("base agent task scope fingerprint: %w", err)
+	}
+	if err := r.ProposedAgentTaskScope.Validate(); err != nil {
+		return fmt.Errorf("proposed agent task scope fingerprint: %w", err)
+	}
 	return validateUTC("requested_at", r.RequestedAt)
 }
 
@@ -841,32 +883,65 @@ const (
 	PolicyImpactRevoke        PolicyImpactKind = "revoke"
 	PolicyImpactUnchanged     PolicyImpactKind = "unchanged"
 	PolicyImpactIndeterminate PolicyImpactKind = "indeterminate"
+	PolicyImpactUnknown       PolicyImpactKind = "unknown"
+	PolicyImpactFailure       PolicyImpactKind = "failure"
+)
+
+type PolicyImpactTargetKind string
+
+const (
+	PolicyTargetAuthorizationTuple PolicyImpactTargetKind = "authorization_tuple"
+	PolicyTargetIdentityMembership PolicyImpactTargetKind = "identity_membership"
+	PolicyTargetConnectorState     PolicyImpactTargetKind = "connector_state"
+	PolicyTargetResidencyRoute     PolicyImpactTargetKind = "residency_route"
 )
 
 type PolicyImpactEntry struct {
-	CorrelationID string           `json:"correlation_id"`
-	SubjectID     string           `json:"subject_id"`
-	Relation      string           `json:"relation"`
-	Object        string           `json:"object"`
-	Kind          PolicyImpactKind `json:"kind"`
-	Before        DecisionOutcome  `json:"before"`
-	After         DecisionOutcome  `json:"after"`
+	CorrelationID string                 `json:"correlation_id"`
+	TargetKind    PolicyImpactTargetKind `json:"target_kind,omitempty"`
+	TargetID      string                 `json:"target_id,omitempty"`
+	SubjectID     string                 `json:"subject_id"`
+	Relation      string                 `json:"relation"`
+	Object        string                 `json:"object"`
+	Kind          PolicyImpactKind       `json:"kind"`
+	Before        DecisionOutcome        `json:"before"`
+	After         DecisionOutcome        `json:"after"`
+	ReasonCode    string                 `json:"reason_code,omitempty"`
 }
 
 func (e PolicyImpactEntry) Validate() error {
-	if err := validateEnterpriseFields(
-		"correlation_id", e.CorrelationID,
-	); err != nil {
+	return e.validateForVersion(EnterpriseContractVersion)
+}
+
+func (e PolicyImpactEntry) validateForVersion(version string) error {
+	if err := validateEnterpriseID("correlation_id", e.CorrelationID); err != nil {
 		return err
 	}
-	if err := validateAuthorizationReference("subject_id", e.SubjectID, true, true); err != nil {
-		return err
-	}
-	if err := validateAuthorizationName("relation", e.Relation); err != nil {
-		return err
-	}
-	if err := validateAuthorizationReference("object", e.Object, false, false); err != nil {
-		return err
+	if version == EnterpriseContractVersion {
+		if e.TargetKind != "" || e.TargetID != "" || e.ReasonCode != "" {
+			return fmt.Errorf("legacy policy impact entry cannot contain governance v2 fields")
+		}
+		if err := validatePolicyTupleImpact(e); err != nil {
+			return err
+		}
+	} else if version == GovernanceContractVersion {
+		if err := validateEnterpriseFields("target_id", e.TargetID, "reason_code", e.ReasonCode); err != nil {
+			return err
+		}
+		switch e.TargetKind {
+		case PolicyTargetAuthorizationTuple:
+			if err := validatePolicyTupleImpact(e); err != nil {
+				return err
+			}
+		case PolicyTargetIdentityMembership, PolicyTargetConnectorState, PolicyTargetResidencyRoute:
+			if e.SubjectID != "" || e.Relation != "" || e.Object != "" {
+				return fmt.Errorf("non-tuple policy impact cannot contain tuple fields")
+			}
+		default:
+			return fmt.Errorf("unsupported policy impact target kind %q", e.TargetKind)
+		}
+	} else {
+		return fmt.Errorf("unsupported policy impact entry version %q", version)
 	}
 	if err := validateDecisionOutcome("before", e.Before); err != nil {
 		return err
@@ -888,13 +963,33 @@ func (e PolicyImpactEntry) Validate() error {
 			return fmt.Errorf("unchanged impact must preserve a determinate outcome")
 		}
 	case PolicyImpactIndeterminate:
+		if version != EnterpriseContractVersion {
+			return fmt.Errorf("governance v2 impact must distinguish unknown from failure")
+		}
 		if e.Before != DecisionIndeterminate && e.After != DecisionIndeterminate {
 			return fmt.Errorf("indeterminate impact requires an indeterminate outcome")
+		}
+	case PolicyImpactUnknown, PolicyImpactFailure:
+		if version != GovernanceContractVersion {
+			return fmt.Errorf("legacy policy impact cannot use %q", e.Kind)
+		}
+		if e.Before != DecisionIndeterminate && e.After != DecisionIndeterminate {
+			return fmt.Errorf("%s impact requires an indeterminate outcome", e.Kind)
 		}
 	default:
 		return fmt.Errorf("unsupported policy impact kind %q", e.Kind)
 	}
 	return nil
+}
+
+func validatePolicyTupleImpact(e PolicyImpactEntry) error {
+	if err := validateAuthorizationReference("subject_id", e.SubjectID, true, true); err != nil {
+		return err
+	}
+	if err := validateAuthorizationName("relation", e.Relation); err != nil {
+		return err
+	}
+	return validateAuthorizationReference("object", e.Object, false, false)
 }
 
 type PolicyImpactReport struct {
@@ -906,11 +1001,14 @@ type PolicyImpactReport struct {
 }
 
 func (r PolicyImpactReport) ValidateFor(request PolicySimulationRequest, scope TenantScope) error {
-	if r.Version != EnterpriseContractVersion {
+	if r.Version != EnterpriseContractVersion && r.Version != GovernanceContractVersion {
 		return fmt.Errorf("unsupported policy impact report version %q", r.Version)
 	}
 	if err := request.ValidateFor(scope); err != nil {
 		return err
+	}
+	if r.Version != request.Version {
+		return fmt.Errorf("policy impact report version does not match the simulation request")
 	}
 	if r.TenantID != request.TenantID || r.SimulationID != request.SimulationID {
 		return fmt.Errorf("policy impact report does not match the simulation request")
@@ -918,23 +1016,23 @@ func (r PolicyImpactReport) ValidateFor(request PolicySimulationRequest, scope T
 	if err := validateUTC("generated_at", r.GeneratedAt); err != nil {
 		return err
 	}
-	if len(r.Entries) == 0 {
+	if r.Version == EnterpriseContractVersion && len(r.Entries) == 0 {
 		return fmt.Errorf("policy impact report requires at least one entry")
 	}
 	var previous string
-	seenTuples := make(map[[3]string]struct{}, len(r.Entries))
+	seenTargets := make(map[string]struct{}, len(r.Entries))
 	for index, entry := range r.Entries {
-		if err := entry.Validate(); err != nil {
+		if err := entry.validateForVersion(r.Version); err != nil {
 			return fmt.Errorf("policy impact entry %d: %w", index, err)
 		}
 		if index > 0 && entry.CorrelationID <= previous {
 			return fmt.Errorf("policy impact entries must be sorted by unique correlation_id")
 		}
-		tuple := [3]string{entry.SubjectID, entry.Relation, entry.Object}
-		if _, exists := seenTuples[tuple]; exists {
-			return fmt.Errorf("policy impact entries must use unique subject, relation, and object tuples")
+		target := strings.Join([]string{string(entry.TargetKind), entry.TargetID, entry.SubjectID, entry.Relation, entry.Object}, "\x00")
+		if _, exists := seenTargets[target]; exists {
+			return fmt.Errorf("policy impact entries must use unique targets")
 		}
-		seenTuples[tuple] = struct{}{}
+		seenTargets[target] = struct{}{}
 		previous = entry.CorrelationID
 	}
 	return nil

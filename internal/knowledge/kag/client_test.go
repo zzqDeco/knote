@@ -3,11 +3,36 @@ package kag
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestClientResidencyDenialDoesNotStartAdapter(t *testing.T) {
+	workspace := t.TempDir()
+	marker := filepath.Join(workspace, "adapter-started")
+	adapter := filepath.Join(workspace, "adapter.py")
+	script := `from pathlib import Path
+Path(` + fmt.Sprintf("%q", marker) + `).write_text("started")
+`
+	if err := os.WriteFile(adapter, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	denied := errors.New("residency denied")
+	client := Client{
+		AdapterPath: adapter, Workspace: workspace,
+		ProcessingResidency: func(context.Context, string) error { return denied },
+	}
+	if _, err := client.Query(context.Background(), "protected query"); !errors.Is(err, denied) {
+		t.Fatalf("Query error = %v, want residency denial", err)
+	}
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("adapter marker exists after residency denial: %v", err)
+	}
+}
 
 func TestClientReadsLargeNDJSONLine(t *testing.T) {
 	workspace := t.TempDir()
