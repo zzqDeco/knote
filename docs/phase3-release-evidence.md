@@ -40,7 +40,7 @@ scripts/verify_phase3_acceptance.sh
 | Exit status | `0` | `pending` |
 | Final fixed line | `Phase 3 deterministic acceptance passed.` | `pending` |
 | Baseline Go tests | `pass` | `pending` |
-| Canonical Phase 3 matrix and exact anchors | `pass` | `pending` |
+| Canonical Phase 3 matrix and anchor declarations | `pass` | `pending` |
 | Python adapter tests | `pass` | `pending` |
 | Permissioned graph real-adapter self-test | `pass` | `pending` |
 | Exact built-binary smoke | `pass` | `pending` |
@@ -74,6 +74,9 @@ The detailed test mapping and failure semantics are in
 
 Nearest-rank percentiles include every declared sample. A missing, discarded,
 timed-out, or malformed sample fails the budget.
+
+Record `batch-check-latency` from the required real OpenFGA job. Record the
+remaining five rows from the deterministic gate.
 
 | Canonical ID | Metric | Cohort | Required | Observed | Result |
 |---|---|---:|---|---:|---|
@@ -110,6 +113,7 @@ scripts/smoke_phase3_openfga.sh
 | Complete user-agent-task Check | `allow` | `pending` |
 | Incomplete BatchCheck item | `deny` | `pending` |
 | Complete BatchCheck item | `allow` | `pending` |
+| Real BatchCheck latency cohort | `12` samples; nearest-rank P99 `<= 100ms` | `pending` |
 | Post-revocation Check | `deny` | `pending` |
 | Container and temporary credential cleanup | `pass` | `pending` |
 

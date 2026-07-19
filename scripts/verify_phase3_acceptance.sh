@@ -16,14 +16,14 @@ cd "${ROOT}"
 CGO_ENABLED=0 go build -trimpath -o "${TEMP_ROOT}/knote" ./cmd/knote
 scripts/smoke_permissioned_binary.sh --bin "${TEMP_ROOT}/knote"
 
-KNOTE_KAG_FAKE=1 go test ./...
+KNOTE_KAG_FAKE=1 go test -count=1 ./...
 "${PYTHON_BIN}" -m unittest discover -s adapters/kag -p '*test*.py'
 "${PYTHON_BIN}" tests/smoke/permissioned_graph_real_smoke.py --self-test
 
 GOTOOLCHAIN=go1.25.12 go run "github.com/openfga/cli/cmd/fga@${FGA_CLI_VERSION}" \
   model test --tests internal/authz/model/authorization.fga.yaml
 
-go test -race \
+go test -race -count=1 \
   ./internal/audit \
   ./internal/authz \
   ./internal/connector \

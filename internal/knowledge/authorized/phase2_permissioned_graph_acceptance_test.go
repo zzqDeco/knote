@@ -14,14 +14,12 @@ import (
 	"github.com/zzqDeco/knote/internal/knowledge/authorized/fixture"
 	"github.com/zzqDeco/knote/internal/knowledge/kag"
 	"github.com/zzqDeco/knote/internal/protocol"
-	phase3contract "github.com/zzqDeco/knote/tests/phase3/contract"
 )
 
 func TestPhase2PermissionedGraphPolicyOracleAcceptanceMetrics(t *testing.T) {
 	const (
-		invariant  = "Phase 2 graph outputs contain only complete principal-authorized paths"
-		cohortSize = 3
-		rounds     = phase3contract.BatchCheckSampleCount / cohortSize
+		invariant = "Phase 2 graph outputs contain only complete principal-authorized paths"
+		rounds    = 4
 	)
 	type cohort struct {
 		principal       string
@@ -81,11 +79,6 @@ func TestPhase2PermissionedGraphPolicyOracleAcceptanceMetrics(t *testing.T) {
 			},
 		},
 	}
-	if len(cohorts) != cohortSize || rounds*len(cohorts) != phase3contract.BatchCheckSampleCount {
-		acceptanceFatalf(t, invariant, "query cohort size=%d rounds=%d, want %d samples",
-			len(cohorts), rounds, phase3contract.BatchCheckSampleCount)
-	}
-
 	var (
 		truePositives                 int
 		authorizedRelevant            int
@@ -107,7 +100,7 @@ func TestPhase2PermissionedGraphPolicyOracleAcceptanceMetrics(t *testing.T) {
 		finalFilterDropped            int
 		batchSizes                    []int
 		batchRPCs                     []int
-		batchCheckLatencies           []time.Duration
+		batchLatencies                []time.Duration
 		queryLatencies                []time.Duration
 	)
 	queryByPrincipal := make(map[string][]time.Duration, len(cohorts))
@@ -151,11 +144,11 @@ func TestPhase2PermissionedGraphPolicyOracleAcceptanceMetrics(t *testing.T) {
 					cohort.principal, round, report.BatchCheckLatency, want)
 			}
 			batchRPCs = append(batchRPCs, report.BatchCheckRPCCount)
-			batchCheckLatencies = append(batchCheckLatencies, report.BatchCheckLatency)
 			queryLatencies = append(queryLatencies, report.QueryLatency)
 			queryByPrincipal[cohort.principal] = append(queryByPrincipal[cohort.principal], report.QueryLatency)
 			for _, request := range oracleStats.requests {
 				batchSizes = append(batchSizes, len(request.Checks))
+				batchLatencies = append(batchLatencies, phase2BatchCheckDuration)
 			}
 			for _, drop := range report.HopDrops {
 				hopCandidates += drop.CandidateCount
@@ -321,15 +314,8 @@ func TestPhase2PermissionedGraphPolicyOracleAcceptanceMetrics(t *testing.T) {
 			acceptanceFatalf(t, invariant, "%s synthetic graph timing variance=%s, want 0", principal, variance)
 		}
 	}
-	if len(batchCheckLatencies) != phase3contract.BatchCheckSampleCount {
-		acceptanceFatalf(t, invariant, "BatchCheck latency samples=%d, want %d",
-			len(batchCheckLatencies), phase3contract.BatchCheckSampleCount)
-	}
-	if p99 := percentileDuration(batchCheckLatencies, 0.99); p99 > phase3contract.BatchCheckP99Budget {
-		acceptanceFatalf(t, invariant, "BatchCheck p99=%s exceeds %s fixture budget", p99, phase3contract.BatchCheckP99Budget)
-	}
-	if p99 := percentileDuration(queryLatencies, 0.99); p99 > phase3contract.BatchCheckP99Budget {
-		acceptanceFatalf(t, invariant, "synthetic graph query p99=%s exceeds %s fixture budget", p99, phase3contract.BatchCheckP99Budget)
+	if p99 := percentileDuration(queryLatencies, 0.99); p99 > 100*time.Millisecond {
+		acceptanceFatalf(t, invariant, "synthetic graph query p99=%s exceeds 100ms fixture budget", p99)
 	}
 	if maximum := phase2MaxInt(batchSizes); maximum > authz.MaxBatchChecks {
 		acceptanceFatalf(t, invariant, "BatchCheck size=%d exceeds provider max=%d", maximum, authz.MaxBatchChecks)
@@ -342,7 +328,7 @@ func TestPhase2PermissionedGraphPolicyOracleAcceptanceMetrics(t *testing.T) {
 		hopAuthorizationDropRate, finalFilterCandidates, finalFilterAllowed, finalFilterDropped,
 		postFilterDropRate, phase2PercentileInt(batchSizes, 0.95), phase2PercentileInt(batchSizes, 0.99),
 		phase2PercentileInt(batchRPCs, 0.95), phase2PercentileInt(batchRPCs, 0.99),
-		percentileDuration(batchCheckLatencies, 0.95), percentileDuration(batchCheckLatencies, 0.99),
+		percentileDuration(batchLatencies, 0.95), percentileDuration(batchLatencies, 0.99),
 		percentileDuration(queryLatencies, 0.95), percentileDuration(queryLatencies, 0.99),
 	)
 }

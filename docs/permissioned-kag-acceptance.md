@@ -57,7 +57,7 @@ commands for diagnosis; running a subset is not equivalent to this entrypoint.
 ### 2. Baseline constituents
 
 ```sh
-KNOTE_KAG_FAKE=1 go test ./...
+KNOTE_KAG_FAKE=1 go test -count=1 ./...
 /usr/bin/python3 -m unittest discover -s adapters/kag -p '*test*.py'
 CGO_ENABLED=0 go build -o /tmp/knote-check ./cmd/knote
 go vet ./...
@@ -163,12 +163,14 @@ their filenames do not make them Phase 3 aggregate evidence by themselves.
 
 The canonical values below come directly from
 `tests/fixtures/phase3-acceptance.json`. Percentile cohorts use nearest rank;
-`max` cohorts require every sample to stay within the threshold. The live smoke
-reports service timing only as a diagnostic and cannot replace these budgets.
+`max` cohorts require every sample to stay within the threshold. The real
+OpenFGA smoke is authoritative for the `openfga_batch_check` cohort; its total
+wall-clock duration and all other live-service timing remain diagnostic. The
+other five budgets are deterministic test cohorts.
 
 | Canonical budget ID | Metric | Cohort | Limit | Exact anchor |
 |---|---|---:|---:|---|
-| `batch-check-latency` | `openfga_batch_check`, P99 | `12` | `100ms` | `internal/knowledge/authorized/phase2_permissioned_graph_acceptance_test.go#TestPhase2PermissionedGraphPolicyOracleAcceptanceMetrics` |
+| `batch-check-latency` | `openfga_batch_check`, P99 | `12` | `100ms` | `internal/authz/phase3_openfga_live_test.go#TestPhase3OpenFGALiveSmoke` |
 | `connector-lag` | `connector_apply_lag`, max | `1` | `2000ms` | `internal/connector/acceptance_test.go#TestSlowConnectorCallbackDoesNotBlockAnotherTenantAndCanReadStore` |
 | `governance-latency` | `governance_view`, max | `2` | `1000ms` | `internal/governance/service_test.go#TestViewAndRenderAreDeterministic` |
 | `reconciliation-latency` | `full_reconciliation`, max | `1` | `1000ms` | `internal/authz/reconciliation_telemetry_test.go#TestTupleReconcilerTelemetryFailureDoesNotChangePublishedResult` |
@@ -184,25 +186,29 @@ security invariants regardless of the latency result.
 Run the existing functional and budget anchors directly with:
 
 ```sh
+scripts/smoke_phase3_openfga.sh
+
 go test -count=1 ./internal/authz \
-  -run 'TestOpenFGABatch'
+  -run '^TestTupleReconcilerTelemetryFailureDoesNotChangePublishedResult$'
 
 go test -count=1 ./internal/connector \
-  -run 'Test(ConnectorReplay|SnapshotReplay|Processor|SnapshotReconciliation|StandaloneReconciliation)'
+  -run '^TestSlowConnectorCallbackDoesNotBlockAnotherTenantAndCanReadStore$'
+
+go test -count=1 ./internal/governance \
+  -run '^TestViewAndRenderAreDeterministic$'
 
 go test -count=1 ./internal/runtime \
-  -run 'TestPermissionedAcceptanceRevocationPropagationPercentiles'
-
-go test -count=1 ./internal/governance ./internal/policysim ./internal/audit ./internal/residency
+  -run '^(TestPermissionedAcceptanceRevocationPropagationPercentiles|TestPhase2GraphReplayAcceptanceRevocationClosesTraversalCacheCitationAndSession)$'
 
 go test -count=1 ./tests/phase3 -run '^TestPhase3AcceptanceMatrix$'
 ```
 
 The matrix test proves that the fixture is canonical, complete, sorted, and
 bound to exact test declarations. `scripts/verify_phase3_acceptance.sh` runs the
-matrix and every anchor through `go test ./...`; final measured values and the
-fixture digest are recorded in the PR and issue completion comments using the
-schema in `docs/phase3-release-evidence.md`.
+matrix and every deterministic anchor through `go test -count=1 ./...`;
+`scripts/smoke_phase3_openfga.sh` runs the real OpenFGA budget anchor. Final
+measured values and the fixture digest are recorded in the PR and issue
+completion comments using the schema in `docs/phase3-release-evidence.md`.
 
 ## Quality and no-leak metrics
 

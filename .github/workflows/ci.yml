@@ -31,7 +31,7 @@ jobs:
           python-version: "3.11"
 
       - name: Go tests
-        run: KNOTE_KAG_FAKE=1 go test ./...
+        run: KNOTE_KAG_FAKE=1 go test -count=1 ./...
 
       - name: Go race tests
         run: |
@@ -43,6 +43,7 @@ jobs:
             ./internal/connector \
             ./internal/governance \
             ./internal/identity \
+            ./internal/knowledge/authorized \
             ./internal/policysim \
             ./internal/residency \
             ./internal/runtime \

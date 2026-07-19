@@ -265,8 +265,8 @@
       "budget_milliseconds": 100,
       "anchors": [
         {
-          "file": "internal/knowledge/authorized/phase2_permissioned_graph_acceptance_test.go",
-          "test": "TestPhase2PermissionedGraphPolicyOracleAcceptanceMetrics"
+          "file": "internal/authz/phase3_openfga_live_test.go",
+          "test": "TestPhase3OpenFGALiveSmoke"
         }
       ]
     },

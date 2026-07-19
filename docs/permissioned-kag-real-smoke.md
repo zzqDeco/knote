@@ -87,6 +87,8 @@ The live test proves:
   `can_view` when the underlying user grant also exists;
 - a BatchCheck item missing the task assignee evidence denies while a complete
   item in the same request allows;
+- twelve higher-consistency real OpenFGA BatchCheck samples satisfy the
+  nearest-rank P99 `<= 100ms` budget;
 - correlation order and ordinary deny survive the real BatchCheck boundary;
 - deleting the user's viewer tuple invalidates the otherwise complete
   user-agent-task scope on the next higher-consistency Check.
@@ -169,9 +171,10 @@ and review URLs in the PR and issue completion comments, following
 `docs/phase3-release-evidence.md`. Do not copy temporary store, model, tenant,
 principal, agent, task, resource, endpoint, or token values into the record.
 
-The OpenFGA smoke is pass/fail compatibility evidence. Its wall-clock duration
-is diagnostic only; deterministic BatchCheck and revocation budgets are proved
-by the release gate described in `docs/permissioned-kag-acceptance.md`.
+The OpenFGA smoke is pass/fail compatibility evidence and the authoritative
+source for the twelve-sample BatchCheck P99 budget. Its total wall-clock
+duration is diagnostic only; the remaining deterministic budgets are proved by
+the release gate described in `docs/permissioned-kag-acceptance.md`.
 
 ## Troubleshooting without disclosure
 

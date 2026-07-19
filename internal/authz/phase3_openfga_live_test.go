@@ -3,9 +3,12 @@ package authz
 import (
 	"context"
 	"os"
+	"sort"
 	"strings"
 	"testing"
 	"time"
+
+	phase3contract "github.com/zzqDeco/knote/tests/phase3/contract"
 )
 
 const phase3OpenFGALiveEnv = "KNOTE_PHASE3_OPENFGA_LIVE"
@@ -102,6 +105,50 @@ func TestPhase3OpenFGALiveSmoke(t *testing.T) {
 	if len(decisions) != 2 || !decisions[0].Allowed || decisions[1].Allowed {
 		t.Fatal("live BatchCheck did not enforce the complete user-agent-task intersection")
 	}
+
+	latencies := make([]time.Duration, 0, phase3contract.BatchCheckSampleCount)
+	for sample := 0; sample < phase3contract.BatchCheckSampleCount; sample++ {
+		started := time.Now()
+		decisions, err = authorizer.BatchCheck(ctx, BatchCheckRequest{
+			AuthorizationModelID: modelID,
+			Consistency:          ConsistencyHigherConsistency,
+			Checks: []BatchCheckItem{
+				{
+					CorrelationID: "complete-scope", User: user, Relation: RelationCanView,
+					Object: document, AgentTaskScope: completeScope,
+				},
+				{
+					CorrelationID: "missing-assignee", User: user, Relation: RelationCanView,
+					Object: document, AgentTaskScope: incompleteScope,
+				},
+			},
+		})
+		elapsed := time.Since(started)
+		if err != nil {
+			t.Fatalf("live BatchCheck latency sample %d failed: %v", sample, err)
+		}
+		if len(decisions) != 2 || !decisions[0].Allowed || decisions[1].Allowed {
+			t.Fatalf("live BatchCheck latency sample %d violated the scoped oracle", sample)
+		}
+		latencies = append(latencies, elapsed)
+	}
+	sort.Slice(latencies, func(left, right int) bool { return latencies[left] < latencies[right] })
+	p99Index := (99*len(latencies)+99)/100 - 1
+	p99 := latencies[p99Index]
+	if p99 > phase3contract.BatchCheckP99Budget {
+		t.Fatalf(
+			"live OpenFGA BatchCheck p99 %s exceeds %s across %d samples",
+			p99,
+			phase3contract.BatchCheckP99Budget,
+			len(latencies),
+		)
+	}
+	t.Logf(
+		"live OpenFGA BatchCheck samples=%d p99=%s budget=%s",
+		len(latencies),
+		p99,
+		phase3contract.BatchCheckP99Budget,
+	)
 
 	if err := authorizer.ApplyTupleChanges(ctx, TupleWriteRequest{
 		StoreID: storeID, AuthorizationModelID: modelID, Deletes: []Tuple{viewer},
