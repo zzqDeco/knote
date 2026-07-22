@@ -34,6 +34,7 @@ type SideEffectBridge struct {
 type pendingSideEffect struct {
 	request SideEffectRequest
 	confirm protocol.ConfirmRequest
+	turnID  string
 	emitted bool
 }
 
@@ -83,7 +84,7 @@ func (b *SideEffectBridge) Request(ctx context.Context, req SideEffectRequest) e
 		RejectText:  "Cancel",
 		CreatedAt:   createdAt,
 	}
-	b.pending[confirm.RequestID] = pendingSideEffect{request: req, confirm: confirm}
+	b.pending[confirm.RequestID] = pendingSideEffect{request: req, confirm: confirm, turnID: activeTurnIDFromContext(ctx)}
 	b.queue = append(b.queue, confirm.RequestID)
 	b.mu.Unlock()
 	return ErrSideEffectPending
@@ -110,6 +111,36 @@ func (b *SideEffectBridge) ClearSession(sessionID string) int {
 	if removed == 0 {
 		return 0
 	}
+	b.compactQueueLocked()
+	return removed
+}
+
+func (b *SideEffectBridge) ClearTurn(sessionID, turnID string) int {
+	if b == nil {
+		return 0
+	}
+	sessionID = strings.TrimSpace(sessionID)
+	turnID = strings.TrimSpace(turnID)
+	if sessionID == "" || turnID == "" {
+		return 0
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	removed := 0
+	for requestID, pending := range b.pending {
+		if pending.request.SessionID != sessionID || pending.turnID != turnID {
+			continue
+		}
+		delete(b.pending, requestID)
+		removed++
+	}
+	if removed > 0 {
+		b.compactQueueLocked()
+	}
+	return removed
+}
+
+func (b *SideEffectBridge) compactQueueLocked() {
 	queue := b.queue[:0]
 	for _, requestID := range b.queue {
 		if _, ok := b.pending[requestID]; ok {
@@ -117,7 +148,6 @@ func (b *SideEffectBridge) ClearSession(sessionID string) int {
 		}
 	}
 	b.queue = queue
-	return removed
 }
 
 func (b *SideEffectBridge) PendingEvents(sessionID string) []protocol.Event {

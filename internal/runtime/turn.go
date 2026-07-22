@@ -43,6 +43,17 @@ func (m *Manager) beginTurn(parent context.Context, title string, rotation bool)
 	if err := parent.Err(); err != nil {
 		return nil, nil, err
 	}
+	timeout := m.deps.TurnTimeout
+	if timeout <= 0 {
+		timeout = DefaultTurnTimeout
+	}
+	timedCtx, cancel := context.WithTimeout(parent, timeout)
+	keepContext := false
+	defer func() {
+		if !keepContext {
+			cancel()
+		}
+	}()
 
 	if rotation {
 		m.mu.Lock()
@@ -66,19 +77,13 @@ func (m *Manager) beginTurn(parent context.Context, title string, rotation bool)
 			} else {
 				select {
 				case <-previous.done:
-				case <-parent.Done():
+				case <-timedCtx.Done():
 					m.mu.Lock()
 					m.rotating = false
 					m.mu.Unlock()
-					return nil, nil, parent.Err()
+					return nil, nil, timedCtx.Err()
 				}
 			}
-		}
-		m.mu.Lock()
-		oldSessionID := m.einoSession.ID
-		m.mu.Unlock()
-		if m.deps.SideEffects != nil {
-			m.deps.SideEffects.ClearSession(oldSessionID)
 		}
 	}
 
@@ -101,11 +106,7 @@ func (m *Manager) beginTurn(parent context.Context, title string, rotation bool)
 	}
 	m.nextTurnID++
 	taskID := fmt.Sprintf("task_%06d", m.nextTurnID)
-	timeout := m.deps.TurnTimeout
-	if timeout <= 0 {
-		timeout = DefaultTurnTimeout
-	}
-	turnCtx, cancel := context.WithTimeout(context.WithValue(parent, activeTurnContextKey{}, taskID), timeout)
+	turnCtx := context.WithValue(timedCtx, activeTurnContextKey{}, taskID)
 	now := time.Now().UTC()
 	turn := &activeTurn{
 		id:                 taskID,
@@ -130,6 +131,7 @@ func (m *Manager) beginTurn(parent context.Context, title string, rotation bool)
 		UpdatedAt: now,
 	})
 	if !m.commitTurnResult(turn, []protocol.Event{started}, []protocol.Event{started}) {
+		turnErr := turn.ctx.Err()
 		turn.cancel()
 		m.mu.Lock()
 		if m.activeTurn == turn {
@@ -140,11 +142,12 @@ func (m *Manager) beginTurn(parent context.Context, title string, rotation bool)
 		}
 		close(turn.done)
 		m.mu.Unlock()
-		if err := turn.ctx.Err(); err != nil {
-			return nil, nil, err
+		if turnErr != nil {
+			return nil, nil, turnErr
 		}
 		return nil, nil, ErrTurnBusy
 	}
+	keepContext = true
 	return turn, []protocol.Event{started}, nil
 }
 
@@ -196,6 +199,9 @@ func (m *Manager) completeTurn(turn *activeTurn, status protocol.TaskStatus, mes
 	turn.terminal = terminal
 	subscribers := m.subscribersLocked()
 	m.mu.Unlock()
+	if status == protocol.TaskKilled && m.deps.SideEffects != nil {
+		m.deps.SideEffects.ClearTurn(turn.lifecycleSessionID, turn.id)
+	}
 	m.persist([]protocol.Event{terminal})
 	dispatch := m.enqueueNotifications(turn, subscribers, []protocol.Event{terminal})
 	m.mu.Lock()
@@ -219,16 +225,6 @@ func (m *Manager) rotateSession(turn *activeTurn, info protocol.SessionInfo, bin
 	if turn == nil || strings.TrimSpace(info.ID) == "" {
 		return false
 	}
-	m.mu.Lock()
-	if m.activeTurn != turn || turn.finished || turn.ctx.Err() != nil {
-		m.mu.Unlock()
-		return false
-	}
-	oldSessionID := m.einoSession.ID
-	m.mu.Unlock()
-	if m.deps.SideEffects != nil {
-		m.deps.SideEffects.ClearSession(oldSessionID)
-	}
 	m.commitMu.Lock()
 	m.mu.Lock()
 	if m.activeTurn != turn || turn.finished || turn.ctx.Err() != nil {
@@ -236,6 +232,12 @@ func (m *Manager) rotateSession(turn *activeTurn, info protocol.SessionInfo, bin
 		m.commitMu.Unlock()
 		return false
 	}
+	oldSessionID := m.einoSession.ID
+	m.mu.Unlock()
+	if m.deps.SideEffects != nil {
+		m.deps.SideEffects.ClearSession(oldSessionID)
+	}
+	m.mu.Lock()
 	m.generation++
 	m.einoSession = info
 	m.authorizationBinding = binding
@@ -264,6 +266,9 @@ func (m *Manager) finishTurnResult(turn *activeTurn, persisted, emitted []protoc
 	message := "Task completed"
 	returnErr := error(nil)
 	if err := turn.ctx.Err(); err != nil && !rotationCommitted {
+		if m.deps.SideEffects != nil {
+			m.deps.SideEffects.ClearTurn(turn.lifecycleSessionID, turn.id)
+		}
 		returnErr = err
 		if errors.Is(err, context.DeadlineExceeded) {
 			status = protocol.TaskFailed

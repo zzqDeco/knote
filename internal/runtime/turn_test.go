@@ -122,6 +122,42 @@ func TestTurnControllerAppliesConfiguredDeadline(t *testing.T) {
 	assertSingleTaskLifecycle(t, events, protocol.TaskFailed)
 }
 
+func TestSessionRotationDrainUsesConfiguredDeadline(t *testing.T) {
+	runner := &stubbornTurnRunner{started: make(chan struct{}), release: make(chan struct{})}
+	manager := newTurnTestManager(t, runner, 25*time.Millisecond)
+	if _, err := manager.Start(context.Background(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	oldDone := make(chan error, 1)
+	go func() {
+		_, err := manager.SendMessage(context.Background(), "stubborn turn")
+		oldDone <- err
+	}()
+	select {
+	case <-runner.started:
+	case <-time.After(time.Second):
+		t.Fatal("stubborn turn did not reach runner")
+	}
+
+	startedAt := time.Now()
+	events, err := manager.SendMessage(context.Background(), "/new")
+	if !errors.Is(err, context.DeadlineExceeded) || len(events) != 0 {
+		t.Fatalf("rotation = events:%+v err:%v, want deadline without lifecycle", events, err)
+	}
+	if elapsed := time.Since(startedAt); elapsed > 500*time.Millisecond {
+		t.Fatalf("rotation exceeded its configured drain deadline: %s", elapsed)
+	}
+	close(runner.release)
+	select {
+	case err := <-oldDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("old turn error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("old turn did not finish after runner release")
+	}
+}
+
 func TestTurnControllerRejectsCancelledParentWithoutLifecycle(t *testing.T) {
 	runner := newControlledTurnRunner()
 	manager := newTurnTestManager(t, runner, time.Second)
@@ -189,6 +225,92 @@ func TestCancelledTurnDropsRunnerEventsReturnedAfterCancellation(t *testing.T) {
 	}
 	if hasMessage(persisted, protocol.EventAssistantDone, "late answer") {
 		t.Fatalf("cancelled turn persisted late event: %+v", persisted)
+	}
+}
+
+func TestCancelledTurnClearsItsAbandonedConfirmation(t *testing.T) {
+	bridge := NewSideEffectBridge()
+	runner := &cancelPendingTurnRunner{bridge: bridge, requested: make(chan struct{})}
+	manager := New(Dependencies{
+		Sessions:     local.New(t.TempDir()),
+		EinoRunner:   runner,
+		SideEffects:  bridge,
+		TurnTimeout:  time.Second,
+		NewSessionID: func() string { return "sess_cancel_pending" },
+	})
+	if _, err := manager.Start(context.Background(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := manager.SendMessage(context.Background(), "queue then cancel")
+		done <- err
+	}()
+	select {
+	case <-runner.requested:
+	case <-time.After(time.Second):
+		t.Fatal("runner did not queue a confirmation")
+	}
+	if _, err := manager.Interrupt(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancelled send error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cancelled send did not finish")
+	}
+	bridge.mu.Lock()
+	pendingCount := len(bridge.pending)
+	queueCount := len(bridge.queue)
+	bridge.mu.Unlock()
+	if pendingCount != 0 || queueCount != 0 {
+		t.Fatalf("abandoned confirmations remain pending=%d queued=%d", pendingCount, queueCount)
+	}
+}
+
+func TestFailedResumePreservesCurrentSessionConfirmation(t *testing.T) {
+	bridge := NewSideEffectBridge()
+	executions := atomic.Int32{}
+	manager := New(Dependencies{
+		Sessions:     local.New(t.TempDir()),
+		EinoRunner:   newControlledTurnRunner(),
+		SideEffects:  bridge,
+		TurnTimeout:  time.Second,
+		NewSessionID: func() string { return "sess_current" },
+	})
+	if _, err := manager.Start(context.Background(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := bridge.Request(withSideEffectSession(context.Background(), "sess_current"), SideEffectRequest{
+		ToolName: "knote_build",
+		Action:   "build",
+		Execute: func(context.Context, SideEffectRequest) ([]protocol.Event, error) {
+			executions.Add(1)
+			return nil, nil
+		},
+	}); !errors.Is(err, ErrSideEffectPending) {
+		t.Fatalf("seed confirmation: %v", err)
+	}
+	pending := bridge.PendingEvents("sess_current")
+	if len(pending) != 1 {
+		t.Fatalf("seed pending events = %+v", pending)
+	}
+	confirm := firstConfirm(t, pending)
+
+	if events, err := manager.SendMessage(context.Background(), "/resume sess_missing"); err != nil || !hasEvent(events, protocol.EventError) {
+		t.Fatalf("failed resume = events:%+v err:%v", events, err)
+	}
+	if got := manager.SessionID(); got != "sess_current" {
+		t.Fatalf("failed resume changed session to %q", got)
+	}
+	if _, err := manager.Confirm(context.Background(), confirm, true); err != nil {
+		t.Fatalf("confirm after failed resume: %v", err)
+	}
+	if got := executions.Load(); got != 1 {
+		t.Fatalf("preserved confirmation executions = %d, want 1", got)
 	}
 }
 
@@ -468,6 +590,47 @@ type controlledTurnRunner struct {
 }
 
 type lateEventTurnRunner struct{ started chan struct{} }
+
+type stubbornTurnRunner struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (*stubbornTurnRunner) Ready(context.Context) error { return nil }
+
+func (*stubbornTurnRunner) ToolInventory(context.Context) ([]RunnerToolInfo, error) {
+	return nil, nil
+}
+
+func (r *stubbornTurnRunner) Run(ctx context.Context, _ EinoRunInput) ([]protocol.Event, error) {
+	close(r.started)
+	<-r.release
+	return nil, ctx.Err()
+}
+
+type cancelPendingTurnRunner struct {
+	bridge    *SideEffectBridge
+	requested chan struct{}
+}
+
+func (*cancelPendingTurnRunner) Ready(context.Context) error { return nil }
+
+func (*cancelPendingTurnRunner) ToolInventory(context.Context) ([]RunnerToolInfo, error) {
+	return nil, nil
+}
+
+func (r *cancelPendingTurnRunner) Run(ctx context.Context, _ EinoRunInput) ([]protocol.Event, error) {
+	err := r.bridge.Request(ctx, SideEffectRequest{
+		ToolName: "knote_build",
+		Action:   "build",
+		Execute: func(context.Context, SideEffectRequest) ([]protocol.Event, error) {
+			return nil, nil
+		},
+	})
+	close(r.requested)
+	<-ctx.Done()
+	return nil, err
+}
 
 func (*lateEventTurnRunner) Ready(context.Context) error { return nil }
 

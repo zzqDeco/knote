@@ -8,7 +8,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -213,6 +215,56 @@ func TestSendMessageRetainsRuntimeErrorWithoutDuplicatingReturnedEvents(t *testi
 	}
 }
 
+func TestBlockedSendCommandLeavesInterruptHandlingResponsive(t *testing.T) {
+	model := newTestModel(t)
+	blocked := &blockingSendRuntime{
+		Runtime: model.runtime,
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	model.runtime = blocked
+	model.composer.SetValue("blocked request")
+
+	next, cmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	updated, ok := next.(Model)
+	if !ok {
+		t.Fatalf("unexpected model type %T", next)
+	}
+	model = updated
+	if cmd == nil {
+		t.Fatal("send did not return a tea.Cmd")
+	}
+	result := make(chan tea.Msg, 1)
+	go func() { result <- cmd() }()
+	select {
+	case <-blocked.started:
+	case <-time.After(time.Second):
+		t.Fatal("send command did not reach runtime")
+	}
+
+	next, _ = model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	model = next.(Model)
+	if got := blocked.interruptCalls.Load(); got != 1 {
+		t.Fatalf("interrupt calls = %d, want 1 while send is blocked", got)
+	}
+	select {
+	case <-result:
+		t.Fatal("send command completed before the runtime was released")
+	default:
+	}
+	close(blocked.release)
+	select {
+	case msg := <-result:
+		next, _ = model.Update(msg)
+		model = next.(Model)
+	case <-time.After(time.Second):
+		t.Fatal("send command did not complete after release")
+	}
+	if !hasTUIEvent(model.events, protocol.EventAssistantDone) {
+		t.Fatalf("async send result was not applied: %+v", model.events)
+	}
+}
+
 func TestGovernanceOverlayScrollsAndCloses(t *testing.T) {
 	model := newTestModel(t)
 	model.applyEvents([]protocol.Event{protocol.NewEvent(
@@ -411,6 +463,24 @@ type sendResultRuntime struct {
 	err    error
 }
 
+type blockingSendRuntime struct {
+	runtime.Runtime
+	started        chan struct{}
+	release        chan struct{}
+	interruptCalls atomic.Int32
+}
+
+func (r *blockingSendRuntime) SendMessage(context.Context, string) ([]protocol.Event, error) {
+	close(r.started)
+	<-r.release
+	return []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, r.SessionID(), "released", nil)}, nil
+}
+
+func (r *blockingSendRuntime) Interrupt(context.Context) ([]protocol.Event, error) {
+	r.interruptCalls.Add(1)
+	return nil, nil
+}
+
 func (r *sendResultRuntime) SendMessage(context.Context, string) ([]protocol.Event, error) {
 	r.calls++
 	return r.events, r.err
@@ -418,8 +488,21 @@ func (r *sendResultRuntime) SendMessage(context.Context, string) ([]protocol.Eve
 
 func updateModel(t *testing.T, model *Model, msg tea.Msg) {
 	t.Helper()
-	next, _ := model.Update(msg)
+	next, cmd := model.Update(msg)
 	updated, ok := next.(Model)
+	if !ok {
+		t.Fatalf("unexpected model type %T", next)
+	}
+	*model = updated
+	if cmd == nil {
+		return
+	}
+	result := cmd()
+	if _, ok := result.(runtimeResultMsg); !ok {
+		return
+	}
+	next, _ = model.Update(result)
+	updated, ok = next.(Model)
 	if !ok {
 		t.Fatalf("unexpected model type %T", next)
 	}

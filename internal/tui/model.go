@@ -48,6 +48,11 @@ type Model struct {
 	err             error
 }
 
+type runtimeResultMsg struct {
+	events []protocol.Event
+	err    error
+}
+
 func New(rt runtime.Runtime, initial []protocol.Event) Model {
 	composer := textinput.New()
 	composer.Placeholder = "Ask, /build, /governance, /tasks, /help"
@@ -82,6 +87,9 @@ func (m Model) Init() tea.Cmd {
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
 	switch msg := msg.(type) {
+	case runtimeResultMsg:
+		m.applyRuntimeResult(msg.events, msg.err)
+		return m, nil
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
@@ -97,15 +105,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.pendingConfirm != nil {
 			switch msg.String() {
 			case "enter", "y", "Y":
-				events, err := m.runtime.Confirm(context.Background(), *m.pendingConfirm, true)
+				req := *m.pendingConfirm
 				m.pendingConfirm = nil
-				m.applyRuntimeResult(events, err)
-				return m, nil
+				m.closeOverlay()
+				return m, confirmCmd(m.runtime, req, true)
 			case "esc", "n", "N":
-				events, err := m.runtime.Confirm(context.Background(), *m.pendingConfirm, false)
+				req := *m.pendingConfirm
 				m.pendingConfirm = nil
-				m.applyRuntimeResult(events, err)
-				return m, nil
+				m.closeOverlay()
+				return m, confirmCmd(m.runtime, req, false)
 			default:
 				return m, nil
 			}
@@ -154,10 +162,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.composer.SetValue("")
 			m.pushHistory(value)
-			events, err := m.runtime.SendMessage(context.Background(), value)
-			m.applyRuntimeResult(events, err)
-			m.refreshViewport()
-			return m, nil
+			return m, sendMessageCmd(m.runtime, value)
 		}
 	}
 
@@ -167,6 +172,28 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	m.composer, cmd = m.composer.Update(msg)
 	cmds = append(cmds, cmd)
 	return m, tea.Batch(cmds...)
+}
+
+func sendMessageCmd(rt runtime.Runtime, input string) tea.Cmd {
+	return func() tea.Msg {
+		events, err := rt.SendMessage(context.Background(), input)
+		return runtimeResultMsg{events: events, err: err}
+	}
+}
+
+func confirmCmd(rt runtime.Runtime, req protocol.ConfirmRequest, approved bool) tea.Cmd {
+	return func() tea.Msg {
+		events, err := rt.Confirm(context.Background(), req, approved)
+		return runtimeResultMsg{events: events, err: err}
+	}
+}
+
+func (m *Model) closeOverlay() {
+	m.overlayMode = overlayNone
+	m.overlay = ""
+	m.refreshOverlay()
+	m.resize()
+	m.refreshViewport()
 }
 
 func (m Model) View() string {
