@@ -458,6 +458,94 @@ func TestInterruptCancelsBlockedTaskStartWithoutWaitingForDeadline(t *testing.T)
 	close(store.release)
 }
 
+func TestInterruptAndStopTaskPersistenceUseBoundedContext(t *testing.T) {
+	tests := []struct {
+		name   string
+		invoke func(*Manager, string) ([]protocol.Event, error)
+	}{
+		{
+			name: "interrupt",
+			invoke: func(manager *Manager, _ string) ([]protocol.Event, error) {
+				return manager.Interrupt(context.Background())
+			},
+		},
+		{
+			name: "stop task",
+			invoke: func(manager *Manager, taskID string) ([]protocol.Event, error) {
+				return manager.StopTask(context.Background(), taskID)
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := &blockingResultSessions{
+				Sessions: local.New(t.TempDir()),
+				blocked:  make(chan struct{}),
+				release:  make(chan struct{}),
+			}
+			runner := newControlledTurnRunner()
+			manager := New(Dependencies{
+				Sessions:     store,
+				EinoRunner:   runner,
+				TurnTimeout:  25 * time.Millisecond,
+				NewSessionID: func() string { return "sess_bounded_control" },
+			})
+			if _, err := manager.Start(context.Background(), StartOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			store.blockType = protocol.EventStatusUpdate
+
+			type result struct {
+				events []protocol.Event
+				err    error
+			}
+			sendDone := make(chan result, 1)
+			go func() {
+				events, err := manager.SendMessage(context.Background(), "bounded control persistence")
+				sendDone <- result{events: events, err: err}
+			}()
+			select {
+			case <-runner.started:
+			case <-time.After(time.Second):
+				t.Fatal("turn did not reach runner")
+			}
+			manager.mu.Lock()
+			taskID := manager.activeTurn.id
+			manager.mu.Unlock()
+
+			startedAt := time.Now()
+			events, err := test.invoke(manager, taskID)
+			if !errors.Is(err, context.DeadlineExceeded) || !hasEvent(events, protocol.EventStatusUpdate) {
+				t.Fatalf("bounded control result = events:%+v err:%v", events, err)
+			}
+			if elapsed := time.Since(startedAt); elapsed > 500*time.Millisecond {
+				t.Fatalf("control persistence exceeded configured bound: %s", elapsed)
+			}
+			select {
+			case <-store.blocked:
+			default:
+				t.Fatal("control event did not reach persistence")
+			}
+			close(store.release)
+
+			select {
+			case got := <-sendDone:
+				if !errors.Is(got.err, context.Canceled) {
+					t.Fatalf("cancelled turn = events:%+v err:%v", got.events, got.err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("cancelled turn did not finish after bounded control persistence")
+			}
+			manager.mu.Lock()
+			manager.deps.EinoRunner = immediateTurnRunner{}
+			manager.mu.Unlock()
+			if _, err := manager.SendMessage(context.Background(), "accepted after bounded control persistence"); err != nil {
+				t.Fatalf("turn after bounded control persistence: %v", err)
+			}
+		})
+	}
+}
+
 func TestTaskStartPersistenceHonorsTurnDeadlineAndClearsActiveTurn(t *testing.T) {
 	store := &blockingResultSessions{
 		Sessions:  local.New(t.TempDir()),
@@ -989,8 +1077,23 @@ func TestResultPersistenceUsesBoundedFinalizationContext(t *testing.T) {
 		t.Fatal("result persistence exceeded the configured finalization bound")
 	}
 	close(store.release)
+	manager.deps.TurnTimeout = time.Second
 	if _, err := manager.SendMessage(context.Background(), "accepted after bounded failure"); err != nil {
 		t.Fatalf("turn after bounded persistence failure: %v", err)
+	}
+}
+
+func TestFinalizationContextCapsLongTurnTimeout(t *testing.T) {
+	manager := New(Dependencies{TurnTimeout: time.Minute})
+	ctx, cancel := manager.turnFinalizationContext(context.Background())
+	defer cancel()
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		t.Fatal("finalization context has no deadline")
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 || remaining > maxTurnFinalizationTimeout+100*time.Millisecond {
+		t.Fatalf("finalization deadline = %s, want at most %s", remaining, maxTurnFinalizationTimeout)
 	}
 }
 

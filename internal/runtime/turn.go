@@ -10,7 +10,10 @@ import (
 	"github.com/zzqDeco/knote/internal/protocol"
 )
 
-const DefaultTurnTimeout = 3 * time.Minute
+const (
+	DefaultTurnTimeout         = 3 * time.Minute
+	maxTurnFinalizationTimeout = 2 * time.Second
+)
 
 var (
 	ErrTurnBusy                 = errors.New("runtime turn is already active")
@@ -243,6 +246,20 @@ func (m *Manager) turnTimeoutContext(parent context.Context) (context.Context, c
 	return context.WithTimeout(parent, timeout)
 }
 
+func (m *Manager) turnFinalizationContext(parent context.Context) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	timeout := m.deps.TurnTimeout
+	if timeout <= 0 {
+		timeout = DefaultTurnTimeout
+	}
+	if timeout > maxTurnFinalizationTimeout {
+		timeout = maxTurnFinalizationTimeout
+	}
+	return context.WithTimeout(parent, timeout)
+}
+
 func (m *Manager) clearRotationLocked(reservationID uint64) {
 	if reservationID != 0 && m.rotationReservation != reservationID {
 		return
@@ -283,7 +300,7 @@ func (m *Manager) completeTurn(turn *activeTurn, status protocol.TaskStatus, mes
 	if status == protocol.TaskKilled && m.deps.SideEffects != nil {
 		m.deps.SideEffects.ClearTurn(turn.lifecycleSessionID, turn.id)
 	}
-	persistCtx, persistCancel := m.turnTimeoutContext(context.WithoutCancel(turn.ctx))
+	persistCtx, persistCancel := m.turnFinalizationContext(context.WithoutCancel(turn.ctx))
 	persistErr := m.persist(persistCtx, []protocol.Event{terminal})
 	persistCancel()
 	if persistErr != nil {
@@ -467,7 +484,7 @@ func (m *Manager) finishTurnResultWithStatusEvents(
 	toPersist = append(toPersist, terminal)
 	// Once a result is accepted, cancellation stops new work but cannot split the
 	// result from its terminal record. Keep the turn busy until both are durable.
-	persistCtx, persistCancel := m.turnTimeoutContext(context.WithoutCancel(turn.ctx))
+	persistCtx, persistCancel := m.turnFinalizationContext(context.WithoutCancel(turn.ctx))
 	persistErr := m.persist(persistCtx, toPersist)
 	persistCancel()
 	if persistErr != nil {

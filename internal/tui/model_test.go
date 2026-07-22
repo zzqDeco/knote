@@ -227,6 +227,46 @@ func TestSendMessageRetainsRuntimeErrorWithoutDuplicatingReturnedEvents(t *testi
 	}
 }
 
+func TestGenericSendFailureRestoresInputAndClosesStartedTask(t *testing.T) {
+	model := newTestModel(t)
+	wantErr := errors.New("persist task result: storage unavailable")
+	now := time.Now().UTC()
+	started := protocol.NewEvent(protocol.EventTaskStarted, model.runtime.SessionID(), "Task started", protocol.Task{
+		ID: "task_failed_send", Title: "Message", Status: protocol.TaskRunning, CreatedAt: now, UpdatedAt: now,
+	})
+	stub := &sendResultRuntime{
+		Runtime: model.runtime,
+		events:  []protocol.Event{started},
+		err:     wantErr,
+	}
+	model.setRuntime(stub)
+	model.composer.SetValue("retry this message")
+
+	updateModel(t, &model, tea.KeyMsg{Type: tea.KeyEnter})
+
+	if !errors.Is(model.err, wantErr) {
+		t.Fatalf("send message error = %v, want %v", model.err, wantErr)
+	}
+	if got := model.composer.Value(); got != "retry this message" {
+		t.Fatalf("failed send composer = %q, want original input restored", got)
+	}
+	if view := model.View(); !strings.Contains(view, wantErr.Error()) {
+		t.Fatalf("failed send error is not visible in view: %q", view)
+	}
+	if got := currentTaskStatuses(model.events)["task_failed_send"]; got != protocol.TaskFailed {
+		t.Fatalf("failed send task status = %q, want %q", got, protocol.TaskFailed)
+	}
+	if got := countTUIEvents(model.events, protocol.EventTaskStarted); got != 1 {
+		t.Fatalf("task.started events = %d, want 1", got)
+	}
+	if got := countTUIEvents(model.events, protocol.EventTaskComplete); got != 1 {
+		t.Fatalf("task.complete events = %d, want 1", got)
+	}
+	if !strings.Contains(model.status, "tasks 0") {
+		t.Fatalf("failed send left active task in status: %q", model.status)
+	}
+}
+
 func TestBusyConfirmationRestoresCanonicalOverlay(t *testing.T) {
 	model := newTestModel(t)
 	req := protocol.ConfirmRequest{

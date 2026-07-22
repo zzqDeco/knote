@@ -572,7 +572,9 @@ func (m *Manager) Interrupt(ctx context.Context) ([]protocol.Event, error) {
 		}
 		events = []protocol.Event{protocol.NewEvent(protocol.EventStatusUpdate, einoSessionID, "interrupt requested", payload)}
 	}
-	persistErr := m.persist(ctx, events)
+	persistCtx, persistCancel := m.turnFinalizationContext(ctx)
+	persistErr := m.persist(persistCtx, events)
+	persistCancel()
 	dispatch := m.enqueueNotifications(nil, subscribers, events)
 	m.commitMu.Unlock()
 	if dispatch {
@@ -610,7 +612,9 @@ func (m *Manager) StopTask(ctx context.Context, taskID string) ([]protocol.Event
 
 	turn.cancel()
 	events := []protocol.Event{protocol.NewEvent(protocol.EventStatusUpdate, einoSessionID, "task stop requested", map[string]string{"task_id": taskID})}
-	persistErr := m.persist(ctx, events)
+	persistCtx, persistCancel := m.turnFinalizationContext(ctx)
+	persistErr := m.persist(persistCtx, events)
+	persistCancel()
 	dispatch := m.enqueueNotifications(nil, subscribers, events)
 	m.commitMu.Unlock()
 	if dispatch {

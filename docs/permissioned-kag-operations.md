@@ -141,7 +141,7 @@ whitespace.
 | `KNOTE_OPENFGA_MODEL_ID` | Required canonical OpenFGA authorization-model ULID. |
 | `KNOTE_OPENFGA_API_TOKEN` | Required non-empty API token, read only from the process environment. |
 | `KNOTE_OPENFGA_TIMEOUT` | Optional positive Go duration; default `3s`. |
-| `KNOTE_TURN_TIMEOUT` | Optional positive Go duration bounding each message or confirmation turn; default `3m`. |
+| `KNOTE_TURN_TIMEOUT` | Optional positive Go duration bounding each message or confirmation turn; default `3m`. Cancellation and terminal persistence use at most the configured duration, capped at two seconds. |
 | `KNOTE_OPENFGA_CONSISTENCY` | Optional `higher_consistency` (default) or `minimize_latency`. |
 | `KNOTE_PERMISSIONED_TELEMETRY_PATH` | Optional path for the content-free JSONL telemetry sink described below. |
 

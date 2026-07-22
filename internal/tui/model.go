@@ -60,16 +60,23 @@ type Model struct {
 	quitPending      bool
 	interruptDone    bool
 	quitTaskIDs      map[string]struct{}
+	failedTasks      map[string]runtimeTaskRef
 	ready            bool
 	err              error
 }
 
 type runtimeResultMsg struct {
-	commandID uint64
-	kind      runtimeCommandKind
-	input     string
-	confirm   *protocol.ConfirmRequest
-	err       error
+	commandID  uint64
+	kind       runtimeCommandKind
+	input      string
+	confirm    *protocol.ConfirmRequest
+	unfinished []runtimeTaskRef
+	err        error
+}
+
+type runtimeTaskRef struct {
+	sessionID string
+	task      protocol.Task
 }
 
 type interruptResultMsg struct {
@@ -169,7 +176,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case runtimeEventsMsg:
 		m.applyEvents(msg.events)
-		m.observeQuitTerminals(msg.events)
 		if m.shouldQuit() {
 			return m, tea.Quit
 		}
@@ -194,11 +200,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			switch msg.String() {
 			case "enter", "y", "Y":
 				req := *m.pendingConfirm
+				m.err = nil
 				m.pendingConfirm = nil
 				m.closeOverlay()
 				return m, confirmCmd(m.runtime, m.nextRuntimeCommand(false), req, true)
 			case "esc", "n", "N":
 				req := *m.pendingConfirm
+				m.err = nil
 				m.pendingConfirm = nil
 				m.closeOverlay()
 				return m, confirmCmd(m.runtime, m.nextRuntimeCommand(false), req, false)
@@ -249,6 +257,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.overlayMode != overlayNone {
 				m.closeOverlay()
 			}
+			m.err = nil
 			m.composer.SetValue("")
 			m.pushHistory(value)
 			rotation := isSessionRotationCommand(value)
@@ -303,15 +312,27 @@ func statusRefreshCmd(rt runtime.Runtime, requestID uint64, sessionID string) te
 
 func sendMessageCmd(rt runtime.Runtime, commandID uint64, input string) tea.Cmd {
 	return func() tea.Msg {
-		_, err := rt.SendMessage(context.Background(), input)
-		return runtimeResultMsg{commandID: commandID, kind: runtimeCommandSend, input: input, err: err}
+		events, err := rt.SendMessage(context.Background(), input)
+		return runtimeResultMsg{
+			commandID:  commandID,
+			kind:       runtimeCommandSend,
+			input:      input,
+			unfinished: unfinishedRuntimeTasks(events),
+			err:        err,
+		}
 	}
 }
 
 func confirmCmd(rt runtime.Runtime, commandID uint64, req protocol.ConfirmRequest, approved bool) tea.Cmd {
 	return func() tea.Msg {
-		_, err := rt.Confirm(context.Background(), req, approved)
-		return runtimeResultMsg{commandID: commandID, kind: runtimeCommandConfirm, confirm: &req, err: err}
+		events, err := rt.Confirm(context.Background(), req, approved)
+		return runtimeResultMsg{
+			commandID:  commandID,
+			kind:       runtimeCommandConfirm,
+			confirm:    &req,
+			unfinished: unfinishedRuntimeTasks(events),
+			err:        err,
+		}
 	}
 }
 
@@ -490,6 +511,11 @@ func (m *Model) refreshOverlay() {
 
 func (m *Model) applyEvents(events []protocol.Event) {
 	m.events = append(m.events, events...)
+	if terminals := m.failedTaskTerminals(); len(terminals) > 0 {
+		m.events = append(m.events, terminals...)
+		events = append(events, terminals...)
+	}
+	m.observeQuitTerminals(events)
 	cleared := hasClearEvent(events)
 	if cleared {
 		m.pendingConfirm = nil
@@ -536,19 +562,28 @@ func (m *Model) applyRuntimeResult(result runtimeResultMsg) {
 		return
 	}
 	m.err = result.err
-	if !errors.Is(result.err, runtime.ErrTurnBusy) &&
-		!errors.Is(result.err, runtime.ErrTurnNotStarted) &&
-		!errors.Is(result.err, runtime.ErrConfirmationNotExecuted) {
-		return
-	}
 	switch result.kind {
 	case runtimeCommandSend:
 		if strings.TrimSpace(m.composer.Value()) == "" {
 			m.setComposerValue(result.input)
 		}
 	case runtimeCommandConfirm:
-		if result.confirm != nil && m.pendingConfirm == nil {
+		if result.confirm != nil && m.pendingConfirm == nil &&
+			(errors.Is(result.err, runtime.ErrTurnBusy) ||
+				errors.Is(result.err, runtime.ErrTurnNotStarted) ||
+				errors.Is(result.err, runtime.ErrConfirmationNotExecuted)) {
 			m.restoreConfirmation(*result.confirm)
+		}
+	}
+	if !errors.Is(result.err, runtime.ErrTurnBusy) && !errors.Is(result.err, runtime.ErrTurnNotStarted) {
+		if m.failedTasks == nil {
+			m.failedTasks = map[string]runtimeTaskRef{}
+		}
+		for _, task := range result.unfinished {
+			m.failedTasks[task.task.ID] = task
+		}
+		if terminals := m.failedTaskTerminals(); len(terminals) > 0 {
+			m.applyEvents(terminals)
 		}
 	}
 }
@@ -609,6 +644,9 @@ func (m *Model) setComposerValue(value string) {
 func (m Model) overlayView() string {
 	if strings.TrimSpace(m.overlay) != "" {
 		return m.overlayViewport.View()
+	}
+	if m.err != nil {
+		return "error: " + m.err.Error()
 	}
 	return " "
 }
@@ -822,6 +860,58 @@ func tasksFromEvent(event protocol.Event) []protocol.Task {
 		return tasks
 	}
 	return nil
+}
+
+func unfinishedRuntimeTasks(events []protocol.Event) []runtimeTaskRef {
+	pending := map[string]runtimeTaskRef{}
+	var order []string
+	for _, event := range events {
+		for _, task := range tasksFromEvent(event) {
+			if _, seen := pending[task.ID]; !seen {
+				order = append(order, task.ID)
+			}
+			switch task.Status {
+			case protocol.TaskPending, protocol.TaskRunning:
+				pending[task.ID] = runtimeTaskRef{sessionID: event.SessionID, task: task}
+			default:
+				delete(pending, task.ID)
+			}
+		}
+	}
+	unfinished := make([]runtimeTaskRef, 0, len(pending))
+	for _, taskID := range order {
+		if task, ok := pending[taskID]; ok {
+			unfinished = append(unfinished, task)
+		}
+	}
+	return unfinished
+}
+
+func (m *Model) failedTaskTerminals() []protocol.Event {
+	if len(m.failedTasks) == 0 {
+		return nil
+	}
+	statuses := currentTaskStatuses(m.events)
+	now := time.Now().UTC()
+	terminals := make([]protocol.Event, 0, len(m.failedTasks))
+	for taskID, ref := range m.failedTasks {
+		status, seen := statuses[taskID]
+		if !seen {
+			continue
+		}
+		delete(m.failedTasks, taskID)
+		if status != protocol.TaskPending && status != protocol.TaskRunning {
+			continue
+		}
+		task := ref.task
+		task.Status = protocol.TaskFailed
+		task.UpdatedAt = now
+		task.Message = "Task failed"
+		terminals = append(terminals, protocol.NewEvent(
+			protocol.EventTaskComplete, ref.sessionID, "Task failed", task,
+		))
+	}
+	return terminals
 }
 
 func confirmFromEvents(events []protocol.Event) *protocol.ConfirmRequest {
