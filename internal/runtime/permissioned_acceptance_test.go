@@ -46,16 +46,16 @@ func TestPermissionedAcceptanceRevocationDeniesCacheCitationAndSessionReplay(t *
 
 	_, err := harness.manager.Start(context.Background(), StartOptions{})
 	permissionedAcceptanceNoError(t, invariant, err)
-	slashEvents := harness.manager.SendMessage(context.Background(), "/help")
+	slashEvents, _ := harness.manager.SendMessage(context.Background(), "/help")
 	permissionedAcceptanceRequire(t, invariant, hasEvent(slashEvents, protocol.EventAssistantDone),
 		"safe slash command did not complete: %+v", slashEvents)
-	localEvents := harness.manager.Interrupt(context.Background())
+	localEvents, _ := harness.manager.Interrupt(context.Background())
 	permissionedAcceptanceRequire(t, invariant,
 		len(localEvents) == 1 && localEvents[0].Type == protocol.EventStatusUpdate,
 		"safe local runtime history was not created: %+v", localEvents)
 	safeLocalMessage := localEvents[0].Message
 
-	queryEvents := harness.manager.SendMessage(context.Background(), "What is knote?")
+	queryEvents, _ := harness.manager.SendMessage(context.Background(), "What is knote?")
 	permissionedAcceptanceRequire(t, invariant, !hasEvent(queryEvents, protocol.EventError),
 		"initial permissioned query failed: %+v", queryEvents)
 	initial := harness.runner.snapshot()
@@ -142,7 +142,7 @@ func TestPermissionedAcceptanceSideChannelSurfacesHideCanaries(t *testing.T) {
 
 	_, err := harness.manager.Start(context.Background(), StartOptions{})
 	permissionedAcceptanceNoError(t, invariant, err)
-	events := harness.manager.SendMessage(context.Background(), "What is knote?")
+	events, _ := harness.manager.SendMessage(context.Background(), "What is knote?")
 	permissionedAcceptanceRequire(t, invariant, !hasEvent(events, protocol.EventError),
 		"Bob permissioned query failed: %+v", events)
 
@@ -197,7 +197,7 @@ func TestPermissionedAcceptanceSideChannelSurfacesHideCanaries(t *testing.T) {
 	denied := newPermissionedAcceptanceHarness(t, "mallory", "sess_acceptance_denied_error")
 	_, err = denied.manager.Start(context.Background(), StartOptions{})
 	permissionedAcceptanceNoError(t, invariant, err)
-	deniedEvents := denied.manager.SendMessage(context.Background(), "What is knote?")
+	deniedEvents, _ := denied.manager.SendMessage(context.Background(), "What is knote?")
 	permissionedAcceptanceRequire(t, invariant, hasEvent(deniedEvents, protocol.EventError),
 		"unknown principal did not receive a fail-closed error: %+v", deniedEvents)
 	permissionedAcceptanceRequire(t, invariant, len(denied.probe.generateSnapshots()) == 0,
@@ -211,12 +211,12 @@ func TestPermissionedAcceptanceProtectedReplayFailsClosed(t *testing.T) {
 	_, err := prime.manager.Start(context.Background(), StartOptions{})
 	permissionedAcceptanceNoError(t, invariant, err)
 	prime.manager.SendMessage(context.Background(), "/help")
-	localEvents := prime.manager.Interrupt(context.Background())
+	localEvents, _ := prime.manager.Interrupt(context.Background())
 	permissionedAcceptanceRequire(t, invariant,
 		len(localEvents) == 1 && localEvents[0].Type == protocol.EventStatusUpdate,
 		"safe local runtime history was not created: %+v", localEvents)
 	safeLocalMessage := localEvents[0].Message
-	queryEvents := prime.manager.SendMessage(context.Background(), "What is knote?")
+	queryEvents, _ := prime.manager.SendMessage(context.Background(), "What is knote?")
 	permissionedAcceptanceRequire(t, invariant, !hasEvent(queryEvents, protocol.EventError),
 		"fixture query failed while priming replay: %+v", queryEvents)
 	protected := prime.runner.snapshot()
@@ -303,7 +303,7 @@ func TestPermissionedAcceptanceRevocationPropagationPercentiles(t *testing.T) {
 	prime := newPermissionedAcceptanceHarness(t, fixture.Alice, "sess_acceptance_latency")
 	_, err := prime.manager.Start(context.Background(), StartOptions{})
 	permissionedAcceptanceNoError(t, invariant, err)
-	events := prime.manager.SendMessage(context.Background(), "What is knote?")
+	events, _ := prime.manager.SendMessage(context.Background(), "What is knote?")
 	permissionedAcceptanceRequire(t, invariant, !hasEvent(events, protocol.EventError),
 		"fixture query failed while creating latency binding: %+v", events)
 	protected := prime.runner.snapshot()

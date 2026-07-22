@@ -45,6 +45,9 @@ func (b *SideEffectBridge) Request(ctx context.Context, req SideEffectRequest) e
 	if b == nil {
 		return fmt.Errorf("side-effect bridge is not configured")
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	sessionID := strings.TrimSpace(sideEffectSessionID(ctx))
 	if sessionID == "" {
 		sessionID = strings.TrimSpace(req.SessionID)
@@ -84,6 +87,37 @@ func (b *SideEffectBridge) Request(ctx context.Context, req SideEffectRequest) e
 	b.queue = append(b.queue, confirm.RequestID)
 	b.mu.Unlock()
 	return ErrSideEffectPending
+}
+
+func (b *SideEffectBridge) ClearSession(sessionID string) int {
+	if b == nil {
+		return 0
+	}
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return 0
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	removed := 0
+	for requestID, pending := range b.pending {
+		if pending.request.SessionID != sessionID {
+			continue
+		}
+		delete(b.pending, requestID)
+		removed++
+	}
+	if removed == 0 {
+		return 0
+	}
+	queue := b.queue[:0]
+	for _, requestID := range b.queue {
+		if _, ok := b.pending[requestID]; ok {
+			queue = append(queue, requestID)
+		}
+	}
+	b.queue = queue
+	return removed
 }
 
 func (b *SideEffectBridge) PendingEvents(sessionID string) []protocol.Event {

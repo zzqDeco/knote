@@ -78,7 +78,7 @@ func TestPermissionedSlashRejectsProtectedAndUnknownCommandsUniformly(t *testing
 
 	commands := []string{"/details", "/versions", "/status", "/settings", "/model", "/diff", "/eval", "/unknown"}
 	for _, command := range commands {
-		events := rt.SendMessage(context.Background(), command)
+		events, _ := rt.SendMessage(context.Background(), command)
 		assertEventsExcludeCanary(t, events, canary)
 		var rejection string
 		for _, event := range events {
@@ -117,7 +117,7 @@ func TestPermissionedSlashHelpListsOnlyAvailableCommands(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	events := rt.SendMessage(context.Background(), "/help")
+	events, _ := rt.SendMessage(context.Background(), "/help")
 	var help string
 	for _, event := range events {
 		if event.Type == protocol.EventAssistantDone {

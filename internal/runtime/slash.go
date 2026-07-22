@@ -15,7 +15,13 @@ import (
 	"github.com/zzqDeco/knote/internal/repository"
 )
 
-func (m *Manager) handleSlash(ctx context.Context, sessionID string, input string) []protocol.Event {
+type slashResult struct {
+	events    []protocol.Event
+	persisted []protocol.Event
+	err       error
+}
+
+func (m *Manager) handleSlash(ctx context.Context, turn *activeTurn, sessionID string, input string) slashResult {
 	userEvent := protocol.NewEvent(protocol.EventUserMessage, sessionID, input, nil)
 	cmd, arg := parseSlash(input)
 	if !m.deps.Capabilities.AllowsSlashCommand(cmd) {
@@ -23,21 +29,41 @@ func (m *Manager) handleSlash(ctx context.Context, sessionID string, input strin
 			userEvent,
 			protocol.NewEvent(protocol.EventError, sessionID, permissionedCommandUnavailableMessage, nil),
 		}
-		return m.persistEmitAndReturn(events)
+		return slashResult{events: events, persisted: events, err: fmt.Errorf("slash command is unavailable")}
 	}
 	switch cmd {
 	case "new":
-		events := append([]protocol.Event{userEvent}, m.newSession(ctx)...)
-		m.emit(events)
-		return events
+		newSessionEvents := m.newSession(ctx, turn, sessionID)
+		events := append([]protocol.Event{userEvent}, newSessionEvents...)
+		result := slashResult{events: events, persisted: newSessionEvents}
+		if hasErrorEvent(events) {
+			result.err = fmt.Errorf("new session failed")
+		}
+		return result
 	case "resume":
-		m.persist([]protocol.Event{userEvent})
-		events := append([]protocol.Event{userEvent}, m.resumeSession(ctx, sessionID, arg)...)
-		m.emit(events)
-		return events
+		if strings.TrimSpace(arg) == "" {
+			events := append([]protocol.Event{userEvent}, m.sessionList(ctx, sessionID)...)
+			result := slashResult{events: events, persisted: events}
+			if hasErrorEvent(events) {
+				result.err = fmt.Errorf("list sessions failed")
+			}
+			return result
+		}
+		events, persisted := m.resumeSession(ctx, turn, sessionID, arg)
+		events = append([]protocol.Event{userEvent}, events...)
+		persisted = append([]protocol.Event{userEvent}, persisted...)
+		result := slashResult{events: events, persisted: persisted}
+		if hasErrorEvent(events) {
+			result.err = fmt.Errorf("resume session failed")
+		}
+		return result
 	default:
 		events := append([]protocol.Event{userEvent}, markSlashEvents(m.routeSlash(ctx, sessionID, cmd, arg))...)
-		return m.persistEmitAndReturn(events)
+		result := slashResult{events: events, persisted: events}
+		if hasErrorEvent(events) {
+			result.err = fmt.Errorf("slash command failed")
+		}
+		return result
 	}
 }
 
@@ -146,69 +172,93 @@ func (m *Manager) permissionedToolContext(ctx context.Context, sessionID string)
 	return runCtx, nil
 }
 
-func (m *Manager) newSession(ctx context.Context) []protocol.Event {
-	m.mu.Lock()
-	info := m.newEinoSessionLocked(ctx, "")
-	m.einoSession = info
-	m.authorizationBinding = nil
-	m.mu.Unlock()
+func (m *Manager) newSession(ctx context.Context, turn *activeTurn, currentSessionID string) []protocol.Event {
+	info := m.newEinoSession(ctx, "")
+	if !m.rotateSession(turn, info, nil) {
+		return []protocol.Event{protocol.NewEvent(protocol.EventError, currentSessionID, "new session cancelled", nil)}
+	}
 	events := []protocol.Event{
 		protocol.NewEvent(protocol.EventGatewayReady, info.ID, "knote runtime ready", nil),
 		protocol.NewEvent(protocol.EventSessionInfo, info.ID, "session ready", info),
 		protocol.NewEvent(protocol.EventViewClear, info.ID, "new session", nil),
 	}
-	m.persist(events)
 	return events
 }
 
-func (m *Manager) resumeSession(ctx context.Context, currentSessionID string, sessionID string) []protocol.Event {
+func (m *Manager) resumeSession(ctx context.Context, turn *activeTurn, currentSessionID string, sessionID string) ([]protocol.Event, []protocol.Event) {
 	sessionID = strings.TrimSpace(sessionID)
-	if sessionID == "" {
-		return m.sessionList(ctx, currentSessionID)
-	}
 	if m.deps.Sessions == nil {
-		return []protocol.Event{protocol.NewEvent(protocol.EventError, currentSessionID, "session storage is not configured", nil)}
+		events := []protocol.Event{protocol.NewEvent(protocol.EventError, currentSessionID, "session storage is not configured", nil)}
+		return events, events
 	}
 	var resumeAuthorization *protocol.AuthorizationContext
 	if m.deps.Capabilities.IsPermissioned() && m.deps.AuthorizationContextProvider == nil {
-		return []protocol.Event{protocol.NewEvent(protocol.EventError, currentSessionID, permissionedResumeErrorMessage, nil)}
+		events := []protocol.Event{protocol.NewEvent(protocol.EventError, currentSessionID, permissionedResumeErrorMessage, nil)}
+		return events, events
 	}
 	if m.deps.AuthorizationContextProvider != nil {
 		authorization, err := m.authorizeSessionResume(ctx, sessionID)
 		if err != nil {
-			return []protocol.Event{protocol.NewEvent(protocol.EventError, currentSessionID, permissionedResumeErrorMessage, nil)}
+			events := []protocol.Event{protocol.NewEvent(protocol.EventError, currentSessionID, permissionedResumeErrorMessage, nil)}
+			return events, events
 		}
 		resumeAuthorization = &authorization
 	}
 	loaded, err := m.deps.Sessions.Load(ctx, sessionID)
 	if err != nil {
 		if resumeAuthorization != nil {
-			return []protocol.Event{protocol.NewEvent(protocol.EventError, currentSessionID, permissionedResumeErrorMessage, nil)}
+			events := []protocol.Event{protocol.NewEvent(protocol.EventError, currentSessionID, permissionedResumeErrorMessage, nil)}
+			return events, events
 		}
-		return []protocol.Event{protocol.NewEvent(protocol.EventError, currentSessionID, "resume failed: "+err.Error(), nil)}
+		events := []protocol.Event{protocol.NewEvent(protocol.EventError, currentSessionID, "resume failed: "+err.Error(), nil)}
+		return events, events
 	}
 	authorization := protocol.AuthorizationContext{}
 	if resumeAuthorization != nil {
 		authorization = *resumeAuthorization
 	}
 	loaded = m.filterPersistedEvents(ctx, authorization, loaded)
-	info := m.newEinoSessionLocked(ctx, sessionID)
-	m.mu.Lock()
-	m.einoSession = info
+	loaded = withoutTaskLifecycleID(loaded, turn.id)
+	info := m.newEinoSession(ctx, sessionID)
+	var binding *authorizationBinding
 	if resumeAuthorization == nil {
-		m.authorizationBinding = nil
+		binding = nil
 	} else {
-		binding := newAuthorizationBinding(*resumeAuthorization)
-		m.authorizationBinding = &binding
+		value := newAuthorizationBinding(*resumeAuthorization)
+		binding = &value
 	}
-	m.mu.Unlock()
+	if !m.rotateSession(turn, info, binding) {
+		events := []protocol.Event{protocol.NewEvent(protocol.EventError, currentSessionID, "resume cancelled", nil)}
+		return events, events
+	}
 	infoEvent := protocol.NewEvent(protocol.EventSessionInfo, sessionID, "session resumed", info)
-	m.persist([]protocol.Event{infoEvent})
 	events := make([]protocol.Event, 0, len(loaded)+2)
 	events = append(events, protocol.NewEvent(protocol.EventViewClear, sessionID, "resume session", nil))
 	events = append(events, loaded...)
 	events = append(events, infoEvent)
-	return events
+	return events, []protocol.Event{infoEvent}
+}
+
+func withoutTaskLifecycleID(events []protocol.Event, taskID string) []protocol.Event {
+	taskID = strings.TrimSpace(taskID)
+	if taskID == "" {
+		return events
+	}
+	filtered := make([]protocol.Event, 0, len(events))
+	for _, event := range events {
+		switch event.Type {
+		case protocol.EventTaskStarted, protocol.EventTaskProgress, protocol.EventTaskComplete:
+			data, err := json.Marshal(event.Payload)
+			if err == nil {
+				var task protocol.Task
+				if json.Unmarshal(data, &task) == nil && task.ID == taskID {
+					continue
+				}
+			}
+		}
+		filtered = append(filtered, event)
+	}
+	return filtered
 }
 
 func (m *Manager) sessionList(ctx context.Context, sessionID string) []protocol.Event {

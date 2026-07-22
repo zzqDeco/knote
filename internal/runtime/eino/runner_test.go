@@ -239,7 +239,7 @@ func TestRunnerPendingSideEffectWaitsForManagerConfirmationWithoutError(t *testi
 		t.Fatal(err)
 	}
 
-	events := manager.SendMessage(context.Background(), "build knowledge")
+	events, _ := manager.SendMessage(context.Background(), "build knowledge")
 	if !hasEvent(events, protocol.EventConfirmRequest) {
 		t.Fatalf("pending side effect did not reach confirmation state: %+v", events)
 	}
@@ -376,7 +376,7 @@ func TestRunnerPersistsLoadsAndResumesVersionsOutputWithoutAuthorization(t *test
 	if _, err := manager.Start(context.Background(), runtime.StartOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	produced := manager.SendMessage(context.Background(), "compare versions")
+	produced, _ := manager.SendMessage(context.Background(), "compare versions")
 	if !hasEventMessage(produced, protocol.EventAssistantDone, "SAFE_PERSISTED_ANSWER_CANARY") {
 		t.Fatalf("safe answer was not produced: %+v", produced)
 	}
@@ -529,7 +529,7 @@ func TestRunnerRedactsPermissionedToolOutputBeforeSessionPersistence(t *testing.
 	if _, err := manager.Start(context.Background(), runtime.StartOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	produced := manager.SendMessage(context.Background(), "private question")
+	produced, _ := manager.SendMessage(context.Background(), "private question")
 	if !hasEventMessage(produced, protocol.EventAssistantDone, "AUTHORIZED_FINAL_ANSWER_CANARY") {
 		t.Fatalf("authorized answer was not produced: %+v", produced)
 	}
@@ -591,7 +591,7 @@ func TestRunnerBindsPermissionedInterruptForRevocationReplay(t *testing.T) {
 	if _, err := manager.Start(context.Background(), runtime.StartOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	produced := manager.SendMessage(context.Background(), "question")
+	produced, _ := manager.SendMessage(context.Background(), "question")
 	var blockID string
 	boundTypes := map[protocol.EventType]bool{}
 	for _, event := range produced {
@@ -662,7 +662,7 @@ func TestRunnerBindsPermissionedStatusForRevocationReplay(t *testing.T) {
 	if _, err := manager.Start(context.Background(), runtime.StartOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	produced := manager.SendMessage(context.Background(), "question")
+	produced, _ := manager.SendMessage(context.Background(), "question")
 	var blockID string
 	boundTypes := map[protocol.EventType]bool{}
 	for _, event := range produced {

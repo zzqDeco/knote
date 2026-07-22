@@ -125,7 +125,7 @@ KNOTE_EINO_BASE_URL=https://api.openai.com/v1 \
 ./bin/knote --workspace tests/fixtures/basic-kb
 ```
 
-`KNOTE_EINO_MODEL_PROFILE` selects a profile from `.knote/config.yaml` and defaults to `default`. Environment variables override the selected profile. `OPENAI_MODEL`, `OPENAI_API_KEY`, and `OPENAI_BASE_URL` are also accepted; when those overrides are present, provider defaults to `openai-compatible`. `KNOTE_EINO_REASONING_EFFORT` accepts `low`, `medium`, or `high`. `KNOTE_RUNTIME_MODE=direct` is rejected.
+`KNOTE_EINO_MODEL_PROFILE` selects a profile from `.knote/config.yaml` and defaults to `default`. Environment variables override the selected profile. `OPENAI_MODEL`, `OPENAI_API_KEY`, and `OPENAI_BASE_URL` are also accepted; when those overrides are present, provider defaults to `openai-compatible`. `KNOTE_EINO_REASONING_EFFORT` accepts `low`, `medium`, or `high`. `KNOTE_TURN_TIMEOUT` accepts a positive Go duration and defaults to `3m`; it bounds each message or confirmation turn. `KNOTE_RUNTIME_MODE=direct` is rejected.
 
 Mutating Eino tools require a runtime side-effect gate, matching the TUI confirmation rule for `/build`, `/commit`, `/release`, and `/checkout`.
 

@@ -89,25 +89,28 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.refreshOverlay()
 		m.refreshViewport()
 	case tea.KeyMsg:
+		if msg.String() == "ctrl+c" {
+			_, err := m.runtime.Interrupt(context.Background())
+			m.err = err
+			return m, tea.Quit
+		}
 		if m.pendingConfirm != nil {
 			switch msg.String() {
 			case "enter", "y", "Y":
-				events := m.runtime.Confirm(context.Background(), *m.pendingConfirm, true)
+				events, err := m.runtime.Confirm(context.Background(), *m.pendingConfirm, true)
 				m.pendingConfirm = nil
-				m.applyEvents(events)
+				m.applyRuntimeResult(events, err)
 				return m, nil
 			case "esc", "n", "N":
-				events := m.runtime.Confirm(context.Background(), *m.pendingConfirm, false)
+				events, err := m.runtime.Confirm(context.Background(), *m.pendingConfirm, false)
 				m.pendingConfirm = nil
-				m.applyEvents(events)
+				m.applyRuntimeResult(events, err)
 				return m, nil
 			default:
 				return m, nil
 			}
 		}
 		switch msg.String() {
-		case "ctrl+c":
-			return m, tea.Quit
 		case "esc":
 			if m.overlayMode != overlayNone {
 				m.overlayMode = overlayNone
@@ -117,6 +120,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.refreshViewport()
 				return m, nil
 			}
+			events, err := m.runtime.Interrupt(context.Background())
+			m.applyRuntimeResult(events, err)
+			return m, nil
 		case "pgup", "pgdown", "ctrl+u", "ctrl+d":
 			if m.overlayMode != overlayNone {
 				var cmd tea.Cmd
@@ -148,8 +154,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.composer.SetValue("")
 			m.pushHistory(value)
-			events := m.runtime.SendMessage(context.Background(), value)
-			m.applyEvents(events)
+			events, err := m.runtime.SendMessage(context.Background(), value)
+			m.applyRuntimeResult(events, err)
 			m.refreshViewport()
 			return m, nil
 		}
@@ -226,6 +232,11 @@ func (m *Model) applyEvents(events []protocol.Event) {
 	m.resize()
 	m.refreshOverlay()
 	m.refreshViewport()
+}
+
+func (m *Model) applyRuntimeResult(events []protocol.Event, err error) {
+	m.err = err
+	m.applyEvents(events)
 }
 
 func (m *Model) pushHistory(value string) {
@@ -403,15 +414,32 @@ func overlayFromEvents(events []protocol.Event) (overlayMode, string) {
 
 func visibleEvents(events []protocol.Event) []protocol.Event {
 	cut := -1
+	currentSessionID := ""
 	for i, event := range events {
 		if event.Type == protocol.EventViewClear {
 			cut = i
+		}
+		if event.Type == protocol.EventSessionInfo && event.SessionID != "" {
+			currentSessionID = event.SessionID
 		}
 	}
 	if cut < 0 {
 		return events
 	}
-	return events[cut+1:]
+	visible := make([]protocol.Event, 0, len(events)-cut-1)
+	for _, event := range events[cut+1:] {
+		if currentSessionID != "" && event.SessionID != "" && event.SessionID != currentSessionID {
+			continue
+		}
+		if event.Type == protocol.EventTaskComplete {
+			tasks := tasksFromEvent(event)
+			if len(tasks) == 1 && tasks[0].Title == "/clear" {
+				continue
+			}
+		}
+		visible = append(visible, event)
+	}
+	return visible
 }
 
 func hasClearEvent(events []protocol.Event) bool {
@@ -469,10 +497,20 @@ func tasksFromEvent(event protocol.Event) []protocol.Task {
 }
 
 func confirmFromEvents(events []protocol.Event) *protocol.ConfirmRequest {
-	if len(events) == 0 {
-		return nil
+	for i := len(events) - 1; i >= 0; i-- {
+		if req := confirmFromEvent(events[i]); req != nil {
+			return req
+		}
+		switch events[i].Type {
+		case protocol.EventTaskStarted, protocol.EventTaskProgress, protocol.EventTaskComplete,
+			protocol.EventGatewayReady, protocol.EventSessionInfo, protocol.EventStatusUpdate:
+			continue
+		case protocol.EventAssistantDone, protocol.EventToolComplete, protocol.EventToolError,
+			protocol.EventBuildComplete, protocol.EventError, protocol.EventViewClear:
+			return nil
+		}
 	}
-	return confirmFromEvent(events[len(events)-1])
+	return nil
 }
 
 func confirmFromEvent(event protocol.Event) *protocol.ConfirmRequest {

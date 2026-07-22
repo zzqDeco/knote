@@ -385,7 +385,7 @@ func TestRuntimeStartAndSlashResumeReplayAuthorizedProtectedBlocks(t *testing.T)
 				if _, err := manager.Start(context.Background(), StartOptions{}); err != nil {
 					return nil, err
 				}
-				return manager.SendMessage(context.Background(), "/resume sess_authorized"), nil
+				return manager.SendMessage(context.Background(), "/resume sess_authorized")
 			},
 		},
 	} {
@@ -455,7 +455,7 @@ func TestRuntimeStartAndSlashResumeDropProtectedContentWhenAuthorizationUnavaila
 					if _, err := manager.Start(context.Background(), StartOptions{}); err != nil {
 						return nil, err
 					}
-					return manager.SendMessage(context.Background(), "/resume "+sessionID), nil
+					return manager.SendMessage(context.Background(), "/resume "+sessionID)
 				},
 			},
 		} {
@@ -543,7 +543,7 @@ func TestHistoricalSafeToolAssistantIsDroppedFromPermissionedReplay(t *testing.T
 				if _, err := manager.Start(context.Background(), StartOptions{}); err != nil {
 					return nil, err
 				}
-				return manager.SendMessage(context.Background(), "/resume "+sessionID), nil
+				return manager.SendMessage(context.Background(), "/resume "+sessionID)
 			},
 		},
 	} {

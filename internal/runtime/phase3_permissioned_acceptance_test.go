@@ -179,12 +179,12 @@ func TestPhase3PermissionedAcceptanceIntersectionGuardsReplayWithoutSideChannels
 			if _, err := harness.manager.Start(context.Background(), StartOptions{}); err != nil {
 				t.Fatalf("start prime runtime: %v", err)
 			}
-			safe := harness.manager.Interrupt(context.Background())
+			safe, _ := harness.manager.Interrupt(context.Background())
 			if len(safe) != 1 || safe[0].Type != protocol.EventStatusUpdate {
 				t.Fatalf("safe local history was not created: %+v", safe)
 			}
 			safeMessage := safe[0].Message
-			initial := harness.manager.SendMessage(context.Background(), phase3AcceptanceQuestion)
+			initial, _ := harness.manager.SendMessage(context.Background(), phase3AcceptanceQuestion)
 			if phase3AcceptanceHasEvent(initial, protocol.EventError) || harness.runner.binding.BlockID == "" {
 				t.Fatalf("prime protected result failed: %+v", initial)
 			}
@@ -378,7 +378,11 @@ func (h *phase3AcceptanceHarness) startAndSend(t *testing.T) []protocol.Event {
 	if _, err := h.manager.Start(context.Background(), StartOptions{}); err != nil {
 		t.Fatalf("start runtime: %v", err)
 	}
-	return h.manager.SendMessage(context.Background(), phase3AcceptanceQuestion)
+	events, err := h.manager.SendMessage(context.Background(), phase3AcceptanceQuestion)
+	if err != nil {
+		t.Fatalf("send acceptance question: %v", err)
+	}
+	return events
 }
 
 func phase3AcceptanceAgentTaskScope() protocol.AgentTaskScope {
@@ -572,8 +576,10 @@ func phase3AcceptanceAssertDeniedSurface(
 ) {
 	t.Helper()
 	want := strings.Join([]string{
+		string(protocol.EventTaskStarted) + "|Task started",
 		string(protocol.EventUserMessage) + "|" + phase3AcceptanceQuestion,
 		string(protocol.EventError) + "|" + authz.ErrToolAuthorizationDenied.Error(),
+		string(protocol.EventTaskComplete) + "|Task failed",
 	}, "\n")
 	if got := phase3AcceptanceObservableSurface(events); got != want {
 		t.Fatalf("denied public surface:\n%s\nwant:\n%s", got, want)

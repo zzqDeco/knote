@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -115,9 +116,100 @@ func TestOverlaySwitchAndEsc(t *testing.T) {
 	if model.overlayMode != overlayTasks || !strings.Contains(model.overlay, "tasks") {
 		t.Fatalf("/tasks did not show tasks overlay: mode=%s overlay=%q", model.overlayMode, model.overlay)
 	}
+	tracked := &interruptRecordingRuntime{Runtime: model.runtime}
+	model.runtime = tracked
 	updateModel(t, &model, tea.KeyMsg{Type: tea.KeyEsc})
 	if model.overlayMode != overlayNone || strings.TrimSpace(model.overlay) != "" {
 		t.Fatalf("esc did not close overlay: mode=%s overlay=%q", model.overlayMode, model.overlay)
+	}
+	if tracked.interruptCalls != 0 {
+		t.Fatalf("esc interrupted runtime while closing overlay %d times", tracked.interruptCalls)
+	}
+}
+
+func TestEscWithoutOverlayInterruptsAndAppliesReturnedEventsOnce(t *testing.T) {
+	model := newTestModel(t)
+	wantErr := errors.New("interrupt failed")
+	interruptEvent := protocol.NewEvent(protocol.EventStatusUpdate, model.runtime.SessionID(), "turn interrupted", nil)
+	tracked := &interruptRecordingRuntime{
+		Runtime:         model.runtime,
+		interruptEvents: []protocol.Event{interruptEvent},
+		interruptErr:    wantErr,
+	}
+	model.runtime = tracked
+
+	var subscribed []protocol.Event
+	unsubscribe := tracked.Subscribe(func(events []protocol.Event) {
+		subscribed = append(subscribed, events...)
+	})
+	defer unsubscribe()
+
+	updateModel(t, &model, tea.KeyMsg{Type: tea.KeyEsc})
+	if tracked.interruptCalls != 1 {
+		t.Fatalf("esc interrupt calls = %d, want 1", tracked.interruptCalls)
+	}
+	if !errors.Is(model.err, wantErr) {
+		t.Fatalf("esc interrupt error = %v, want %v", model.err, wantErr)
+	}
+	if got := countTUIEventMessages(model.events, protocol.EventStatusUpdate, interruptEvent.Message); got != 1 {
+		t.Fatalf("returned interrupt events in model = %d, want 1", got)
+	}
+	if got := countTUIEventMessages(subscribed, protocol.EventStatusUpdate, interruptEvent.Message); got != 1 {
+		t.Fatalf("subscription interrupt events = %d, want 1", got)
+	}
+}
+
+func TestCtrlCInterruptsBeforeQuittingWithOverlayActive(t *testing.T) {
+	model := newTestModel(t)
+	model.composer.SetValue("/build")
+	updateModel(t, &model, tea.KeyMsg{Type: tea.KeyEnter})
+	if model.pendingConfirm == nil || model.overlayMode != overlayConfirm {
+		t.Fatalf("build did not enter confirm overlay: pending=%v overlay=%s", model.pendingConfirm, model.overlayMode)
+	}
+
+	wantErr := errors.New("interrupt failed")
+	tracked := &interruptRecordingRuntime{Runtime: model.runtime, interruptErr: wantErr}
+	model.runtime = tracked
+	next, cmd := model.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	updated, ok := next.(Model)
+	if !ok {
+		t.Fatalf("unexpected model type %T", next)
+	}
+	if tracked.interruptCalls != 1 {
+		t.Fatalf("ctrl+c interrupt calls = %d, want 1", tracked.interruptCalls)
+	}
+	if !errors.Is(updated.err, wantErr) {
+		t.Fatalf("ctrl+c interrupt error = %v, want %v", updated.err, wantErr)
+	}
+	if cmd == nil {
+		t.Fatal("ctrl+c did not return a quit command")
+	}
+	if _, ok := cmd().(tea.QuitMsg); !ok {
+		t.Fatal("ctrl+c command did not produce tea.QuitMsg")
+	}
+}
+
+func TestSendMessageRetainsRuntimeErrorWithoutDuplicatingReturnedEvents(t *testing.T) {
+	model := newTestModel(t)
+	wantErr := errors.New("turn busy")
+	returned := protocol.NewEvent(protocol.EventError, model.runtime.SessionID(), "turn already active", nil)
+	stub := &sendResultRuntime{
+		Runtime: model.runtime,
+		events:  []protocol.Event{returned},
+		err:     wantErr,
+	}
+	model.runtime = stub
+	model.composer.SetValue("hello")
+
+	updateModel(t, &model, tea.KeyMsg{Type: tea.KeyEnter})
+	if stub.calls != 1 {
+		t.Fatalf("send message calls = %d, want 1", stub.calls)
+	}
+	if !errors.Is(model.err, wantErr) {
+		t.Fatalf("send message error = %v, want %v", model.err, wantErr)
+	}
+	if got := countTUIEventMessages(model.events, protocol.EventError, returned.Message); got != 1 {
+		t.Fatalf("returned send events in model = %d, want 1", got)
 	}
 }
 
@@ -289,6 +381,41 @@ func (e *fakeToolExecutor) Invoke(ctx context.Context, sessionID string, toolNam
 	return []protocol.Event{protocol.NewEvent(protocol.EventToolComplete, sessionID, toolName+" complete", nil)}, nil
 }
 
+type interruptRecordingRuntime struct {
+	runtime.Runtime
+	interruptCalls  int
+	interruptEvents []protocol.Event
+	interruptErr    error
+	subscriber      runtime.EventSubscriber
+}
+
+func (r *interruptRecordingRuntime) Interrupt(context.Context) ([]protocol.Event, error) {
+	r.interruptCalls++
+	if r.subscriber != nil {
+		r.subscriber(r.interruptEvents)
+	}
+	return r.interruptEvents, r.interruptErr
+}
+
+func (r *interruptRecordingRuntime) Subscribe(fn runtime.EventSubscriber) func() {
+	r.subscriber = fn
+	return func() {
+		r.subscriber = nil
+	}
+}
+
+type sendResultRuntime struct {
+	runtime.Runtime
+	calls  int
+	events []protocol.Event
+	err    error
+}
+
+func (r *sendResultRuntime) SendMessage(context.Context, string) ([]protocol.Event, error) {
+	r.calls++
+	return r.events, r.err
+}
+
 func updateModel(t *testing.T, model *Model, msg tea.Msg) {
 	t.Helper()
 	next, _ := model.Update(msg)
@@ -312,6 +439,16 @@ func countTUIEvents(events []protocol.Event, eventType protocol.EventType) int {
 	count := 0
 	for _, event := range events {
 		if event.Type == eventType {
+			count++
+		}
+	}
+	return count
+}
+
+func countTUIEventMessages(events []protocol.Event, eventType protocol.EventType, message string) int {
+	count := 0
+	for _, event := range events {
+		if event.Type == eventType && event.Message == message {
 			count++
 		}
 	}

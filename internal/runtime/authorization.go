@@ -164,11 +164,13 @@ func (m *Manager) RebindSessionAuthorization(ctx context.Context, sessionID stri
 	nextBinding := newAuthorizationBinding(authorization)
 
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if m.einoSession.ID != sessionID || m.authorizationBinding == nil {
+		m.mu.Unlock()
 		return sessionAuthorizationError()
 	}
 	currentBinding := *m.authorizationBinding
+	currentGeneration := m.generation
+	m.mu.Unlock()
 	if currentBinding != expectedBinding {
 		return sessionAuthorizationError()
 	}
@@ -180,12 +182,30 @@ func (m *Manager) RebindSessionAuthorization(ctx context.Context, sessionID stri
 		if err != nil || existing != expectedEnvelope {
 			return sessionAuthorizationError()
 		}
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		if m.einoSession.ID != sessionID || m.generation != currentGeneration || m.authorizationBinding == nil || *m.authorizationBinding != currentBinding {
+			return sessionAuthorizationError()
+		}
 		return nil
 	}
 	if err != nil {
 		return sessionAuthorizationError()
 	}
+	m.commitMu.Lock()
+	defer m.commitMu.Unlock()
+	m.mu.Lock()
+	if m.einoSession.ID != sessionID || m.generation != currentGeneration || m.authorizationBinding == nil || *m.authorizationBinding != currentBinding {
+		m.mu.Unlock()
+		return sessionAuthorizationError()
+	}
+	m.mu.Unlock()
 	if err := sessions.RebindAuthorization(ctx, expectedEnvelope, replacement); err != nil {
+		return sessionAuthorizationError()
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.einoSession.ID != sessionID || m.generation != currentGeneration || m.authorizationBinding == nil || *m.authorizationBinding != currentBinding {
 		return sessionAuthorizationError()
 	}
 	m.authorizationBinding = &nextBinding
