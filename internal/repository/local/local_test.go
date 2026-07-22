@@ -120,6 +120,147 @@ func TestSessionsAppendLoadAndList(t *testing.T) {
 	}
 }
 
+func TestSessionsAppendBatchPersistsSingleSessionInOrder(t *testing.T) {
+	ctx := context.Background()
+	workspace := t.TempDir()
+	store := New(workspace)
+
+	if err := store.Append(ctx, protocol.NewEvent(protocol.EventUserMessage, "sess_one", "before", nil)); err != nil {
+		t.Fatal(err)
+	}
+	batch := []protocol.Event{
+		protocol.NewEvent(protocol.EventAssistantStart, "sess_one", "started", nil),
+		protocol.NewEvent(protocol.EventAssistantDone, "sess_one", "after", nil),
+	}
+	if err := store.AppendBatch(ctx, batch); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := store.Load(ctx, "sess_one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded) != 3 || loaded[0].Message != "before" || loaded[1].Message != "started" || loaded[2].Message != "after" {
+		t.Fatalf("batch order = %+v", loaded)
+	}
+	assertPermissions(t, filepath.Join(workspace, ".knote", "sessions", "sess_one.jsonl"), 0o600)
+}
+
+func TestSessionsAppendBatchPrevalidatesEveryEvent(t *testing.T) {
+	tests := []struct {
+		name  string
+		later protocol.Event
+	}{
+		{
+			name:  "invalid session id",
+			later: protocol.NewEvent(protocol.EventAssistantDone, "../escape", "invalid", nil),
+		},
+		{
+			name:  "unencodable payload",
+			later: protocol.NewEvent(protocol.EventAssistantDone, "sess_one", "invalid", func() {}),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			workspace := t.TempDir()
+			store := New(workspace)
+			seed := protocol.NewEvent(protocol.EventUserMessage, "sess_one", "before", nil)
+			if err := store.Append(ctx, seed); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(workspace, ".knote", "sessions", "sess_one.jsonl")
+			before := mustRead(t, path)
+
+			err := store.AppendBatch(ctx, []protocol.Event{
+				protocol.NewEvent(protocol.EventAssistantStart, "sess_one", "must not persist", nil),
+				tt.later,
+			})
+			if err == nil {
+				t.Fatal("invalid batch was accepted")
+			}
+			if after := mustRead(t, path); after != before {
+				t.Fatalf("prevalidation failure changed session bytes:\nbefore=%s\nafter=%s", before, after)
+			}
+		})
+	}
+}
+
+func TestSessionsAppendBatchSpansSessionsWithoutChangingPerSessionOrder(t *testing.T) {
+	ctx := context.Background()
+	store := New(t.TempDir())
+	if err := store.Append(ctx, protocol.NewEvent(protocol.EventUserMessage, "sess_a", "a0", nil)); err != nil {
+		t.Fatal(err)
+	}
+
+	batch := []protocol.Event{
+		protocol.NewEvent(protocol.EventAssistantStart, "sess_b", "b1", nil),
+		protocol.NewEvent(protocol.EventAssistantStart, "sess_a", "a1", nil),
+		protocol.NewEvent(protocol.EventAssistantDone, "sess_b", "b2", nil),
+		protocol.NewEvent(protocol.EventAssistantDone, "sess_a", "a2", nil),
+	}
+	if err := store.AppendBatch(ctx, batch); err != nil {
+		t.Fatal(err)
+	}
+
+	a, err := store.Load(ctx, "sess_a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := store.Load(ctx, "sess_b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(a) != 3 || a[0].Message != "a0" || a[1].Message != "a1" || a[2].Message != "a2" {
+		t.Fatalf("sess_a events = %+v", a)
+	}
+	if len(b) != 2 || b[0].Message != "b1" || b[1].Message != "b2" {
+		t.Fatalf("sess_b events = %+v", b)
+	}
+}
+
+func TestSessionsAppendBatchRollsBackPublishedFilesOnFailure(t *testing.T) {
+	ctx := context.Background()
+	workspace := t.TempDir()
+	store := New(workspace)
+	if err := store.Append(ctx, protocol.NewEvent(protocol.EventUserMessage, "sess_a", "before", nil)); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(workspace, ".knote", "sessions")
+	aPath := filepath.Join(dir, "sess_a.jsonl")
+	bPath := filepath.Join(dir, "sess_b.jsonl")
+	before := mustRead(t, aPath)
+
+	store.beforeSessionBatchPublish = func(sessionID string, published int) error {
+		if sessionID == "sess_b" && published == 1 {
+			return errors.New("injected publish failure")
+		}
+		return nil
+	}
+	err := store.AppendBatch(ctx, []protocol.Event{
+		protocol.NewEvent(protocol.EventAssistantDone, "sess_a", "must roll back", nil),
+		protocol.NewEvent(protocol.EventAssistantDone, "sess_b", "must not appear", nil),
+	})
+	if err == nil || !strings.Contains(err.Error(), "injected publish failure") {
+		t.Fatalf("publish error = %v", err)
+	}
+	if after := mustRead(t, aPath); after != before {
+		t.Fatalf("rollback changed existing session bytes:\nbefore=%s\nafter=%s", before, after)
+	}
+	if _, err := os.Stat(bPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed batch created second session: %v", err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasSuffix(entry.Name(), ".tmp") {
+			t.Fatalf("batch staging file was not removed: %s", entry.Name())
+		}
+	}
+}
+
 func TestSessionAuthorizationBindIsIdempotentAndPersistent(t *testing.T) {
 	ctx := context.Background()
 	workspace := t.TempDir()

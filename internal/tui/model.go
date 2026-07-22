@@ -154,15 +154,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.interruptDone = true
 		m.trackInterruptedTasks(msg.taskIDs)
-		if msg.timedOut || m.shouldQuit() {
+		if m.shouldQuit() {
 			return m, tea.Quit
 		}
 		return m, quitDrainTimeoutCmd()
 	case quitDrainTimeoutMsg:
-		if m.quitPending {
+		if !m.quitPending {
+			return m, nil
+		}
+		m.refreshQuitTasks()
+		if m.shouldQuit() {
 			return m, tea.Quit
 		}
-		return m, nil
+		m.interruptDone = false
+		return m, interruptCmd(m.runtime, true)
 	case statusRefreshMsg:
 		if msg.requestID < m.appliedStatusID || msg.sessionID != m.runtime.SessionID() {
 			return m, nil
@@ -402,6 +407,20 @@ func (m *Model) trackInterruptedTasks(taskIDs []string) {
 			continue
 		}
 		m.quitTaskIDs[taskID] = struct{}{}
+	}
+}
+
+func (m *Model) refreshQuitTasks() {
+	if m.quitTaskIDs == nil {
+		m.quitTaskIDs = map[string]struct{}{}
+	}
+	for taskID, status := range currentTaskStatuses(m.events) {
+		switch status {
+		case protocol.TaskPending, protocol.TaskRunning:
+			m.quitTaskIDs[taskID] = struct{}{}
+		default:
+			delete(m.quitTaskIDs, taskID)
+		}
 	}
 }
 

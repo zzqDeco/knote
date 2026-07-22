@@ -137,6 +137,10 @@ func (s Store) Append(context.Context, protocol.Event) error {
 	return repository.ErrRemoteNotImplemented
 }
 
+func (s Store) AppendBatch(context.Context, []protocol.Event) error {
+	return repository.ErrRemoteNotImplemented
+}
+
 func (s Store) Load(context.Context, string) ([]protocol.Event, error) {
 	return nil, repository.ErrRemoteNotImplemented
 }

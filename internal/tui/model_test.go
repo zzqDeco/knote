@@ -567,6 +567,120 @@ func TestCtrlCWaitsForInFlightCommandBeforeTaskStartCommits(t *testing.T) {
 	}
 }
 
+func TestCtrlCRetriesInterruptForTurnStartedAfterInitialInterrupt(t *testing.T) {
+	tests := []struct {
+		name  string
+		start func(*Model) (tea.Model, tea.Cmd)
+	}{
+		{
+			name: "message",
+			start: func(model *Model) (tea.Model, tea.Cmd) {
+				model.composer.SetValue("late turn")
+				return model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+			},
+		},
+		{
+			name: "confirmation",
+			start: func(model *Model) (tea.Model, tea.Cmd) {
+				model.restoreConfirmation(protocol.ConfirmRequest{
+					RequestID: "confirm_late_turn", Title: "Confirm late turn", Command: "/build",
+				})
+				return model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			model := newTestModel(t)
+			stub := newLateStartRuntime(model.runtime, "task_late_"+tt.name)
+			model.setRuntime(stub)
+
+			next, command := tt.start(&model)
+			model = next.(Model)
+			commandResult := make(chan tea.Msg, 1)
+			go func() { commandResult <- command() }()
+			select {
+			case <-stub.commandEntered:
+			case <-time.After(time.Second):
+				t.Fatal("command did not reach runtime")
+			}
+
+			next, interrupt := model.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+			model = next.(Model)
+			next, initialDrain := model.Update(interrupt())
+			model = next.(Model)
+			if initialDrain == nil {
+				t.Fatal("initial interrupt did not start drain timeout")
+			}
+			if got := stub.interruptCalls.Load(); got != 1 {
+				t.Fatalf("initial interrupt calls = %d, want 1", got)
+			}
+
+			close(stub.allowTurnStart)
+			select {
+			case <-stub.turnStarted:
+			case <-time.After(time.Second):
+				t.Fatal("turn did not start after initial interrupt")
+			}
+			drainRuntimeEvents(t, &model)
+
+			next, retry := model.Update(quitDrainTimeoutMsg{})
+			model = next.(Model)
+			if retry == nil {
+				t.Fatal("drain timeout did not schedule another interrupt")
+			}
+			retryMsg := retry()
+			if _, quitting := retryMsg.(tea.QuitMsg); quitting {
+				t.Fatal("drain timeout quit while a late turn was still active")
+			}
+			if _, ok := retryMsg.(interruptResultMsg); !ok {
+				t.Fatalf("retry command returned %T, want interruptResultMsg", retryMsg)
+			}
+			next, nextDrain := model.Update(retryMsg)
+			model = next.(Model)
+			if nextDrain == nil {
+				t.Fatal("second interrupt quit before command and task terminal drained")
+			}
+			if got := stub.interruptCalls.Load(); got != 2 {
+				t.Fatalf("interrupt calls = %d, want 2", got)
+			}
+
+			select {
+			case msg := <-commandResult:
+				next, quit := model.Update(msg)
+				model = next.(Model)
+				if quit != nil {
+					if _, quitting := quit().(tea.QuitMsg); quitting {
+						t.Fatal("command completion quit before task terminal was consumed")
+					}
+				}
+			case <-time.After(time.Second):
+				t.Fatal("command did not complete after second interrupt")
+			}
+
+			var quit tea.Cmd
+			for {
+				events, ok := model.runtimeEvents.popNow()
+				if !ok {
+					break
+				}
+				next, cmd := model.Update(runtimeEventsMsg{events: events})
+				model = next.(Model)
+				if cmd != nil {
+					quit = cmd
+				}
+			}
+			if quit == nil {
+				t.Fatal("drained late turn did not release quit")
+			}
+			if _, ok := quit().(tea.QuitMsg); !ok {
+				t.Fatal("drained late turn did not produce tea.QuitMsg")
+			}
+		})
+	}
+}
+
 func TestStatusRefreshRunsOutsideUpdate(t *testing.T) {
 	model := newTestModel(t)
 	stub := &blockingStatusRuntime{
@@ -834,6 +948,29 @@ type preStartBlockingRuntime struct {
 	publisher      runtimePublisher
 }
 
+type lateStartRuntime struct {
+	runtime.Runtime
+	taskID         string
+	commandEntered chan struct{}
+	allowTurnStart chan struct{}
+	turnStarted    chan struct{}
+	finish         chan struct{}
+	finishOnce     sync.Once
+	interruptCalls atomic.Int32
+	publisher      runtimePublisher
+}
+
+func newLateStartRuntime(rt runtime.Runtime, taskID string) *lateStartRuntime {
+	return &lateStartRuntime{
+		Runtime:        rt,
+		taskID:         taskID,
+		commandEntered: make(chan struct{}),
+		allowTurnStart: make(chan struct{}),
+		turnStarted:    make(chan struct{}),
+		finish:         make(chan struct{}),
+	}
+}
+
 type blockingStatusRuntime struct {
 	runtime.Runtime
 	started   chan struct{}
@@ -890,6 +1027,49 @@ func (r *preStartBlockingRuntime) Interrupt(context.Context) ([]protocol.Event, 
 }
 
 func (r *preStartBlockingRuntime) Subscribe(fn runtime.EventSubscriber) func() {
+	return r.publisher.subscribe(fn)
+}
+
+func (r *lateStartRuntime) SendMessage(context.Context, string) ([]protocol.Event, error) {
+	return r.runCommand()
+}
+
+func (r *lateStartRuntime) Confirm(context.Context, protocol.ConfirmRequest, bool) ([]protocol.Event, error) {
+	return r.runCommand()
+}
+
+func (r *lateStartRuntime) runCommand() ([]protocol.Event, error) {
+	close(r.commandEntered)
+	<-r.allowTurnStart
+	now := time.Now().UTC()
+	started := protocol.NewEvent(protocol.EventTaskStarted, r.SessionID(), "Task started", protocol.Task{
+		ID: r.taskID, Title: "Late turn", Status: protocol.TaskRunning, CreatedAt: now, UpdatedAt: now,
+	})
+	r.publisher.publish([]protocol.Event{started})
+	close(r.turnStarted)
+	<-r.finish
+	terminal := protocol.NewEvent(protocol.EventTaskComplete, r.SessionID(), "Task interrupted", protocol.Task{
+		ID: r.taskID, Title: "Late turn", Status: protocol.TaskKilled, CreatedAt: now, UpdatedAt: time.Now().UTC(),
+	})
+	r.publisher.publish([]protocol.Event{terminal})
+	return []protocol.Event{started, terminal}, context.Canceled
+}
+
+func (r *lateStartRuntime) Interrupt(context.Context) ([]protocol.Event, error) {
+	call := r.interruptCalls.Add(1)
+	payload := map[string]string{}
+	message := "no active task"
+	if call > 1 {
+		payload["task_id"] = r.taskID
+		message = "interrupt requested"
+		r.finishOnce.Do(func() { close(r.finish) })
+	}
+	events := []protocol.Event{protocol.NewEvent(protocol.EventStatusUpdate, r.SessionID(), message, payload)}
+	r.publisher.publish(events)
+	return events, nil
+}
+
+func (r *lateStartRuntime) Subscribe(fn runtime.EventSubscriber) func() {
 	return r.publisher.subscribe(fn)
 }
 

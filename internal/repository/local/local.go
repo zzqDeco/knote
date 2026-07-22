@@ -20,6 +20,7 @@ type Store struct {
 	beforePointerWrite         func(protocol.ArtifactCurrentPointer) error
 	beforeCompatibilityPublish func() error
 	beforeConfigCommit         func() error
+	beforeSessionBatchPublish  func(sessionID string, published int) error
 }
 
 func New(workspace string) Store {
@@ -241,6 +242,13 @@ func (s Store) Append(ctx context.Context, event protocol.Event) error {
 		return err
 	}
 	return appendSessionEvent(s.workspace, event)
+}
+
+func (s Store) AppendBatch(ctx context.Context, events []protocol.Event) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return appendSessionEvents(ctx, s.workspace, events, s.beforeSessionBatchPublish)
 }
 
 func (s Store) Load(ctx context.Context, sessionID string) ([]protocol.Event, error) {

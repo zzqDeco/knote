@@ -1027,6 +1027,15 @@ func TestOrdinaryTurnPersistenceErrorReleasesController(t *testing.T) {
 	if active != nil {
 		t.Fatalf("ordinary persistence failure left active turn %+v", active)
 	}
+	loaded, err := store.Sessions.Load(context.Background(), manager.SessionID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasMessage(loaded, protocol.EventUserMessage, "first result fails") ||
+		hasMessage(loaded, protocol.EventAssistantDone, "accepted answer") ||
+		hasTaskTitle(loaded, protocol.EventTaskComplete, "first result fails") {
+		t.Fatalf("failed result batch left partial durable state: %+v", loaded)
+	}
 
 	events, err := manager.SendMessage(context.Background(), "retry after transient failure")
 	if err != nil {
@@ -1135,6 +1144,58 @@ func TestRejectedConfirmationRestoresAfterPersistenceFailure(t *testing.T) {
 	}
 }
 
+func TestUnexecutedConfirmationPreservesRetryClassificationOnPersistenceFailure(t *testing.T) {
+	writeErr := errors.New("confirmation persistence unavailable")
+	store := &failOnceEventSessions{Sessions: local.New(t.TempDir())}
+	bridge := NewSideEffectBridge()
+	var authorizationCalls atomic.Int32
+	manager := New(Dependencies{
+		Sessions:   store,
+		EinoRunner: immediateTurnRunner{},
+		AuthorizationContextProvider: func(_ context.Context, sessionID string) (protocol.AuthorizationContext, error) {
+			if authorizationCalls.Add(1) == 1 {
+				return protocol.AuthorizationContext{}, errors.New("authorization unavailable")
+			}
+			return testAuthorizationContext(sessionID), nil
+		},
+		SideEffects:  bridge,
+		TurnTimeout:  time.Second,
+		NewSessionID: func() string { return "sess_unexecuted_confirmation" },
+	})
+	if _, err := manager.Start(context.Background(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	var executions atomic.Int32
+	if err := bridge.Request(withSideEffectSession(context.Background(), manager.SessionID()), SideEffectRequest{
+		ToolName: "knote_build",
+		Action:   "build",
+		Execute: func(context.Context, SideEffectRequest) ([]protocol.Event, error) {
+			executions.Add(1)
+			return nil, nil
+		},
+	}); !errors.Is(err, ErrSideEffectPending) {
+		t.Fatalf("seed side effect: %v", err)
+	}
+	confirm := firstConfirm(t, bridge.PendingEvents(manager.SessionID()))
+	store.failType = protocol.EventError
+	store.err = writeErr
+
+	events, err := manager.Confirm(context.Background(), confirm, true)
+	if !errors.Is(err, ErrConfirmationNotExecuted) || !errors.Is(err, writeErr) || len(events) != 1 {
+		t.Fatalf("failed unexecuted confirmation = events:%+v err:%v", events, err)
+	}
+	if got := executions.Load(); got != 0 {
+		t.Fatalf("failed unexecuted confirmation executed side effect %d times", got)
+	}
+	retryEvents, retryErr := manager.Confirm(context.Background(), confirm, true)
+	if retryErr != nil {
+		t.Fatalf("retry after persistence failure = events:%+v err:%v", retryEvents, retryErr)
+	}
+	if got := executions.Load(); got != 1 {
+		t.Fatalf("retried confirmation executions = %d, want 1: authorization_calls=%d events=%+v", got, authorizationCalls.Load(), retryEvents)
+	}
+}
+
 func TestSessionRotationDrainUsesConfiguredDeadline(t *testing.T) {
 	runner := &stubbornTurnRunner{started: make(chan struct{}), release: make(chan struct{})}
 	manager := newTurnTestManager(t, runner, 25*time.Millisecond)
@@ -1192,6 +1253,13 @@ func TestInvalidResumeDoesNotCancelActiveTurn(t *testing.T) {
 	events, err := manager.SendMessage(context.Background(), "/resume sess_missing")
 	if err != nil || !hasEvent(events, protocol.EventError) {
 		t.Fatalf("invalid resume = events:%+v err:%v", events, err)
+	}
+	loaded, err := manager.deps.Sessions.Load(context.Background(), currentSessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasMessage(loaded, protocol.EventUserMessage, "/resume sess_missing") || hasEvent(loaded, protocol.EventError) {
+		t.Fatalf("failed resume was persisted ahead of the active turn: %+v", loaded)
 	}
 	if manager.SessionID() != currentSessionID {
 		t.Fatalf("invalid resume changed session to %q", manager.SessionID())
@@ -1312,6 +1380,65 @@ func TestResumeCurrentSessionReloadsAfterActiveTurnDrains(t *testing.T) {
 	}
 	if !hasMessage(events, protocol.EventAssistantDone, "committed before rotation") {
 		t.Fatalf("resume replay omitted result committed after validation snapshot: %+v", events)
+	}
+}
+
+func TestResumeTargetReauthorizesAfterActiveTurnDrains(t *testing.T) {
+	store := local.New(t.TempDir())
+	targetSessionID := "sess_reauthorized_target"
+	bindTestSessionAuthorization(t, store, testAuthorizationContext(targetSessionID))
+	if err := store.Append(context.Background(), protocol.NewEvent(protocol.EventAssistantDone, targetSessionID, "stale authorized target", nil)); err != nil {
+		t.Fatal(err)
+	}
+	runner := newControlledTurnRunner()
+	var targetAuthorizationCalls atomic.Int32
+	manager := New(Dependencies{
+		Sessions:   store,
+		EinoRunner: runner,
+		AuthorizationContextProvider: func(_ context.Context, sessionID string) (protocol.AuthorizationContext, error) {
+			if sessionID == targetSessionID && targetAuthorizationCalls.Add(1) > 1 {
+				return protocol.AuthorizationContext{}, errors.New("authorization revoked during drain")
+			}
+			return testAuthorizationContext(sessionID), nil
+		},
+		TurnTimeout:  time.Second,
+		NewSessionID: func() string { return "sess_reauthorization_current" },
+	})
+	if _, err := manager.Start(context.Background(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	currentSessionID := manager.SessionID()
+	activeDone := make(chan error, 1)
+	go func() {
+		_, err := manager.SendMessage(context.Background(), "cancel before target resume")
+		activeDone <- err
+	}()
+	select {
+	case <-runner.started:
+	case <-time.After(time.Second):
+		t.Fatal("active turn did not reach runner")
+	}
+
+	events, err := manager.SendMessage(context.Background(), "/resume "+targetSessionID)
+	if err != nil {
+		t.Fatalf("resume with revoked target authorization: %v", err)
+	}
+	if got := targetAuthorizationCalls.Load(); got != 2 {
+		t.Fatalf("target authorization calls = %d, want 2", got)
+	}
+	if manager.SessionID() != currentSessionID {
+		t.Fatalf("revoked target resume changed session to %q", manager.SessionID())
+	}
+	if hasMessage(events, protocol.EventAssistantDone, "stale authorized target") || !hasMessage(events, protocol.EventError, permissionedResumeErrorMessage) {
+		t.Fatalf("revoked target resume exposed target history: %+v", events)
+	}
+	select {
+	case err := <-activeDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("drained turn error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("resume did not drain active turn")
 	}
 }
 
@@ -1679,6 +1806,9 @@ func TestSessionRotationPersistenceFailureRestoresOldSessionAndConfirmation(t *t
 	}
 	if got := manager.SessionID(); got != oldSessionID {
 		t.Fatalf("failed rotation left session %q, want %q", got, oldSessionID)
+	}
+	if newEvents, loadErr := store.Sessions.Load(context.Background(), "sess_rotation_new"); loadErr == nil && len(newEvents) > 0 {
+		t.Fatalf("failed rotation created partial target history: %+v", newEvents)
 	}
 	events, err = manager.Confirm(context.Background(), confirm, false)
 	if err != nil || !hasMessage(events, protocol.EventAssistantDone, "Cancelled: build") {
@@ -2358,11 +2488,41 @@ func (s *failingEventSessions) Append(ctx context.Context, event protocol.Event)
 	return s.Sessions.Append(ctx, event)
 }
 
+func (s *failingEventSessions) AppendBatch(ctx context.Context, events []protocol.Event) error {
+	for _, event := range events {
+		if event.Type == s.failType {
+			return s.err
+		}
+	}
+	return s.Sessions.AppendBatch(ctx, events)
+}
+
 func (s *failOnceEventSessions) Append(ctx context.Context, event protocol.Event) error {
 	if event.Type == s.failType && s.failed.CompareAndSwap(false, true) {
 		return s.err
 	}
 	return s.Sessions.Append(ctx, event)
+}
+
+func (s *failOnceEventSessions) AppendBatch(ctx context.Context, events []protocol.Event) error {
+	for _, event := range events {
+		if event.Type == s.failType && s.failed.CompareAndSwap(false, true) {
+			return s.err
+		}
+	}
+	return s.Sessions.AppendBatch(ctx, events)
+}
+
+func (s *failOnceEventSessions) BindAuthorization(ctx context.Context, envelope protocol.SessionAuthorizationEnvelope) error {
+	return s.Sessions.(repository.PermissionedSessions).BindAuthorization(ctx, envelope)
+}
+
+func (s *failOnceEventSessions) LoadAuthorization(ctx context.Context, sessionID string) (protocol.SessionAuthorizationEnvelope, error) {
+	return s.Sessions.(repository.PermissionedSessions).LoadAuthorization(ctx, sessionID)
+}
+
+func (s *failOnceEventSessions) ListAuthorization(ctx context.Context) ([]protocol.SessionAuthorizationEnvelope, error) {
+	return s.Sessions.(repository.PermissionedSessions).ListAuthorization(ctx)
 }
 
 func (s *contextBlockingLoadSessions) Load(ctx context.Context, sessionID string) ([]protocol.Event, error) {
@@ -2405,6 +2565,22 @@ func (s *blockingResultSessions) Append(ctx context.Context, event protocol.Even
 		}
 	}
 	return s.Sessions.Append(ctx, event)
+}
+
+func (s *blockingResultSessions) AppendBatch(ctx context.Context, events []protocol.Event) error {
+	for _, event := range events {
+		if event.Type != s.blockType {
+			continue
+		}
+		s.once.Do(func() { close(s.blocked) })
+		select {
+		case <-s.release:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		break
+	}
+	return s.Sessions.AppendBatch(ctx, events)
 }
 
 func interruptTaskIDsForTest(events []protocol.Event) []string {

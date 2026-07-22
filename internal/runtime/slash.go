@@ -272,7 +272,7 @@ func (m *Manager) prepareResumeSession(ctx context.Context, currentSessionID str
 		binding = &value
 	}
 	return resumePreparation{
-		refreshAfterDrain: sessionID == currentSessionID && activeStart.Type != "",
+		refreshAfterDrain: activeStart.Type != "",
 		sessionID:         sessionID,
 		loaded:            loaded,
 		reconciled:        reconciled,

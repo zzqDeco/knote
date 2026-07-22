@@ -288,8 +288,12 @@ func (m *Manager) SendMessage(ctx context.Context, input string) ([]protocol.Eve
 		if len(failure) > 0 {
 			m.releaseRotationPreparation(reservationID)
 			events := append([]protocol.Event{protocol.NewEvent(protocol.EventUserMessage, currentSessionID, input, nil)}, failure...)
-			if err := m.persist(resumeCtx, events); err != nil {
-				return nil, fmt.Errorf("persist resume validation failure: %w", err)
+			// The active turn persists its user/result events only when it finishes.
+			// Avoid inserting a later validation failure ahead of that history.
+			if activeStart.Type == "" {
+				if err := m.persist(resumeCtx, events); err != nil {
+					return nil, fmt.Errorf("persist resume validation failure: %w", err)
+				}
 			}
 			m.emit(events)
 			return events, nil
@@ -524,7 +528,7 @@ func (m *Manager) finishUnexecutedConfirmation(
 	completed, finishErr := m.finishTurnResultWithStatusEvents(turn, events, events, events, operationErr, true, false, nil)
 	result := append(startedEvents, completed...)
 	if finishErr != nil {
-		return result, finishErr
+		return result, fmt.Errorf("%w: %w", ErrConfirmationNotExecuted, finishErr)
 	}
 	if errors.Is(operationErr, context.Canceled) || errors.Is(operationErr, context.DeadlineExceeded) {
 		return result, fmt.Errorf("%w: %w", ErrConfirmationNotExecuted, operationErr)
@@ -766,18 +770,16 @@ func permissionedSessionInfo(info protocol.SessionInfo) protocol.SessionInfo {
 }
 
 func (m *Manager) persist(ctx context.Context, events []protocol.Event) error {
-	if m.deps.Sessions == nil {
+	if m.deps.Sessions == nil || len(events) == 0 {
 		return nil
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	for _, event := range events {
-		if err := m.deps.Sessions.Append(ctx, event); err != nil {
-			return err
-		}
+	if len(events) == 1 {
+		return m.deps.Sessions.Append(ctx, events[0])
 	}
-	return nil
+	return m.deps.Sessions.AppendBatch(ctx, events)
 }
 
 func (m *Manager) loadHistory(ctx context.Context, sessionID string) []protocol.Event {

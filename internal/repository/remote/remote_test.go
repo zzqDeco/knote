@@ -41,6 +41,7 @@ func TestRemoteStoreReturnsNotImplemented(t *testing.T) {
 		{name: "WriteEval", run: func() error { return store.WriteEval(ctx, repository.EvalReport{}) }},
 		{name: "EvalGate", run: func() error { return store.EvalGate(ctx) }},
 		{name: "Append", run: func() error { return store.Append(ctx, protocol.Event{}) }},
+		{name: "AppendBatch", run: func() error { return store.AppendBatch(ctx, []protocol.Event{{}}) }},
 		{name: "Load", run: func() error { _, err := store.Load(ctx, "sess"); return err }},
 		{name: "List", run: func() error { _, err := store.List(ctx, 10); return err }},
 		{name: "Status", run: func() error { _, err := store.Status(ctx); return err }},
