@@ -112,6 +112,8 @@ type Manager struct {
 	nextSubID            int
 	nextTurnID           uint64
 	generation           uint64
+	nextRotationID       uint64
+	rotationReservation  uint64
 	activeTurn           *activeTurn
 	starting             bool
 	rotating             bool
@@ -260,13 +262,47 @@ func (m *Manager) SendMessage(ctx context.Context, input string) ([]protocol.Eve
 	if strings.HasPrefix(input, "/") {
 		command, argument = parseSlash(input)
 	}
+	if command == "tasks" && m.deps.Capabilities.AllowsSlashCommand(command) {
+		return m.inspectTasks(ctx, input)
+	}
 	rotation := command == "new" || (command == "resume" && strings.TrimSpace(argument) != "")
+	var preparedResume *resumePreparation
+	reservedRotation := false
+	if command == "resume" && strings.TrimSpace(argument) != "" && m.deps.Capabilities.AllowsSlashCommand(command) {
+		reservationID, currentSessionID, activeStart, err := m.reserveRotationPreparation()
+		if err != nil {
+			return nil, err
+		}
+		reservedRotation = true
+		prepared, failure := m.prepareResumeSession(ctx, currentSessionID, argument, activeStart)
+		if len(failure) > 0 {
+			m.releaseRotationPreparation(reservationID)
+			events := append([]protocol.Event{protocol.NewEvent(protocol.EventUserMessage, currentSessionID, input, nil)}, failure...)
+			if err := m.persist(ctx, events); err != nil {
+				return nil, fmt.Errorf("persist resume validation failure: %w", err)
+			}
+			m.emit(events)
+			return events, nil
+		}
+		preparedResume = &prepared
+		preparedResume.reservationID = reservationID
+	}
 	title := "Message"
 	if command != "" {
 		title = "/" + command
 	}
-	turn, startedEvents, err := m.beginTurn(ctx, title, rotation)
+	var turn *activeTurn
+	var startedEvents []protocol.Event
+	var err error
+	if reservedRotation {
+		turn, startedEvents, err = m.beginReservedRotation(ctx, title, preparedResume.reservationID)
+	} else {
+		turn, startedEvents, err = m.beginTurn(ctx, title, rotation)
+	}
 	if err != nil {
+		if reservedRotation {
+			m.releaseRotationPreparation(preparedResume.reservationID)
+		}
 		return nil, err
 	}
 	if err := turn.ctx.Err(); err != nil {
@@ -281,7 +317,7 @@ func (m *Manager) SendMessage(ctx context.Context, input string) ([]protocol.Eve
 	events := []protocol.Event{protocol.NewEvent(protocol.EventUserMessage, einoSession.ID, input, nil)}
 	runCtx := turn.ctx
 	if strings.HasPrefix(input, "/") && (!m.deps.Capabilities.AllowsSlashCommand(command) || command == "new") {
-		result := m.handleSlash(runCtx, turn, einoSession.ID, input)
+		result := m.handleSlash(runCtx, turn, einoSession.ID, input, preparedResume)
 		completed, returnErr := m.finishTurnResultWithStatusEvents(
 			turn, result.persisted, result.events, result.lifecycleStatusEvents(), result.err, false,
 		)
@@ -307,7 +343,7 @@ func (m *Manager) SendMessage(ctx context.Context, input string) ([]protocol.Eve
 		}
 	}
 	if strings.HasPrefix(input, "/") {
-		result := m.handleSlash(runCtx, turn, einoSession.ID, input)
+		result := m.handleSlash(runCtx, turn, einoSession.ID, input, preparedResume)
 		completed, returnErr := m.finishTurnResultWithStatusEvents(
 			turn, result.persisted, result.events, result.lifecycleStatusEvents(), result.err, false,
 		)
@@ -335,6 +371,49 @@ func (m *Manager) SendMessage(ctx context.Context, input string) ([]protocol.Eve
 	}
 	completed, returnErr := m.finishTurn(turn, events, nil)
 	return append(startedEvents, completed...), returnErr
+}
+
+func (m *Manager) inspectTasks(_ context.Context, input string) ([]protocol.Event, error) {
+	m.commitMu.Lock()
+	m.mu.Lock()
+	sessionID := m.einoSession.ID
+	turn := m.activeTurn
+	var tasks []protocol.Task
+	if turn != nil {
+		status := protocol.TaskRunning
+		message := "Task running"
+		if !turn.startCommitted {
+			status = protocol.TaskPending
+			message = "Task start in progress"
+		} else if turn.finished {
+			message = "Task completion in progress"
+		}
+		tasks = append(tasks, protocol.Task{
+			ID:        turn.id,
+			Title:     turn.title,
+			Status:    status,
+			CreatedAt: turn.createdAt,
+			UpdatedAt: time.Now().UTC(),
+			Message:   message,
+		})
+	}
+	subscribers := m.subscribersLocked()
+	m.mu.Unlock()
+	var events []protocol.Event
+	if sessionID == "" {
+		events = []protocol.Event{protocol.NewEvent(protocol.EventError, "", "runtime has not started", nil)}
+	} else {
+		events = []protocol.Event{
+			protocol.NewEvent(protocol.EventUserMessage, sessionID, input, nil),
+			protocol.NewEvent(protocol.EventTaskProgress, sessionID, "tasks", tasks),
+		}
+	}
+	dispatch := m.enqueueNotifications(nil, subscribers, events)
+	m.commitMu.Unlock()
+	if dispatch {
+		m.drainNotifications()
+	}
+	return events, nil
 }
 
 func (m *Manager) authorizationFailureMessage(err error) string {

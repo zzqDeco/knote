@@ -34,33 +34,34 @@ const (
 )
 
 type Model struct {
-	runtime         runtime.Runtime
-	viewport        viewport.Model
-	overlayViewport viewport.Model
-	composer        textinput.Model
-	events          []protocol.Event
-	history         []string
-	historyIndex    int
-	historyDraft    string
-	width           int
-	height          int
-	status          string
-	overlay         string
-	overlayMode     overlayMode
-	pendingConfirm  *protocol.ConfirmRequest
-	runtimeEvents   *runtimeEventBridge
-	unsubscribe     func()
-	nextCommandID   uint64
-	latestRotation  uint64
-	latestResult    uint64
-	statusInfo      protocol.SessionInfo
-	nextStatusID    uint64
-	appliedStatusID uint64
-	quitPending     bool
-	interruptDone   bool
-	quitTaskIDs     map[string]struct{}
-	ready           bool
-	err             error
+	runtime          runtime.Runtime
+	viewport         viewport.Model
+	overlayViewport  viewport.Model
+	composer         textinput.Model
+	events           []protocol.Event
+	history          []string
+	historyIndex     int
+	historyDraft     string
+	width            int
+	height           int
+	status           string
+	overlay          string
+	overlayMode      overlayMode
+	pendingConfirm   *protocol.ConfirmRequest
+	runtimeEvents    *runtimeEventBridge
+	unsubscribe      func()
+	nextCommandID    uint64
+	inFlightCommands map[uint64]struct{}
+	latestRotation   uint64
+	latestResult     uint64
+	statusInfo       protocol.SessionInfo
+	nextStatusID     uint64
+	appliedStatusID  uint64
+	quitPending      bool
+	interruptDone    bool
+	quitTaskIDs      map[string]struct{}
+	ready            bool
+	err              error
 }
 
 type runtimeResultMsg struct {
@@ -133,7 +134,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
 	switch msg := msg.(type) {
 	case runtimeResultMsg:
+		delete(m.inFlightCommands, msg.commandID)
 		m.applyRuntimeResult(msg)
+		if m.shouldQuit() {
+			return m, tea.Quit
+		}
 		return m, m.nextStatusRefreshCmd()
 	case interruptResultMsg:
 		m.err = msg.err
@@ -320,6 +325,10 @@ func (m *Model) setRuntime(rt runtime.Runtime) {
 
 func (m *Model) nextRuntimeCommand(rotation bool) uint64 {
 	m.nextCommandID++
+	if m.inFlightCommands == nil {
+		m.inFlightCommands = map[uint64]struct{}{}
+	}
+	m.inFlightCommands[m.nextCommandID] = struct{}{}
 	if rotation {
 		m.latestRotation = m.nextCommandID
 	}
@@ -390,7 +399,7 @@ func (m *Model) observeQuitTerminals(events []protocol.Event) {
 }
 
 func (m Model) shouldQuit() bool {
-	return m.quitPending && m.interruptDone && len(m.quitTaskIDs) == 0
+	return m.quitPending && m.interruptDone && len(m.quitTaskIDs) == 0 && len(m.inFlightCommands) == 0
 }
 
 func interruptTaskIDs(events []protocol.Event) []string {

@@ -270,6 +270,24 @@ func TestUnstartedConfirmationRestoresCanonicalOverlay(t *testing.T) {
 	}
 }
 
+func TestUnstartedRotationDeadlineRestoresComposer(t *testing.T) {
+	model := newTestModel(t)
+	commandID := model.nextRuntimeCommand(true)
+	next, _ := model.Update(runtimeResultMsg{
+		commandID: commandID,
+		kind:      runtimeCommandSend,
+		input:     "/new",
+		err:       fmt.Errorf("%w: %w", runtime.ErrTurnNotStarted, context.DeadlineExceeded),
+	})
+	model = next.(Model)
+	if got := model.composer.Value(); got != "/new" {
+		t.Fatalf("restored composer = %q, want /new", got)
+	}
+	if len(model.inFlightCommands) != 0 {
+		t.Fatalf("completed rotation remains in flight: %+v", model.inFlightCommands)
+	}
+}
+
 func TestUnexecutedConfirmationRestoresCanonicalOverlay(t *testing.T) {
 	model := newTestModel(t)
 	req := protocol.ConfirmRequest{
@@ -459,6 +477,53 @@ func TestCtrlCWaitsForActiveTaskTerminalBeforeQuitting(t *testing.T) {
 	}
 	if _, ok := quit().(tea.QuitMsg); !ok {
 		t.Fatal("task terminal did not produce tea.QuitMsg")
+	}
+}
+
+func TestCtrlCWaitsForInFlightCommandBeforeTaskStartCommits(t *testing.T) {
+	model := newTestModel(t)
+	blocked := &preStartBlockingRuntime{
+		Runtime: model.runtime,
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	model.setRuntime(blocked)
+	model.composer.SetValue("blocked before task start")
+
+	next, send := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = next.(Model)
+	sendResult := make(chan tea.Msg, 1)
+	go func() { sendResult <- send() }()
+	select {
+	case <-blocked.started:
+	case <-time.After(time.Second):
+		t.Fatal("send command did not reach runtime")
+	}
+
+	next, interrupt := model.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	model = next.(Model)
+	if interrupt == nil {
+		t.Fatal("ctrl+c did not schedule interruption")
+	}
+	next, drainTimeout := model.Update(interrupt())
+	model = next.(Model)
+	if drainTimeout == nil {
+		t.Fatal("ctrl+c quit before the in-flight command resolved task-start commitment")
+	}
+
+	close(blocked.release)
+	select {
+	case msg := <-sendResult:
+		next, quit := model.Update(msg)
+		model = next.(Model)
+		if quit == nil {
+			t.Fatal("completed in-flight command did not release quit")
+		}
+		if _, ok := quit().(tea.QuitMsg); !ok {
+			t.Fatal("completed in-flight command did not produce tea.QuitMsg")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("send command did not finish after release")
 	}
 }
 
@@ -721,6 +786,14 @@ type blockingSendRuntime struct {
 	publisher      runtimePublisher
 }
 
+type preStartBlockingRuntime struct {
+	runtime.Runtime
+	started        chan struct{}
+	release        chan struct{}
+	interruptCalls atomic.Int32
+	publisher      runtimePublisher
+}
+
 type blockingStatusRuntime struct {
 	runtime.Runtime
 	started   chan struct{}
@@ -762,6 +835,21 @@ func (r *blockingSendRuntime) Interrupt(context.Context) ([]protocol.Event, erro
 }
 
 func (r *blockingSendRuntime) Subscribe(fn runtime.EventSubscriber) func() {
+	return r.publisher.subscribe(fn)
+}
+
+func (r *preStartBlockingRuntime) SendMessage(context.Context, string) ([]protocol.Event, error) {
+	close(r.started)
+	<-r.release
+	return nil, nil
+}
+
+func (r *preStartBlockingRuntime) Interrupt(context.Context) ([]protocol.Event, error) {
+	r.interruptCalls.Add(1)
+	return nil, nil
+}
+
+func (r *preStartBlockingRuntime) Subscribe(fn runtime.EventSubscriber) func() {
 	return r.publisher.subscribe(fn)
 }
 

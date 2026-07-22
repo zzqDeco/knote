@@ -22,6 +22,15 @@ type slashResult struct {
 	err          error
 }
 
+type resumePreparation struct {
+	reservationID uint64
+	sessionID     string
+	loaded        []protocol.Event
+	reconciled    []protocol.Event
+	info          protocol.SessionInfo
+	binding       *authorizationBinding
+}
+
 func (r slashResult) lifecycleStatusEvents() []protocol.Event {
 	if r.statusEvents != nil {
 		return r.statusEvents
@@ -29,7 +38,7 @@ func (r slashResult) lifecycleStatusEvents() []protocol.Event {
 	return r.events
 }
 
-func (m *Manager) handleSlash(ctx context.Context, turn *activeTurn, sessionID string, input string) slashResult {
+func (m *Manager) handleSlash(ctx context.Context, turn *activeTurn, sessionID string, input string, preparedResume *resumePreparation) slashResult {
 	userEvent := protocol.NewEvent(protocol.EventUserMessage, sessionID, input, nil)
 	cmd, arg := parseSlash(input)
 	if !m.deps.Capabilities.AllowsSlashCommand(cmd) {
@@ -57,7 +66,12 @@ func (m *Manager) handleSlash(ctx context.Context, turn *activeTurn, sessionID s
 			}
 			return result
 		}
-		events, persisted, statusEvents := m.resumeSession(ctx, turn, sessionID, arg)
+		var events, persisted, statusEvents []protocol.Event
+		if preparedResume != nil && preparedResume.sessionID == strings.TrimSpace(arg) {
+			events, persisted, statusEvents = m.applyPreparedResume(turn, sessionID, *preparedResume)
+		} else {
+			events, persisted, statusEvents = m.resumeSession(ctx, turn, sessionID, arg)
+		}
 		events = append([]protocol.Event{userEvent}, events...)
 		persisted = append([]protocol.Event{userEvent}, persisted...)
 		result := slashResult{events: events, persisted: persisted, statusEvents: statusEvents}
@@ -194,21 +208,33 @@ func (m *Manager) newSession(ctx context.Context, turn *activeTurn, currentSessi
 }
 
 func (m *Manager) resumeSession(ctx context.Context, turn *activeTurn, currentSessionID string, sessionID string) ([]protocol.Event, []protocol.Event, []protocol.Event) {
+	var activeStart protocol.Event
+	if turn != nil {
+		activeStart = turn.lifecycleStart
+	}
+	prepared, failure := m.prepareResumeSession(ctx, currentSessionID, sessionID, activeStart)
+	if len(failure) > 0 {
+		return failure, failure, failure
+	}
+	return m.applyPreparedResume(turn, currentSessionID, prepared)
+}
+
+func (m *Manager) prepareResumeSession(ctx context.Context, currentSessionID string, sessionID string, activeStart protocol.Event) (resumePreparation, []protocol.Event) {
 	sessionID = strings.TrimSpace(sessionID)
 	if m.deps.Sessions == nil {
 		events := []protocol.Event{protocol.NewEvent(protocol.EventError, currentSessionID, "session storage is not configured", nil)}
-		return events, events, events
+		return resumePreparation{}, events
 	}
 	var resumeAuthorization *protocol.AuthorizationContext
 	if m.deps.Capabilities.IsPermissioned() && m.deps.AuthorizationContextProvider == nil {
 		events := []protocol.Event{protocol.NewEvent(protocol.EventError, currentSessionID, permissionedResumeErrorMessage, nil)}
-		return events, events, events
+		return resumePreparation{}, events
 	}
 	if m.deps.AuthorizationContextProvider != nil {
 		authorization, err := m.authorizeSessionResume(ctx, sessionID)
 		if err != nil {
 			events := []protocol.Event{protocol.NewEvent(protocol.EventError, currentSessionID, permissionedResumeErrorMessage, nil)}
-			return events, events, events
+			return resumePreparation{}, events
 		}
 		resumeAuthorization = &authorization
 	}
@@ -216,17 +242,17 @@ func (m *Manager) resumeSession(ctx context.Context, turn *activeTurn, currentSe
 	if err != nil {
 		if resumeAuthorization != nil {
 			events := []protocol.Event{protocol.NewEvent(protocol.EventError, currentSessionID, permissionedResumeErrorMessage, nil)}
-			return events, events, events
+			return resumePreparation{}, events
 		}
 		events := []protocol.Event{protocol.NewEvent(protocol.EventError, currentSessionID, "resume failed: "+err.Error(), nil)}
-		return events, events, events
+		return resumePreparation{}, events
 	}
 	authorization := protocol.AuthorizationContext{}
 	if resumeAuthorization != nil {
 		authorization = *resumeAuthorization
 	}
 	loaded = m.filterPersistedEvents(ctx, authorization, loaded)
-	loaded = withoutCurrentTaskStart(loaded, turn.lifecycleStart)
+	loaded = withoutCurrentTaskStart(loaded, activeStart)
 	loaded, reconciled, replayErr := prepareSessionReplay(loaded, time.Now().UTC())
 	if replayErr != nil {
 		message := "resume failed: " + replayErr.Error()
@@ -234,7 +260,7 @@ func (m *Manager) resumeSession(ctx context.Context, turn *activeTurn, currentSe
 			message = permissionedResumeErrorMessage
 		}
 		events := []protocol.Event{protocol.NewEvent(protocol.EventError, currentSessionID, message, nil)}
-		return events, events, events
+		return resumePreparation{}, events
 	}
 	info := m.newEinoSession(ctx, sessionID)
 	var binding *authorizationBinding
@@ -244,17 +270,27 @@ func (m *Manager) resumeSession(ctx context.Context, turn *activeTurn, currentSe
 		value := newAuthorizationBinding(*resumeAuthorization)
 		binding = &value
 	}
-	if !m.rotateSession(turn, info, binding) {
+	return resumePreparation{
+		sessionID:  sessionID,
+		loaded:     loaded,
+		reconciled: reconciled,
+		info:       info,
+		binding:    binding,
+	}, nil
+}
+
+func (m *Manager) applyPreparedResume(turn *activeTurn, currentSessionID string, prepared resumePreparation) ([]protocol.Event, []protocol.Event, []protocol.Event) {
+	if !m.rotateSession(turn, prepared.info, prepared.binding) {
 		events := []protocol.Event{protocol.NewEvent(protocol.EventError, currentSessionID, "resume cancelled", nil)}
 		return events, events, events
 	}
-	infoEvent := protocol.NewEvent(protocol.EventSessionInfo, sessionID, "session resumed", info)
-	events := make([]protocol.Event, 0, len(loaded)+2)
-	events = append(events, protocol.NewEvent(protocol.EventViewClear, sessionID, "resume session", nil))
-	events = append(events, loaded...)
+	infoEvent := protocol.NewEvent(protocol.EventSessionInfo, prepared.sessionID, "session resumed", prepared.info)
+	events := make([]protocol.Event, 0, len(prepared.loaded)+2)
+	events = append(events, protocol.NewEvent(protocol.EventViewClear, prepared.sessionID, "resume session", nil))
+	events = append(events, prepared.loaded...)
 	events = append(events, infoEvent)
-	persisted := make([]protocol.Event, 0, len(reconciled)+1)
-	persisted = append(persisted, reconciled...)
+	persisted := make([]protocol.Event, 0, len(prepared.reconciled)+1)
+	persisted = append(persisted, prepared.reconciled...)
 	persisted = append(persisted, infoEvent)
 	return events, persisted, []protocol.Event{infoEvent}
 }

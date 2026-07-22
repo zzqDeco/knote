@@ -60,6 +60,79 @@ func TestTurnControllerRejectsOverlapAndInterruptsActiveTurn(t *testing.T) {
 	}
 }
 
+func TestTasksInspectsActiveTurnWithoutEnteringTurnGate(t *testing.T) {
+	runner := newControlledTurnRunner()
+	manager := newTurnTestManager(t, runner, time.Second)
+	if _, err := manager.Start(context.Background(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := manager.SendMessage(context.Background(), "active work")
+		done <- err
+	}()
+	select {
+	case <-runner.started:
+	case <-time.After(time.Second):
+		t.Fatal("active turn did not reach runner")
+	}
+
+	events, err := manager.SendMessage(context.Background(), "/tasks")
+	if err != nil {
+		t.Fatalf("tasks inspection: %v", err)
+	}
+	var tasks []protocol.Task
+	for _, event := range events {
+		if event.Type != protocol.EventTaskProgress {
+			continue
+		}
+		data, marshalErr := json.Marshal(event.Payload)
+		if marshalErr != nil || json.Unmarshal(data, &tasks) != nil {
+			t.Fatalf("decode tasks payload: %v payload=%+v", marshalErr, event.Payload)
+		}
+	}
+	if len(tasks) != 1 || tasks[0].Title != "Message" || tasks[0].Status != protocol.TaskRunning {
+		t.Fatalf("active task snapshot = %+v", tasks)
+	}
+
+	if _, err := manager.Interrupt(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("active turn error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("active turn did not stop")
+	}
+}
+
+func TestStaleRotationReleaseCannotClearNewReservation(t *testing.T) {
+	manager := newTurnTestManager(t, immediateTurnRunner{}, time.Second)
+	if _, err := manager.Start(context.Background(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	first, _, _, err := manager.reserveRotationPreparation()
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.releaseRotationPreparation(first)
+	second, _, _, err := manager.reserveRotationPreparation()
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.releaseRotationPreparation(first)
+	manager.mu.Lock()
+	rotating := manager.rotating
+	reservation := manager.rotationReservation
+	manager.mu.Unlock()
+	if !rotating || reservation != second {
+		t.Fatalf("stale release changed reservation: rotating=%t reservation=%d want=%d", rotating, reservation, second)
+	}
+	manager.releaseRotationPreparation(second)
+}
+
 func TestTurnControllerStopsOnlyMatchingTask(t *testing.T) {
 	runner := newControlledTurnRunner()
 	manager := newTurnTestManager(t, runner, time.Second)
@@ -859,8 +932,8 @@ func TestSessionRotationDrainUsesConfiguredDeadline(t *testing.T) {
 
 	startedAt := time.Now()
 	events, err := manager.SendMessage(context.Background(), "/new")
-	if !errors.Is(err, context.DeadlineExceeded) || len(events) != 0 {
-		t.Fatalf("rotation = events:%+v err:%v, want deadline without lifecycle", events, err)
+	if !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, ErrTurnNotStarted) || len(events) != 0 {
+		t.Fatalf("rotation = events:%+v err:%v, want unstarted deadline without lifecycle", events, err)
 	}
 	if elapsed := time.Since(startedAt); elapsed > 500*time.Millisecond {
 		t.Fatalf("rotation exceeded its configured drain deadline: %s", elapsed)
@@ -873,6 +946,94 @@ func TestSessionRotationDrainUsesConfiguredDeadline(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("old turn did not finish after runner release")
+	}
+}
+
+func TestInvalidResumeDoesNotCancelActiveTurn(t *testing.T) {
+	runner := newControlledTurnRunner()
+	manager := newTurnTestManager(t, runner, time.Second)
+	if _, err := manager.Start(context.Background(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	currentSessionID := manager.SessionID()
+	activeDone := make(chan error, 1)
+	go func() {
+		_, err := manager.SendMessage(context.Background(), "keep running")
+		activeDone <- err
+	}()
+	select {
+	case <-runner.started:
+	case <-time.After(time.Second):
+		t.Fatal("active turn did not reach runner")
+	}
+
+	events, err := manager.SendMessage(context.Background(), "/resume sess_missing")
+	if err != nil || !hasEvent(events, protocol.EventError) {
+		t.Fatalf("invalid resume = events:%+v err:%v", events, err)
+	}
+	if manager.SessionID() != currentSessionID {
+		t.Fatalf("invalid resume changed session to %q", manager.SessionID())
+	}
+	select {
+	case err := <-activeDone:
+		t.Fatalf("invalid resume cancelled active turn: %v", err)
+	default:
+	}
+
+	if _, err := manager.Interrupt(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-activeDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("active turn error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("active turn did not stop")
+	}
+}
+
+func TestValidatedResumeCancelsActiveTurnAndUsesPreparedTarget(t *testing.T) {
+	store := local.New(t.TempDir())
+	targetSessionID := "sess_valid_target"
+	if err := store.Append(context.Background(), protocol.NewEvent(protocol.EventAssistantDone, targetSessionID, "stored target", nil)); err != nil {
+		t.Fatal(err)
+	}
+	runner := newControlledTurnRunner()
+	manager := New(Dependencies{
+		Sessions:     store,
+		EinoRunner:   runner,
+		TurnTimeout:  time.Second,
+		NewSessionID: func() string { return "sess_current" },
+	})
+	if _, err := manager.Start(context.Background(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	activeDone := make(chan error, 1)
+	go func() {
+		_, err := manager.SendMessage(context.Background(), "replace me")
+		activeDone <- err
+	}()
+	select {
+	case <-runner.started:
+	case <-time.After(time.Second):
+		t.Fatal("active turn did not reach runner")
+	}
+
+	events, err := manager.SendMessage(context.Background(), "/resume "+targetSessionID)
+	if err != nil {
+		t.Fatalf("validated resume: %v", err)
+	}
+	if manager.SessionID() != targetSessionID || !hasMessage(events, protocol.EventAssistantDone, "stored target") {
+		t.Fatalf("validated resume = session:%q events:%+v", manager.SessionID(), events)
+	}
+	select {
+	case err := <-activeDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("replaced turn error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("validated resume did not drain active turn")
 	}
 }
 

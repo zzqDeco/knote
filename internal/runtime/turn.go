@@ -44,6 +44,43 @@ type activeTurn struct {
 type activeTurnContextKey struct{}
 
 func (m *Manager) beginTurn(parent context.Context, title string, rotation bool) (*activeTurn, []protocol.Event, error) {
+	return m.beginTurnWithRotationReservation(parent, title, rotation, 0)
+}
+
+func (m *Manager) reserveRotationPreparation() (uint64, string, protocol.Event, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.starting || m.rotating {
+		return 0, "", protocol.Event{}, ErrTurnBusy
+	}
+	if m.einoSession.ID == "" {
+		return 0, "", protocol.Event{}, fmt.Errorf("runtime has not started")
+	}
+	m.nextRotationID++
+	reservationID := m.nextRotationID
+	m.rotating = true
+	m.rotationReservation = reservationID
+	var activeStart protocol.Event
+	if m.activeTurn != nil {
+		activeStart = m.activeTurn.lifecycleStart
+	}
+	return reservationID, m.einoSession.ID, activeStart, nil
+}
+
+func (m *Manager) releaseRotationPreparation(reservationID uint64) {
+	m.mu.Lock()
+	if reservationID != 0 && m.rotationReservation == reservationID {
+		m.rotating = false
+		m.rotationReservation = 0
+	}
+	m.mu.Unlock()
+}
+
+func (m *Manager) beginReservedRotation(parent context.Context, title string, reservationID uint64) (*activeTurn, []protocol.Event, error) {
+	return m.beginTurnWithRotationReservation(parent, title, true, reservationID)
+}
+
+func (m *Manager) beginTurnWithRotationReservation(parent context.Context, title string, rotation bool, reservationID uint64) (*activeTurn, []protocol.Event, error) {
 	if parent == nil {
 		parent = context.Background()
 	}
@@ -64,7 +101,8 @@ func (m *Manager) beginTurn(parent context.Context, title string, rotation bool)
 
 	if rotation {
 		m.mu.Lock()
-		if m.starting || m.rotating {
+		reserved := reservationID != 0
+		if m.starting || (reserved && (!m.rotating || m.rotationReservation != reservationID)) || (!reserved && m.rotating) {
 			m.mu.Unlock()
 			return nil, nil, ErrTurnBusy
 		}
@@ -72,7 +110,10 @@ func (m *Manager) beginTurn(parent context.Context, title string, rotation bool)
 			m.mu.Unlock()
 			return nil, nil, fmt.Errorf("runtime has not started")
 		}
-		m.rotating = true
+		if !reserved {
+			m.rotating = true
+			m.rotationReservation = 0
+		}
 		previous := m.activeTurn
 		reentrant := previous != nil && (previous.notifying || activeTurnIDFromContext(parent) == previous.id)
 		m.mu.Unlock()
@@ -86,9 +127,9 @@ func (m *Manager) beginTurn(parent context.Context, title string, rotation bool)
 				case <-previous.done:
 				case <-timedCtx.Done():
 					m.mu.Lock()
-					m.rotating = false
+					m.clearRotationLocked(reservationID)
 					m.mu.Unlock()
-					return nil, nil, timedCtx.Err()
+					return nil, nil, fmt.Errorf("%w: drain active turn: %w", ErrTurnNotStarted, timedCtx.Err())
 				}
 			}
 		}
@@ -98,11 +139,11 @@ func (m *Manager) beginTurn(parent context.Context, title string, rotation bool)
 	m.mu.Lock()
 	if err := timedCtx.Err(); err != nil {
 		if rotation {
-			m.rotating = false
+			m.clearRotationLocked(reservationID)
 		}
 		m.mu.Unlock()
 		m.commitMu.Unlock()
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("%w: prepare task start: %w", ErrTurnNotStarted, err)
 	}
 	if m.starting || (!rotation && (m.rotating || m.activeTurn != nil)) {
 		m.mu.Unlock()
@@ -111,14 +152,14 @@ func (m *Manager) beginTurn(parent context.Context, title string, rotation bool)
 	}
 	if m.einoSession.ID == "" {
 		if rotation {
-			m.rotating = false
+			m.clearRotationLocked(reservationID)
 		}
 		m.mu.Unlock()
 		m.commitMu.Unlock()
 		return nil, nil, fmt.Errorf("runtime has not started")
 	}
 	if rotation && m.activeTurn != nil {
-		m.rotating = false
+		m.clearRotationLocked(reservationID)
 		m.mu.Unlock()
 		m.commitMu.Unlock()
 		return nil, nil, ErrTurnBusy
@@ -147,6 +188,9 @@ func (m *Manager) beginTurn(parent context.Context, title string, rotation bool)
 		UpdatedAt: now,
 	})
 	turn.lifecycleStart = started
+	if rotation {
+		m.rotationReservation = 0
+	}
 	m.activeTurn = turn
 	m.mu.Unlock()
 	m.commitMu.Unlock()
@@ -181,6 +225,14 @@ func (m *Manager) beginTurn(parent context.Context, title string, rotation bool)
 	}
 	keepContext = true
 	return turn, []protocol.Event{started}, nil
+}
+
+func (m *Manager) clearRotationLocked(reservationID uint64) {
+	if reservationID != 0 && m.rotationReservation != reservationID {
+		return
+	}
+	m.rotating = false
+	m.rotationReservation = 0
 }
 
 func (m *Manager) completeTurn(turn *activeTurn, status protocol.TaskStatus, message string) (protocol.Event, bool) {
