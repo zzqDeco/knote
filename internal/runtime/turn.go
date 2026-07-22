@@ -31,6 +31,7 @@ type activeTurn struct {
 	rotationCommitted  bool
 	notifying          bool
 	finished           bool
+	lifecycleStart     protocol.Event
 	terminal           protocol.Event
 }
 
@@ -87,9 +88,19 @@ func (m *Manager) beginTurn(parent context.Context, title string, rotation bool)
 		}
 	}
 
+	m.commitMu.Lock()
 	m.mu.Lock()
+	if err := timedCtx.Err(); err != nil {
+		if rotation {
+			m.rotating = false
+		}
+		m.mu.Unlock()
+		m.commitMu.Unlock()
+		return nil, nil, err
+	}
 	if m.starting || (!rotation && (m.rotating || m.activeTurn != nil)) {
 		m.mu.Unlock()
+		m.commitMu.Unlock()
 		return nil, nil, ErrTurnBusy
 	}
 	if m.einoSession.ID == "" {
@@ -97,11 +108,13 @@ func (m *Manager) beginTurn(parent context.Context, title string, rotation bool)
 			m.rotating = false
 		}
 		m.mu.Unlock()
+		m.commitMu.Unlock()
 		return nil, nil, fmt.Errorf("runtime has not started")
 	}
 	if rotation && m.activeTurn != nil {
 		m.rotating = false
 		m.mu.Unlock()
+		m.commitMu.Unlock()
 		return nil, nil, ErrTurnBusy
 	}
 	m.nextTurnID++
@@ -120,9 +133,6 @@ func (m *Manager) beginTurn(parent context.Context, title string, rotation bool)
 		done:               make(chan struct{}),
 		rotation:           rotation,
 	}
-	m.activeTurn = turn
-	m.mu.Unlock()
-
 	started := protocol.NewEvent(protocol.EventTaskStarted, turn.lifecycleSessionID, "Task started", protocol.Task{
 		ID:        turn.id,
 		Title:     turn.title,
@@ -130,48 +140,18 @@ func (m *Manager) beginTurn(parent context.Context, title string, rotation bool)
 		CreatedAt: now,
 		UpdatedAt: now,
 	})
-	if !m.commitTurnResult(turn, []protocol.Event{started}, []protocol.Event{started}) {
-		turnErr := turn.ctx.Err()
-		turn.cancel()
-		m.mu.Lock()
-		if m.activeTurn == turn {
-			m.activeTurn = nil
-		}
-		if turn.rotation {
-			m.rotating = false
-		}
-		close(turn.done)
-		m.mu.Unlock()
-		if turnErr != nil {
-			return nil, nil, turnErr
-		}
-		return nil, nil, ErrTurnBusy
-	}
-	keepContext = true
-	return turn, []protocol.Event{started}, nil
-}
-
-func (m *Manager) commitTurnResult(turn *activeTurn, persisted, emitted []protocol.Event) bool {
-	if turn == nil {
-		return false
-	}
-	m.commitMu.Lock()
-	m.mu.Lock()
-	valid := m.activeTurn == turn && !turn.finished && (turn.ctx.Err() == nil || turn.rotationCommitted) &&
-		m.generation == turn.targetGeneration && m.einoSession.ID == turn.targetSessionID
+	turn.lifecycleStart = started
+	m.activeTurn = turn
 	subscribers := m.subscribersLocked()
 	m.mu.Unlock()
-	if !valid {
-		m.commitMu.Unlock()
-		return false
-	}
-	m.persist(persisted)
-	dispatch := m.enqueueNotifications(turn, subscribers, emitted)
+	m.persist([]protocol.Event{started})
+	dispatch := m.enqueueNotifications(turn, subscribers, []protocol.Event{started})
 	m.commitMu.Unlock()
 	if dispatch {
 		m.drainNotifications()
 	}
-	return true
+	keepContext = true
+	return turn, []protocol.Event{started}, nil
 }
 
 func (m *Manager) completeTurn(turn *activeTurn, status protocol.TaskStatus, message string) (protocol.Event, bool) {
@@ -254,49 +234,104 @@ func (m *Manager) finishTurn(turn *activeTurn, events []protocol.Event, operatio
 }
 
 func (m *Manager) finishTurnResult(turn *activeTurn, persisted, emitted []protocol.Event, operationErr error) ([]protocol.Event, error) {
-	committed := m.commitTurnResult(turn, persisted, emitted)
-	if !committed {
-		emitted = nil
-	}
+	return m.finishTurnResultWithStatusEvents(turn, persisted, emitted, emitted, operationErr)
+}
 
+func (m *Manager) finishTurnResultWithStatusEvents(
+	turn *activeTurn,
+	persisted []protocol.Event,
+	emitted []protocol.Event,
+	statusEvents []protocol.Event,
+	operationErr error,
+) ([]protocol.Event, error) {
+	if turn == nil {
+		return nil, operationErr
+	}
+	m.commitMu.Lock()
 	m.mu.Lock()
 	rotationCommitted := turn.rotationCommitted
-	m.mu.Unlock()
+	contextErr := turn.ctx.Err()
+	if m.activeTurn != turn || turn.finished {
+		terminal := turn.terminal
+		m.mu.Unlock()
+		m.commitMu.Unlock()
+		var returnErr error
+		if contextErr != nil && !rotationCommitted {
+			returnErr = contextErr
+		}
+		if terminal.Type == "" {
+			return nil, returnErr
+		}
+		return []protocol.Event{terminal}, returnErr
+	}
+	commitResult := (contextErr == nil || rotationCommitted) &&
+		m.generation == turn.targetGeneration && m.einoSession.ID == turn.targetSessionID
 	status := protocol.TaskCompleted
 	message := "Task completed"
 	returnErr := error(nil)
-	if err := turn.ctx.Err(); err != nil && !rotationCommitted {
-		if m.deps.SideEffects != nil {
-			m.deps.SideEffects.ClearTurn(turn.lifecycleSessionID, turn.id)
-		}
-		returnErr = err
-		if errors.Is(err, context.DeadlineExceeded) {
+	clearTurn := false
+	if contextErr != nil && !rotationCommitted {
+		commitResult = false
+		returnErr = contextErr
+		clearTurn = true
+		if errors.Is(contextErr, context.DeadlineExceeded) {
 			status = protocol.TaskFailed
 			message = "Task timed out"
 		} else {
 			status = protocol.TaskKilled
 			message = "Task interrupted"
 		}
-	} else if operationErr != nil || hasErrorEvent(emitted) {
+	} else if operationErr != nil || hasErrorEvent(statusEvents) {
 		status = protocol.TaskFailed
 		message = "Task failed"
 	}
-	terminal, ok := m.completeTurn(turn, status, message)
-	if ok {
-		emitted = append(emitted, terminal)
-	} else if terminal, ok := m.terminalEvent(turn); ok {
-		emitted = append(emitted, terminal)
+	if !commitResult {
+		persisted = nil
+		emitted = nil
 	}
-	return emitted, returnErr
-}
+	turn.finished = true
+	now := time.Now().UTC()
+	terminal := protocol.NewEvent(protocol.EventTaskComplete, turn.lifecycleSessionID, message, protocol.Task{
+		ID:        turn.id,
+		Title:     turn.title,
+		Status:    status,
+		CreatedAt: turn.createdAt,
+		UpdatedAt: now,
+		Message:   message,
+	})
+	turn.terminal = terminal
+	subscribers := m.subscribersLocked()
+	m.mu.Unlock()
 
-func (m *Manager) terminalEvent(turn *activeTurn) (protocol.Event, bool) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if turn == nil || turn.terminal.Type == "" {
-		return protocol.Event{}, false
+	if clearTurn && m.deps.SideEffects != nil {
+		m.deps.SideEffects.ClearTurn(turn.lifecycleSessionID, turn.id)
 	}
-	return turn.terminal, true
+	toPersist := make([]protocol.Event, 0, len(persisted)+1)
+	toPersist = append(toPersist, persisted...)
+	toPersist = append(toPersist, terminal)
+	m.persist(toPersist)
+	dispatch := false
+	if commitResult && m.enqueueNotifications(turn, subscribers, emitted) {
+		dispatch = true
+	}
+	if m.enqueueNotifications(turn, subscribers, []protocol.Event{terminal}) {
+		dispatch = true
+	}
+	m.mu.Lock()
+	if m.activeTurn == turn {
+		m.activeTurn = nil
+	}
+	if turn.rotation {
+		m.rotating = false
+	}
+	close(turn.done)
+	m.mu.Unlock()
+	m.commitMu.Unlock()
+	turn.cancel()
+	if dispatch {
+		m.drainNotifications()
+	}
+	return append(emitted, terminal), returnErr
 }
 
 func activeTurnIDFromContext(ctx context.Context) string {

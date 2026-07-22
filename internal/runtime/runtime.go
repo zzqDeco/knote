@@ -269,7 +269,9 @@ func (m *Manager) SendMessage(ctx context.Context, input string) ([]protocol.Eve
 	runCtx := turn.ctx
 	if strings.HasPrefix(input, "/") && (!m.deps.Capabilities.AllowsSlashCommand(command) || command == "new") {
 		result := m.handleSlash(runCtx, turn, einoSession.ID, input)
-		completed, returnErr := m.finishTurnResult(turn, result.persisted, result.events, result.err)
+		completed, returnErr := m.finishTurnResultWithStatusEvents(
+			turn, result.persisted, result.events, result.lifecycleStatusEvents(), result.err,
+		)
 		return append(startedEvents, completed...), returnErr
 	}
 	if authorizationProvider != nil {
@@ -293,7 +295,9 @@ func (m *Manager) SendMessage(ctx context.Context, input string) ([]protocol.Eve
 	}
 	if strings.HasPrefix(input, "/") {
 		result := m.handleSlash(runCtx, turn, einoSession.ID, input)
-		completed, returnErr := m.finishTurnResult(turn, result.persisted, result.events, result.err)
+		completed, returnErr := m.finishTurnResultWithStatusEvents(
+			turn, result.persisted, result.events, result.lifecycleStatusEvents(), result.err,
+		)
 		return append(startedEvents, completed...), returnErr
 	}
 	history := m.loadHistory(runCtx, einoSession.ID)
@@ -400,19 +404,32 @@ func (m *Manager) confirmBeforeConsumptionError(sessionID string, req protocol.C
 }
 
 func (m *Manager) Interrupt(context.Context) ([]protocol.Event, error) {
+	m.commitMu.Lock()
 	m.mu.Lock()
 	einoSessionID := m.einoSession.ID
 	turn := m.activeTurn
-	m.mu.Unlock()
 	if einoSessionID == "" {
+		m.mu.Unlock()
+		m.commitMu.Unlock()
 		return m.emitAndReturn(m.runtimeError("runtime has not started")), nil
 	}
+	subscribers := m.subscribersLocked()
+	m.mu.Unlock()
+
+	var events []protocol.Event
 	if turn == nil {
-		return m.persistEmitAndReturn([]protocol.Event{protocol.NewEvent(protocol.EventStatusUpdate, einoSessionID, "no active task", nil)}), nil
+		events = []protocol.Event{protocol.NewEvent(protocol.EventStatusUpdate, einoSessionID, "no active task", nil)}
+	} else {
+		turn.cancel()
+		events = []protocol.Event{protocol.NewEvent(protocol.EventStatusUpdate, einoSessionID, "interrupt requested", map[string]string{"task_id": turn.id})}
 	}
-	turn.cancel()
-	events := []protocol.Event{protocol.NewEvent(protocol.EventStatusUpdate, einoSessionID, "interrupt requested", map[string]string{"task_id": turn.id})}
-	return m.persistEmitAndReturn(events), nil
+	m.persist(events)
+	dispatch := m.enqueueNotifications(nil, subscribers, events)
+	m.commitMu.Unlock()
+	if dispatch {
+		m.drainNotifications()
+	}
+	return events, nil
 }
 
 func (m *Manager) StopTask(_ context.Context, taskID string) ([]protocol.Event, error) {
@@ -420,19 +437,32 @@ func (m *Manager) StopTask(_ context.Context, taskID string) ([]protocol.Event, 
 	if taskID == "" {
 		return nil, fmt.Errorf("task id is required")
 	}
+	m.commitMu.Lock()
 	m.mu.Lock()
 	einoSessionID := m.einoSession.ID
 	turn := m.activeTurn
-	m.mu.Unlock()
 	if einoSessionID == "" {
+		m.mu.Unlock()
+		m.commitMu.Unlock()
 		return nil, fmt.Errorf("runtime has not started")
 	}
 	if turn == nil || turn.id != taskID {
+		m.mu.Unlock()
+		m.commitMu.Unlock()
 		return nil, fmt.Errorf("%w: %s", ErrTaskNotFound, taskID)
 	}
+	subscribers := m.subscribersLocked()
+	m.mu.Unlock()
+
 	turn.cancel()
 	events := []protocol.Event{protocol.NewEvent(protocol.EventStatusUpdate, einoSessionID, "task stop requested", map[string]string{"task_id": taskID})}
-	return m.persistEmitAndReturn(events), nil
+	m.persist(events)
+	dispatch := m.enqueueNotifications(nil, subscribers, events)
+	m.commitMu.Unlock()
+	if dispatch {
+		m.drainNotifications()
+	}
+	return events, nil
 }
 
 func (m *Manager) WorkspaceStatus(ctx context.Context) (repository.Status, error) {

@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -119,7 +120,7 @@ func TestOverlaySwitchAndEsc(t *testing.T) {
 		t.Fatalf("/tasks did not show tasks overlay: mode=%s overlay=%q", model.overlayMode, model.overlay)
 	}
 	tracked := &interruptRecordingRuntime{Runtime: model.runtime}
-	model.runtime = tracked
+	model.setRuntime(tracked)
 	updateModel(t, &model, tea.KeyMsg{Type: tea.KeyEsc})
 	if model.overlayMode != overlayNone || strings.TrimSpace(model.overlay) != "" {
 		t.Fatalf("esc did not close overlay: mode=%s overlay=%q", model.overlayMode, model.overlay)
@@ -138,7 +139,7 @@ func TestEscWithoutOverlayInterruptsAndAppliesReturnedEventsOnce(t *testing.T) {
 		interruptEvents: []protocol.Event{interruptEvent},
 		interruptErr:    wantErr,
 	}
-	model.runtime = tracked
+	model.setRuntime(tracked)
 
 	var subscribed []protocol.Event
 	unsubscribe := tracked.Subscribe(func(events []protocol.Event) {
@@ -171,36 +172,44 @@ func TestCtrlCInterruptsBeforeQuittingWithOverlayActive(t *testing.T) {
 
 	wantErr := errors.New("interrupt failed")
 	tracked := &interruptRecordingRuntime{Runtime: model.runtime, interruptErr: wantErr}
-	model.runtime = tracked
+	model.setRuntime(tracked)
 	next, cmd := model.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
 	updated, ok := next.(Model)
 	if !ok {
 		t.Fatalf("unexpected model type %T", next)
 	}
+	if tracked.interruptCalls != 0 {
+		t.Fatalf("ctrl+c blocked Update with %d synchronous interrupt calls", tracked.interruptCalls)
+	}
+	if cmd == nil {
+		t.Fatal("ctrl+c did not return an interrupt command")
+	}
+	next, quitCmd := updated.Update(cmd())
+	updated = next.(Model)
 	if tracked.interruptCalls != 1 {
 		t.Fatalf("ctrl+c interrupt calls = %d, want 1", tracked.interruptCalls)
 	}
 	if !errors.Is(updated.err, wantErr) {
 		t.Fatalf("ctrl+c interrupt error = %v, want %v", updated.err, wantErr)
 	}
-	if cmd == nil {
-		t.Fatal("ctrl+c did not return a quit command")
+	if quitCmd == nil {
+		t.Fatal("ctrl+c did not quit after interrupt completion")
 	}
-	if _, ok := cmd().(tea.QuitMsg); !ok {
-		t.Fatal("ctrl+c command did not produce tea.QuitMsg")
+	if _, ok := quitCmd().(tea.QuitMsg); !ok {
+		t.Fatal("ctrl+c completion did not produce tea.QuitMsg")
 	}
 }
 
 func TestSendMessageRetainsRuntimeErrorWithoutDuplicatingReturnedEvents(t *testing.T) {
 	model := newTestModel(t)
-	wantErr := errors.New("turn busy")
+	wantErr := runtime.ErrTurnBusy
 	returned := protocol.NewEvent(protocol.EventError, model.runtime.SessionID(), "turn already active", nil)
 	stub := &sendResultRuntime{
 		Runtime: model.runtime,
 		events:  []protocol.Event{returned},
 		err:     wantErr,
 	}
-	model.runtime = stub
+	model.setRuntime(stub)
 	model.composer.SetValue("hello")
 
 	updateModel(t, &model, tea.KeyMsg{Type: tea.KeyEnter})
@@ -210,8 +219,49 @@ func TestSendMessageRetainsRuntimeErrorWithoutDuplicatingReturnedEvents(t *testi
 	if !errors.Is(model.err, wantErr) {
 		t.Fatalf("send message error = %v, want %v", model.err, wantErr)
 	}
+	if got := model.composer.Value(); got != "hello" {
+		t.Fatalf("busy send composer = %q, want rejected input restored", got)
+	}
 	if got := countTUIEventMessages(model.events, protocol.EventError, returned.Message); got != 1 {
 		t.Fatalf("returned send events in model = %d, want 1", got)
+	}
+}
+
+func TestBusyConfirmationRestoresCanonicalOverlay(t *testing.T) {
+	model := newTestModel(t)
+	req := protocol.ConfirmRequest{
+		RequestID: "confirm_busy", Title: "Confirm build", Summary: "Run build.", Command: "/build",
+		ApproveText: "approve", RejectText: "reject",
+	}
+	model.restoreConfirmation(req)
+	stub := &busyConfirmRuntime{Runtime: model.runtime}
+	model.setRuntime(stub)
+
+	updateModel(t, &model, tea.KeyMsg{Type: tea.KeyEnter})
+	if !errors.Is(model.err, runtime.ErrTurnBusy) {
+		t.Fatalf("confirm error = %v, want ErrTurnBusy", model.err)
+	}
+	if model.pendingConfirm == nil || *model.pendingConfirm != req {
+		t.Fatalf("busy confirmation was not restored: %+v", model.pendingConfirm)
+	}
+	if model.overlayMode != overlayConfirm || !strings.Contains(model.overlay, req.Title) {
+		t.Fatalf("busy confirmation overlay = mode:%s content:%q", model.overlayMode, model.overlay)
+	}
+}
+
+func TestStaleCommandResultCannotMutateRotatedInteractionState(t *testing.T) {
+	model := newTestModel(t)
+	req := protocol.ConfirmRequest{RequestID: "confirm_new", Title: "Current confirmation"}
+	model.restoreConfirmation(req)
+	model.latestRotation = 2
+
+	next, _ := model.Update(runtimeResultMsg{commandID: 1, kind: runtimeCommandSend, input: "old input", err: context.Canceled})
+	model = next.(Model)
+	if model.err != nil {
+		t.Fatalf("stale result changed current error: %v", model.err)
+	}
+	if model.pendingConfirm == nil || model.pendingConfirm.RequestID != req.RequestID || model.overlayMode != overlayConfirm {
+		t.Fatalf("stale result changed current confirmation: pending=%+v overlay=%s", model.pendingConfirm, model.overlayMode)
 	}
 }
 
@@ -222,7 +272,7 @@ func TestBlockedSendCommandLeavesInterruptHandlingResponsive(t *testing.T) {
 		started: make(chan struct{}),
 		release: make(chan struct{}),
 	}
-	model.runtime = blocked
+	model.setRuntime(blocked)
 	model.composer.SetValue("blocked request")
 
 	next, cmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
@@ -241,8 +291,17 @@ func TestBlockedSendCommandLeavesInterruptHandlingResponsive(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("send command did not reach runtime")
 	}
+	drainRuntimeEvents(t, &model)
+	if !hasTUIEvent(model.events, protocol.EventTaskStarted) || !strings.Contains(model.status, "tasks 1") {
+		t.Fatalf("task.started was not rendered while runner was blocked: status=%q events=%+v", model.status, model.events)
+	}
 
-	next, _ = model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	next, interrupt := model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	model = next.(Model)
+	if interrupt == nil {
+		t.Fatal("esc did not return an asynchronous interrupt command")
+	}
+	next, _ = model.Update(interrupt())
 	model = next.(Model)
 	if got := blocked.interruptCalls.Load(); got != 1 {
 		t.Fatalf("interrupt calls = %d, want 1 while send is blocked", got)
@@ -257,11 +316,113 @@ func TestBlockedSendCommandLeavesInterruptHandlingResponsive(t *testing.T) {
 	case msg := <-result:
 		next, _ = model.Update(msg)
 		model = next.(Model)
+		drainRuntimeEvents(t, &model)
 	case <-time.After(time.Second):
 		t.Fatal("send command did not complete after release")
 	}
 	if !hasTUIEvent(model.events, protocol.EventAssistantDone) {
 		t.Fatalf("async send result was not applied: %+v", model.events)
+	}
+}
+
+func TestCtrlCWaitsForActiveTaskTerminalBeforeQuitting(t *testing.T) {
+	model := newTestModel(t)
+	blocked := &blockingSendRuntime{
+		Runtime: model.runtime,
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	model.setRuntime(blocked)
+	model.composer.SetValue("blocked request")
+
+	next, send := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = next.(Model)
+	sendResult := make(chan tea.Msg, 1)
+	go func() { sendResult <- send() }()
+	select {
+	case <-blocked.started:
+	case <-time.After(time.Second):
+		t.Fatal("send command did not reach runtime")
+	}
+	drainRuntimeEvents(t, &model)
+
+	next, interrupt := model.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	model = next.(Model)
+	if interrupt == nil || blocked.interruptCalls.Load() != 0 {
+		t.Fatal("ctrl+c did not schedule interruption asynchronously")
+	}
+	next, drainTimeout := model.Update(interrupt())
+	model = next.(Model)
+	if drainTimeout == nil {
+		t.Fatal("ctrl+c did not wait for the active task terminal")
+	}
+
+	close(blocked.release)
+	select {
+	case msg := <-sendResult:
+		next, _ = model.Update(msg)
+		model = next.(Model)
+	case <-time.After(time.Second):
+		t.Fatal("send command did not finish after release")
+	}
+	var quit tea.Cmd
+	for {
+		events, ok := model.runtimeEvents.popNow()
+		if !ok {
+			break
+		}
+		next, quit = model.Update(runtimeEventsMsg{events: events})
+		model = next.(Model)
+	}
+	if quit == nil {
+		t.Fatal("task terminal did not release ctrl+c quit")
+	}
+	if _, ok := quit().(tea.QuitMsg); !ok {
+		t.Fatal("task terminal did not produce tea.QuitMsg")
+	}
+}
+
+func TestStatusRefreshRunsOutsideUpdate(t *testing.T) {
+	model := newTestModel(t)
+	stub := &blockingStatusRuntime{
+		Runtime: model.runtime,
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	model.setRuntime(stub)
+	refresh := model.nextStatusRefreshCmd()
+	result := make(chan tea.Msg, 1)
+	go func() { result <- refresh() }()
+	select {
+	case <-stub.started:
+	case <-time.After(time.Second):
+		t.Fatal("status refresh did not reach runtime")
+	}
+
+	updated := make(chan Model, 1)
+	go func() {
+		next, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}})
+		updated <- next.(Model)
+	}()
+	select {
+	case model = <-updated:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("Update blocked behind status I/O")
+	}
+	if got := model.composer.Value(); got != "x" {
+		t.Fatalf("composer value = %q, want responsive input", got)
+	}
+
+	close(stub.release)
+	select {
+	case msg := <-result:
+		next, _ := model.Update(msg)
+		model = next.(Model)
+	case <-time.After(time.Second):
+		t.Fatal("status refresh did not complete")
+	}
+	if !strings.Contains(model.status, "branch async-status") {
+		t.Fatalf("async status was not applied: %q", model.status)
 	}
 }
 
@@ -438,29 +599,38 @@ type interruptRecordingRuntime struct {
 	interruptCalls  int
 	interruptEvents []protocol.Event
 	interruptErr    error
-	subscriber      runtime.EventSubscriber
+	publisher       runtimePublisher
 }
 
 func (r *interruptRecordingRuntime) Interrupt(context.Context) ([]protocol.Event, error) {
 	r.interruptCalls++
-	if r.subscriber != nil {
-		r.subscriber(r.interruptEvents)
-	}
+	r.publisher.publish(r.interruptEvents)
 	return r.interruptEvents, r.interruptErr
 }
 
 func (r *interruptRecordingRuntime) Subscribe(fn runtime.EventSubscriber) func() {
-	r.subscriber = fn
-	return func() {
-		r.subscriber = nil
-	}
+	return r.publisher.subscribe(fn)
 }
 
 type sendResultRuntime struct {
 	runtime.Runtime
-	calls  int
-	events []protocol.Event
-	err    error
+	calls     int
+	events    []protocol.Event
+	err       error
+	publisher runtimePublisher
+}
+
+type busyConfirmRuntime struct {
+	runtime.Runtime
+	publisher runtimePublisher
+}
+
+func (r *busyConfirmRuntime) Confirm(context.Context, protocol.ConfirmRequest, bool) ([]protocol.Event, error) {
+	return nil, runtime.ErrTurnBusy
+}
+
+func (r *busyConfirmRuntime) Subscribe(fn runtime.EventSubscriber) func() {
+	return r.publisher.subscribe(fn)
 }
 
 type blockingSendRuntime struct {
@@ -468,12 +638,42 @@ type blockingSendRuntime struct {
 	started        chan struct{}
 	release        chan struct{}
 	interruptCalls atomic.Int32
+	publisher      runtimePublisher
+}
+
+type blockingStatusRuntime struct {
+	runtime.Runtime
+	started   chan struct{}
+	release   chan struct{}
+	startOnce sync.Once
+	publisher runtimePublisher
+}
+
+func (r *blockingStatusRuntime) CurrentSessionInfo(context.Context) protocol.SessionInfo {
+	r.startOnce.Do(func() { close(r.started) })
+	<-r.release
+	return protocol.SessionInfo{ID: r.SessionID(), Branch: "async-status", KAGMode: "fake"}
+}
+
+func (r *blockingStatusRuntime) Subscribe(fn runtime.EventSubscriber) func() {
+	return r.publisher.subscribe(fn)
 }
 
 func (r *blockingSendRuntime) SendMessage(context.Context, string) ([]protocol.Event, error) {
+	now := time.Now().UTC()
+	r.publisher.publish([]protocol.Event{protocol.NewEvent(protocol.EventTaskStarted, r.SessionID(), "Task started", protocol.Task{
+		ID: "task_blocked", Title: "Message", Status: protocol.TaskRunning, CreatedAt: now, UpdatedAt: now,
+	})})
 	close(r.started)
 	<-r.release
-	return []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, r.SessionID(), "released", nil)}, nil
+	events := []protocol.Event{
+		protocol.NewEvent(protocol.EventAssistantDone, r.SessionID(), "released", nil),
+		protocol.NewEvent(protocol.EventTaskComplete, r.SessionID(), "Task completed", protocol.Task{
+			ID: "task_blocked", Title: "Message", Status: protocol.TaskCompleted, CreatedAt: now, UpdatedAt: time.Now().UTC(),
+		}),
+	}
+	r.publisher.publish(events)
+	return events, nil
 }
 
 func (r *blockingSendRuntime) Interrupt(context.Context) ([]protocol.Event, error) {
@@ -481,9 +681,55 @@ func (r *blockingSendRuntime) Interrupt(context.Context) ([]protocol.Event, erro
 	return nil, nil
 }
 
+func (r *blockingSendRuntime) Subscribe(fn runtime.EventSubscriber) func() {
+	return r.publisher.subscribe(fn)
+}
+
 func (r *sendResultRuntime) SendMessage(context.Context, string) ([]protocol.Event, error) {
 	r.calls++
+	r.publisher.publish(r.events)
 	return r.events, r.err
+}
+
+func (r *sendResultRuntime) Subscribe(fn runtime.EventSubscriber) func() {
+	return r.publisher.subscribe(fn)
+}
+
+type runtimePublisher struct {
+	mu          sync.Mutex
+	nextID      int
+	subscribers map[int]runtime.EventSubscriber
+}
+
+func (p *runtimePublisher) subscribe(fn runtime.EventSubscriber) func() {
+	p.mu.Lock()
+	if p.subscribers == nil {
+		p.subscribers = map[int]runtime.EventSubscriber{}
+	}
+	id := p.nextID
+	p.nextID++
+	p.subscribers[id] = fn
+	p.mu.Unlock()
+	return func() {
+		p.mu.Lock()
+		delete(p.subscribers, id)
+		p.mu.Unlock()
+	}
+}
+
+func (p *runtimePublisher) publish(events []protocol.Event) {
+	if len(events) == 0 {
+		return
+	}
+	p.mu.Lock()
+	subscribers := make([]runtime.EventSubscriber, 0, len(p.subscribers))
+	for _, subscriber := range p.subscribers {
+		subscribers = append(subscribers, subscriber)
+	}
+	p.mu.Unlock()
+	for _, subscriber := range subscribers {
+		subscriber(events)
+	}
 }
 
 func updateModel(t *testing.T, model *Model, msg tea.Msg) {
@@ -494,19 +740,35 @@ func updateModel(t *testing.T, model *Model, msg tea.Msg) {
 		t.Fatalf("unexpected model type %T", next)
 	}
 	*model = updated
-	if cmd == nil {
-		return
+	if cmd != nil {
+		result := cmd()
+		switch result.(type) {
+		case runtimeResultMsg, interruptResultMsg:
+			next, _ = model.Update(result)
+			updated, ok = next.(Model)
+			if !ok {
+				t.Fatalf("unexpected model type %T", next)
+			}
+			*model = updated
+		}
 	}
-	result := cmd()
-	if _, ok := result.(runtimeResultMsg); !ok {
-		return
+	drainRuntimeEvents(t, model)
+}
+
+func drainRuntimeEvents(t *testing.T, model *Model) {
+	t.Helper()
+	for {
+		events, ok := model.runtimeEvents.popNow()
+		if !ok {
+			return
+		}
+		next, _ := model.Update(runtimeEventsMsg{events: events})
+		updated, ok := next.(Model)
+		if !ok {
+			t.Fatalf("unexpected model type %T", next)
+		}
+		*model = updated
 	}
-	next, _ = model.Update(result)
-	updated, ok = next.(Model)
-	if !ok {
-		t.Fatalf("unexpected model type %T", next)
-	}
-	*model = updated
 }
 
 func hasTUIEvent(events []protocol.Event, eventType protocol.EventType) bool {

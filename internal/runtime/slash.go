@@ -16,9 +16,17 @@ import (
 )
 
 type slashResult struct {
-	events    []protocol.Event
-	persisted []protocol.Event
-	err       error
+	events       []protocol.Event
+	persisted    []protocol.Event
+	statusEvents []protocol.Event
+	err          error
+}
+
+func (r slashResult) lifecycleStatusEvents() []protocol.Event {
+	if r.statusEvents != nil {
+		return r.statusEvents
+	}
+	return r.events
 }
 
 func (m *Manager) handleSlash(ctx context.Context, turn *activeTurn, sessionID string, input string) slashResult {
@@ -49,11 +57,11 @@ func (m *Manager) handleSlash(ctx context.Context, turn *activeTurn, sessionID s
 			}
 			return result
 		}
-		events, persisted := m.resumeSession(ctx, turn, sessionID, arg)
+		events, persisted, statusEvents := m.resumeSession(ctx, turn, sessionID, arg)
 		events = append([]protocol.Event{userEvent}, events...)
 		persisted = append([]protocol.Event{userEvent}, persisted...)
-		result := slashResult{events: events, persisted: persisted}
-		if hasErrorEvent(events) {
+		result := slashResult{events: events, persisted: persisted, statusEvents: statusEvents}
+		if hasErrorEvent(statusEvents) {
 			result.err = fmt.Errorf("resume session failed")
 		}
 		return result
@@ -185,22 +193,22 @@ func (m *Manager) newSession(ctx context.Context, turn *activeTurn, currentSessi
 	return events
 }
 
-func (m *Manager) resumeSession(ctx context.Context, turn *activeTurn, currentSessionID string, sessionID string) ([]protocol.Event, []protocol.Event) {
+func (m *Manager) resumeSession(ctx context.Context, turn *activeTurn, currentSessionID string, sessionID string) ([]protocol.Event, []protocol.Event, []protocol.Event) {
 	sessionID = strings.TrimSpace(sessionID)
 	if m.deps.Sessions == nil {
 		events := []protocol.Event{protocol.NewEvent(protocol.EventError, currentSessionID, "session storage is not configured", nil)}
-		return events, events
+		return events, events, events
 	}
 	var resumeAuthorization *protocol.AuthorizationContext
 	if m.deps.Capabilities.IsPermissioned() && m.deps.AuthorizationContextProvider == nil {
 		events := []protocol.Event{protocol.NewEvent(protocol.EventError, currentSessionID, permissionedResumeErrorMessage, nil)}
-		return events, events
+		return events, events, events
 	}
 	if m.deps.AuthorizationContextProvider != nil {
 		authorization, err := m.authorizeSessionResume(ctx, sessionID)
 		if err != nil {
 			events := []protocol.Event{protocol.NewEvent(protocol.EventError, currentSessionID, permissionedResumeErrorMessage, nil)}
-			return events, events
+			return events, events, events
 		}
 		resumeAuthorization = &authorization
 	}
@@ -208,17 +216,17 @@ func (m *Manager) resumeSession(ctx context.Context, turn *activeTurn, currentSe
 	if err != nil {
 		if resumeAuthorization != nil {
 			events := []protocol.Event{protocol.NewEvent(protocol.EventError, currentSessionID, permissionedResumeErrorMessage, nil)}
-			return events, events
+			return events, events, events
 		}
 		events := []protocol.Event{protocol.NewEvent(protocol.EventError, currentSessionID, "resume failed: "+err.Error(), nil)}
-		return events, events
+		return events, events, events
 	}
 	authorization := protocol.AuthorizationContext{}
 	if resumeAuthorization != nil {
 		authorization = *resumeAuthorization
 	}
 	loaded = m.filterPersistedEvents(ctx, authorization, loaded)
-	loaded = withoutTaskLifecycleID(loaded, turn.id)
+	loaded = withoutCurrentTaskStart(loaded, turn.lifecycleStart)
 	info := m.newEinoSession(ctx, sessionID)
 	var binding *authorizationBinding
 	if resumeAuthorization == nil {
@@ -229,36 +237,55 @@ func (m *Manager) resumeSession(ctx context.Context, turn *activeTurn, currentSe
 	}
 	if !m.rotateSession(turn, info, binding) {
 		events := []protocol.Event{protocol.NewEvent(protocol.EventError, currentSessionID, "resume cancelled", nil)}
-		return events, events
+		return events, events, events
 	}
 	infoEvent := protocol.NewEvent(protocol.EventSessionInfo, sessionID, "session resumed", info)
 	events := make([]protocol.Event, 0, len(loaded)+2)
 	events = append(events, protocol.NewEvent(protocol.EventViewClear, sessionID, "resume session", nil))
 	events = append(events, loaded...)
 	events = append(events, infoEvent)
-	return events, []protocol.Event{infoEvent}
+	return events, []protocol.Event{infoEvent}, []protocol.Event{infoEvent}
 }
 
-func withoutTaskLifecycleID(events []protocol.Event, taskID string) []protocol.Event {
-	taskID = strings.TrimSpace(taskID)
-	if taskID == "" {
+func withoutCurrentTaskStart(events []protocol.Event, current protocol.Event) []protocol.Event {
+	if current.Type != protocol.EventTaskStarted || current.CreatedAt.IsZero() {
 		return events
 	}
-	filtered := make([]protocol.Event, 0, len(events))
-	for _, event := range events {
-		switch event.Type {
-		case protocol.EventTaskStarted, protocol.EventTaskProgress, protocol.EventTaskComplete:
-			data, err := json.Marshal(event.Payload)
-			if err == nil {
-				var task protocol.Task
-				if json.Unmarshal(data, &task) == nil && task.ID == taskID {
-					continue
-				}
-			}
-		}
-		filtered = append(filtered, event)
+	currentTask, ok := taskFromLifecycleEvent(current)
+	if !ok {
+		return events
 	}
+	remove := -1
+	for index := len(events) - 1; index >= 0; index-- {
+		event := events[index]
+		if event.Type != protocol.EventTaskStarted || event.SessionID != current.SessionID || !event.CreatedAt.Equal(current.CreatedAt) {
+			continue
+		}
+		task, ok := taskFromLifecycleEvent(event)
+		if ok && task.ID == currentTask.ID && task.CreatedAt.Equal(currentTask.CreatedAt) {
+			remove = index
+			break
+		}
+	}
+	if remove < 0 {
+		return events
+	}
+	filtered := make([]protocol.Event, 0, len(events)-1)
+	filtered = append(filtered, events[:remove]...)
+	filtered = append(filtered, events[remove+1:]...)
 	return filtered
+}
+
+func taskFromLifecycleEvent(event protocol.Event) (protocol.Task, bool) {
+	data, err := json.Marshal(event.Payload)
+	if err != nil {
+		return protocol.Task{}, false
+	}
+	var task protocol.Task
+	if json.Unmarshal(data, &task) != nil {
+		return protocol.Task{}, false
+	}
+	return task, true
 }
 
 func (m *Manager) sessionList(ctx context.Context, sessionID string) []protocol.Event {

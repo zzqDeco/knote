@@ -108,6 +108,282 @@ func TestTurnControllerStopsOnlyMatchingTask(t *testing.T) {
 	}
 }
 
+func TestInterruptRevalidatesReplacementTurnUnderCommitSerialization(t *testing.T) {
+	manager := newTurnTestManager(t, newControlledTurnRunner(), time.Second)
+	if _, err := manager.Start(context.Background(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	oldCtx, cancelOldContext := context.WithCancel(context.Background())
+	defer cancelOldContext()
+	oldCancelled := make(chan struct{})
+	var oldCancelOnce sync.Once
+	oldTurn := &activeTurn{
+		id:     "task_old",
+		ctx:    oldCtx,
+		cancel: func() { oldCancelOnce.Do(func() { close(oldCancelled) }); cancelOldContext() },
+		done:   make(chan struct{}),
+	}
+	replacementCtx, cancelReplacementContext := context.WithCancel(context.Background())
+	defer cancelReplacementContext()
+	replacementTurn := &activeTurn{
+		id:     "task_replacement",
+		ctx:    replacementCtx,
+		cancel: cancelReplacementContext,
+		done:   make(chan struct{}),
+	}
+	manager.mu.Lock()
+	manager.activeTurn = oldTurn
+	manager.mu.Unlock()
+
+	manager.commitMu.Lock()
+	type result struct {
+		events []protocol.Event
+		err    error
+	}
+	invoked := make(chan struct{})
+	completed := make(chan result, 1)
+	go func() {
+		close(invoked)
+		events, err := manager.Interrupt(context.Background())
+		completed <- result{events: events, err: err}
+	}()
+	<-invoked
+	staleCancelled := false
+	select {
+	case <-oldCancelled:
+		staleCancelled = true
+	case <-time.After(25 * time.Millisecond):
+	}
+	manager.mu.Lock()
+	manager.activeTurn = replacementTurn
+	manager.mu.Unlock()
+	manager.commitMu.Unlock()
+
+	var got result
+	select {
+	case got = <-completed:
+	case <-time.After(time.Second):
+		t.Fatal("interrupt did not complete after commit serialization was released")
+	}
+	if staleCancelled {
+		t.Fatal("interrupt cancelled the stale turn before commit revalidation")
+	}
+	if got.err != nil || len(got.events) != 1 {
+		t.Fatalf("interrupt replacement = events:%+v err:%v", got.events, got.err)
+	}
+	payload, ok := got.events[0].Payload.(map[string]string)
+	if !ok || payload["task_id"] != replacementTurn.id {
+		t.Fatalf("interrupt targeted stale task: %+v", got.events)
+	}
+	select {
+	case <-replacementCtx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("interrupt did not cancel the replacement turn")
+	}
+}
+
+func TestStopTaskRevalidatesReplacementTurnUnderCommitSerialization(t *testing.T) {
+	manager := newTurnTestManager(t, newControlledTurnRunner(), time.Second)
+	if _, err := manager.Start(context.Background(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	oldCtx, cancelOldContext := context.WithCancel(context.Background())
+	defer cancelOldContext()
+	oldCancelled := make(chan struct{})
+	var oldCancelOnce sync.Once
+	oldTurn := &activeTurn{
+		id:     "task_old",
+		ctx:    oldCtx,
+		cancel: func() { oldCancelOnce.Do(func() { close(oldCancelled) }); cancelOldContext() },
+		done:   make(chan struct{}),
+	}
+	replacementCtx, cancelReplacementContext := context.WithCancel(context.Background())
+	defer cancelReplacementContext()
+	replacementTurn := &activeTurn{
+		id:     "task_replacement",
+		ctx:    replacementCtx,
+		cancel: cancelReplacementContext,
+		done:   make(chan struct{}),
+	}
+	manager.mu.Lock()
+	manager.activeTurn = oldTurn
+	manager.mu.Unlock()
+
+	manager.commitMu.Lock()
+	type result struct {
+		events []protocol.Event
+		err    error
+	}
+	invoked := make(chan struct{})
+	completed := make(chan result, 1)
+	go func() {
+		close(invoked)
+		events, err := manager.StopTask(context.Background(), oldTurn.id)
+		completed <- result{events: events, err: err}
+	}()
+	<-invoked
+	staleCancelled := false
+	select {
+	case <-oldCancelled:
+		staleCancelled = true
+	case <-time.After(25 * time.Millisecond):
+	}
+	manager.mu.Lock()
+	manager.activeTurn = replacementTurn
+	manager.mu.Unlock()
+	manager.commitMu.Unlock()
+
+	var got result
+	select {
+	case got = <-completed:
+	case <-time.After(time.Second):
+		t.Fatal("stop did not complete after commit serialization was released")
+	}
+	if staleCancelled {
+		t.Fatal("stop cancelled the stale turn before commit revalidation")
+	}
+	if !errors.Is(got.err, ErrTaskNotFound) || len(got.events) != 0 {
+		t.Fatalf("stale stop = events:%+v err:%v, want ErrTaskNotFound", got.events, got.err)
+	}
+	select {
+	case <-replacementCtx.Done():
+		t.Fatal("stale stop cancelled the replacement turn")
+	default:
+	}
+}
+
+func TestAcceptedResultAndTerminalCommitBeforeConcurrentInterrupt(t *testing.T) {
+	store := &blockingResultSessions{
+		Sessions:  local.New(t.TempDir()),
+		blocked:   make(chan struct{}),
+		release:   make(chan struct{}),
+		blockType: protocol.EventAssistantDone,
+	}
+	manager := New(Dependencies{
+		Sessions:     store,
+		EinoRunner:   immediateTurnRunner{},
+		TurnTimeout:  time.Second,
+		NewSessionID: func() string { return "sess_atomic_finish" },
+	})
+	if _, err := manager.Start(context.Background(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	type result struct {
+		events []protocol.Event
+		err    error
+	}
+	sendDone := make(chan result, 1)
+	go func() {
+		events, err := manager.SendMessage(context.Background(), "finish atomically")
+		sendDone <- result{events: events, err: err}
+	}()
+	select {
+	case <-store.blocked:
+	case <-time.After(time.Second):
+		t.Fatal("result persistence did not reach the blocking commit point")
+	}
+
+	interruptDone := make(chan result, 1)
+	go func() {
+		events, err := manager.Interrupt(context.Background())
+		interruptDone <- result{events: events, err: err}
+	}()
+	select {
+	case got := <-interruptDone:
+		t.Fatalf("interrupt crossed the result commit point early: %+v", got)
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(store.release)
+
+	var sent result
+	select {
+	case sent = <-sendDone:
+	case <-time.After(time.Second):
+		t.Fatal("send did not finish after persistence was released")
+	}
+	if sent.err != nil {
+		t.Fatalf("send error: %v", sent.err)
+	}
+	if !hasMessage(sent.events, protocol.EventAssistantDone, "accepted answer") {
+		t.Fatalf("accepted result missing: %+v", sent.events)
+	}
+	assertTaskStatus(t, sent.events, "Message", protocol.TaskCompleted)
+
+	select {
+	case interrupted := <-interruptDone:
+		if interrupted.err != nil || !hasMessage(interrupted.events, protocol.EventStatusUpdate, "no active task") {
+			t.Fatalf("post-commit interrupt = events:%+v err:%v", interrupted.events, interrupted.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("interrupt did not complete after the atomic finish")
+	}
+}
+
+func TestTaskStartCommitsBeforeConcurrentInterrupt(t *testing.T) {
+	store := &blockingResultSessions{
+		Sessions:  local.New(t.TempDir()),
+		blocked:   make(chan struct{}),
+		release:   make(chan struct{}),
+		blockType: protocol.EventTaskStarted,
+	}
+	manager := New(Dependencies{
+		Sessions:     store,
+		EinoRunner:   newControlledTurnRunner(),
+		TurnTimeout:  time.Second,
+		NewSessionID: func() string { return "sess_atomic_start" },
+	})
+	if _, err := manager.Start(context.Background(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	type result struct {
+		events []protocol.Event
+		err    error
+	}
+	sendDone := make(chan result, 1)
+	go func() {
+		events, err := manager.SendMessage(context.Background(), "interrupt start")
+		sendDone <- result{events: events, err: err}
+	}()
+	select {
+	case <-store.blocked:
+	case <-time.After(time.Second):
+		t.Fatal("task.started persistence did not reach the blocking commit point")
+	}
+	interruptDone := make(chan result, 1)
+	go func() {
+		events, err := manager.Interrupt(context.Background())
+		interruptDone <- result{events: events, err: err}
+	}()
+	select {
+	case got := <-interruptDone:
+		t.Fatalf("interrupt crossed task.started commit early: %+v", got)
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(store.release)
+
+	select {
+	case interrupted := <-interruptDone:
+		if interrupted.err != nil || len(interruptTaskIDsForTest(interrupted.events)) != 1 {
+			t.Fatalf("interrupt result = events:%+v err:%v", interrupted.events, interrupted.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("interrupt did not complete after task.started committed")
+	}
+	select {
+	case sent := <-sendDone:
+		if !errors.Is(sent.err, context.Canceled) {
+			t.Fatalf("send error = %v, want context.Canceled", sent.err)
+		}
+		assertSingleTaskLifecycle(t, sent.events, protocol.TaskKilled)
+	case <-time.After(time.Second):
+		t.Fatal("interrupted send did not finish")
+	}
+}
+
 func TestTurnControllerAppliesConfiguredDeadline(t *testing.T) {
 	runner := newControlledTurnRunner()
 	manager := newTurnTestManager(t, runner, 25*time.Millisecond)
@@ -545,6 +821,94 @@ func TestResumeCurrentSessionDoesNotReplayActiveTaskStart(t *testing.T) {
 	}
 }
 
+func TestResumePreservesHistoricalLifecycleWhenTaskIDCollides(t *testing.T) {
+	store := local.New(t.TempDir())
+	manager := New(Dependencies{
+		Sessions:     store,
+		EinoRunner:   newControlledTurnRunner(),
+		TurnTimeout:  time.Second,
+		NewSessionID: func() string { return "sess_resume_collision" },
+	})
+	if _, err := manager.Start(context.Background(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	sessionID := manager.SessionID()
+	historicalTime := time.Now().UTC().Add(-time.Hour)
+	historicalTask := protocol.Task{
+		ID:        "task_000001",
+		Title:     "Historical task",
+		Status:    protocol.TaskRunning,
+		CreatedAt: historicalTime,
+		UpdatedAt: historicalTime,
+	}
+	historical := []protocol.Event{
+		protocol.NewEvent(protocol.EventTaskStarted, sessionID, "Historical task started", historicalTask),
+		protocol.NewEvent(protocol.EventTaskProgress, sessionID, "Historical task progressed", historicalTask),
+		protocol.NewEvent(protocol.EventTaskComplete, sessionID, "Historical task completed", protocol.Task{
+			ID:        historicalTask.ID,
+			Title:     historicalTask.Title,
+			Status:    protocol.TaskCompleted,
+			CreatedAt: historicalTime,
+			UpdatedAt: historicalTime.Add(time.Minute),
+		}),
+	}
+	for _, event := range historical {
+		if err := store.Append(context.Background(), event); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	events, err := manager.SendMessage(context.Background(), "/resume "+sessionID)
+	if err != nil {
+		t.Fatalf("resume current session: %v", err)
+	}
+	for _, eventType := range []protocol.EventType{
+		protocol.EventTaskStarted,
+		protocol.EventTaskProgress,
+		protocol.EventTaskComplete,
+	} {
+		if got := countTaskTitle(events, eventType, historicalTask.Title); got != 1 {
+			t.Fatalf("historical %s count = %d, want 1: %+v", eventType, got, events)
+		}
+	}
+	if got := countTaskTitle(events, protocol.EventTaskStarted, "/resume"); got != 1 {
+		t.Fatalf("current resume start count = %d, want 1: %+v", got, events)
+	}
+	assertTaskStatus(t, events, "/resume", protocol.TaskCompleted)
+}
+
+func TestResumeReplayErrorsDoNotFailCurrentTask(t *testing.T) {
+	store := local.New(t.TempDir())
+	manager := New(Dependencies{
+		Sessions:     store,
+		EinoRunner:   newControlledTurnRunner(),
+		TurnTimeout:  time.Second,
+		NewSessionID: func() string { return "sess_resume_errors" },
+	})
+	if _, err := manager.Start(context.Background(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	sessionID := manager.SessionID()
+	for _, event := range []protocol.Event{
+		protocol.NewEvent(protocol.EventError, sessionID, "historical runtime error", nil),
+		protocol.NewEvent(protocol.EventToolError, sessionID, "historical tool error", map[string]string{"tool": "knote_diff"}),
+	} {
+		if err := store.Append(context.Background(), event); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	events, err := manager.SendMessage(context.Background(), "/resume "+sessionID)
+	if err != nil {
+		t.Fatalf("resume current session: %v", err)
+	}
+	if !hasMessage(events, protocol.EventError, "historical runtime error") ||
+		!hasMessage(events, protocol.EventToolError, "historical tool error") {
+		t.Fatalf("historical errors were not replayed: %+v", events)
+	}
+	assertTaskStatus(t, events, "/resume", protocol.TaskCompleted)
+}
+
 func TestStartDoesNotHoldStateMutexAcrossDependencyIO(t *testing.T) {
 	store := local.New(t.TempDir())
 	if err := store.Append(context.Background(), protocol.NewEvent(protocol.EventAssistantDone, "sess_resume", "stored", nil)); err != nil {
@@ -587,6 +951,18 @@ func TestStartDoesNotHoldStateMutexAcrossDependencyIO(t *testing.T) {
 type controlledTurnRunner struct {
 	started chan struct{}
 	calls   atomic.Int32
+}
+
+type immediateTurnRunner struct{}
+
+func (immediateTurnRunner) Ready(context.Context) error { return nil }
+
+func (immediateTurnRunner) ToolInventory(context.Context) ([]RunnerToolInfo, error) {
+	return nil, nil
+}
+
+func (immediateTurnRunner) Run(_ context.Context, input EinoRunInput) ([]protocol.Event, error) {
+	return []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, input.SessionID, "accepted answer", nil)}, nil
 }
 
 type lateEventTurnRunner struct{ started chan struct{} }
@@ -736,6 +1112,40 @@ func hasTaskTitle(events []protocol.Event, eventType protocol.EventType, title s
 	return false
 }
 
+func countTaskTitle(events []protocol.Event, eventType protocol.EventType, title string) int {
+	count := 0
+	for _, event := range events {
+		if hasTaskTitle([]protocol.Event{event}, eventType, title) {
+			count++
+		}
+	}
+	return count
+}
+
+func assertTaskStatus(t *testing.T, events []protocol.Event, title string, want protocol.TaskStatus) {
+	t.Helper()
+	for _, event := range events {
+		if event.Type != protocol.EventTaskComplete {
+			continue
+		}
+		data, err := json.Marshal(event.Payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var task protocol.Task
+		if err := json.Unmarshal(data, &task); err != nil {
+			t.Fatal(err)
+		}
+		if task.Title == title {
+			if task.Status != want {
+				t.Fatalf("task %q status = %s, want %s", title, task.Status, want)
+			}
+			return
+		}
+	}
+	t.Fatalf("task %q terminal missing from %+v", title, events)
+}
+
 func eventIndex(events []protocol.Event, eventType protocol.EventType, title string) int {
 	for i, event := range events {
 		if hasTaskTitle([]protocol.Event{event}, eventType, title) {
@@ -763,6 +1173,43 @@ func (*reentrantReadyRunner) Run(context.Context, EinoRunInput) ([]protocol.Even
 type reentrantSessions struct {
 	repository.Sessions
 	onLoad func()
+}
+
+type blockingResultSessions struct {
+	repository.Sessions
+	blocked   chan struct{}
+	release   chan struct{}
+	blockType protocol.EventType
+	once      sync.Once
+}
+
+func (s *blockingResultSessions) Append(ctx context.Context, event protocol.Event) error {
+	if event.Type == s.blockType {
+		s.once.Do(func() { close(s.blocked) })
+		select {
+		case <-s.release:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return s.Sessions.Append(ctx, event)
+}
+
+func interruptTaskIDsForTest(events []protocol.Event) []string {
+	var ids []string
+	for _, event := range events {
+		if event.Type != protocol.EventStatusUpdate {
+			continue
+		}
+		data, _ := json.Marshal(event.Payload)
+		var payload struct {
+			TaskID string `json:"task_id"`
+		}
+		if json.Unmarshal(data, &payload) == nil && payload.TaskID != "" {
+			ids = append(ids, payload.TaskID)
+		}
+	}
+	return ids
 }
 
 func (s *reentrantSessions) Load(ctx context.Context, sessionID string) ([]protocol.Event, error) {
