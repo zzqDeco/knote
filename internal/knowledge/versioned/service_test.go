@@ -862,6 +862,52 @@ func TestServiceKAGRuntimeDirChangeCreatesNewProjection(t *testing.T) {
 	}
 }
 
+func TestServiceProjectionUsesEffectiveConfigWithoutPersistingOverride(t *testing.T) {
+	ctx := context.Background()
+	baselineRepo := newMemoryRepo()
+	baselineRepo.config.KAG.Namespace = "EffectiveConfigTest"
+	baselineRepo.sources["sources/intro.md"] = "stable\n"
+	baseline, err := New(Options{
+		Workspace: baselineRepo.config.Workspace, Repo: baselineRepo,
+		Backend: &recordingNamespacedBackend{}, Mode: ModeFake,
+	}).Build(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	effectiveRepo := newMemoryRepo()
+	effectiveRepo.config.KAG.Namespace = "EffectiveConfigTest"
+	effectiveRepo.sources["sources/intro.md"] = "stable\n"
+	effective := effectiveRepo.config
+	effective.KAG.Fake = true
+	overlayService := New(Options{
+		Workspace: effectiveRepo.config.Workspace, Repo: effectiveRepo,
+		Backend: &recordingNamespacedBackend{}, Mode: ModeFake,
+		ConfigOverlay: func(cfg repository.Config) repository.Config {
+			cfg.KAG.Fake = effective.KAG.Fake
+			return cfg
+		},
+	})
+	withOverride, err := overlayService.Build(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if baseline.BundleManifest.ProjectionVersion == withOverride.BundleManifest.ProjectionVersion {
+		t.Fatalf("effective fake override reused persisted projection identity %q", baseline.BundleManifest.ProjectionVersion)
+	}
+	if effectiveRepo.config.KAG.Fake {
+		t.Fatal("effective build config mutated the repository config")
+	}
+	effectiveRepo.config.KAG.Namespace = "EffectiveConfigAfterCheckout"
+	afterCheckout, err := overlayService.Build(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterCheckout.Manifest.Workspace != "EffectiveConfigAfterCheckout" {
+		t.Fatalf("config overlay hid checked-out namespace: %+v", afterCheckout.Manifest)
+	}
+}
+
 func TestServiceBuildPassesProjectionWideIdempotencyKey(t *testing.T) {
 	ctx := context.Background()
 	repo := newMemoryRepo()

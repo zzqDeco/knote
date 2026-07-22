@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -60,7 +61,7 @@ func permissionedAuditRoot(workspace string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("resolve workspace for audit store: %w", err)
 	}
-	workspaceRoot, err = filepath.EvalSymlinks(workspaceRoot)
+	workspaceRoot, err = canonicalPathAllowMissing(workspaceRoot)
 	if err != nil {
 		return "", fmt.Errorf("resolve workspace for audit store: %w", err)
 	}
@@ -78,6 +79,31 @@ func permissionedAuditRoot(workspace string) (string, error) {
 		return "", fmt.Errorf("default audit store must be outside workspace %q", workspaceRoot)
 	}
 	return root, nil
+}
+
+func canonicalPathAllowMissing(path string) (string, error) {
+	current := filepath.Clean(path)
+	missing := make([]string, 0, 2)
+	for {
+		if _, err := os.Lstat(current); err == nil {
+			resolved, err := filepath.EvalSymlinks(current)
+			if err != nil {
+				return "", err
+			}
+			for i := len(missing) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, missing[i])
+			}
+			return filepath.Clean(resolved), nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return "", fmt.Errorf("no existing ancestor for %q", path)
+		}
+		missing = append(missing, filepath.Base(current))
+		current = parent
+	}
 }
 
 func pathWithinDirectory(directory, path string) (bool, error) {

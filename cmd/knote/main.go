@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"github.com/zzqDeco/knote/internal/knowledge/kag"
 	"github.com/zzqDeco/knote/internal/knowledge/versioned"
 	"github.com/zzqDeco/knote/internal/protocol"
+	"github.com/zzqDeco/knote/internal/repository"
 	"github.com/zzqDeco/knote/internal/repository/local"
 	"github.com/zzqDeco/knote/internal/runtime"
 	runtimeeino "github.com/zzqDeco/knote/internal/runtime/eino"
@@ -62,29 +64,17 @@ func newRuntime(ctx context.Context, workspacePath string, resumeID string) (run
 	if err != nil {
 		return nil, nil, err
 	}
-	if err := validateRuntimeMode(); err != nil {
-		return nil, nil, err
-	}
 	repo := local.New(workspace)
-	repoCfg, err := repo.Config(ctx)
+	startupConfig, err := loadStartupConfiguration(ctx, workspace, repo)
 	if err != nil {
 		return nil, nil, err
 	}
-	if os.Getenv("KNOTE_KAG_FAKE") == "1" {
-		repoCfg.KAG.Fake = true
-	}
-	repoCfg.Workspace = workspace
-	if err := repo.SaveConfig(ctx, repoCfg); err != nil {
-		return nil, nil, err
-	}
+	repoCfg := startupConfig.Effective
 	knowledgeMode := versioned.ModeReal
 	if repoCfg.KAG.Fake {
 		knowledgeMode = versioned.ModeFake
 	}
-	permissionedConfig, err := loadPermissionedRuntimeConfig(repoCfg.KAG.Fake)
-	if err != nil {
-		return nil, nil, err
-	}
+	permissionedConfig := startupConfig.Permissioned
 	if permissionedConfig.Enabled {
 		permissionedConfig.residency, err = newPermissionedResidencyBoundary()
 		if err != nil {
@@ -110,7 +100,10 @@ func newRuntime(ctx context.Context, workspacePath string, resumeID string) (run
 	if permissionedConfig.residency != nil {
 		kagClient.ProcessingResidency = permissionedConfig.residency.AuthorizeKAGProcessing
 	}
-	knowledgeService := versioned.New(versioned.Options{Workspace: workspace, Repo: repo, Versions: repo, Backend: kagClient, Mode: knowledgeMode})
+	knowledgeService := versioned.New(versioned.Options{
+		Workspace: workspace, Repo: repo, Versions: repo, Backend: kagClient, Mode: knowledgeMode,
+		ConfigOverlay: startupConfig.ConfigOverlay,
+	})
 	permissionedApplication, err := newPermissionedApplication(ctx, permissionedConfig, kagClient, repo)
 	if err != nil {
 		return nil, nil, err
@@ -196,6 +189,9 @@ func newRuntime(ctx context.Context, workspacePath string, resumeID string) (run
 	if err != nil {
 		return nil, nil, err
 	}
+	if err := repo.EnsureConfig(ctx, startupConfig.Persisted); err != nil {
+		return nil, nil, err
+	}
 	capabilities := runtime.DefaultSessionCapabilityProfile()
 	if permissionedConfig.Enabled {
 		capabilities = runtime.PermissionedSessionCapabilityProfile()
@@ -219,6 +215,47 @@ func newRuntime(ctx context.Context, workspacePath string, resumeID string) (run
 	})
 	events, err := rt.Start(ctx, runtime.StartOptions{ResumeID: resumeID})
 	return rt, events, err
+}
+
+type startupConfiguration struct {
+	Persisted     repository.Config
+	Effective     repository.Config
+	Permissioned  permissionedRuntimeConfig
+	ConfigOverlay func(repository.Config) repository.Config
+}
+
+func loadStartupConfiguration(ctx context.Context, workspace string, repo local.Store) (startupConfiguration, error) {
+	if err := validateRuntimeMode(); err != nil {
+		return startupConfiguration{}, err
+	}
+	persisted, err := repo.Config(ctx)
+	if err != nil {
+		return startupConfiguration{}, err
+	}
+	effective := persisted
+	effective.Models = maps.Clone(persisted.Models)
+	effective.Workspace = workspace
+	if os.Getenv("KNOTE_KAG_FAKE") == "1" {
+		effective.KAG.Fake = true
+	}
+	forceFake := os.Getenv("KNOTE_KAG_FAKE") == "1"
+	configOverlay := func(cfg repository.Config) repository.Config {
+		cfg.Workspace = workspace
+		if forceFake {
+			cfg.KAG.Fake = true
+		}
+		return cfg
+	}
+	permissioned, err := loadPermissionedRuntimeConfig(effective.KAG.Fake)
+	if err != nil {
+		return startupConfiguration{}, err
+	}
+	return startupConfiguration{
+		Persisted:     persisted,
+		Effective:     effective,
+		Permissioned:  permissioned,
+		ConfigOverlay: configOverlay,
+	}, nil
 }
 
 func validateRuntimeMode() error {

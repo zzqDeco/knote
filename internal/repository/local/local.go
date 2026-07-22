@@ -19,6 +19,7 @@ type Store struct {
 	workspace                  string
 	beforePointerWrite         func(protocol.ArtifactCurrentPointer) error
 	beforeCompatibilityPublish func() error
+	beforeConfigCommit         func() error
 }
 
 func New(workspace string) Store {
@@ -40,7 +41,16 @@ func (s Store) SaveConfig(ctx context.Context, cfg repository.Config) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return ensureConfig(s.workspace, cfg)
+	return saveConfig(ctx, s.workspace, cfg, s.beforeConfigCommit)
+}
+
+// EnsureConfig creates the workspace config when it is absent. Existing
+// configs are deliberately left byte-for-byte unchanged during startup.
+func (s Store) EnsureConfig(ctx context.Context, cfg repository.Config) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return ensureConfig(ctx, s.workspace, cfg, s.beforeConfigCommit)
 }
 
 func (s Store) ListSources(ctx context.Context) ([]repository.Source, error) {
