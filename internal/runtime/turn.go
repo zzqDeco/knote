@@ -34,6 +34,9 @@ type activeTurn struct {
 	done               chan struct{}
 	rotation           bool
 	rotationCommitted  bool
+	previousSession    protocol.SessionInfo
+	previousBinding    *authorizationBinding
+	previousGeneration uint64
 	notifying          bool
 	finished           bool
 	startCommitted     bool
@@ -260,6 +263,9 @@ func (m *Manager) completeTurn(turn *activeTurn, status protocol.TaskStatus, mes
 		return protocol.Event{}, false
 	}
 	turn.finished = true
+	if turn.rotationCommitted {
+		m.rollbackRotationLocked(turn)
+	}
 	terminalSessionID := turn.lifecycleSessionID
 	now := time.Now().UTC()
 	terminal := protocol.NewEvent(protocol.EventTaskComplete, terminalSessionID, message, protocol.Task{
@@ -277,7 +283,11 @@ func (m *Manager) completeTurn(turn *activeTurn, status protocol.TaskStatus, mes
 	if status == protocol.TaskKilled && m.deps.SideEffects != nil {
 		m.deps.SideEffects.ClearTurn(turn.lifecycleSessionID, turn.id)
 	}
-	if err := m.persist(context.WithoutCancel(turn.ctx), []protocol.Event{terminal}); err != nil {
+	persistCtx, persistCancel := m.turnTimeoutContext(context.WithoutCancel(turn.ctx))
+	persistErr := m.persist(persistCtx, []protocol.Event{terminal})
+	persistCancel()
+	if persistErr != nil {
+		m.releaseFinishedTurn(turn, false)
 		return terminal, false
 	}
 	m.commitMu.Lock()
@@ -310,12 +320,12 @@ func (m *Manager) rotateSession(turn *activeTurn, info protocol.SessionInfo, bin
 		m.commitMu.Unlock()
 		return false
 	}
-	oldSessionID := m.einoSession.ID
-	m.mu.Unlock()
-	if m.deps.SideEffects != nil {
-		m.deps.SideEffects.ClearSession(oldSessionID)
+	turn.previousSession = m.einoSession
+	turn.previousGeneration = m.generation
+	if m.authorizationBinding != nil {
+		previous := *m.authorizationBinding
+		turn.previousBinding = &previous
 	}
-	m.mu.Lock()
 	m.generation++
 	m.einoSession = info
 	m.authorizationBinding = binding
@@ -325,6 +335,41 @@ func (m *Manager) rotateSession(turn *activeTurn, info protocol.SessionInfo, bin
 	m.mu.Unlock()
 	m.commitMu.Unlock()
 	return true
+}
+
+func (m *Manager) rollbackRotationLocked(turn *activeTurn) {
+	if turn == nil || !turn.rotationCommitted {
+		return
+	}
+	if m.einoSession.ID == turn.targetSessionID && m.generation == turn.targetGeneration {
+		m.einoSession = turn.previousSession
+		m.authorizationBinding = turn.previousBinding
+		m.generation = turn.previousGeneration
+	}
+	turn.rotationCommitted = false
+	turn.targetSessionID = turn.previousSession.ID
+	turn.targetGeneration = turn.previousGeneration
+}
+
+func (m *Manager) releaseFinishedTurn(turn *activeTurn, rollbackRotation bool) {
+	if turn == nil {
+		return
+	}
+	m.commitMu.Lock()
+	m.mu.Lock()
+	if rollbackRotation {
+		m.rollbackRotationLocked(turn)
+	}
+	if m.activeTurn == turn {
+		m.activeTurn = nil
+	}
+	if turn.rotation {
+		m.rotating = false
+	}
+	close(turn.done)
+	m.mu.Unlock()
+	m.commitMu.Unlock()
+	turn.cancel()
 }
 
 func (m *Manager) finishTurn(turn *activeTurn, events []protocol.Event, operationErr error) ([]protocol.Event, error) {
@@ -337,11 +382,11 @@ func (m *Manager) finishTurnWithCommittedOutcome(
 	operationErr error,
 	committed bool,
 ) ([]protocol.Event, error) {
-	return m.finishTurnResultWithStatusEvents(turn, events, events, events, operationErr, committed, committed)
+	return m.finishTurnResultWithStatusEvents(turn, events, events, events, operationErr, committed, committed, nil)
 }
 
 func (m *Manager) finishTurnResult(turn *activeTurn, persisted, emitted []protocol.Event, operationErr error) ([]protocol.Event, error) {
-	return m.finishTurnResultWithStatusEvents(turn, persisted, emitted, emitted, operationErr, false, false)
+	return m.finishTurnResultWithStatusEvents(turn, persisted, emitted, emitted, operationErr, false, false, nil)
 }
 
 func (m *Manager) finishTurnResultWithStatusEvents(
@@ -352,6 +397,7 @@ func (m *Manager) finishTurnResultWithStatusEvents(
 	operationErr error,
 	committedOutcome bool,
 	failClosedOnPersistenceError bool,
+	recoverPersistenceFailure func(),
 ) ([]protocol.Event, error) {
 	if turn == nil {
 		return nil, operationErr
@@ -421,27 +467,24 @@ func (m *Manager) finishTurnResultWithStatusEvents(
 	toPersist = append(toPersist, terminal)
 	// Once a result is accepted, cancellation stops new work but cannot split the
 	// result from its terminal record. Keep the turn busy until both are durable.
-	persistCtx := context.WithoutCancel(turn.ctx)
+	persistCtx, persistCancel := m.turnTimeoutContext(context.WithoutCancel(turn.ctx))
 	persistErr := m.persist(persistCtx, toPersist)
+	persistCancel()
 	if persistErr != nil {
 		turn.cancel()
 		if returnErr == nil {
 			returnErr = fmt.Errorf("persist task result: %w", persistErr)
 		}
 		if !failClosedOnPersistenceError {
-			m.commitMu.Lock()
-			m.mu.Lock()
-			if m.activeTurn == turn {
-				m.activeTurn = nil
+			if recoverPersistenceFailure != nil {
+				recoverPersistenceFailure()
 			}
-			if turn.rotation {
-				m.rotating = false
-			}
-			close(turn.done)
-			m.mu.Unlock()
-			m.commitMu.Unlock()
+			m.releaseFinishedTurn(turn, true)
 		}
 		return nil, returnErr
+	}
+	if rotationCommitted && m.deps.SideEffects != nil {
+		m.deps.SideEffects.ClearSession(turn.previousSession.ID)
 	}
 	m.commitMu.Lock()
 	dispatch := false

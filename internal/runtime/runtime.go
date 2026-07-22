@@ -341,7 +341,7 @@ func (m *Manager) SendMessage(ctx context.Context, input string) ([]protocol.Eve
 	if strings.HasPrefix(input, "/") && (!m.deps.Capabilities.AllowsSlashCommand(command) || command == "new") {
 		result := m.handleSlash(runCtx, turn, einoSession.ID, input, preparedResume)
 		completed, returnErr := m.finishTurnResultWithStatusEvents(
-			turn, result.persisted, result.events, result.lifecycleStatusEvents(), result.err, false, false,
+			turn, result.persisted, result.events, result.lifecycleStatusEvents(), result.err, false, false, nil,
 		)
 		return append(startedEvents, completed...), returnErr
 	}
@@ -367,7 +367,7 @@ func (m *Manager) SendMessage(ctx context.Context, input string) ([]protocol.Eve
 	if strings.HasPrefix(input, "/") {
 		result := m.handleSlash(runCtx, turn, einoSession.ID, input, preparedResume)
 		completed, returnErr := m.finishTurnResultWithStatusEvents(
-			turn, result.persisted, result.events, result.lifecycleStatusEvents(), result.err, false, false,
+			turn, result.persisted, result.events, result.lifecycleStatusEvents(), result.err, false, false, nil,
 		)
 		return append(startedEvents, completed...), returnErr
 	}
@@ -491,9 +491,22 @@ func (m *Manager) Confirm(ctx context.Context, req protocol.ConfirmRequest, appr
 				return m.finishUnexecutedConfirmation(turn, startedEvents, einoSessionID, req, err)
 			}
 		}
-		events, executed := m.deps.SideEffects.confirmOutcome(confirmCtx, einoSessionID, req, approved)
-		completed, returnErr := m.finishTurnWithCommittedOutcome(turn, events, nil, executed)
-		return append(startedEvents, completed...), returnErr
+		outcome := m.deps.SideEffects.confirmOutcome(confirmCtx, einoSessionID, req, approved)
+		completed, returnErr := m.finishTurnResultWithStatusEvents(
+			turn,
+			outcome.events,
+			outcome.events,
+			outcome.events,
+			nil,
+			outcome.consumed,
+			outcome.executed,
+			outcome.restore,
+		)
+		result := append(startedEvents, completed...)
+		if returnErr != nil && outcome.consumed && !outcome.executed {
+			return result, fmt.Errorf("%w: %w", ErrConfirmationNotExecuted, returnErr)
+		}
+		return result, returnErr
 	}
 	events := []protocol.Event{protocol.NewEvent(protocol.EventError, einoSessionID, "confirm is not available without a side-effect bridge", nil)}
 	completed, returnErr := m.finishTurn(turn, events, fmt.Errorf("side-effect bridge is not configured"))
@@ -508,7 +521,7 @@ func (m *Manager) finishUnexecutedConfirmation(
 	operationErr error,
 ) ([]protocol.Event, error) {
 	events := m.confirmBeforeConsumptionError(sessionID, req, operationErr)
-	completed, finishErr := m.finishTurnResultWithStatusEvents(turn, events, events, events, operationErr, true, false)
+	completed, finishErr := m.finishTurnResultWithStatusEvents(turn, events, events, events, operationErr, true, false, nil)
 	result := append(startedEvents, completed...)
 	if finishErr != nil {
 		return result, finishErr

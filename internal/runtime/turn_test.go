@@ -581,7 +581,7 @@ func TestCommittedSideEffectRemainsBusyUntilOutcomeIsDurable(t *testing.T) {
 		Sessions:     store,
 		EinoRunner:   immediateTurnRunner{},
 		SideEffects:  bridge,
-		TurnTimeout:  25 * time.Millisecond,
+		TurnTimeout:  250 * time.Millisecond,
 		NewSessionID: func() string { return "sess_durable_side_effect" },
 	})
 	if _, err := manager.Start(context.Background(), StartOptions{}); err != nil {
@@ -949,6 +949,89 @@ func TestOrdinaryTurnPersistenceErrorReleasesController(t *testing.T) {
 	}
 }
 
+func TestResultPersistenceUsesBoundedFinalizationContext(t *testing.T) {
+	store := &blockingResultSessions{
+		Sessions:  local.New(t.TempDir()),
+		blocked:   make(chan struct{}),
+		release:   make(chan struct{}),
+		blockType: protocol.EventAssistantDone,
+	}
+	manager := New(Dependencies{
+		Sessions:     store,
+		EinoRunner:   immediateTurnRunner{},
+		TurnTimeout:  25 * time.Millisecond,
+		NewSessionID: func() string { return "sess_bounded_result" },
+	})
+	if _, err := manager.Start(context.Background(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	type result struct {
+		events []protocol.Event
+		err    error
+	}
+	done := make(chan result, 1)
+	go func() {
+		events, err := manager.SendMessage(context.Background(), "blocked result persistence")
+		done <- result{events: events, err: err}
+	}()
+	select {
+	case <-store.blocked:
+	case <-time.After(time.Second):
+		t.Fatal("result did not reach persistence")
+	}
+	select {
+	case got := <-done:
+		if !errors.Is(got.err, context.DeadlineExceeded) || len(got.events) != 1 {
+			t.Fatalf("bounded persistence = events:%+v err:%v", got.events, got.err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		close(store.release)
+		t.Fatal("result persistence exceeded the configured finalization bound")
+	}
+	close(store.release)
+	if _, err := manager.SendMessage(context.Background(), "accepted after bounded failure"); err != nil {
+		t.Fatalf("turn after bounded persistence failure: %v", err)
+	}
+}
+
+func TestRejectedConfirmationRestoresAfterPersistenceFailure(t *testing.T) {
+	writeErr := errors.New("rejection persistence unavailable")
+	store := &failOnceEventSessions{Sessions: local.New(t.TempDir())}
+	bridge := NewSideEffectBridge()
+	manager := New(Dependencies{
+		Sessions:     store,
+		EinoRunner:   immediateTurnRunner{},
+		SideEffects:  bridge,
+		TurnTimeout:  time.Second,
+		NewSessionID: func() string { return "sess_rejected_confirmation" },
+	})
+	if _, err := manager.Start(context.Background(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	sessionID := manager.SessionID()
+	if err := bridge.Request(withSideEffectSession(context.Background(), sessionID), SideEffectRequest{
+		ToolName: "knote_build",
+		Action:   "build",
+		Execute: func(context.Context, SideEffectRequest) ([]protocol.Event, error) {
+			return nil, fmt.Errorf("rejected side effect must not execute")
+		},
+	}); !errors.Is(err, ErrSideEffectPending) {
+		t.Fatalf("seed side effect: %v", err)
+	}
+	confirm := firstConfirm(t, bridge.PendingEvents(sessionID))
+	store.failType = protocol.EventAssistantDone
+	store.err = writeErr
+
+	events, err := manager.Confirm(context.Background(), confirm, false)
+	if !errors.Is(err, ErrConfirmationNotExecuted) || !errors.Is(err, writeErr) || len(events) != 1 {
+		t.Fatalf("failed rejection = events:%+v err:%v", events, err)
+	}
+	events, err = manager.Confirm(context.Background(), confirm, false)
+	if err != nil || !hasMessage(events, protocol.EventAssistantDone, "Cancelled: build") {
+		t.Fatalf("retried rejection = events:%+v err:%v", events, err)
+	}
+}
+
 func TestSessionRotationDrainUsesConfiguredDeadline(t *testing.T) {
 	runner := &stubbornTurnRunner{started: make(chan struct{}), release: make(chan struct{})}
 	manager := newTurnTestManager(t, runner, 25*time.Millisecond)
@@ -1079,6 +1162,7 @@ func TestResumePreparationUsesConfiguredTurnTimeout(t *testing.T) {
 	if rotating || reservation != 0 {
 		t.Fatalf("timed-out preparation retained rotation state: rotating=%t reservation=%d", rotating, reservation)
 	}
+	manager.deps.TurnTimeout = time.Second
 	if _, err := manager.SendMessage(context.Background(), "accepted after resume timeout"); err != nil {
 		t.Fatalf("turn after resume timeout: %v", err)
 	}
@@ -1450,6 +1534,55 @@ func TestSessionRotationPublishesTransitionAfterItsCommitPoint(t *testing.T) {
 	assertSingleTaskLifecycle(t, events, protocol.TaskCompleted)
 }
 
+func TestSessionRotationPersistenceFailureRestoresOldSessionAndConfirmation(t *testing.T) {
+	store := &failOnceEventSessions{Sessions: local.New(t.TempDir())}
+	bridge := NewSideEffectBridge()
+	ids := []string{"sess_rotation_old", "sess_rotation_new"}
+	var idMu sync.Mutex
+	manager := New(Dependencies{
+		Sessions:    store,
+		EinoRunner:  immediateTurnRunner{},
+		SideEffects: bridge,
+		TurnTimeout: time.Second,
+		NewSessionID: func() string {
+			idMu.Lock()
+			defer idMu.Unlock()
+			id := ids[0]
+			ids = ids[1:]
+			return id
+		},
+	})
+	if _, err := manager.Start(context.Background(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	oldSessionID := manager.SessionID()
+	if err := bridge.Request(withSideEffectSession(context.Background(), oldSessionID), SideEffectRequest{
+		ToolName: "knote_build",
+		Action:   "build",
+		Execute: func(context.Context, SideEffectRequest) ([]protocol.Event, error) {
+			return nil, nil
+		},
+	}); !errors.Is(err, ErrSideEffectPending) {
+		t.Fatalf("seed side effect: %v", err)
+	}
+	confirm := firstConfirm(t, bridge.PendingEvents(oldSessionID))
+	writeErr := errors.New("rotation transition unavailable")
+	store.failType = protocol.EventSessionInfo
+	store.err = writeErr
+
+	events, err := manager.SendMessage(context.Background(), "/new")
+	if !errors.Is(err, writeErr) || len(events) != 1 {
+		t.Fatalf("failed rotation = events:%+v err:%v", events, err)
+	}
+	if got := manager.SessionID(); got != oldSessionID {
+		t.Fatalf("failed rotation left session %q, want %q", got, oldSessionID)
+	}
+	events, err = manager.Confirm(context.Background(), confirm, false)
+	if err != nil || !hasMessage(events, protocol.EventAssistantDone, "Cancelled: build") {
+		t.Fatalf("old confirmation after rollback = events:%+v err:%v", events, err)
+	}
+}
+
 func TestSubscriberCanRotateSessionFromTaskStartedWithoutDeadlock(t *testing.T) {
 	runner := newControlledTurnRunner()
 	ids := []string{"sess_old", "sess_new"}
@@ -1527,6 +1660,64 @@ func TestSubscriberCanRotateSessionFromTaskStartedWithoutDeadlock(t *testing.T) 
 	rotationIndex := eventIndex(observed, protocol.EventTaskStarted, "/new")
 	if startedIndex < 0 || terminalIndex <= startedIndex || rotationIndex <= terminalIndex {
 		t.Fatalf("subscriber lifecycle order is invalid: %+v", observed)
+	}
+}
+
+func TestSubscriberRotationReleasesTurnWhenReentrantTerminalPersistenceFails(t *testing.T) {
+	store := &failOnceEventSessions{
+		Sessions: local.New(t.TempDir()),
+		failType: protocol.EventTaskComplete,
+		err:      errors.New("terminal persistence unavailable"),
+	}
+	ids := []string{"sess_reentrant_old", "sess_reentrant_new"}
+	var idMu sync.Mutex
+	manager := New(Dependencies{
+		Sessions:    store,
+		EinoRunner:  newControlledTurnRunner(),
+		TurnTimeout: time.Second,
+		NewSessionID: func() string {
+			idMu.Lock()
+			defer idMu.Unlock()
+			id := ids[0]
+			ids = ids[1:]
+			return id
+		},
+	})
+	if _, err := manager.Start(context.Background(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	var once atomic.Bool
+	nested := make(chan error, 1)
+	unsubscribe := manager.Subscribe(func(events []protocol.Event) {
+		if hasTaskTitle(events, protocol.EventTaskStarted, "Message") && once.CompareAndSwap(false, true) {
+			_, err := manager.SendMessage(context.Background(), "/new")
+			nested <- err
+		}
+	})
+	defer unsubscribe()
+	outer := make(chan error, 1)
+	go func() {
+		_, err := manager.SendMessage(context.Background(), "rotate after failed terminal")
+		outer <- err
+	}()
+	select {
+	case err := <-nested:
+		if err != nil {
+			t.Fatalf("subscriber rotation: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("subscriber rotation did not recover from terminal persistence failure")
+	}
+	select {
+	case err := <-outer:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("outer turn error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("outer turn remained wedged")
+	}
+	if got := manager.SessionID(); got != "sess_reentrant_new" {
+		t.Fatalf("session ID = %q, want sess_reentrant_new", got)
 	}
 }
 
