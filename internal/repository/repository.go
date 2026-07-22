@@ -84,6 +84,7 @@ type SelectedArtifactReader interface {
 
 type Sessions interface {
 	Append(ctx context.Context, event protocol.Event) error
+	AppendBatch(ctx context.Context, events []protocol.Event) error
 	Load(ctx context.Context, sessionID string) ([]protocol.Event, error)
 	List(ctx context.Context, limit int) ([]SessionSummary, error)
 }

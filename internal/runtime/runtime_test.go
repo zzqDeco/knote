@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -38,9 +39,9 @@ func TestRuntimeStartSendConfirmAndSubscribe(t *testing.T) {
 		t.Fatalf("runtime did not start session: events=%+v session=%q", initial, rt.SessionID())
 	}
 
-	buildEvents := rt.SendMessage(context.Background(), "/build")
+	buildEvents, _ := rt.SendMessage(context.Background(), "/build")
 	confirm := firstConfirm(t, buildEvents)
-	buildEvents = rt.Confirm(context.Background(), confirm, true)
+	buildEvents, _ = rt.Confirm(context.Background(), confirm, true)
 	if !hasEvent(buildEvents, protocol.EventBuildComplete) {
 		t.Fatalf("runtime build did not complete: %+v", buildEvents)
 	}
@@ -49,7 +50,7 @@ func TestRuntimeStartSendConfirmAndSubscribe(t *testing.T) {
 	}
 	unsubscribe()
 	before := len(emitted)
-	_ = rt.SendMessage(context.Background(), "/status")
+	_, _ = rt.SendMessage(context.Background(), "/status")
 	if len(emitted) != before {
 		t.Fatal("runtime subscriber received events after unsubscribe")
 	}
@@ -72,14 +73,15 @@ func TestRuntimeWorkspaceStatusAndEinoControls(t *testing.T) {
 	if status.Branch == "" {
 		t.Fatalf("workspace status did not include branch: %+v", status)
 	}
-	if !hasEvent(rt.Interrupt(context.Background()), protocol.EventStatusUpdate) {
+	interruptEvents, err := rt.Interrupt(context.Background())
+	if err != nil || !hasEvent(interruptEvents, protocol.EventStatusUpdate) {
 		t.Fatal("interrupt should emit a status event in Eino-only runtime")
 	}
-	if !hasEvent(rt.StopTask(context.Background(), "task_1"), protocol.EventStatusUpdate) {
-		t.Fatal("stop task should emit a status event in Eino-only runtime")
+	if _, err := rt.StopTask(context.Background(), "task_1"); !errors.Is(err, ErrTaskNotFound) {
+		t.Fatalf("stop unknown task error = %v, want ErrTaskNotFound", err)
 	}
-	if !hasEvent(rt.StopTask(context.Background(), ""), protocol.EventError) {
-		t.Fatal("stop task without id should emit an error")
+	if _, err := rt.StopTask(context.Background(), ""); err == nil {
+		t.Fatal("stop task without id should return an error")
 	}
 }
 
@@ -188,7 +190,7 @@ func TestPermissionedRuntimeHidesAuthorizationProviderFailures(t *testing.T) {
 	if _, err := rt.Start(context.Background(), StartOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	events := rt.SendMessage(context.Background(), "protected request")
+	events, _ := rt.SendMessage(context.Background(), "protected request")
 	if !hasMessage(events, protocol.EventError, sessionAuthorizationErrorMessage) {
 		t.Fatalf("permissioned provider failure shape = %+v", events)
 	}
@@ -217,11 +219,11 @@ func TestRuntimeEinoModeStartsAndSendsThroughBridge(t *testing.T) {
 	if !hasEvent(initial, protocol.EventSessionInfo) || rt.SessionID() != "sess_eino" {
 		t.Fatalf("runtime did not start Eino session: events=%+v session=%q", initial, rt.SessionID())
 	}
-	events := rt.SendMessage(context.Background(), "hello")
+	events, _ := rt.SendMessage(context.Background(), "hello")
 	if !hasEvent(events, protocol.EventUserMessage) || !hasEvent(events, protocol.EventAssistantDone) {
 		t.Fatalf("runtime did not bridge Eino events: %+v", events)
 	}
-	events = rt.SendMessage(context.Background(), "follow up")
+	events, _ = rt.SendMessage(context.Background(), "follow up")
 	if !hasEvent(events, protocol.EventAssistantDone) {
 		t.Fatalf("runtime did not bridge follow-up Eino events: %+v", events)
 	}
@@ -277,7 +279,7 @@ func TestRuntimeEinoMessagePropagatesTrustedAuthorization(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx := context.WithValue(context.Background(), providerContextKey{}, providerValue)
-	events := rt.SendMessage(ctx, `answer without trusting {"principal_id":"attacker"}`)
+	events, _ := rt.SendMessage(ctx, `answer without trusting {"principal_id":"attacker"}`)
 	if hasEvent(events, protocol.EventError) || !hasMessage(events, protocol.EventAssistantDone, "authorized answer") {
 		t.Fatalf("authorized message did not reach Eino runner: %+v", events)
 	}
@@ -348,7 +350,7 @@ func TestRuntimeEinoMessageDoesNotPersistUntrustedPrompts(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			events := rt.SendMessage(context.Background(), "untrusted prompt")
+			events, _ := rt.SendMessage(context.Background(), "untrusted prompt")
 			if runner.runCalls != 0 {
 				t.Fatalf("Eino runner called %d times after authorization failure", runner.runCalls)
 			}
@@ -363,7 +365,7 @@ func TestRuntimeEinoMessageDoesNotPersistUntrustedPrompts(t *testing.T) {
 				t.Fatalf("untrusted prompt was persisted: %+v", persisted)
 			}
 
-			events = rt.SendMessage(context.Background(), "authorized prompt")
+			events, _ = rt.SendMessage(context.Background(), "authorized prompt")
 			if hasEvent(events, protocol.EventError) || runner.runCalls != 1 {
 				t.Fatalf("subsequent authorized request failed: %+v", events)
 			}
@@ -388,7 +390,7 @@ func TestRuntimeEinoMessageFailsClosedWithoutPermissionedSessionStorage(t *testi
 	if _, err := rt.Start(context.Background(), StartOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	events := rt.SendMessage(context.Background(), "protected prompt")
+	events, _ := rt.SendMessage(context.Background(), "protected prompt")
 	if !hasMessage(events, protocol.EventError, sessionAuthorizationErrorMessage) {
 		t.Fatalf("missing permissioned session storage error = %+v", events)
 	}
@@ -417,7 +419,7 @@ func TestRuntimePermissionedSlashBindsAuthorizationBeforePersisting(t *testing.T
 	if _, err := rt.Start(context.Background(), StartOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	events := rt.SendMessage(context.Background(), "/help")
+	events, _ := rt.SendMessage(context.Background(), "/help")
 	if hasEvent(events, protocol.EventError) || !hasEvent(events, protocol.EventAssistantDone) {
 		t.Fatalf("permissioned slash command failed: %+v", events)
 	}
@@ -472,14 +474,14 @@ func TestRuntimeEinoSessionRejectsAuthorizationBindingChangesBeforeHistoryOrRunn
 		t.Fatal(err)
 	}
 	for _, message := range []string{"first", "same binding, new request id"} {
-		if events := rt.SendMessage(context.Background(), message); hasEvent(events, protocol.EventError) {
+		if events, _ := rt.SendMessage(context.Background(), message); hasEvent(events, protocol.EventError) {
 			t.Fatalf("authorized request %q failed: %+v", message, events)
 		}
 	}
 
 	loadCalls := store.loadCalls
 	runCalls := runner.runCalls
-	events := rt.SendMessage(context.Background(), "cross-principal request")
+	events, _ := rt.SendMessage(context.Background(), "cross-principal request")
 	if !hasMessage(events, protocol.EventError, `authorization context changed for live session "sess_first"`) {
 		t.Fatalf("authorization binding change was not rejected: %+v", events)
 	}
@@ -497,8 +499,8 @@ func TestRuntimeEinoSessionRejectsAuthorizationBindingChangesBeforeHistoryOrRunn
 		t.Fatalf("rejected request was persisted into the bound session: %+v", persisted)
 	}
 
-	_ = rt.SendMessage(context.Background(), "/new")
-	events = rt.SendMessage(context.Background(), "new principal, new session")
+	_, _ = rt.SendMessage(context.Background(), "/new")
+	events, _ = rt.SendMessage(context.Background(), "new principal, new session")
 	if hasEvent(events, protocol.EventError) || !hasMessage(events, protocol.EventAssistantDone, "authorized answer") {
 		t.Fatalf("/new did not reset the authorization binding: %+v", events)
 	}
@@ -524,7 +526,7 @@ func TestRuntimeExplicitlyRebindsConfirmedArtifactScopeChanges(t *testing.T) {
 	if _, err := rt.Start(context.Background(), StartOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	if events := rt.SendMessage(context.Background(), "before scope change"); hasEvent(events, protocol.EventError) {
+	if events, _ := rt.SendMessage(context.Background(), "before scope change"); hasEvent(events, protocol.EventError) {
 		t.Fatalf("initial authorization failed: %+v", events)
 	}
 
@@ -545,7 +547,7 @@ func TestRuntimeExplicitlyRebindsConfirmedArtifactScopeChanges(t *testing.T) {
 	if err := rt.RebindSessionAuthorization(rebindCtx, "sess_eino"); err != nil {
 		t.Fatalf("explicit scope rebind failed: %v", err)
 	}
-	if events := rt.SendMessage(context.Background(), "after scope change"); hasEvent(events, protocol.EventError) {
+	if events, _ := rt.SendMessage(context.Background(), "after scope change"); hasEvent(events, protocol.EventError) {
 		t.Fatalf("request after explicit scope rebind failed: %+v", events)
 	}
 	envelope, err := store.LoadAuthorization(context.Background(), "sess_eino")
@@ -576,6 +578,93 @@ func TestRuntimeExplicitlyRebindsConfirmedArtifactScopeChanges(t *testing.T) {
 	}
 }
 
+func TestRuntimeSerializesAuthorizationRebindWithSessionRotation(t *testing.T) {
+	workspace := t.TempDir()
+	delegate := local.New(workspace)
+	store := &blockingRebindSessions{
+		RebindablePermissionedSessions: delegate,
+		started:                        make(chan struct{}),
+		release:                        make(chan struct{}),
+	}
+	current := testAuthorizationContext("sess_old")
+	sessionIDs := []string{"sess_old", "sess_new"}
+	var idMu sync.Mutex
+	rt := New(Dependencies{
+		Workspace:    workspace,
+		Capabilities: PermissionedSessionCapabilityProfile(),
+		Sessions:     store,
+		EinoRunner:   &fakeEinoRunner{events: []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, "", "authorized answer", nil)}},
+		AuthorizationContextProvider: func(_ context.Context, sessionID string) (protocol.AuthorizationContext, error) {
+			authorization := current
+			authorization.SessionID = sessionID
+			return authorization, nil
+		},
+		NewSessionID: func() string {
+			idMu.Lock()
+			defer idMu.Unlock()
+			id := sessionIDs[0]
+			sessionIDs = sessionIDs[1:]
+			return id
+		},
+	})
+	if _, err := rt.Start(context.Background(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if events, _ := rt.SendMessage(context.Background(), "bind session"); hasEvent(events, protocol.EventError) {
+		t.Fatalf("initial authorization failed: %+v", events)
+	}
+	expectedEnvelope, err := delegate.LoadAuthorization(context.Background(), "sess_old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rebindCtx, err := protocol.WithAuthorizationContext(context.Background(), current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rebindCtx = withExpectedSessionAuthorizationEnvelope(rebindCtx, expectedEnvelope)
+	current.ACLWatermark = "acl-v2"
+	current.RequestID = "request-2"
+
+	rebindDone := make(chan error, 1)
+	go func() {
+		rebindDone <- rt.RebindSessionAuthorization(rebindCtx, "sess_old")
+	}()
+	select {
+	case <-store.started:
+	case <-time.After(time.Second):
+		t.Fatal("authorization rebind did not reach durable CAS")
+	}
+	rotationDone := make(chan error, 1)
+	go func() {
+		_, err := rt.SendMessage(context.Background(), "/new")
+		rotationDone <- err
+	}()
+	select {
+	case err := <-rotationDone:
+		t.Fatalf("session rotation completed before durable rebind: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(store.release)
+	if err := <-rebindDone; err != nil {
+		t.Fatalf("authorization rebind: %v", err)
+	}
+	if err := <-rotationDone; err != nil {
+		t.Fatalf("session rotation: %v", err)
+	}
+	if got := rt.SessionID(); got != "sess_new" {
+		t.Fatalf("session ID = %q, want sess_new", got)
+	}
+	persisted, err := delegate.LoadAuthorization(context.Background(), "sess_old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldAuthorization := current
+	oldAuthorization.SessionID = "sess_old"
+	if err := persisted.ValidateFor(oldAuthorization); err != nil {
+		t.Fatalf("serialized rebind did not persist the replacement envelope: %v", err)
+	}
+}
+
 func TestRuntimeExplicitScopeRebindRejectsIdentityChanges(t *testing.T) {
 	workspace := t.TempDir()
 	store := local.New(workspace)
@@ -595,7 +684,7 @@ func TestRuntimeExplicitScopeRebindRejectsIdentityChanges(t *testing.T) {
 	if _, err := rt.Start(context.Background(), StartOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	if events := rt.SendMessage(context.Background(), "bind session"); hasEvent(events, protocol.EventError) {
+	if events, _ := rt.SendMessage(context.Background(), "bind session"); hasEvent(events, protocol.EventError) {
 		t.Fatalf("initial authorization failed: %+v", events)
 	}
 	original, err := store.LoadAuthorization(context.Background(), "sess_eino")
@@ -641,7 +730,7 @@ func TestRuntimeNoopScopeRebindStillRequiresDurableEnvelope(t *testing.T) {
 	if _, err := rt.Start(context.Background(), StartOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	if events := rt.SendMessage(context.Background(), "bind session"); hasEvent(events, protocol.EventError) {
+	if events, _ := rt.SendMessage(context.Background(), "bind session"); hasEvent(events, protocol.EventError) {
 		t.Fatalf("initial authorization failed: %+v", events)
 	}
 	expectedEnvelope, err := store.LoadAuthorization(context.Background(), "sess_eino")
@@ -692,10 +781,10 @@ func TestRuntimeNewSessionBypassesStaleLiveAuthorizationWithoutPersistingToOldSe
 	if _, err := rt.Start(context.Background(), StartOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	if events := rt.SendMessage(context.Background(), "first message"); hasEvent(events, protocol.EventError) {
+	if events, _ := rt.SendMessage(context.Background(), "first message"); hasEvent(events, protocol.EventError) {
 		t.Fatalf("first authorized message failed: %+v", events)
 	}
-	events := rt.SendMessage(context.Background(), "/new")
+	events, _ := rt.SendMessage(context.Background(), "/new")
 	if hasEvent(events, protocol.EventError) || rt.SessionID() != "sess_second" {
 		t.Fatalf("/new did not escape stale session binding: session=%q events=%+v", rt.SessionID(), events)
 	}
@@ -709,7 +798,7 @@ func TestRuntimeNewSessionBypassesStaleLiveAuthorizationWithoutPersistingToOldSe
 	if hasMessage(persisted, protocol.EventUserMessage, "/new") {
 		t.Fatalf("/new was persisted into stale session history: %+v", persisted)
 	}
-	events = rt.SendMessage(context.Background(), "new session message")
+	events, _ = rt.SendMessage(context.Background(), "new session message")
 	if hasEvent(events, protocol.EventError) || !hasMessage(events, protocol.EventAssistantDone, "authorized answer") {
 		t.Fatalf("new session did not accept rotated authorization: %+v", events)
 	}
@@ -864,7 +953,7 @@ func TestRuntimeSlashResumeFailsClosedWithoutAuthorizationEnvelope(t *testing.T)
 	}
 	var emitted []protocol.Event
 	rt.Subscribe(func(events []protocol.Event) { emitted = append(emitted, events...) })
-	events := rt.SendMessage(context.Background(), "/resume sess_legacy")
+	events, _ := rt.SendMessage(context.Background(), "/resume sess_legacy")
 	if !hasMessage(events, protocol.EventError, permissionedResumeErrorMessage) {
 		t.Fatalf("permissioned slash resume did not return fail-closed error: %+v", events)
 	}
@@ -896,7 +985,7 @@ func TestRuntimeSlashResumeSuppressesLegacyHistoryForMatchingAuthorizationEnvelo
 	if _, err := rt.Start(context.Background(), StartOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	events := rt.SendMessage(context.Background(), "/resume sess_authorized")
+	events, _ := rt.SendMessage(context.Background(), "/resume sess_authorized")
 	if hasMessage(events, protocol.EventAssistantDone, "old answer") || hasEvent(events, protocol.EventError) {
 		t.Fatalf("permissioned slash resume exposed legacy history: %+v", events)
 	}
@@ -935,7 +1024,7 @@ func TestRuntimePermissionedResumeListsOnlyMatchingSessionEnvelopes(t *testing.T
 	if _, err := rt.Start(context.Background(), StartOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	events := rt.SendMessage(context.Background(), "/resume")
+	events, _ := rt.SendMessage(context.Background(), "/resume")
 	if hasEvent(events, protocol.EventError) {
 		t.Fatalf("permissioned session list failed: %+v", events)
 	}
@@ -1001,7 +1090,7 @@ func TestRuntimeResumeWithoutAuthorizationProviderPreservesLegacyReplay(t *testi
 		if _, err := rt.Start(context.Background(), StartOptions{}); err != nil {
 			t.Fatal(err)
 		}
-		events := rt.SendMessage(context.Background(), "/resume sess_legacy")
+		events, _ := rt.SendMessage(context.Background(), "/resume sess_legacy")
 		if !hasMessage(events, protocol.EventAssistantDone, "old answer") || rt.SessionID() != "sess_legacy" {
 			t.Fatalf("legacy slash resume was not preserved: session=%q events=%+v", rt.SessionID(), events)
 		}
@@ -1057,7 +1146,7 @@ func TestRuntimeEvalSlashFailsClosedBeforeToolExecution(t *testing.T) {
 	if _, err := rt.Start(context.Background(), StartOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	events := rt.SendMessage(context.Background(), "/eval")
+	events, _ := rt.SendMessage(context.Background(), "/eval")
 	if !hasMessage(events, protocol.EventError, "eval is unavailable until authorized explain is implemented") {
 		t.Fatalf("disabled eval did not fail closed: %+v", events)
 	}
@@ -1082,12 +1171,12 @@ func TestRuntimeEinoModeConfirmsSideEffectTool(t *testing.T) {
 	if _, err := rt.Start(context.Background(), StartOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	events := rt.SendMessage(context.Background(), "build knowledge")
+	events, _ := rt.SendMessage(context.Background(), "build knowledge")
 	if hasEvent(events, protocol.EventError) || !hasEvent(events, protocol.EventConfirmRequest) {
 		t.Fatalf("side-effect request should surface as confirm without error: %+v", events)
 	}
 	confirm := firstConfirm(t, events)
-	events = rt.Confirm(context.Background(), confirm, true)
+	events, _ = rt.Confirm(context.Background(), confirm, true)
 	if !hasEvent(events, protocol.EventStatusUpdate) || !hasEvent(events, protocol.EventToolComplete) {
 		t.Fatalf("approved side-effect did not execute: %+v", events)
 	}
@@ -1155,14 +1244,19 @@ func TestRuntimeEinoModeRevalidatesAuthorizationBeforeApprovedSideEffect(t *test
 			if _, err := rt.Start(context.Background(), StartOptions{}); err != nil {
 				t.Fatal(err)
 			}
-			confirm := firstConfirm(t, rt.SendMessage(context.Background(), "build knowledge"))
+			pending, sendErr := rt.SendMessage(context.Background(), "build knowledge")
+			if sendErr != nil {
+				t.Fatal(sendErr)
+			}
+			confirm := firstConfirm(t, pending)
 			test.invalidate(&current, &providerErr)
 
-			events := rt.Confirm(context.Background(), confirm, true)
+			events, _ := rt.Confirm(context.Background(), confirm, true)
 			if !hasMessage(events, protocol.EventError, test.wantError) {
 				t.Fatalf("authorization change was not rejected: %+v", events)
 			}
-			if len(events) != 2 || events[0].Type != protocol.EventError || events[1].Type != protocol.EventConfirmRequest {
+			logicalEvents := withoutTaskLifecycle(events)
+			if len(logicalEvents) != 2 || logicalEvents[0].Type != protocol.EventError || logicalEvents[1].Type != protocol.EventConfirmRequest {
 				t.Fatalf("authorization rejection events = %+v, want error then confirm request", events)
 			}
 			retry := firstConfirm(t, events)
@@ -1175,7 +1269,7 @@ func TestRuntimeEinoModeRevalidatesAuthorizationBeforeApprovedSideEffect(t *test
 
 			current = original
 			providerErr = nil
-			events = rt.Confirm(context.Background(), retry, true)
+			events, _ = rt.Confirm(context.Background(), retry, true)
 			if hasEvent(events, protocol.EventError) || hasEvent(events, protocol.EventConfirmRequest) || !hasEvent(events, protocol.EventToolComplete) {
 				t.Fatalf("pending confirmation was consumed by authorization rejection: %+v", events)
 			}
@@ -1184,8 +1278,9 @@ func TestRuntimeEinoModeRevalidatesAuthorizationBeforeApprovedSideEffect(t *test
 			}
 
 			providerErr = fmt.Errorf("identity provider unavailable again")
-			events = rt.Confirm(context.Background(), retry, true)
-			if len(events) != 1 || events[0].Type != protocol.EventError || hasEvent(events, protocol.EventConfirmRequest) {
+			events, _ = rt.Confirm(context.Background(), retry, true)
+			logicalEvents = withoutTaskLifecycle(events)
+			if len(logicalEvents) != 1 || logicalEvents[0].Type != protocol.EventError || hasEvent(events, protocol.EventConfirmRequest) {
 				t.Fatalf("stale confirmation was re-emitted after consumption: %+v", events)
 			}
 			if einoRunner.executions != 1 {
@@ -1212,9 +1307,13 @@ func TestRuntimeEinoModeDoesNotRetryPostConsumptionExecutionFailure(t *testing.T
 	if _, err := rt.Start(context.Background(), StartOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	confirm := firstConfirm(t, rt.SendMessage(context.Background(), "build knowledge"))
+	pending, err := rt.SendMessage(context.Background(), "build knowledge")
+	if err != nil {
+		t.Fatal(err)
+	}
+	confirm := firstConfirm(t, pending)
 
-	events := rt.Confirm(context.Background(), confirm, true)
+	events, _ := rt.Confirm(context.Background(), confirm, true)
 	if !hasMessage(events, protocol.EventError, "workspace write failed") || hasEvent(events, protocol.EventConfirmRequest) {
 		t.Fatalf("post-consumption execution failure became retryable: %+v", events)
 	}
@@ -1222,7 +1321,7 @@ func TestRuntimeEinoModeDoesNotRetryPostConsumptionExecutionFailure(t *testing.T
 		t.Fatalf("failed side-effect executions = %d, want 1", einoRunner.executions)
 	}
 
-	events = rt.Confirm(context.Background(), confirm, true)
+	events, _ = rt.Confirm(context.Background(), confirm, true)
 	if !hasMessage(events, protocol.EventError, "confirmation is not pending or has already been used") || hasEvent(events, protocol.EventConfirmRequest) {
 		t.Fatalf("consumed confirmation was not cleared: %+v", events)
 	}
@@ -1248,7 +1347,7 @@ func TestRuntimeEinoSlashReadOnlyToolUsesExecutor(t *testing.T) {
 	if _, err := rt.Start(context.Background(), StartOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	events := rt.SendMessage(context.Background(), "/diff HEAD")
+	events, _ := rt.SendMessage(context.Background(), "/diff HEAD")
 	if !hasEvent(events, protocol.EventUserMessage) || !hasEvent(events, protocol.EventVersionDiff) {
 		t.Fatalf("slash diff did not use tool executor: %+v", events)
 	}
@@ -1287,14 +1386,14 @@ func TestRuntimeEinoSlashMutatingToolRequiresConfirmation(t *testing.T) {
 	if _, err := rt.Start(context.Background(), StartOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	events := rt.SendMessage(context.Background(), "/build")
+	events, _ := rt.SendMessage(context.Background(), "/build")
 	if !hasEvent(events, protocol.EventConfirmRequest) || hasEvent(events, protocol.EventToolComplete) {
 		t.Fatalf("slash build should request confirmation before execution: %+v", events)
 	}
 	if toolExecutor.executions != 0 {
 		t.Fatalf("slash build executed before confirmation: %d", toolExecutor.executions)
 	}
-	events = rt.Confirm(context.Background(), firstConfirm(t, events), true)
+	events, _ = rt.Confirm(context.Background(), firstConfirm(t, events), true)
 	if !hasEvent(events, protocol.EventToolComplete) || toolExecutor.executions != 1 {
 		t.Fatalf("approved slash build did not execute once: executions=%d events=%+v", toolExecutor.executions, events)
 	}
@@ -1315,8 +1414,12 @@ func TestRuntimeEinoModeRejectsSideEffectTool(t *testing.T) {
 	if _, err := rt.Start(context.Background(), StartOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	confirm := firstConfirm(t, rt.SendMessage(context.Background(), "build knowledge"))
-	events := rt.Confirm(context.Background(), confirm, false)
+	pending, err := rt.SendMessage(context.Background(), "build knowledge")
+	if err != nil {
+		t.Fatal(err)
+	}
+	confirm := firstConfirm(t, pending)
+	events, _ := rt.Confirm(context.Background(), confirm, false)
 	if !hasMessage(events, protocol.EventAssistantDone, "Cancelled: build") {
 		t.Fatalf("rejected side-effect should be cancelled: %+v", events)
 	}
@@ -1386,7 +1489,7 @@ func TestRuntimeEinoModePersistsPartialEventsOnRunnerError(t *testing.T) {
 	if _, err := rt.Start(context.Background(), StartOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	events := rt.SendMessage(context.Background(), "hello")
+	events, _ := rt.SendMessage(context.Background(), "hello")
 	if !hasMessage(events, protocol.EventAssistantDone, "partial answer") || !hasEvent(events, protocol.EventError) {
 		t.Fatalf("runtime did not keep partial runner events before error: %+v", events)
 	}
@@ -1501,6 +1604,19 @@ func countEvents(events []protocol.Event, eventType protocol.EventType) int {
 	return count
 }
 
+func withoutTaskLifecycle(events []protocol.Event) []protocol.Event {
+	filtered := make([]protocol.Event, 0, len(events))
+	for _, event := range events {
+		switch event.Type {
+		case protocol.EventTaskStarted, protocol.EventTaskComplete:
+			continue
+		default:
+			filtered = append(filtered, event)
+		}
+	}
+	return filtered
+}
+
 func hasMessage(events []protocol.Event, eventType protocol.EventType, message string) bool {
 	for _, event := range events {
 		if event.Type == eventType && event.Message == message {
@@ -1508,6 +1624,26 @@ func hasMessage(events []protocol.Event, eventType protocol.EventType, message s
 		}
 	}
 	return false
+}
+
+type blockingRebindSessions struct {
+	repository.RebindablePermissionedSessions
+	started chan struct{}
+	release chan struct{}
+}
+
+func (s *blockingRebindSessions) RebindAuthorization(
+	ctx context.Context,
+	expected protocol.SessionAuthorizationEnvelope,
+	replacement protocol.SessionAuthorizationEnvelope,
+) error {
+	close(s.started)
+	select {
+	case <-s.release:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return s.RebindablePermissionedSessions.RebindAuthorization(ctx, expected, replacement)
 }
 
 type fakeEinoRunner struct {

@@ -437,14 +437,14 @@ func TestPermissionedSlashBuildConfirmationKeepsSideEffectResultsFixed(t *testin
 			if _, err := manager.Start(context.Background(), runtime.StartOptions{}); err != nil {
 				t.Fatal(err)
 			}
-			pending := manager.SendMessage(context.Background(), "/build")
+			pending, _ := manager.SendMessage(context.Background(), "/build")
 			confirm := firstToolConfirm(t, pending)
 			for _, event := range pending {
 				if event.Type == protocol.EventToolComplete || event.Type == protocol.EventBuildComplete {
 					t.Fatalf("permissioned /build executed before confirmation: %+v", pending)
 				}
 			}
-			events := manager.Confirm(context.Background(), confirm, true)
+			events, _ := manager.Confirm(context.Background(), confirm, true)
 			if providerCalls < 2 {
 				t.Fatalf("permissioned /build authorization provider calls = %d, want send and confirm revalidation", providerCalls)
 			}

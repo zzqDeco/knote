@@ -34,7 +34,15 @@ type SideEffectBridge struct {
 type pendingSideEffect struct {
 	request SideEffectRequest
 	confirm protocol.ConfirmRequest
+	turnID  string
 	emitted bool
+}
+
+type sideEffectConfirmationOutcome struct {
+	events   []protocol.Event
+	consumed bool
+	executed bool
+	restore  func()
 }
 
 func NewSideEffectBridge() *SideEffectBridge {
@@ -44,6 +52,9 @@ func NewSideEffectBridge() *SideEffectBridge {
 func (b *SideEffectBridge) Request(ctx context.Context, req SideEffectRequest) error {
 	if b == nil {
 		return fmt.Errorf("side-effect bridge is not configured")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	sessionID := strings.TrimSpace(sideEffectSessionID(ctx))
 	if sessionID == "" {
@@ -80,10 +91,70 @@ func (b *SideEffectBridge) Request(ctx context.Context, req SideEffectRequest) e
 		RejectText:  "Cancel",
 		CreatedAt:   createdAt,
 	}
-	b.pending[confirm.RequestID] = pendingSideEffect{request: req, confirm: confirm}
+	b.pending[confirm.RequestID] = pendingSideEffect{request: req, confirm: confirm, turnID: activeTurnIDFromContext(ctx)}
 	b.queue = append(b.queue, confirm.RequestID)
 	b.mu.Unlock()
 	return ErrSideEffectPending
+}
+
+func (b *SideEffectBridge) ClearSession(sessionID string) int {
+	if b == nil {
+		return 0
+	}
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return 0
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	removed := 0
+	for requestID, pending := range b.pending {
+		if pending.request.SessionID != sessionID {
+			continue
+		}
+		delete(b.pending, requestID)
+		removed++
+	}
+	if removed == 0 {
+		return 0
+	}
+	b.compactQueueLocked()
+	return removed
+}
+
+func (b *SideEffectBridge) ClearTurn(sessionID, turnID string) int {
+	if b == nil {
+		return 0
+	}
+	sessionID = strings.TrimSpace(sessionID)
+	turnID = strings.TrimSpace(turnID)
+	if sessionID == "" || turnID == "" {
+		return 0
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	removed := 0
+	for requestID, pending := range b.pending {
+		if pending.request.SessionID != sessionID || pending.turnID != turnID {
+			continue
+		}
+		delete(b.pending, requestID)
+		removed++
+	}
+	if removed > 0 {
+		b.compactQueueLocked()
+	}
+	return removed
+}
+
+func (b *SideEffectBridge) compactQueueLocked() {
+	queue := b.queue[:0]
+	for _, requestID := range b.queue {
+		if _, ok := b.pending[requestID]; ok {
+			queue = append(queue, requestID)
+		}
+	}
+	b.queue = queue
 }
 
 func (b *SideEffectBridge) PendingEvents(sessionID string) []protocol.Event {
@@ -126,21 +197,34 @@ func (b *SideEffectBridge) retryEvents(sessionID string, req protocol.ConfirmReq
 }
 
 func (b *SideEffectBridge) Confirm(ctx context.Context, sessionID string, req protocol.ConfirmRequest, approved bool) []protocol.Event {
+	return b.confirmOutcome(ctx, sessionID, req, approved).events
+}
+
+func (b *SideEffectBridge) confirmOutcome(ctx context.Context, sessionID string, req protocol.ConfirmRequest, approved bool) sideEffectConfirmationOutcome {
 	if b == nil {
-		return []protocol.Event{protocol.NewEvent(protocol.EventError, sessionID, "side-effect bridge is not configured", nil)}
+		return sideEffectConfirmationOutcome{events: []protocol.Event{
+			protocol.NewEvent(protocol.EventError, sessionID, "side-effect bridge is not configured", nil),
+		}}
 	}
 	pending, ok := b.consume(sessionID, req)
 	if !ok {
-		return []protocol.Event{
+		return sideEffectConfirmationOutcome{events: []protocol.Event{
 			protocol.NewEvent(protocol.EventError, sessionID, "confirmation is not pending or has already been used", map[string]string{"request_id": req.RequestID}),
-		}
+		}}
+	}
+	outcome := sideEffectConfirmationOutcome{
+		consumed: true,
 	}
 	if !approved {
-		events := []protocol.Event{
+		outcome.events = []protocol.Event{
 			protocol.NewEvent(protocol.EventAssistantDone, sessionID, "Cancelled: "+pending.confirm.Action, map[string]string{"request_id": pending.confirm.RequestID}),
 		}
-		events = append(events, b.PendingEvents(sessionID)...)
-		return events
+		nextEvents := b.PendingEvents(sessionID)
+		outcome.events = append(outcome.events, nextEvents...)
+		outcome.restore = func() {
+			b.restoreRejected(pending, nextEvents)
+		}
+		return outcome
 	}
 	events := []protocol.Event{
 		protocol.NewEvent(protocol.EventStatusUpdate, sessionID, "Confirmed: "+pending.confirm.Action, map[string]string{"request_id": pending.confirm.RequestID}),
@@ -154,7 +238,9 @@ func (b *SideEffectBridge) Confirm(ctx context.Context, sessionID string, req pr
 		}))
 	}
 	events = append(events, b.PendingEvents(sessionID)...)
-	return events
+	outcome.events = events
+	outcome.executed = true
+	return outcome
 }
 
 func (b *SideEffectBridge) consume(sessionID string, req protocol.ConfirmRequest) (pendingSideEffect, bool) {
@@ -167,6 +253,32 @@ func (b *SideEffectBridge) consume(sessionID string, req protocol.ConfirmRequest
 	delete(b.pending, req.RequestID)
 	b.removeQueuedLocked(req.RequestID)
 	return pending, true
+}
+
+func (b *SideEffectBridge) restoreRejected(pending pendingSideEffect, nextEvents []protocol.Event) {
+	if b == nil || strings.TrimSpace(pending.confirm.RequestID) == "" {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	requestID := pending.confirm.RequestID
+	if _, exists := b.pending[requestID]; exists {
+		return
+	}
+	b.pending[requestID] = pending
+	b.queue = append([]string{requestID}, b.queue...)
+	for _, event := range nextEvents {
+		request, ok := event.Payload.(protocol.ConfirmRequest)
+		if !ok || strings.TrimSpace(request.RequestID) == "" {
+			continue
+		}
+		next, exists := b.pending[request.RequestID]
+		if !exists {
+			continue
+		}
+		next.emitted = false
+		b.pending[request.RequestID] = next
+	}
 }
 
 func (b *SideEffectBridge) pendingForRequestLocked(sessionID string, req protocol.ConfirmRequest) (pendingSideEffect, bool) {

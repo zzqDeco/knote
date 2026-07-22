@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -66,6 +67,10 @@ func newRuntime(ctx context.Context, workspacePath string, resumeID string) (run
 	}
 	repo := local.New(workspace)
 	startupConfig, err := loadStartupConfiguration(ctx, workspace, repo)
+	if err != nil {
+		return nil, nil, err
+	}
+	turnTimeout, err := configuredTurnTimeout()
 	if err != nil {
 		return nil, nil, err
 	}
@@ -212,9 +217,22 @@ func newRuntime(ctx context.Context, workspacePath string, resumeID string) (run
 		SideEffects:                  sideEffects,
 		ToolExecutor:                 toolExecutor,
 		NewSessionID:                 local.NewSessionID,
+		TurnTimeout:                  turnTimeout,
 	})
 	events, err := rt.Start(ctx, runtime.StartOptions{ResumeID: resumeID})
 	return rt, events, err
+}
+
+func configuredTurnTimeout() (time.Duration, error) {
+	raw := strings.TrimSpace(os.Getenv("KNOTE_TURN_TIMEOUT"))
+	if raw == "" {
+		return runtime.DefaultTurnTimeout, nil
+	}
+	timeout, err := time.ParseDuration(raw)
+	if err != nil || timeout <= 0 {
+		return 0, fmt.Errorf("KNOTE_TURN_TIMEOUT must be a positive duration")
+	}
+	return timeout, nil
 }
 
 type startupConfiguration struct {

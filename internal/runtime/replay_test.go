@@ -134,6 +134,46 @@ func TestFilterPersistedEventsPreservesOnlyPermissionedSafeSlashResponses(t *tes
 	}
 }
 
+func TestFilterPersistedEventsKeepsRestrictedSlashTaskTerminal(t *testing.T) {
+	authorization := testAuthorizationContext("sess_restricted_slash")
+	createdAt := time.Unix(100, 0).UTC()
+	startedTask := protocol.Task{
+		ID: "task_governance", Title: "/governance", Status: protocol.TaskRunning, CreatedAt: createdAt, UpdatedAt: createdAt,
+	}
+	completedTask := startedTask
+	completedTask.Status = protocol.TaskCompleted
+	completedTask.UpdatedAt = createdAt.Add(time.Second)
+	events := []protocol.Event{
+		protocol.NewEvent(protocol.EventTaskStarted, authorization.SessionID, "Task started", startedTask),
+		protocol.NewEvent(protocol.EventUserMessage, authorization.SessionID, "/governance", nil),
+		protocol.NewEvent(protocol.EventConfirmRequest, authorization.SessionID, "RESTRICTED_CONFIRMATION_CANARY", protocol.ConfirmRequest{
+			RequestID: "confirm_governance", Action: "governance",
+		}),
+		protocol.NewEvent(protocol.EventTaskComplete, authorization.SessionID, "Task completed", completedTask),
+		protocol.NewEvent(protocol.EventStatusUpdate, authorization.SessionID, "SAFE_AFTER_GOVERNANCE_CANARY", nil),
+	}
+	manager := New(Dependencies{AuthorizationContextProvider: testAuthorizationContextProvider})
+
+	filtered := manager.filterPersistedEvents(context.Background(), authorization, events)
+	if len(filtered) != 3 || filtered[0].Type != protocol.EventTaskStarted ||
+		filtered[1].Type != protocol.EventTaskComplete || filtered[2].Type != protocol.EventStatusUpdate {
+		t.Fatalf("restricted slash replay lifecycle = %+v", filtered)
+	}
+	if encoded := eventsText(filtered); strings.Contains(encoded, "RESTRICTED_CONFIRMATION_CANARY") || strings.Contains(encoded, "/governance") {
+		t.Fatalf("restricted slash replay leaked protected command content: %s", encoded)
+	}
+	replay, reconciled, err := prepareSessionReplay(filtered, createdAt.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reconciled) != 0 {
+		t.Fatalf("completed restricted slash was reconciled as orphaned: %+v", reconciled)
+	}
+	if len(replay) != len(filtered) {
+		t.Fatalf("prepared replay length = %d, want %d", len(replay), len(filtered))
+	}
+}
+
 func TestFilterPersistedEventsDropsCompleteHistoricalDiffTurnsInPermissionedReplay(t *testing.T) {
 	authorization := testAuthorizationContext("sess_diff_turn")
 	events := []protocol.Event{
@@ -385,7 +425,7 @@ func TestRuntimeStartAndSlashResumeReplayAuthorizedProtectedBlocks(t *testing.T)
 				if _, err := manager.Start(context.Background(), StartOptions{}); err != nil {
 					return nil, err
 				}
-				return manager.SendMessage(context.Background(), "/resume sess_authorized"), nil
+				return manager.SendMessage(context.Background(), "/resume sess_authorized")
 			},
 		},
 	} {
@@ -455,7 +495,7 @@ func TestRuntimeStartAndSlashResumeDropProtectedContentWhenAuthorizationUnavaila
 					if _, err := manager.Start(context.Background(), StartOptions{}); err != nil {
 						return nil, err
 					}
-					return manager.SendMessage(context.Background(), "/resume "+sessionID), nil
+					return manager.SendMessage(context.Background(), "/resume "+sessionID)
 				},
 			},
 		} {
@@ -543,7 +583,7 @@ func TestHistoricalSafeToolAssistantIsDroppedFromPermissionedReplay(t *testing.T
 				if _, err := manager.Start(context.Background(), StartOptions{}); err != nil {
 					return nil, err
 				}
-				return manager.SendMessage(context.Background(), "/resume "+sessionID), nil
+				return manager.SendMessage(context.Background(), "/resume "+sessionID)
 			},
 		},
 	} {

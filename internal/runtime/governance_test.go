@@ -49,7 +49,7 @@ func TestGovernanceSlashUsesTrustedAuthorizationAndContentFreeOverlay(t *testing
 	if _, err := rt.Start(context.Background(), StartOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	events := rt.SendMessage(context.Background(), "/governance")
+	events, _ := rt.SendMessage(context.Background(), "/governance")
 	if calls != 1 {
 		t.Fatalf("governance provider calls = %d, want 1", calls)
 	}
@@ -85,7 +85,7 @@ func TestGovernanceSlashSuppressesProviderFailuresAndPersistsNoCanary(t *testing
 	if _, err := rt.Start(context.Background(), StartOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	events := rt.SendMessage(context.Background(), "/governance")
+	events, _ := rt.SendMessage(context.Background(), "/governance")
 	encoded, err := json.Marshal(events)
 	if err != nil {
 		t.Fatal(err)

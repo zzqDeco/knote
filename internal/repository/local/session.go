@@ -26,16 +26,34 @@ const (
 	sessionAuthorizationLockPollInterval = 10 * time.Millisecond
 )
 
-var sessionAuthorizationMu sync.RWMutex
+var (
+	sessionAuthorizationMu sync.RWMutex
+	sessionEventsMu        sync.Mutex
+)
+
+type sessionBatchEntry struct {
+	sessionID  string
+	path       string
+	stagedPath string
+	backupPath string
+	existed    bool
+	published  bool
+}
 
 func NewSessionID() string {
 	return "sess_" + time.Now().UTC().Format("20060102T150405.000000000")
 }
 
-func appendSessionEvent(workspace string, event protocol.Event) error {
+func appendSessionEvent(ctx context.Context, workspace string, event protocol.Event) error {
 	if err := validateSessionID(event.SessionID); err != nil {
 		return err
 	}
+	sessionEventsMu.Lock()
+	defer sessionEventsMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	path := sessionPath(workspace, event.SessionID)
 	if err := secureSessionDirectory(workspace, true); err != nil {
 		return err
@@ -58,7 +76,367 @@ func appendSessionEvent(workspace string, event protocol.Event) error {
 	return file.Close()
 }
 
+func appendSessionEvents(
+	ctx context.Context,
+	workspace string,
+	events []protocol.Event,
+	beforePublish func(sessionID string, published int) error,
+) error {
+	encoded, sessionIDs, err := encodeSessionBatch(ctx, events)
+	if err != nil || len(sessionIDs) == 0 {
+		return err
+	}
+
+	sessionEventsMu.Lock()
+	defer sessionEventsMu.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := secureSessionDirectory(workspace, true); err != nil {
+		return err
+	}
+	if len(sessionIDs) == 1 {
+		sessionID := sessionIDs[0]
+		if beforePublish != nil {
+			if err := beforePublish(sessionID, 0); err != nil {
+				return err
+			}
+		}
+		return appendSingleSessionBatch(ctx, workspace, sessionID, encoded[sessionID])
+	}
+	dir := sessionsDirectory(workspace)
+	entries := make([]sessionBatchEntry, 0, len(sessionIDs))
+	for _, sessionID := range sessionIDs {
+		if err := ctx.Err(); err != nil {
+			return cleanupUnpublishedSessionBatch(dir, entries, err)
+		}
+		entry, err := stageSessionBatchEntry(workspace, sessionID, encoded[sessionID])
+		if err != nil {
+			return cleanupUnpublishedSessionBatch(dir, entries, err)
+		}
+		entries = append(entries, entry)
+	}
+
+	published := 0
+	for i := range entries {
+		if err := ctx.Err(); err != nil {
+			return rollbackSessionBatch(dir, entries, err)
+		}
+		if beforePublish != nil {
+			if err := beforePublish(entries[i].sessionID, published); err != nil {
+				return rollbackSessionBatch(dir, entries, err)
+			}
+		}
+		if err := replaceArtifactFile(entries[i].stagedPath, entries[i].path); err != nil {
+			return rollbackSessionBatch(dir, entries, fmt.Errorf("publish session %q batch: %w", entries[i].sessionID, err))
+		}
+		entries[i].stagedPath = ""
+		entries[i].published = true
+		published++
+	}
+	if err := syncArtifactDirectory(dir); err != nil {
+		return rollbackSessionBatch(dir, entries, fmt.Errorf("sync published session batch: %w", err))
+	}
+
+	// The synced directory is the commit point. Backup cleanup is best effort so
+	// a committed batch is never reported as failed because a 0600 temp remains.
+	cleanupSessionBatchFiles(entries)
+	return nil
+}
+
+func appendSingleSessionBatch(ctx context.Context, workspace, sessionID string, appended []byte) error {
+	path := sessionPath(workspace, sessionID)
+	existed := true
+	if err := secureSessionFile(path); err != nil {
+		if !os.IsNotExist(err) {
+			return err
+		}
+		existed = false
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	originalSize, err := file.Seek(0, io.SeekEnd)
+	if err != nil {
+		_ = file.Close()
+		if !existed {
+			_ = os.Remove(path)
+		}
+		return err
+	}
+	if err := file.Chmod(0o600); err != nil {
+		return rollbackOpenSessionAppend(file, path, existed, originalSize, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return rollbackOpenSessionAppend(file, path, existed, originalSize, err)
+	}
+	written, writeErr := file.Write(appended)
+	if writeErr == nil && written != len(appended) {
+		writeErr = io.ErrShortWrite
+	}
+	if writeErr != nil {
+		return rollbackOpenSessionAppend(file, path, existed, originalSize, writeErr)
+	}
+	if err := ctx.Err(); err != nil {
+		return rollbackOpenSessionAppend(file, path, existed, originalSize, err)
+	}
+	if err := file.Sync(); err != nil {
+		return rollbackOpenSessionAppend(file, path, existed, originalSize, err)
+	}
+	if err := file.Close(); err != nil {
+		return rollbackClosedSessionAppend(path, existed, originalSize, err)
+	}
+	if !existed {
+		if err := syncArtifactDirectory(sessionsDirectory(workspace)); err != nil {
+			return rollbackClosedSessionAppend(path, false, originalSize, err)
+		}
+	}
+	return nil
+}
+
+func rollbackOpenSessionAppend(file *os.File, path string, existed bool, originalSize int64, cause error) error {
+	errs := []error{cause}
+	if err := file.Truncate(originalSize); err != nil {
+		errs = append(errs, fmt.Errorf("truncate failed session batch: %w", err))
+	}
+	if err := file.Sync(); err != nil {
+		errs = append(errs, fmt.Errorf("sync failed session batch rollback: %w", err))
+	}
+	if err := file.Close(); err != nil {
+		errs = append(errs, fmt.Errorf("close failed session batch rollback: %w", err))
+	}
+	if !existed {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			errs = append(errs, fmt.Errorf("remove failed new session batch: %w", err))
+		}
+		if err := syncArtifactDirectory(filepath.Dir(path)); err != nil {
+			errs = append(errs, fmt.Errorf("sync session directory after append rollback: %w", err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func rollbackClosedSessionAppend(path string, existed bool, originalSize int64, cause error) error {
+	errs := []error{cause}
+	if existed {
+		file, err := os.OpenFile(path, os.O_WRONLY, 0o600)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("open failed session batch rollback: %w", err))
+		} else {
+			if err := file.Truncate(originalSize); err != nil {
+				errs = append(errs, fmt.Errorf("truncate failed session batch: %w", err))
+			}
+			if err := file.Sync(); err != nil {
+				errs = append(errs, fmt.Errorf("sync failed session batch rollback: %w", err))
+			}
+			if err := file.Close(); err != nil {
+				errs = append(errs, fmt.Errorf("close failed session batch rollback: %w", err))
+			}
+		}
+	} else if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		errs = append(errs, fmt.Errorf("remove failed new session batch: %w", err))
+	}
+	if !existed {
+		if err := syncArtifactDirectory(filepath.Dir(path)); err != nil {
+			errs = append(errs, fmt.Errorf("sync session directory after append rollback: %w", err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func encodeSessionBatch(ctx context.Context, events []protocol.Event) (map[string][]byte, []string, error) {
+	encoded := make(map[string][]byte)
+	for i, event := range events {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
+		if err := validateSessionID(event.SessionID); err != nil {
+			return nil, nil, fmt.Errorf("event %d: %w", i, err)
+		}
+		data, err := json.Marshal(event)
+		if err != nil {
+			return nil, nil, fmt.Errorf("encode event %d for session %q: %w", i, event.SessionID, err)
+		}
+		data = append(data, '\n')
+		encoded[event.SessionID] = append(encoded[event.SessionID], data...)
+	}
+	sessionIDs := make([]string, 0, len(encoded))
+	for sessionID := range encoded {
+		sessionIDs = append(sessionIDs, sessionID)
+	}
+	sort.Strings(sessionIDs)
+	return encoded, sessionIDs, nil
+}
+
+func stageSessionBatchEntry(workspace, sessionID string, appended []byte) (sessionBatchEntry, error) {
+	entry := sessionBatchEntry{
+		sessionID: sessionID,
+		path:      sessionPath(workspace, sessionID),
+	}
+	original, err := readSessionFileForBatch(entry.path)
+	if err != nil {
+		return sessionBatchEntry{}, err
+	}
+	entry.existed = original != nil
+
+	data := make([]byte, 0, len(original)+len(appended))
+	data = append(data, original...)
+	data = append(data, appended...)
+	entry.stagedPath, err = stageSessionBatchFile(entry.path, data, "append")
+	if err != nil {
+		return sessionBatchEntry{}, err
+	}
+	if entry.existed {
+		entry.backupPath, err = stageSessionBatchBackup(entry.path, original)
+		if err != nil {
+			_ = os.Remove(entry.stagedPath)
+			return sessionBatchEntry{}, err
+		}
+	}
+	return entry, nil
+}
+
+func readSessionFileForBatch(path string) ([]byte, error) {
+	if err := secureSessionFile(path); err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	if data == nil {
+		return []byte{}, nil
+	}
+	return data, nil
+}
+
+func stageSessionBatchFile(path string, data []byte, purpose string) (string, error) {
+	file, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+"-"+purpose+"-*.tmp")
+	if err != nil {
+		return "", err
+	}
+	temporary := file.Name()
+	complete := false
+	defer func() {
+		if !complete {
+			_ = file.Close()
+			_ = os.Remove(temporary)
+		}
+	}()
+	if err := file.Chmod(0o600); err != nil {
+		return "", err
+	}
+	if _, err := file.Write(data); err != nil {
+		return "", err
+	}
+	if err := file.Sync(); err != nil {
+		return "", err
+	}
+	if err := file.Close(); err != nil {
+		return "", err
+	}
+	complete = true
+	return temporary, nil
+}
+
+func stageSessionBatchBackup(path string, data []byte) (string, error) {
+	placeholder, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+"-rollback-*.tmp")
+	if err != nil {
+		return "", err
+	}
+	backup := placeholder.Name()
+	if err := placeholder.Close(); err != nil {
+		_ = os.Remove(backup)
+		return "", err
+	}
+	if err := os.Remove(backup); err != nil {
+		return "", err
+	}
+	if err := os.Link(path, backup); err == nil {
+		return backup, nil
+	}
+	return stageSessionBatchFile(path, data, "rollback")
+}
+
+func cleanupUnpublishedSessionBatch(dir string, entries []sessionBatchEntry, cause error) error {
+	errs := []error{cause}
+	for _, entry := range entries {
+		for _, path := range []string{entry.stagedPath, entry.backupPath} {
+			if path == "" {
+				continue
+			}
+			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				errs = append(errs, fmt.Errorf("remove session batch staging %q: %w", path, err))
+			}
+		}
+	}
+	if err := syncArtifactDirectory(dir); err != nil {
+		errs = append(errs, fmt.Errorf("sync session directory after staging cleanup: %w", err))
+	}
+	return errors.Join(errs...)
+}
+
+func rollbackSessionBatch(dir string, entries []sessionBatchEntry, cause error) error {
+	errs := []error{cause}
+	for i := len(entries) - 1; i >= 0; i-- {
+		entry := &entries[i]
+		if !entry.published {
+			continue
+		}
+		if entry.existed {
+			if entry.backupPath == "" {
+				errs = append(errs, fmt.Errorf("rollback session %q: backup is unavailable", entry.sessionID))
+				continue
+			}
+			if err := replaceArtifactFile(entry.backupPath, entry.path); err != nil {
+				errs = append(errs, fmt.Errorf("rollback session %q: %w", entry.sessionID, err))
+				continue
+			}
+			entry.backupPath = ""
+		} else if err := os.Remove(entry.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			errs = append(errs, fmt.Errorf("rollback new session %q: %w", entry.sessionID, err))
+			continue
+		}
+		entry.published = false
+	}
+	for _, entry := range entries {
+		for _, path := range []string{entry.stagedPath, entry.backupPath} {
+			if path == "" {
+				continue
+			}
+			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				errs = append(errs, fmt.Errorf("remove session batch staging %q: %w", path, err))
+			}
+		}
+	}
+	if err := syncArtifactDirectory(dir); err != nil {
+		errs = append(errs, fmt.Errorf("sync session directory after rollback: %w", err))
+	}
+	return errors.Join(errs...)
+}
+
+func cleanupSessionBatchFiles(entries []sessionBatchEntry) {
+	for _, entry := range entries {
+		for _, path := range []string{entry.stagedPath, entry.backupPath} {
+			if path != "" {
+				_ = os.Remove(path)
+			}
+		}
+	}
+}
+
 func loadSessionEvents(workspace string, sessionID string) ([]protocol.Event, error) {
+	sessionEventsMu.Lock()
+	defer sessionEventsMu.Unlock()
+	return loadSessionEventsLocked(workspace, sessionID)
+}
+
+func loadSessionEventsLocked(workspace string, sessionID string) ([]protocol.Event, error) {
 	if err := validateSessionID(sessionID); err != nil {
 		return nil, err
 	}
@@ -82,6 +460,9 @@ func loadSessionEvents(workspace string, sessionID string) ([]protocol.Event, er
 }
 
 func listSessions(workspace string, limit int) ([]repository.SessionSummary, error) {
+	sessionEventsMu.Lock()
+	defer sessionEventsMu.Unlock()
+
 	dir := sessionsDirectory(workspace)
 	if err := secureSessionDirectory(workspace, false); err != nil && !os.IsNotExist(err) {
 		return nil, err
@@ -103,7 +484,7 @@ func listSessions(workspace string, limit int) ([]repository.SessionSummary, err
 		if err != nil {
 			return nil, err
 		}
-		events, err := loadSessionEvents(workspace, id)
+		events, err := loadSessionEventsLocked(workspace, id)
 		if err != nil {
 			return nil, err
 		}

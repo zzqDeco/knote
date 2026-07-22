@@ -16,10 +16,10 @@ import (
 
 type Runtime interface {
 	Start(ctx context.Context, opts StartOptions) ([]protocol.Event, error)
-	SendMessage(ctx context.Context, input string) []protocol.Event
-	Confirm(ctx context.Context, req protocol.ConfirmRequest, approved bool) []protocol.Event
-	Interrupt(ctx context.Context) []protocol.Event
-	StopTask(ctx context.Context, taskID string) []protocol.Event
+	SendMessage(ctx context.Context, input string) ([]protocol.Event, error)
+	Confirm(ctx context.Context, req protocol.ConfirmRequest, approved bool) ([]protocol.Event, error)
+	Interrupt(ctx context.Context) ([]protocol.Event, error)
+	StopTask(ctx context.Context, taskID string) ([]protocol.Event, error)
 	WorkspaceStatus(ctx context.Context) (repository.Status, error)
 	RunnerInfo(ctx context.Context) (RunnerInfo, error)
 	Subscribe(fn EventSubscriber) func()
@@ -46,6 +46,7 @@ type Dependencies struct {
 	ToolExecutor                 ToolExecutor
 	Governance                   GovernanceProvider
 	NewSessionID                 func() string
+	TurnTimeout                  time.Duration
 }
 
 type AuthorizationContextProvider func(ctx context.Context, sessionID string) (protocol.AuthorizationContext, error)
@@ -94,19 +95,39 @@ type GovernanceProvider interface {
 
 type EventSubscriber func([]protocol.Event)
 
+type notificationBatch struct {
+	subscribers []EventSubscriber
+	events      []protocol.Event
+	turn        *activeTurn
+}
+
 type Manager struct {
 	mu                   sync.Mutex
+	commitMu             sync.Mutex
+	notifyMu             sync.Mutex
 	deps                 Dependencies
 	einoSession          protocol.SessionInfo
 	authorizationBinding *authorizationBinding
 	subscribers          map[int]EventSubscriber
 	nextSubID            int
+	nextTurnID           uint64
+	generation           uint64
+	nextRotationID       uint64
+	rotationReservation  uint64
+	activeTurn           *activeTurn
+	starting             bool
+	rotating             bool
+	dispatching          bool
+	notificationQueue    []notificationBatch
 }
 
 var _ Runtime = (*Manager)(nil)
 
 func New(deps Dependencies) *Manager {
 	deps.RunnerMode = RunnerModeEino
+	if deps.TurnTimeout <= 0 {
+		deps.TurnTimeout = DefaultTurnTimeout
+	}
 	return &Manager{
 		deps:        deps,
 		subscribers: map[int]EventSubscriber{},
@@ -122,6 +143,10 @@ func (m *Manager) Start(ctx context.Context, opts StartOptions) ([]protocol.Even
 		m.emit(events)
 		return events, nil
 	}
+	if m.starting {
+		m.mu.Unlock()
+		return nil, ErrTurnBusy
+	}
 	if m.deps.EinoRunner == nil {
 		m.mu.Unlock()
 		return nil, fmt.Errorf("Eino-only runtime requires an Eino runner")
@@ -130,30 +155,39 @@ func (m *Manager) Start(ctx context.Context, opts StartOptions) ([]protocol.Even
 		m.mu.Unlock()
 		return nil, fmt.Errorf("Eino-only runtime requires session storage")
 	}
-	if err := m.deps.EinoRunner.Ready(ctx); err != nil {
+	m.starting = true
+	deps := m.deps
+	m.mu.Unlock()
+	started := false
+	defer func() {
+		if started {
+			return
+		}
+		m.mu.Lock()
+		m.starting = false
 		m.mu.Unlock()
+	}()
+	if err := deps.EinoRunner.Ready(ctx); err != nil {
 		return nil, err
 	}
 	resumeID := strings.TrimSpace(opts.ResumeID)
 	var resumeAuthorization *protocol.AuthorizationContext
-	if resumeID != "" && m.deps.Capabilities.IsPermissioned() && m.deps.AuthorizationContextProvider == nil {
-		m.mu.Unlock()
+	if resumeID != "" && deps.Capabilities.IsPermissioned() && deps.AuthorizationContextProvider == nil {
 		return nil, permissionedResumeError()
 	}
-	if resumeID != "" && m.deps.AuthorizationContextProvider != nil {
+	if resumeID != "" && deps.AuthorizationContextProvider != nil {
 		authorization, err := m.authorizeSessionResume(ctx, resumeID)
 		if err != nil {
-			m.mu.Unlock()
 			return nil, err
 		}
 		resumeAuthorization = &authorization
 	}
 	var loaded []protocol.Event
+	var reconciled []protocol.Event
 	if resumeID != "" {
 		var err error
-		loaded, err = m.deps.Sessions.Load(ctx, resumeID)
+		loaded, err = deps.Sessions.Load(ctx, resumeID)
 		if err != nil {
-			m.mu.Unlock()
 			if resumeAuthorization != nil {
 				return nil, permissionedResumeError()
 			}
@@ -164,70 +198,182 @@ func (m *Manager) Start(ctx context.Context, opts StartOptions) ([]protocol.Even
 			authorization = *resumeAuthorization
 		}
 		loaded = m.filterPersistedEvents(ctx, authorization, loaded)
+		loaded, reconciled, err = prepareSessionReplay(loaded, time.Now().UTC())
+		if err != nil {
+			if resumeAuthorization != nil {
+				return nil, permissionedResumeError()
+			}
+			return nil, fmt.Errorf("resume failed: %w", err)
+		}
 	}
-	info := m.newEinoSessionLocked(ctx, resumeID)
-	m.einoSession = info
+	info := m.newEinoSession(ctx, resumeID)
+	var binding *authorizationBinding
 	if resumeAuthorization == nil {
-		m.authorizationBinding = nil
+		binding = nil
 	} else {
-		binding := newAuthorizationBinding(*resumeAuthorization)
-		m.authorizationBinding = &binding
+		value := newAuthorizationBinding(*resumeAuthorization)
+		binding = &value
 	}
-	m.mu.Unlock()
-	events := []protocol.Event{
+	startupEvents := []protocol.Event{
 		protocol.NewEvent(protocol.EventGatewayReady, info.ID, "knote runtime ready", nil),
 		protocol.NewEvent(protocol.EventSessionInfo, info.ID, "session ready", info),
 	}
-	m.persist(events)
+	events := startupEvents
 	if info.Resumed {
-		events = append(loaded, events...)
+		events = append(append([]protocol.Event(nil), loaded...), startupEvents...)
 	}
-	m.emit(events)
+	startupPersisted := make([]protocol.Event, 0, len(reconciled)+len(startupEvents))
+	startupPersisted = append(startupPersisted, reconciled...)
+	startupPersisted = append(startupPersisted, startupEvents...)
+	if err := m.persist(ctx, startupPersisted); err != nil {
+		return nil, fmt.Errorf("persist runtime startup: %w", err)
+	}
+	m.commitMu.Lock()
+	m.mu.Lock()
+	if m.einoSession.ID != "" {
+		m.starting = false
+		m.mu.Unlock()
+		m.commitMu.Unlock()
+		return nil, ErrTurnBusy
+	}
+	m.generation++
+	m.einoSession = info
+	m.authorizationBinding = binding
+	subscribers := m.subscribersLocked()
+	m.mu.Unlock()
+	dispatch := m.enqueueNotifications(nil, subscribers, events)
+	m.commitMu.Unlock()
+	if dispatch {
+		m.drainNotifications()
+	}
+	m.mu.Lock()
+	m.starting = false
+	m.mu.Unlock()
+	started = true
 	return events, nil
 }
 
-func (m *Manager) SendMessage(ctx context.Context, input string) []protocol.Event {
+func (m *Manager) SendMessage(ctx context.Context, input string) ([]protocol.Event, error) {
 	input = strings.TrimSpace(input)
 	if input == "" {
-		return nil
+		return nil, nil
+	}
+	command, argument := "", ""
+	if strings.HasPrefix(input, "/") {
+		command, argument = parseSlash(input)
+	}
+	if command == "tasks" && m.deps.Capabilities.AllowsSlashCommand(command) {
+		return m.inspectTasks(ctx, input)
+	}
+	rotation := command == "new" || (command == "resume" && strings.TrimSpace(argument) != "")
+	var preparedResume *resumePreparation
+	reservedRotation := false
+	if command == "resume" && strings.TrimSpace(argument) != "" && m.deps.Capabilities.AllowsSlashCommand(command) {
+		resumeCtx, resumeCancel := m.turnTimeoutContext(ctx)
+		defer resumeCancel()
+		reservationID, currentSessionID, activeStart, err := m.reserveRotationPreparation()
+		if err != nil {
+			return nil, err
+		}
+		reservedRotation = true
+		stopTimeoutRelease := context.AfterFunc(resumeCtx, func() {
+			m.releaseRotationPreparation(reservationID)
+		})
+		prepared, failure := m.prepareResumeSession(resumeCtx, currentSessionID, argument, activeStart)
+		stopTimeoutRelease()
+		if err := resumeCtx.Err(); err != nil {
+			m.releaseRotationPreparation(reservationID)
+			return nil, fmt.Errorf("%w: prepare resume: %w", ErrTurnNotStarted, err)
+		}
+		if len(failure) > 0 {
+			m.releaseRotationPreparation(reservationID)
+			events := append([]protocol.Event{protocol.NewEvent(protocol.EventUserMessage, currentSessionID, input, nil)}, failure...)
+			// The active turn persists its user/result events only when it finishes.
+			// Avoid inserting a later validation failure ahead of that history.
+			if activeStart.Type == "" {
+				if err := m.persist(resumeCtx, events); err != nil {
+					return nil, fmt.Errorf("persist resume validation failure: %w", err)
+				}
+			}
+			m.emit(events)
+			return events, nil
+		}
+		preparedResume = &prepared
+		preparedResume.reservationID = reservationID
+		ctx = resumeCtx
+	}
+	title := "Message"
+	if command != "" {
+		title = "/" + command
+	}
+	var turn *activeTurn
+	var startedEvents []protocol.Event
+	var err error
+	if reservedRotation {
+		turn, startedEvents, err = m.beginReservedRotation(ctx, title, preparedResume.reservationID)
+	} else {
+		turn, startedEvents, err = m.beginTurn(ctx, title, rotation)
+	}
+	if err != nil {
+		if reservedRotation {
+			m.releaseRotationPreparation(preparedResume.reservationID)
+		}
+		return nil, err
+	}
+	if err := turn.ctx.Err(); err != nil {
+		completed, returnErr := m.finishTurn(turn, nil, err)
+		return append(startedEvents, completed...), returnErr
+	}
+	if preparedResume != nil && preparedResume.refreshAfterDrain {
+		refreshed, failure := m.prepareResumeSession(turn.ctx, turn.lifecycleSessionID, preparedResume.sessionID, turn.lifecycleStart)
+		if len(failure) > 0 {
+			events := append([]protocol.Event{protocol.NewEvent(protocol.EventUserMessage, turn.lifecycleSessionID, input, nil)}, failure...)
+			completed, returnErr := m.finishTurnResult(turn, events, events, fmt.Errorf("resume session changed during rotation"))
+			return append(startedEvents, completed...), returnErr
+		}
+		refreshed.reservationID = preparedResume.reservationID
+		refreshed.refreshAfterDrain = false
+		preparedResume = &refreshed
 	}
 	m.mu.Lock()
 	einoSession := m.einoSession
 	einoRunner := m.deps.EinoRunner
 	authorizationProvider := m.deps.AuthorizationContextProvider
 	m.mu.Unlock()
-	if einoSession.ID == "" {
-		return m.emitAndReturn(m.runtimeError("runtime has not started"))
-	}
 	events := []protocol.Event{protocol.NewEvent(protocol.EventUserMessage, einoSession.ID, input, nil)}
-	if strings.HasPrefix(input, "/") {
-		command, _ := parseSlash(input)
-		if !m.deps.Capabilities.AllowsSlashCommand(command) {
-			return m.handleSlash(ctx, einoSession.ID, input)
-		}
-		if command == "new" {
-			return m.handleSlash(ctx, einoSession.ID, input)
-		}
+	runCtx := turn.ctx
+	if strings.HasPrefix(input, "/") && (!m.deps.Capabilities.AllowsSlashCommand(command) || command == "new") {
+		result := m.handleSlash(runCtx, turn, einoSession.ID, input, preparedResume)
+		completed, returnErr := m.finishTurnResultWithStatusEvents(
+			turn, result.persisted, result.events, result.lifecycleStatusEvents(), result.err, false, false, nil,
+		)
+		return append(startedEvents, completed...), returnErr
 	}
-	runCtx := ctx
 	if authorizationProvider != nil {
-		authorization, err := authorizationProvider.authorizationContext(ctx, einoSession.ID)
+		authorization, err := authorizationProvider.authorizationContext(runCtx, einoSession.ID)
 		if err != nil {
 			events = append(events, protocol.NewEvent(protocol.EventError, einoSession.ID, m.authorizationFailureMessage(err), nil))
-			return m.emitAndReturn(events)
+			completed, returnErr := m.finishTurnResult(turn, nil, events, err)
+			return append(startedEvents, completed...), returnErr
 		}
-		runCtx, err = protocol.WithAuthorizationContext(ctx, authorization)
+		runCtx, err = protocol.WithAuthorizationContext(runCtx, authorization)
 		if err != nil {
 			events = append(events, protocol.NewEvent(protocol.EventError, einoSession.ID, m.authorizationFailureMessage(err), nil))
-			return m.emitAndReturn(events)
+			completed, returnErr := m.finishTurnResult(turn, nil, events, err)
+			return append(startedEvents, completed...), returnErr
 		}
-		if err := m.bindSessionAuthorization(ctx, einoSession.ID, authorization); err != nil {
+		if err := m.bindSessionAuthorization(runCtx, einoSession.ID, authorization); err != nil {
 			events = append(events, protocol.NewEvent(protocol.EventError, einoSession.ID, m.authorizationFailureMessage(err), nil))
-			return m.emitAndReturn(events)
+			completed, returnErr := m.finishTurnResult(turn, nil, events, err)
+			return append(startedEvents, completed...), returnErr
 		}
 	}
 	if strings.HasPrefix(input, "/") {
-		return m.handleSlash(runCtx, einoSession.ID, input)
+		result := m.handleSlash(runCtx, turn, einoSession.ID, input, preparedResume)
+		completed, returnErr := m.finishTurnResultWithStatusEvents(
+			turn, result.persisted, result.events, result.lifecycleStatusEvents(), result.err, false, false, nil,
+		)
+		return append(startedEvents, completed...), returnErr
 	}
 	history := m.loadHistory(runCtx, einoSession.ID)
 	if m.deps.SideEffects != nil {
@@ -240,12 +386,60 @@ func (m *Manager) SendMessage(ctx context.Context, input string) []protocol.Even
 	}
 	if err != nil {
 		if errors.Is(err, ErrSideEffectPending) {
-			return m.persistEmitAndReturn(events)
+			completed, returnErr := m.finishTurn(turn, events, nil)
+			return append(startedEvents, completed...), returnErr
 		}
-		events = append(events, protocol.NewEvent(protocol.EventError, einoSession.ID, err.Error(), nil))
-		return m.persistEmitAndReturn(events)
+		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			events = append(events, protocol.NewEvent(protocol.EventError, einoSession.ID, err.Error(), nil))
+		}
+		completed, returnErr := m.finishTurn(turn, events, err)
+		return append(startedEvents, completed...), returnErr
 	}
-	return m.persistEmitAndReturn(events)
+	completed, returnErr := m.finishTurn(turn, events, nil)
+	return append(startedEvents, completed...), returnErr
+}
+
+func (m *Manager) inspectTasks(_ context.Context, input string) ([]protocol.Event, error) {
+	m.commitMu.Lock()
+	m.mu.Lock()
+	sessionID := m.einoSession.ID
+	turn := m.activeTurn
+	var tasks []protocol.Task
+	if turn != nil {
+		status := protocol.TaskRunning
+		message := "Task running"
+		if !turn.startCommitted {
+			status = protocol.TaskPending
+			message = "Task start in progress"
+		} else if turn.finished {
+			message = "Task completion in progress"
+		}
+		tasks = append(tasks, protocol.Task{
+			ID:        turn.id,
+			Title:     turn.title,
+			Status:    status,
+			CreatedAt: turn.createdAt,
+			UpdatedAt: time.Now().UTC(),
+			Message:   message,
+		})
+	}
+	subscribers := m.subscribersLocked()
+	m.mu.Unlock()
+	var events []protocol.Event
+	if sessionID == "" {
+		events = []protocol.Event{protocol.NewEvent(protocol.EventError, "", "runtime has not started", nil)}
+	} else {
+		events = []protocol.Event{
+			protocol.NewEvent(protocol.EventUserMessage, sessionID, input, nil),
+			protocol.NewEvent(protocol.EventTaskProgress, sessionID, "tasks", tasks),
+		}
+	}
+	dispatch := m.enqueueNotifications(nil, subscribers, events)
+	m.commitMu.Unlock()
+	if dispatch {
+		m.drainNotifications()
+	}
+	return events, nil
 }
 
 func (m *Manager) authorizationFailureMessage(err error) string {
@@ -255,43 +449,91 @@ func (m *Manager) authorizationFailureMessage(err error) string {
 	return err.Error()
 }
 
-func (m *Manager) Confirm(ctx context.Context, req protocol.ConfirmRequest, approved bool) []protocol.Event {
+func (m *Manager) Confirm(ctx context.Context, req protocol.ConfirmRequest, approved bool) ([]protocol.Event, error) {
+	turn, startedEvents, err := m.beginTurn(ctx, confirmationTurnTitle, false)
+	if err != nil {
+		return nil, err
+	}
+	if err := turn.ctx.Err(); err != nil {
+		if m.deps.SideEffects != nil {
+			return m.finishUnexecutedConfirmation(turn, startedEvents, turn.targetSessionID, req, err)
+		}
+		completed, returnErr := m.finishTurn(turn, nil, err)
+		return append(startedEvents, completed...), returnErr
+	}
 	m.mu.Lock()
 	einoSessionID := m.einoSession.ID
 	authorizationProvider := m.deps.AuthorizationContextProvider
 	permissionedCapabilities := m.deps.Capabilities.IsPermissioned()
 	m.mu.Unlock()
 	if einoSessionID == "" {
-		return m.emitAndReturn(m.runtimeError("runtime has not started"))
+		completed, returnErr := m.finishTurn(turn, m.runtimeError("runtime has not started"), fmt.Errorf("runtime has not started"))
+		return append(startedEvents, completed...), returnErr
 	}
 	if m.deps.SideEffects != nil {
-		confirmCtx := ctx
+		confirmCtx := turn.ctx
 		if approved && authorizationProvider != nil {
-			authorization, err := authorizationProvider.authorizationContext(ctx, einoSessionID)
+			authorization, err := authorizationProvider.authorizationContext(confirmCtx, einoSessionID)
 			if err != nil {
-				return m.confirmBeforeConsumptionError(einoSessionID, req, err)
+				return m.finishUnexecutedConfirmation(turn, startedEvents, einoSessionID, req, err)
 			}
-			confirmCtx, err = protocol.WithAuthorizationContext(ctx, authorization)
+			confirmCtx, err = protocol.WithAuthorizationContext(confirmCtx, authorization)
 			if err != nil {
-				return m.confirmBeforeConsumptionError(einoSessionID, req, err)
+				return m.finishUnexecutedConfirmation(turn, startedEvents, einoSessionID, req, err)
 			}
-			if err := m.bindSessionAuthorization(ctx, einoSessionID, authorization); err != nil {
-				return m.confirmBeforeConsumptionError(einoSessionID, req, err)
+			if err := m.bindSessionAuthorization(confirmCtx, einoSessionID, authorization); err != nil {
+				return m.finishUnexecutedConfirmation(turn, startedEvents, einoSessionID, req, err)
 			}
 			confirmCtx, err = m.withSessionAuthorizationExpectation(confirmCtx, einoSessionID, authorization)
 			if err != nil {
-				return m.confirmBeforeConsumptionError(einoSessionID, req, err)
+				return m.finishUnexecutedConfirmation(turn, startedEvents, einoSessionID, req, err)
 			}
 		} else if approved && permissionedCapabilities {
 			var err error
-			confirmCtx, err = m.permissionedToolContext(ctx, einoSessionID)
+			confirmCtx, err = m.permissionedToolContext(confirmCtx, einoSessionID)
 			if err != nil {
-				return m.confirmBeforeConsumptionError(einoSessionID, req, err)
+				return m.finishUnexecutedConfirmation(turn, startedEvents, einoSessionID, req, err)
 			}
 		}
-		return m.persistEmitAndReturn(m.deps.SideEffects.Confirm(confirmCtx, einoSessionID, req, approved))
+		outcome := m.deps.SideEffects.confirmOutcome(confirmCtx, einoSessionID, req, approved)
+		completed, returnErr := m.finishTurnResultWithStatusEvents(
+			turn,
+			outcome.events,
+			outcome.events,
+			outcome.events,
+			nil,
+			outcome.consumed,
+			outcome.executed,
+			outcome.restore,
+		)
+		result := append(startedEvents, completed...)
+		if returnErr != nil && outcome.consumed && !outcome.executed {
+			return result, fmt.Errorf("%w: %w", ErrConfirmationNotExecuted, returnErr)
+		}
+		return result, returnErr
 	}
-	return m.persistEmitAndReturn([]protocol.Event{protocol.NewEvent(protocol.EventError, einoSessionID, "confirm is not available without a side-effect bridge", nil)})
+	events := []protocol.Event{protocol.NewEvent(protocol.EventError, einoSessionID, "confirm is not available without a side-effect bridge", nil)}
+	completed, returnErr := m.finishTurn(turn, events, fmt.Errorf("side-effect bridge is not configured"))
+	return append(startedEvents, completed...), returnErr
+}
+
+func (m *Manager) finishUnexecutedConfirmation(
+	turn *activeTurn,
+	startedEvents []protocol.Event,
+	sessionID string,
+	req protocol.ConfirmRequest,
+	operationErr error,
+) ([]protocol.Event, error) {
+	events := m.confirmBeforeConsumptionError(sessionID, req, operationErr)
+	completed, finishErr := m.finishTurnResultWithStatusEvents(turn, events, events, events, operationErr, true, false, nil)
+	result := append(startedEvents, completed...)
+	if finishErr != nil {
+		return result, fmt.Errorf("%w: %w", ErrConfirmationNotExecuted, finishErr)
+	}
+	if errors.Is(operationErr, context.Canceled) || errors.Is(operationErr, context.DeadlineExceeded) {
+		return result, fmt.Errorf("%w: %w", ErrConfirmationNotExecuted, operationErr)
+	}
+	return result, nil
 }
 
 func (m *Manager) confirmBeforeConsumptionError(sessionID string, req protocol.ConfirmRequest, err error) []protocol.Event {
@@ -301,30 +543,88 @@ func (m *Manager) confirmBeforeConsumptionError(sessionID string, req protocol.C
 	}
 	events := []protocol.Event{protocol.NewEvent(protocol.EventError, sessionID, message, nil)}
 	events = append(events, m.deps.SideEffects.retryEvents(sessionID, req)...)
-	return m.persistEmitAndReturn(events)
+	return events
 }
 
-func (m *Manager) Interrupt(context.Context) []protocol.Event {
+func (m *Manager) Interrupt(ctx context.Context) ([]protocol.Event, error) {
+	m.commitMu.Lock()
 	m.mu.Lock()
 	einoSessionID := m.einoSession.ID
-	m.mu.Unlock()
-	if einoSessionID != "" {
-		return m.persistEmitAndReturn([]protocol.Event{protocol.NewEvent(protocol.EventStatusUpdate, einoSessionID, "interrupt requested; Eino runner has no active streaming controller yet", nil)})
+	turn := m.activeTurn
+	if einoSessionID == "" {
+		m.mu.Unlock()
+		m.commitMu.Unlock()
+		return m.emitAndReturn(m.runtimeError("runtime has not started")), nil
 	}
-	return m.emitAndReturn(m.runtimeError("runtime has not started"))
+	subscribers := m.subscribersLocked()
+	m.mu.Unlock()
+
+	var events []protocol.Event
+	if turn == nil {
+		events = []protocol.Event{protocol.NewEvent(protocol.EventStatusUpdate, einoSessionID, "no active task", nil)}
+	} else if turn.finished {
+		payload := map[string]string{}
+		if turn.startCommitted {
+			payload["task_id"] = turn.id
+		}
+		events = []protocol.Event{protocol.NewEvent(protocol.EventStatusUpdate, einoSessionID, "task completion in progress", payload)}
+	} else {
+		turn.cancel()
+		payload := map[string]string{}
+		if turn.startCommitted {
+			payload["task_id"] = turn.id
+		}
+		events = []protocol.Event{protocol.NewEvent(protocol.EventStatusUpdate, einoSessionID, "interrupt requested", payload)}
+	}
+	persistCtx, persistCancel := m.turnFinalizationContext(ctx)
+	persistErr := m.persist(persistCtx, events)
+	persistCancel()
+	dispatch := m.enqueueNotifications(nil, subscribers, events)
+	m.commitMu.Unlock()
+	if dispatch {
+		m.drainNotifications()
+	}
+	return events, persistErr
 }
 
-func (m *Manager) StopTask(_ context.Context, taskID string) []protocol.Event {
+func (m *Manager) StopTask(ctx context.Context, taskID string) ([]protocol.Event, error) {
+	taskID = strings.TrimSpace(taskID)
 	if taskID == "" {
-		return m.emitAndReturn(m.runtimeError("task id is required"))
+		return nil, fmt.Errorf("task id is required")
 	}
+	m.commitMu.Lock()
 	m.mu.Lock()
 	einoSessionID := m.einoSession.ID
-	m.mu.Unlock()
-	if einoSessionID != "" {
-		return m.persistEmitAndReturn([]protocol.Event{protocol.NewEvent(protocol.EventStatusUpdate, einoSessionID, fmt.Sprintf("task stop requested for %s; Eino runner has no background task controller yet", taskID), nil)})
+	turn := m.activeTurn
+	if einoSessionID == "" {
+		m.mu.Unlock()
+		m.commitMu.Unlock()
+		return nil, fmt.Errorf("runtime has not started")
 	}
-	return m.emitAndReturn(m.runtimeError("runtime has not started"))
+	if turn == nil || turn.id != taskID {
+		m.mu.Unlock()
+		m.commitMu.Unlock()
+		return nil, fmt.Errorf("%w: %s", ErrTaskNotFound, taskID)
+	}
+	if turn.finished {
+		m.mu.Unlock()
+		m.commitMu.Unlock()
+		return nil, fmt.Errorf("%w: %s", ErrTaskNotFound, taskID)
+	}
+	subscribers := m.subscribersLocked()
+	m.mu.Unlock()
+
+	turn.cancel()
+	events := []protocol.Event{protocol.NewEvent(protocol.EventStatusUpdate, einoSessionID, "task stop requested", map[string]string{"task_id": taskID})}
+	persistCtx, persistCancel := m.turnFinalizationContext(ctx)
+	persistErr := m.persist(persistCtx, events)
+	persistCancel()
+	dispatch := m.enqueueNotifications(nil, subscribers, events)
+	m.commitMu.Unlock()
+	if dispatch {
+		m.drainNotifications()
+	}
+	return events, persistErr
 }
 
 func (m *Manager) WorkspaceStatus(ctx context.Context) (repository.Status, error) {
@@ -361,7 +661,7 @@ func (m *Manager) RunnerInfo(ctx context.Context) (RunnerInfo, error) {
 	return info, nil
 }
 
-func (m *Manager) newEinoSessionLocked(ctx context.Context, resumeID string) protocol.SessionInfo {
+func (m *Manager) newEinoSession(ctx context.Context, resumeID string) protocol.SessionInfo {
 	sessionID := strings.TrimSpace(resumeID)
 	resumed := true
 	if sessionID == "" {
@@ -469,19 +769,17 @@ func permissionedSessionInfo(info protocol.SessionInfo) protocol.SessionInfo {
 	}
 }
 
-func (m *Manager) persistEmitAndReturn(events []protocol.Event) []protocol.Event {
-	m.persist(events)
-	m.emit(events)
-	return events
-}
-
-func (m *Manager) persist(events []protocol.Event) {
-	if m.deps.Sessions == nil {
-		return
+func (m *Manager) persist(ctx context.Context, events []protocol.Event) error {
+	if m.deps.Sessions == nil || len(events) == 0 {
+		return nil
 	}
-	for _, event := range events {
-		_ = m.deps.Sessions.Append(context.Background(), event)
+	if ctx == nil {
+		ctx = context.Background()
 	}
+	if len(events) == 1 {
+		return m.deps.Sessions.Append(ctx, events[0])
+	}
+	return m.deps.Sessions.AppendBatch(ctx, events)
 }
 
 func (m *Manager) loadHistory(ctx context.Context, sessionID string) []protocol.Event {
@@ -496,7 +794,17 @@ func (m *Manager) loadHistory(ctx context.Context, sessionID string) []protocol.
 	if !ok || authorization.SessionID != sessionID {
 		authorization = protocol.AuthorizationContext{}
 	}
-	return m.filterPersistedEvents(ctx, authorization, events)
+	events = m.filterPersistedEvents(ctx, authorization, events)
+	filtered := events[:0]
+	for _, event := range events {
+		switch event.Type {
+		case protocol.EventTaskStarted, protocol.EventTaskProgress, protocol.EventTaskComplete:
+			continue
+		default:
+			filtered = append(filtered, event)
+		}
+	}
+	return filtered
 }
 
 func (m *Manager) emitAndReturn(events []protocol.Event) []protocol.Event {
@@ -509,14 +817,9 @@ func (m *Manager) emit(events []protocol.Event) {
 		return
 	}
 	m.mu.Lock()
-	subscribers := make([]EventSubscriber, 0, len(m.subscribers))
-	for _, fn := range m.subscribers {
-		subscribers = append(subscribers, fn)
-	}
+	subscribers := m.subscribersLocked()
 	m.mu.Unlock()
-	for _, fn := range subscribers {
-		fn(append([]protocol.Event(nil), events...))
-	}
+	m.publishNotifications(nil, subscribers, events)
 }
 
 func (m *Manager) runtimeError(message string) []protocol.Event {

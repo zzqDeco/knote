@@ -50,6 +50,7 @@ func (noopWorkspace) EvalGate(context.Context) error                            
 type noopSessions struct{}
 
 func (noopSessions) Append(context.Context, protocol.Event) error           { return nil }
+func (noopSessions) AppendBatch(context.Context, []protocol.Event) error    { return nil }
 func (noopSessions) Load(context.Context, string) ([]protocol.Event, error) { return nil, nil }
 func (noopSessions) List(context.Context, int) ([]SessionSummary, error)    { return nil, nil }
 

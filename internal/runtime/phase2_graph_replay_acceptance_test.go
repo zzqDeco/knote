@@ -81,12 +81,12 @@ func TestPhase2GraphReplayAcceptanceRevocationClosesTraversalCacheCitationAndSes
 		t.Fatal(err)
 	}
 	manager.SendMessage(context.Background(), "/help")
-	localEvents := manager.Interrupt(context.Background())
+	localEvents, _ := manager.Interrupt(context.Background())
 	if len(localEvents) != 1 || localEvents[0].Type != protocol.EventStatusUpdate {
 		t.Fatalf("safe local history = %+v", localEvents)
 	}
 	safeLocalMessage := localEvents[0].Message
-	queryEvents := manager.SendMessage(context.Background(), phase2GraphQuestion)
+	queryEvents, _ := manager.SendMessage(context.Background(), phase2GraphQuestion)
 	if hasEvent(queryEvents, protocol.EventError) {
 		t.Fatalf("initial graph query failed: %+v", queryEvents)
 	}
