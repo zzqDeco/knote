@@ -481,20 +481,25 @@ func (m *Model) refreshOverlay() {
 
 func (m *Model) applyEvents(events []protocol.Event) {
 	m.events = append(m.events, events...)
-	if hasClearEvent(events) {
+	cleared := hasClearEvent(events)
+	if cleared {
 		m.pendingConfirm = nil
 		m.overlayMode = overlayNone
 		m.overlay = ""
-	}
-	if req := confirmFromEvents(events); req != nil {
-		m.pendingConfirm = req
-	}
-	if mode, overlay := overlayFromEvents(events); strings.TrimSpace(overlay) != "" {
-		m.overlayMode = mode
-		m.overlay = overlay
-	} else if closesOverlay(events) {
-		m.overlayMode = overlayNone
-		m.overlay = ""
+	} else {
+		if req := confirmFromEvents(events); req != nil {
+			m.pendingConfirm = req
+		}
+		if m.pendingConfirm != nil {
+			m.overlayMode = overlayConfirm
+			m.overlay = renderConfirmation(*m.pendingConfirm)
+		} else if mode, overlay := overlayFromEvents(events); strings.TrimSpace(overlay) != "" {
+			m.overlayMode = mode
+			m.overlay = overlay
+		} else if closesOverlay(events) {
+			m.overlayMode = overlayNone
+			m.overlay = ""
+		}
 	}
 	m.status = m.deriveStatus()
 	m.resize()
@@ -522,7 +527,9 @@ func (m *Model) applyRuntimeResult(result runtimeResultMsg) {
 		return
 	}
 	m.err = result.err
-	if !errors.Is(result.err, runtime.ErrTurnBusy) {
+	if !errors.Is(result.err, runtime.ErrTurnBusy) &&
+		!errors.Is(result.err, runtime.ErrTurnNotStarted) &&
+		!errors.Is(result.err, runtime.ErrConfirmationNotExecuted) {
 		return
 	}
 	switch result.kind {

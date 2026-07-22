@@ -227,6 +227,15 @@ func (m *Manager) resumeSession(ctx context.Context, turn *activeTurn, currentSe
 	}
 	loaded = m.filterPersistedEvents(ctx, authorization, loaded)
 	loaded = withoutCurrentTaskStart(loaded, turn.lifecycleStart)
+	loaded, reconciled, replayErr := prepareSessionReplay(loaded, time.Now().UTC())
+	if replayErr != nil {
+		message := "resume failed: " + replayErr.Error()
+		if resumeAuthorization != nil || m.deps.Capabilities.IsPermissioned() {
+			message = permissionedResumeErrorMessage
+		}
+		events := []protocol.Event{protocol.NewEvent(protocol.EventError, currentSessionID, message, nil)}
+		return events, events, events
+	}
 	info := m.newEinoSession(ctx, sessionID)
 	var binding *authorizationBinding
 	if resumeAuthorization == nil {
@@ -244,7 +253,75 @@ func (m *Manager) resumeSession(ctx context.Context, turn *activeTurn, currentSe
 	events = append(events, protocol.NewEvent(protocol.EventViewClear, sessionID, "resume session", nil))
 	events = append(events, loaded...)
 	events = append(events, infoEvent)
-	return events, []protocol.Event{infoEvent}, []protocol.Event{infoEvent}
+	persisted := make([]protocol.Event, 0, len(reconciled)+1)
+	persisted = append(persisted, reconciled...)
+	persisted = append(persisted, infoEvent)
+	return events, persisted, []protocol.Event{infoEvent}
+}
+
+type replayTaskKey struct {
+	id        string
+	createdAt time.Time
+}
+
+type replayOpenTask struct {
+	task      protocol.Task
+	sessionID string
+}
+
+func prepareSessionReplay(events []protocol.Event, resumedAt time.Time) ([]protocol.Event, []protocol.Event, error) {
+	open := make(map[replayTaskKey]replayOpenTask)
+	order := make([]replayTaskKey, 0)
+	replay := make([]protocol.Event, 0, len(events))
+	for _, event := range events {
+		if event.Type == protocol.EventConfirmRequest {
+			continue
+		}
+		replay = append(replay, event)
+		task, ok := taskFromLifecycleEvent(event)
+		if !ok || strings.TrimSpace(task.ID) == "" {
+			continue
+		}
+		key := replayTaskKey{id: task.ID, createdAt: task.CreatedAt}
+		switch event.Type {
+		case protocol.EventTaskStarted:
+			if task.Status != protocol.TaskPending && task.Status != protocol.TaskRunning {
+				continue
+			}
+			if _, exists := open[key]; !exists {
+				order = append(order, key)
+			}
+			open[key] = replayOpenTask{task: task, sessionID: event.SessionID}
+		case protocol.EventTaskProgress:
+			if current, exists := open[key]; exists {
+				current.task = task
+				open[key] = current
+			}
+		case protocol.EventTaskComplete:
+			delete(open, key)
+		}
+	}
+
+	resumedAt = resumedAt.UTC()
+	reconciled := make([]protocol.Event, 0, len(open))
+	for _, key := range order {
+		current, exists := open[key]
+		if !exists {
+			continue
+		}
+		if current.task.Title == confirmationTurnTitle {
+			return nil, nil, fmt.Errorf("%w: %s", ErrSideEffectOutcomeUnknown, current.task.ID)
+		}
+		message := "Task interrupted before session resume"
+		current.task.Status = protocol.TaskKilled
+		current.task.UpdatedAt = resumedAt
+		current.task.Message = message
+		terminal := protocol.NewEvent(protocol.EventTaskComplete, current.sessionID, message, current.task)
+		terminal.CreatedAt = resumedAt
+		reconciled = append(reconciled, terminal)
+	}
+	replay = append(replay, reconciled...)
+	return replay, reconciled, nil
 }
 
 func withoutCurrentTaskStart(events []protocol.Event, current protocol.Event) []protocol.Event {

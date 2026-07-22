@@ -119,18 +119,20 @@ func TestInterruptRevalidatesReplacementTurnUnderCommitSerialization(t *testing.
 	oldCancelled := make(chan struct{})
 	var oldCancelOnce sync.Once
 	oldTurn := &activeTurn{
-		id:     "task_old",
-		ctx:    oldCtx,
-		cancel: func() { oldCancelOnce.Do(func() { close(oldCancelled) }); cancelOldContext() },
-		done:   make(chan struct{}),
+		id:             "task_old",
+		ctx:            oldCtx,
+		cancel:         func() { oldCancelOnce.Do(func() { close(oldCancelled) }); cancelOldContext() },
+		done:           make(chan struct{}),
+		startCommitted: true,
 	}
 	replacementCtx, cancelReplacementContext := context.WithCancel(context.Background())
 	defer cancelReplacementContext()
 	replacementTurn := &activeTurn{
-		id:     "task_replacement",
-		ctx:    replacementCtx,
-		cancel: cancelReplacementContext,
-		done:   make(chan struct{}),
+		id:             "task_replacement",
+		ctx:            replacementCtx,
+		cancel:         cancelReplacementContext,
+		done:           make(chan struct{}),
+		startCommitted: true,
 	}
 	manager.mu.Lock()
 	manager.activeTurn = oldTurn
@@ -194,18 +196,20 @@ func TestStopTaskRevalidatesReplacementTurnUnderCommitSerialization(t *testing.T
 	oldCancelled := make(chan struct{})
 	var oldCancelOnce sync.Once
 	oldTurn := &activeTurn{
-		id:     "task_old",
-		ctx:    oldCtx,
-		cancel: func() { oldCancelOnce.Do(func() { close(oldCancelled) }); cancelOldContext() },
-		done:   make(chan struct{}),
+		id:             "task_old",
+		ctx:            oldCtx,
+		cancel:         func() { oldCancelOnce.Do(func() { close(oldCancelled) }); cancelOldContext() },
+		done:           make(chan struct{}),
+		startCommitted: true,
 	}
 	replacementCtx, cancelReplacementContext := context.WithCancel(context.Background())
 	defer cancelReplacementContext()
 	replacementTurn := &activeTurn{
-		id:     "task_replacement",
-		ctx:    replacementCtx,
-		cancel: cancelReplacementContext,
-		done:   make(chan struct{}),
+		id:             "task_replacement",
+		ctx:            replacementCtx,
+		cancel:         cancelReplacementContext,
+		done:           make(chan struct{}),
+		startCommitted: true,
 	}
 	manager.mu.Lock()
 	manager.activeTurn = oldTurn
@@ -292,9 +296,12 @@ func TestAcceptedResultAndTerminalCommitBeforeConcurrentInterrupt(t *testing.T) 
 		interruptDone <- result{events: events, err: err}
 	}()
 	select {
-	case got := <-interruptDone:
-		t.Fatalf("interrupt crossed the result commit point early: %+v", got)
-	case <-time.After(25 * time.Millisecond):
+	case interrupted := <-interruptDone:
+		if interrupted.err != nil || !hasMessage(interrupted.events, protocol.EventStatusUpdate, "task completion in progress") {
+			t.Fatalf("interrupt during result commit = events:%+v err:%v", interrupted.events, interrupted.err)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("interrupt blocked behind result persistence")
 	}
 	close(store.release)
 
@@ -312,17 +319,12 @@ func TestAcceptedResultAndTerminalCommitBeforeConcurrentInterrupt(t *testing.T) 
 	}
 	assertTaskStatus(t, sent.events, "Message", protocol.TaskCompleted)
 
-	select {
-	case interrupted := <-interruptDone:
-		if interrupted.err != nil || !hasMessage(interrupted.events, protocol.EventStatusUpdate, "no active task") {
-			t.Fatalf("post-commit interrupt = events:%+v err:%v", interrupted.events, interrupted.err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("interrupt did not complete after the atomic finish")
+	if interrupted, err := manager.Interrupt(context.Background()); err != nil || !hasMessage(interrupted, protocol.EventStatusUpdate, "no active task") {
+		t.Fatalf("post-commit interrupt = events:%+v err:%v", interrupted, err)
 	}
 }
 
-func TestTaskStartCommitsBeforeConcurrentInterrupt(t *testing.T) {
+func TestInterruptCancelsBlockedTaskStartWithoutWaitingForDeadline(t *testing.T) {
 	store := &blockingResultSessions{
 		Sessions:  local.New(t.TempDir()),
 		blocked:   make(chan struct{}),
@@ -359,29 +361,73 @@ func TestTaskStartCommitsBeforeConcurrentInterrupt(t *testing.T) {
 		interruptDone <- result{events: events, err: err}
 	}()
 	select {
-	case got := <-interruptDone:
-		t.Fatalf("interrupt crossed task.started commit early: %+v", got)
-	case <-time.After(25 * time.Millisecond):
-	}
-	close(store.release)
-
-	select {
 	case interrupted := <-interruptDone:
-		if interrupted.err != nil || len(interruptTaskIDsForTest(interrupted.events)) != 1 {
+		if interrupted.err != nil || !hasMessage(interrupted.events, protocol.EventStatusUpdate, "interrupt requested") {
 			t.Fatalf("interrupt result = events:%+v err:%v", interrupted.events, interrupted.err)
 		}
-	case <-time.After(time.Second):
-		t.Fatal("interrupt did not complete after task.started committed")
+		if len(interruptTaskIDsForTest(interrupted.events)) != 0 {
+			t.Fatalf("uncommitted task start exposed a task id: %+v", interrupted.events)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("interrupt waited for blocked task.started persistence")
 	}
 	select {
 	case sent := <-sendDone:
-		if !errors.Is(sent.err, context.Canceled) {
-			t.Fatalf("send error = %v, want context.Canceled", sent.err)
+		if !errors.Is(sent.err, context.Canceled) || !errors.Is(sent.err, ErrTurnNotStarted) {
+			t.Fatalf("send error = %v, want cancelled ErrTurnNotStarted", sent.err)
 		}
-		assertSingleTaskLifecycle(t, sent.events, protocol.TaskKilled)
+		if len(sent.events) != 0 {
+			t.Fatalf("cancelled uncommitted start published lifecycle: %+v", sent.events)
+		}
 	case <-time.After(time.Second):
 		t.Fatal("interrupted send did not finish")
 	}
+	close(store.release)
+}
+
+func TestTaskStartPersistenceHonorsTurnDeadlineAndClearsActiveTurn(t *testing.T) {
+	store := &blockingResultSessions{
+		Sessions:  local.New(t.TempDir()),
+		blocked:   make(chan struct{}),
+		release:   make(chan struct{}),
+		blockType: protocol.EventTaskStarted,
+	}
+	manager := New(Dependencies{
+		Sessions:     store,
+		EinoRunner:   immediateTurnRunner{},
+		TurnTimeout:  25 * time.Millisecond,
+		NewSessionID: func() string { return "sess_start_deadline" },
+	})
+	if _, err := manager.Start(context.Background(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	startedAt := time.Now()
+	events, err := manager.SendMessage(context.Background(), "blocked task start")
+	if !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, ErrTurnNotStarted) || len(events) != 0 {
+		t.Fatalf("blocked task start = events:%+v err:%v, want deadline without published lifecycle", events, err)
+	}
+	if elapsed := time.Since(startedAt); elapsed > 500*time.Millisecond {
+		t.Fatalf("blocked task start ignored turn deadline: %s", elapsed)
+	}
+	select {
+	case <-store.blocked:
+	default:
+		t.Fatal("task.started append was not attempted")
+	}
+	manager.mu.Lock()
+	active := manager.activeTurn
+	manager.mu.Unlock()
+	if active != nil {
+		t.Fatalf("failed task start left active turn %+v", active)
+	}
+
+	close(store.release)
+	events, err = manager.SendMessage(context.Background(), "retry after persistence recovered")
+	if err != nil {
+		t.Fatalf("retry after persistence recovery: %v", err)
+	}
+	assertSingleTaskLifecycle(t, events, protocol.TaskCompleted)
 }
 
 func TestTurnControllerAppliesConfiguredDeadline(t *testing.T) {
@@ -396,6 +442,402 @@ func TestTurnControllerAppliesConfiguredDeadline(t *testing.T) {
 		t.Fatalf("deadline error = %v, want context.DeadlineExceeded", err)
 	}
 	assertSingleTaskLifecycle(t, events, protocol.TaskFailed)
+}
+
+func TestCommittedSideEffectOutcomeSurvivesTurnDeadline(t *testing.T) {
+	store := local.New(t.TempDir())
+	bridge := NewSideEffectBridge()
+	manager := New(Dependencies{
+		Sessions:     store,
+		EinoRunner:   immediateTurnRunner{},
+		SideEffects:  bridge,
+		TurnTimeout:  25 * time.Millisecond,
+		NewSessionID: func() string { return "sess_committed_side_effect" },
+	})
+	if _, err := manager.Start(context.Background(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	sessionID := manager.SessionID()
+	var executions atomic.Int32
+	err := bridge.Request(withSideEffectSession(context.Background(), sessionID), SideEffectRequest{
+		ToolName: "knote_build",
+		Action:   "build",
+		Execute: func(ctx context.Context, req SideEffectRequest) ([]protocol.Event, error) {
+			<-ctx.Done()
+			executions.Add(1)
+			return []protocol.Event{protocol.NewEvent(protocol.EventToolComplete, req.SessionID, "build committed", nil)}, nil
+		},
+	})
+	if !errors.Is(err, ErrSideEffectPending) {
+		t.Fatalf("seed side effect: %v", err)
+	}
+	pending := bridge.PendingEvents(sessionID)
+	if len(pending) != 1 {
+		t.Fatalf("pending confirmation events = %+v", pending)
+	}
+
+	events, err := manager.Confirm(context.Background(), firstConfirm(t, pending), true)
+	if err != nil {
+		t.Fatalf("committed side effect returned a retryable deadline: %v", err)
+	}
+	if got := executions.Load(); got != 1 {
+		t.Fatalf("side-effect executions = %d, want 1", got)
+	}
+	if !hasMessage(events, protocol.EventToolComplete, "build committed") {
+		t.Fatalf("committed result was dropped: %+v", events)
+	}
+	assertTaskStatus(t, events, "Confirmation", protocol.TaskCompleted)
+	loaded, err := store.Load(context.Background(), sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasMessage(loaded, protocol.EventToolComplete, "build committed") {
+		t.Fatalf("committed result was not persisted: %+v", loaded)
+	}
+}
+
+func TestCommittedSideEffectRemainsBusyUntilOutcomeIsDurable(t *testing.T) {
+	store := &blockingResultSessions{
+		Sessions:  local.New(t.TempDir()),
+		blocked:   make(chan struct{}),
+		release:   make(chan struct{}),
+		blockType: protocol.EventToolComplete,
+	}
+	bridge := NewSideEffectBridge()
+	manager := New(Dependencies{
+		Sessions:     store,
+		EinoRunner:   immediateTurnRunner{},
+		SideEffects:  bridge,
+		TurnTimeout:  25 * time.Millisecond,
+		NewSessionID: func() string { return "sess_durable_side_effect" },
+	})
+	if _, err := manager.Start(context.Background(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	sessionID := manager.SessionID()
+	err := bridge.Request(withSideEffectSession(context.Background(), sessionID), SideEffectRequest{
+		ToolName: "knote_build",
+		Action:   "build",
+		Execute: func(ctx context.Context, req SideEffectRequest) ([]protocol.Event, error) {
+			<-ctx.Done()
+			return []protocol.Event{protocol.NewEvent(protocol.EventToolComplete, req.SessionID, "durable build", nil)}, nil
+		},
+	})
+	if !errors.Is(err, ErrSideEffectPending) {
+		t.Fatalf("seed side effect: %v", err)
+	}
+	confirm := firstConfirm(t, bridge.PendingEvents(sessionID))
+	type result struct {
+		events []protocol.Event
+		err    error
+	}
+	done := make(chan result, 1)
+	go func() {
+		events, confirmErr := manager.Confirm(context.Background(), confirm, true)
+		done <- result{events: events, err: confirmErr}
+	}()
+	select {
+	case <-store.blocked:
+	case <-time.After(time.Second):
+		t.Fatal("committed outcome did not reach durable persistence")
+	}
+	select {
+	case got := <-done:
+		t.Fatalf("committed outcome returned before persistence completed: %+v", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if events, err := manager.Confirm(context.Background(), confirm, true); !errors.Is(err, ErrTurnBusy) || len(events) != 0 {
+		t.Fatalf("retry while committed outcome persisted = events:%+v err:%v, want ErrTurnBusy", events, err)
+	}
+	close(store.release)
+	var got result
+	select {
+	case got = <-done:
+	case <-time.After(time.Second):
+		t.Fatal("committed outcome did not finish after persistence recovered")
+	}
+	if got.err != nil || !hasMessage(got.events, protocol.EventToolComplete, "durable build") {
+		t.Fatalf("committed outcome = events:%+v err:%v", got.events, got.err)
+	}
+	loaded, err := store.Load(context.Background(), sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasMessage(loaded, protocol.EventToolComplete, "durable build") {
+		t.Fatalf("committed outcome missing from durable log: %+v", loaded)
+	}
+}
+
+func TestInterruptedTurnPersistsTerminalAfterContextCancellation(t *testing.T) {
+	store := &blockingResultSessions{
+		Sessions:  local.New(t.TempDir()),
+		blocked:   make(chan struct{}),
+		release:   make(chan struct{}),
+		blockType: protocol.EventTaskComplete,
+	}
+	runner := newControlledTurnRunner()
+	manager := New(Dependencies{
+		Sessions:     store,
+		EinoRunner:   runner,
+		TurnTimeout:  time.Second,
+		NewSessionID: func() string { return "sess_durable_terminal" },
+	})
+	if _, err := manager.Start(context.Background(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	type result struct {
+		events []protocol.Event
+		err    error
+	}
+	done := make(chan result, 1)
+	go func() {
+		events, err := manager.SendMessage(context.Background(), "interrupt with durable terminal")
+		done <- result{events: events, err: err}
+	}()
+	select {
+	case <-runner.started:
+	case <-time.After(time.Second):
+		t.Fatal("turn did not reach runner")
+	}
+	if _, err := manager.Interrupt(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-store.blocked:
+	case <-time.After(time.Second):
+		t.Fatal("cancelled turn did not attempt durable terminal persistence")
+	}
+	select {
+	case got := <-done:
+		t.Fatalf("cancelled turn returned before terminal was durable: %+v", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(store.release)
+	var got result
+	select {
+	case got = <-done:
+	case <-time.After(time.Second):
+		t.Fatal("cancelled turn did not finish after terminal persistence recovered")
+	}
+	if !errors.Is(got.err, context.Canceled) {
+		t.Fatalf("cancelled turn error = %v, want context.Canceled", got.err)
+	}
+	assertTaskStatus(t, got.events, "Message", protocol.TaskKilled)
+	loaded, err := store.Load(context.Background(), manager.SessionID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertTaskStatus(t, loaded, "Message", protocol.TaskKilled)
+}
+
+func TestConfirmationCanRetryWhenTaskStartNeverCommits(t *testing.T) {
+	store := &blockingResultSessions{
+		Sessions:  local.New(t.TempDir()),
+		blocked:   make(chan struct{}),
+		release:   make(chan struct{}),
+		blockType: protocol.EventTaskStarted,
+	}
+	bridge := NewSideEffectBridge()
+	manager := New(Dependencies{
+		Sessions:     store,
+		EinoRunner:   immediateTurnRunner{},
+		SideEffects:  bridge,
+		TurnTimeout:  25 * time.Millisecond,
+		NewSessionID: func() string { return "sess_retry_confirmation" },
+	})
+	if _, err := manager.Start(context.Background(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	var executions atomic.Int32
+	err := bridge.Request(withSideEffectSession(context.Background(), manager.SessionID()), SideEffectRequest{
+		ToolName: "knote_build",
+		Action:   "build",
+		Execute: func(context.Context, SideEffectRequest) ([]protocol.Event, error) {
+			executions.Add(1)
+			return nil, nil
+		},
+	})
+	if !errors.Is(err, ErrSideEffectPending) {
+		t.Fatalf("seed side effect: %v", err)
+	}
+	confirm := firstConfirm(t, bridge.PendingEvents(manager.SessionID()))
+	if events, err := manager.Confirm(context.Background(), confirm, true); !errors.Is(err, ErrTurnNotStarted) || len(events) != 0 {
+		t.Fatalf("failed confirmation start = events:%+v err:%v", events, err)
+	}
+	if got := executions.Load(); got != 0 {
+		t.Fatalf("uncommitted confirmation executed %d times", got)
+	}
+	close(store.release)
+	if _, err := manager.Confirm(context.Background(), confirm, true); err != nil {
+		t.Fatalf("retry confirmation after storage recovery: %v", err)
+	}
+	if got := executions.Load(); got != 1 {
+		t.Fatalf("retried confirmation executions = %d, want 1", got)
+	}
+}
+
+func TestConfirmationCanRetryWhenCancelledBeforeConsumption(t *testing.T) {
+	bridge := NewSideEffectBridge()
+	manager := New(Dependencies{
+		Sessions:     local.New(t.TempDir()),
+		EinoRunner:   immediateTurnRunner{},
+		SideEffects:  bridge,
+		TurnTimeout:  time.Second,
+		NewSessionID: func() string { return "sess_cancel_before_confirm" },
+	})
+	if _, err := manager.Start(context.Background(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	var executions atomic.Int32
+	err := bridge.Request(withSideEffectSession(context.Background(), manager.SessionID()), SideEffectRequest{
+		ToolName: "knote_build",
+		Action:   "build",
+		Execute: func(context.Context, SideEffectRequest) ([]protocol.Event, error) {
+			executions.Add(1)
+			return nil, nil
+		},
+	})
+	if !errors.Is(err, ErrSideEffectPending) {
+		t.Fatalf("seed side effect: %v", err)
+	}
+	confirm := firstConfirm(t, bridge.PendingEvents(manager.SessionID()))
+	var interrupted atomic.Bool
+	unsubscribe := manager.Subscribe(func(events []protocol.Event) {
+		if hasTaskTitle(events, protocol.EventTaskStarted, confirmationTurnTitle) && interrupted.CompareAndSwap(false, true) {
+			_, _ = manager.Interrupt(context.Background())
+		}
+	})
+
+	events, err := manager.Confirm(context.Background(), confirm, true)
+	unsubscribe()
+	if !errors.Is(err, ErrConfirmationNotExecuted) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled pre-consumption confirmation = events:%+v err:%v", events, err)
+	}
+	if got := executions.Load(); got != 0 {
+		t.Fatalf("pre-consumption cancellation executed side effect %d times", got)
+	}
+	if _, err := manager.Confirm(context.Background(), confirm, true); err != nil {
+		t.Fatalf("retry after pre-consumption cancellation: %v", err)
+	}
+	if got := executions.Load(); got != 1 {
+		t.Fatalf("retried confirmation executions = %d, want 1", got)
+	}
+}
+
+func TestConfirmationCanRetryWhenAuthorizationIsCancelledBeforeConsumption(t *testing.T) {
+	bridge := NewSideEffectBridge()
+	var manager *Manager
+	var interruptOnce atomic.Bool
+	manager = New(Dependencies{
+		Sessions:   local.New(t.TempDir()),
+		EinoRunner: immediateTurnRunner{},
+		AuthorizationContextProvider: func(ctx context.Context, sessionID string) (protocol.AuthorizationContext, error) {
+			if interruptOnce.CompareAndSwap(false, true) {
+				_, _ = manager.Interrupt(context.Background())
+				return protocol.AuthorizationContext{}, ctx.Err()
+			}
+			return testAuthorizationContext(sessionID), nil
+		},
+		SideEffects:  bridge,
+		TurnTimeout:  time.Second,
+		NewSessionID: func() string { return "sess_cancel_authorization" },
+	})
+	if _, err := manager.Start(context.Background(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	var executions atomic.Int32
+	err := bridge.Request(withSideEffectSession(context.Background(), manager.SessionID()), SideEffectRequest{
+		ToolName: "knote_build",
+		Action:   "build",
+		Execute: func(context.Context, SideEffectRequest) ([]protocol.Event, error) {
+			executions.Add(1)
+			return nil, nil
+		},
+	})
+	if !errors.Is(err, ErrSideEffectPending) {
+		t.Fatalf("seed side effect: %v", err)
+	}
+	confirm := firstConfirm(t, bridge.PendingEvents(manager.SessionID()))
+
+	events, err := manager.Confirm(context.Background(), confirm, true)
+	if !errors.Is(err, ErrConfirmationNotExecuted) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled authorization confirmation = events:%+v err:%v", events, err)
+	}
+	if !hasEvent(events, protocol.EventConfirmRequest) {
+		t.Fatalf("cancelled authorization did not re-emit confirmation: %+v", events)
+	}
+	if got := executions.Load(); got != 0 {
+		t.Fatalf("cancelled authorization executed side effect %d times", got)
+	}
+	if _, err := manager.Confirm(context.Background(), confirm, true); err != nil {
+		t.Fatalf("retry after cancelled authorization: %v", err)
+	}
+	if got := executions.Load(); got != 1 {
+		t.Fatalf("retried authorization confirmation executions = %d, want 1", got)
+	}
+}
+
+func TestCommittedSideEffectPersistenceErrorFailsClosedAcrossRestart(t *testing.T) {
+	underlying := local.New(t.TempDir())
+	writeErr := errors.New("session disk unavailable")
+	store := &failingEventSessions{Sessions: underlying, failType: protocol.EventToolComplete, err: writeErr}
+	bridge := NewSideEffectBridge()
+	manager := New(Dependencies{
+		Sessions:     store,
+		EinoRunner:   immediateTurnRunner{},
+		SideEffects:  bridge,
+		TurnTimeout:  time.Second,
+		NewSessionID: func() string { return "sess_unknown_side_effect" },
+	})
+	if _, err := manager.Start(context.Background(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	sessionID := manager.SessionID()
+	var executions atomic.Int32
+	err := bridge.Request(withSideEffectSession(context.Background(), sessionID), SideEffectRequest{
+		ToolName: "knote_build",
+		Action:   "build",
+		Execute: func(_ context.Context, req SideEffectRequest) ([]protocol.Event, error) {
+			executions.Add(1)
+			return []protocol.Event{protocol.NewEvent(protocol.EventToolComplete, req.SessionID, "uncertain build", nil)}, nil
+		},
+	})
+	if !errors.Is(err, ErrSideEffectPending) {
+		t.Fatalf("seed side effect: %v", err)
+	}
+	confirm := firstConfirm(t, bridge.PendingEvents(sessionID))
+	events, err := manager.Confirm(context.Background(), confirm, true)
+	if !errors.Is(err, writeErr) {
+		t.Fatalf("committed persistence failure = events:%+v err:%v", events, err)
+	}
+	if hasEvent(events, protocol.EventToolComplete) {
+		t.Fatalf("undurable committed outcome was returned as complete: %+v", events)
+	}
+	if got := executions.Load(); got != 1 {
+		t.Fatalf("side-effect executions = %d, want 1", got)
+	}
+	if retryEvents, retryErr := manager.Confirm(context.Background(), confirm, true); !errors.Is(retryErr, ErrTurnBusy) || len(retryEvents) != 0 {
+		t.Fatalf("same-process retry = events:%+v err:%v, want ErrTurnBusy", retryEvents, retryErr)
+	}
+
+	restarted := New(Dependencies{
+		Sessions:     underlying,
+		EinoRunner:   immediateTurnRunner{},
+		NewSessionID: func() string { return "sess_fresh_after_unknown" },
+	})
+	if resumed, resumeErr := restarted.Start(context.Background(), StartOptions{ResumeID: sessionID}); !errors.Is(resumeErr, ErrSideEffectOutcomeUnknown) || len(resumed) != 0 {
+		t.Fatalf("uncertain side-effect resume = events:%+v err:%v", resumed, resumeErr)
+	}
+	if _, err := restarted.Start(context.Background(), StartOptions{}); err != nil {
+		t.Fatalf("fresh session after refused resume: %v", err)
+	}
+	loaded, err := underlying.Load(context.Background(), sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := countTaskTitle(loaded, protocol.EventTaskComplete, confirmationTurnTitle); got != 0 {
+		t.Fatalf("uncertain confirmation was auto-reconciled: %+v", loaded)
+	}
 }
 
 func TestSessionRotationDrainUsesConfiguredDeadline(t *testing.T) {
@@ -909,6 +1351,95 @@ func TestResumeReplayErrorsDoNotFailCurrentTask(t *testing.T) {
 	assertTaskStatus(t, events, "/resume", protocol.TaskCompleted)
 }
 
+func TestSlashResumeDropsStaleConfirmationAndReconcilesOrphanTask(t *testing.T) {
+	store := local.New(t.TempDir())
+	manager := New(Dependencies{
+		Sessions:     store,
+		EinoRunner:   immediateTurnRunner{},
+		TurnTimeout:  time.Second,
+		NewSessionID: func() string { return "sess_current" },
+	})
+	if _, err := manager.Start(context.Background(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	targetSessionID := "sess_orphaned"
+	createdAt := time.Now().UTC().Add(-time.Hour)
+	orphan := protocol.Task{
+		ID:        "task_orphaned",
+		Title:     "Interrupted historical task",
+		Status:    protocol.TaskRunning,
+		CreatedAt: createdAt,
+		UpdatedAt: createdAt,
+	}
+	confirm := protocol.ConfirmRequest{RequestID: "stale_confirm", Action: "build", Command: "/build"}
+	for _, event := range []protocol.Event{
+		protocol.NewEvent(protocol.EventTaskStarted, targetSessionID, "Task started", orphan),
+		protocol.NewEvent(protocol.EventConfirmRequest, targetSessionID, "Stale confirmation", confirm),
+	} {
+		if err := store.Append(context.Background(), event); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	events, err := manager.SendMessage(context.Background(), "/resume "+targetSessionID)
+	if err != nil {
+		t.Fatalf("resume orphaned session: %v", err)
+	}
+	if hasEvent(events, protocol.EventConfirmRequest) {
+		t.Fatalf("resume replayed an unexecutable confirmation: %+v", events)
+	}
+	assertTaskStatus(t, events, orphan.Title, protocol.TaskKilled)
+	loaded, err := store.Load(context.Background(), targetSessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertTaskStatus(t, loaded, orphan.Title, protocol.TaskKilled)
+	if got := countTaskTitle(loaded, protocol.EventTaskComplete, orphan.Title); got != 1 {
+		t.Fatalf("persisted orphan terminals = %d, want 1: %+v", got, loaded)
+	}
+}
+
+func TestStartResumeDropsStaleConfirmationAndReconcilesOrphanTask(t *testing.T) {
+	store := local.New(t.TempDir())
+	sessionID := "sess_start_orphaned"
+	createdAt := time.Now().UTC().Add(-time.Hour)
+	orphan := protocol.Task{
+		ID:        "task_start_orphaned",
+		Title:     "Startup interrupted task",
+		Status:    protocol.TaskRunning,
+		CreatedAt: createdAt,
+		UpdatedAt: createdAt,
+	}
+	for _, event := range []protocol.Event{
+		protocol.NewEvent(protocol.EventTaskStarted, sessionID, "Task started", orphan),
+		protocol.NewEvent(protocol.EventConfirmRequest, sessionID, "Stale confirmation", protocol.ConfirmRequest{
+			RequestID: "startup_stale_confirm", Action: "build", Command: "/build",
+		}),
+	} {
+		if err := store.Append(context.Background(), event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	manager := New(Dependencies{Sessions: store, EinoRunner: immediateTurnRunner{}})
+
+	events, err := manager.Start(context.Background(), StartOptions{ResumeID: sessionID})
+	if err != nil {
+		t.Fatalf("start resumed session: %v", err)
+	}
+	if hasEvent(events, protocol.EventConfirmRequest) {
+		t.Fatalf("startup replayed an unexecutable confirmation: %+v", events)
+	}
+	assertTaskStatus(t, events, orphan.Title, protocol.TaskKilled)
+	loaded, err := store.Load(context.Background(), sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertTaskStatus(t, loaded, orphan.Title, protocol.TaskKilled)
+	if got := countTaskTitle(loaded, protocol.EventTaskComplete, orphan.Title); got != 1 {
+		t.Fatalf("persisted startup orphan terminals = %d, want 1: %+v", got, loaded)
+	}
+}
+
 func TestStartDoesNotHoldStateMutexAcrossDependencyIO(t *testing.T) {
 	store := local.New(t.TempDir())
 	if err := store.Append(context.Background(), protocol.NewEvent(protocol.EventAssistantDone, "sess_resume", "stored", nil)); err != nil {
@@ -1181,6 +1712,19 @@ type blockingResultSessions struct {
 	release   chan struct{}
 	blockType protocol.EventType
 	once      sync.Once
+}
+
+type failingEventSessions struct {
+	repository.Sessions
+	failType protocol.EventType
+	err      error
+}
+
+func (s *failingEventSessions) Append(ctx context.Context, event protocol.Event) error {
+	if event.Type == s.failType {
+		return s.err
+	}
+	return s.Sessions.Append(ctx, event)
 }
 
 func (s *blockingResultSessions) Append(ctx context.Context, event protocol.Event) error {

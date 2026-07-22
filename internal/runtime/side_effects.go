@@ -190,21 +190,26 @@ func (b *SideEffectBridge) retryEvents(sessionID string, req protocol.ConfirmReq
 }
 
 func (b *SideEffectBridge) Confirm(ctx context.Context, sessionID string, req protocol.ConfirmRequest, approved bool) []protocol.Event {
+	events, _ := b.confirmOutcome(ctx, sessionID, req, approved)
+	return events
+}
+
+func (b *SideEffectBridge) confirmOutcome(ctx context.Context, sessionID string, req protocol.ConfirmRequest, approved bool) ([]protocol.Event, bool) {
 	if b == nil {
-		return []protocol.Event{protocol.NewEvent(protocol.EventError, sessionID, "side-effect bridge is not configured", nil)}
+		return []protocol.Event{protocol.NewEvent(protocol.EventError, sessionID, "side-effect bridge is not configured", nil)}, false
 	}
 	pending, ok := b.consume(sessionID, req)
 	if !ok {
 		return []protocol.Event{
 			protocol.NewEvent(protocol.EventError, sessionID, "confirmation is not pending or has already been used", map[string]string{"request_id": req.RequestID}),
-		}
+		}, false
 	}
 	if !approved {
 		events := []protocol.Event{
 			protocol.NewEvent(protocol.EventAssistantDone, sessionID, "Cancelled: "+pending.confirm.Action, map[string]string{"request_id": pending.confirm.RequestID}),
 		}
 		events = append(events, b.PendingEvents(sessionID)...)
-		return events
+		return events, false
 	}
 	events := []protocol.Event{
 		protocol.NewEvent(protocol.EventStatusUpdate, sessionID, "Confirmed: "+pending.confirm.Action, map[string]string{"request_id": pending.confirm.RequestID}),
@@ -218,7 +223,7 @@ func (b *SideEffectBridge) Confirm(ctx context.Context, sessionID string, req pr
 		}))
 	}
 	events = append(events, b.PendingEvents(sessionID)...)
-	return events
+	return events, true
 }
 
 func (b *SideEffectBridge) consume(sessionID string, req protocol.ConfirmRequest) (pendingSideEffect, bool) {

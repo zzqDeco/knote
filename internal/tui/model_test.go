@@ -249,6 +249,86 @@ func TestBusyConfirmationRestoresCanonicalOverlay(t *testing.T) {
 	}
 }
 
+func TestUnstartedConfirmationRestoresCanonicalOverlay(t *testing.T) {
+	model := newTestModel(t)
+	req := protocol.ConfirmRequest{
+		RequestID: "confirm_unstarted", Title: "Confirm build", Summary: "Run build.", Command: "/build",
+		ApproveText: "approve", RejectText: "reject",
+	}
+	model.applyRuntimeResult(runtimeResultMsg{
+		commandID: 1,
+		kind:      runtimeCommandConfirm,
+		confirm:   &req,
+		err:       fmt.Errorf("%w: storage unavailable", runtime.ErrTurnNotStarted),
+	})
+
+	if model.pendingConfirm == nil || *model.pendingConfirm != req {
+		t.Fatalf("unstarted confirmation was not restored: %+v", model.pendingConfirm)
+	}
+	if model.overlayMode != overlayConfirm || !strings.Contains(model.overlay, req.Title) {
+		t.Fatalf("unstarted confirmation overlay = mode:%s content:%q", model.overlayMode, model.overlay)
+	}
+}
+
+func TestUnexecutedConfirmationRestoresCanonicalOverlay(t *testing.T) {
+	model := newTestModel(t)
+	req := protocol.ConfirmRequest{
+		RequestID: "confirm_unexecuted", Title: "Confirm build", Summary: "Run build.", Command: "/build",
+		ApproveText: "approve", RejectText: "reject",
+	}
+	model.applyRuntimeResult(runtimeResultMsg{
+		commandID: 1,
+		kind:      runtimeCommandConfirm,
+		confirm:   &req,
+		err:       fmt.Errorf("%w: cancelled", runtime.ErrConfirmationNotExecuted),
+	})
+
+	if model.pendingConfirm == nil || *model.pendingConfirm != req {
+		t.Fatalf("unexecuted confirmation was not restored: %+v", model.pendingConfirm)
+	}
+	if model.overlayMode != overlayConfirm || !strings.Contains(model.overlay, req.Title) {
+		t.Fatalf("unexecuted confirmation overlay = mode:%s content:%q", model.overlayMode, model.overlay)
+	}
+}
+
+func TestUnrelatedCompletionCannotHidePendingConfirmation(t *testing.T) {
+	model := newTestModel(t)
+	req := protocol.ConfirmRequest{
+		RequestID: "confirm_visible", Title: "Confirm build", Summary: "Run build.", Command: "/build",
+		ApproveText: "approve", RejectText: "reject",
+	}
+	model.applyEvents([]protocol.Event{protocol.NewEvent(
+		protocol.EventConfirmRequest, model.runtime.SessionID(), req.Title, req,
+	)})
+	model.applyEvents([]protocol.Event{protocol.NewEvent(
+		protocol.EventAssistantDone, model.runtime.SessionID(), "unrelated completion", nil,
+	)})
+
+	if model.pendingConfirm == nil || *model.pendingConfirm != req {
+		t.Fatalf("unrelated completion cleared pending confirmation: %+v", model.pendingConfirm)
+	}
+	if model.overlayMode != overlayConfirm || !strings.Contains(model.overlay, req.Title) {
+		t.Fatalf("pending confirmation became hidden: mode=%s overlay=%q", model.overlayMode, model.overlay)
+	}
+}
+
+func TestViewClearBatchCannotReactivateHistoricalConfirmation(t *testing.T) {
+	model := newTestModel(t)
+	req := protocol.ConfirmRequest{RequestID: "confirm_stale", Title: "Stale confirmation", Action: "build", Command: "/build"}
+	model.applyEvents([]protocol.Event{
+		protocol.NewEvent(protocol.EventViewClear, "sess_resumed", "resume session", nil),
+		protocol.NewEvent(protocol.EventConfirmRequest, "sess_resumed", req.Title, req),
+		protocol.NewEvent(protocol.EventSessionInfo, "sess_resumed", "session resumed", protocol.SessionInfo{ID: "sess_resumed", Resumed: true}),
+	})
+
+	if model.pendingConfirm != nil {
+		t.Fatalf("clear batch reactivated stale confirmation: %+v", model.pendingConfirm)
+	}
+	if model.overlayMode != overlayNone || strings.TrimSpace(model.overlay) != "" {
+		t.Fatalf("clear batch reopened stale overlay: mode=%s overlay=%q", model.overlayMode, model.overlay)
+	}
+}
+
 func TestStaleCommandResultCannotMutateRotatedInteractionState(t *testing.T) {
 	model := newTestModel(t)
 	req := protocol.ConfirmRequest{RequestID: "confirm_new", Title: "Current confirmation"}

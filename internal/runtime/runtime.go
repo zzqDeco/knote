@@ -181,6 +181,7 @@ func (m *Manager) Start(ctx context.Context, opts StartOptions) ([]protocol.Even
 		resumeAuthorization = &authorization
 	}
 	var loaded []protocol.Event
+	var reconciled []protocol.Event
 	if resumeID != "" {
 		var err error
 		loaded, err = deps.Sessions.Load(ctx, resumeID)
@@ -195,6 +196,13 @@ func (m *Manager) Start(ctx context.Context, opts StartOptions) ([]protocol.Even
 			authorization = *resumeAuthorization
 		}
 		loaded = m.filterPersistedEvents(ctx, authorization, loaded)
+		loaded, reconciled, err = prepareSessionReplay(loaded, time.Now().UTC())
+		if err != nil {
+			if resumeAuthorization != nil {
+				return nil, permissionedResumeError()
+			}
+			return nil, fmt.Errorf("resume failed: %w", err)
+		}
 	}
 	info := m.newEinoSession(ctx, resumeID)
 	var binding *authorizationBinding
@@ -212,6 +220,12 @@ func (m *Manager) Start(ctx context.Context, opts StartOptions) ([]protocol.Even
 	if info.Resumed {
 		events = append(append([]protocol.Event(nil), loaded...), startupEvents...)
 	}
+	startupPersisted := make([]protocol.Event, 0, len(reconciled)+len(startupEvents))
+	startupPersisted = append(startupPersisted, reconciled...)
+	startupPersisted = append(startupPersisted, startupEvents...)
+	if err := m.persist(ctx, startupPersisted); err != nil {
+		return nil, fmt.Errorf("persist runtime startup: %w", err)
+	}
 	m.commitMu.Lock()
 	m.mu.Lock()
 	if m.einoSession.ID != "" {
@@ -225,7 +239,6 @@ func (m *Manager) Start(ctx context.Context, opts StartOptions) ([]protocol.Even
 	m.authorizationBinding = binding
 	subscribers := m.subscribersLocked()
 	m.mu.Unlock()
-	m.persist(startupEvents)
 	dispatch := m.enqueueNotifications(nil, subscribers, events)
 	m.commitMu.Unlock()
 	if dispatch {
@@ -270,7 +283,7 @@ func (m *Manager) SendMessage(ctx context.Context, input string) ([]protocol.Eve
 	if strings.HasPrefix(input, "/") && (!m.deps.Capabilities.AllowsSlashCommand(command) || command == "new") {
 		result := m.handleSlash(runCtx, turn, einoSession.ID, input)
 		completed, returnErr := m.finishTurnResultWithStatusEvents(
-			turn, result.persisted, result.events, result.lifecycleStatusEvents(), result.err,
+			turn, result.persisted, result.events, result.lifecycleStatusEvents(), result.err, false,
 		)
 		return append(startedEvents, completed...), returnErr
 	}
@@ -296,7 +309,7 @@ func (m *Manager) SendMessage(ctx context.Context, input string) ([]protocol.Eve
 	if strings.HasPrefix(input, "/") {
 		result := m.handleSlash(runCtx, turn, einoSession.ID, input)
 		completed, returnErr := m.finishTurnResultWithStatusEvents(
-			turn, result.persisted, result.events, result.lifecycleStatusEvents(), result.err,
+			turn, result.persisted, result.events, result.lifecycleStatusEvents(), result.err, false,
 		)
 		return append(startedEvents, completed...), returnErr
 	}
@@ -332,11 +345,14 @@ func (m *Manager) authorizationFailureMessage(err error) string {
 }
 
 func (m *Manager) Confirm(ctx context.Context, req protocol.ConfirmRequest, approved bool) ([]protocol.Event, error) {
-	turn, startedEvents, err := m.beginTurn(ctx, "Confirmation", false)
+	turn, startedEvents, err := m.beginTurn(ctx, confirmationTurnTitle, false)
 	if err != nil {
 		return nil, err
 	}
 	if err := turn.ctx.Err(); err != nil {
+		if m.deps.SideEffects != nil {
+			return m.finishUnexecutedConfirmation(turn, startedEvents, turn.targetSessionID, req, err)
+		}
 		completed, returnErr := m.finishTurn(turn, nil, err)
 		return append(startedEvents, completed...), returnErr
 	}
@@ -354,43 +370,52 @@ func (m *Manager) Confirm(ctx context.Context, req protocol.ConfirmRequest, appr
 		if approved && authorizationProvider != nil {
 			authorization, err := authorizationProvider.authorizationContext(confirmCtx, einoSessionID)
 			if err != nil {
-				events := m.confirmBeforeConsumptionError(einoSessionID, req, err)
-				completed, returnErr := m.finishTurn(turn, events, err)
-				return append(startedEvents, completed...), returnErr
+				return m.finishUnexecutedConfirmation(turn, startedEvents, einoSessionID, req, err)
 			}
 			confirmCtx, err = protocol.WithAuthorizationContext(confirmCtx, authorization)
 			if err != nil {
-				events := m.confirmBeforeConsumptionError(einoSessionID, req, err)
-				completed, returnErr := m.finishTurn(turn, events, err)
-				return append(startedEvents, completed...), returnErr
+				return m.finishUnexecutedConfirmation(turn, startedEvents, einoSessionID, req, err)
 			}
 			if err := m.bindSessionAuthorization(confirmCtx, einoSessionID, authorization); err != nil {
-				events := m.confirmBeforeConsumptionError(einoSessionID, req, err)
-				completed, returnErr := m.finishTurn(turn, events, err)
-				return append(startedEvents, completed...), returnErr
+				return m.finishUnexecutedConfirmation(turn, startedEvents, einoSessionID, req, err)
 			}
 			confirmCtx, err = m.withSessionAuthorizationExpectation(confirmCtx, einoSessionID, authorization)
 			if err != nil {
-				events := m.confirmBeforeConsumptionError(einoSessionID, req, err)
-				completed, returnErr := m.finishTurn(turn, events, err)
-				return append(startedEvents, completed...), returnErr
+				return m.finishUnexecutedConfirmation(turn, startedEvents, einoSessionID, req, err)
 			}
 		} else if approved && permissionedCapabilities {
 			var err error
 			confirmCtx, err = m.permissionedToolContext(confirmCtx, einoSessionID)
 			if err != nil {
-				events := m.confirmBeforeConsumptionError(einoSessionID, req, err)
-				completed, returnErr := m.finishTurn(turn, events, err)
-				return append(startedEvents, completed...), returnErr
+				return m.finishUnexecutedConfirmation(turn, startedEvents, einoSessionID, req, err)
 			}
 		}
-		events := m.deps.SideEffects.Confirm(confirmCtx, einoSessionID, req, approved)
-		completed, returnErr := m.finishTurn(turn, events, nil)
+		events, executed := m.deps.SideEffects.confirmOutcome(confirmCtx, einoSessionID, req, approved)
+		completed, returnErr := m.finishTurnWithCommittedOutcome(turn, events, nil, executed)
 		return append(startedEvents, completed...), returnErr
 	}
 	events := []protocol.Event{protocol.NewEvent(protocol.EventError, einoSessionID, "confirm is not available without a side-effect bridge", nil)}
 	completed, returnErr := m.finishTurn(turn, events, fmt.Errorf("side-effect bridge is not configured"))
 	return append(startedEvents, completed...), returnErr
+}
+
+func (m *Manager) finishUnexecutedConfirmation(
+	turn *activeTurn,
+	startedEvents []protocol.Event,
+	sessionID string,
+	req protocol.ConfirmRequest,
+	operationErr error,
+) ([]protocol.Event, error) {
+	events := m.confirmBeforeConsumptionError(sessionID, req, operationErr)
+	completed, finishErr := m.finishTurnWithCommittedOutcome(turn, events, operationErr, true)
+	result := append(startedEvents, completed...)
+	if finishErr != nil {
+		return result, finishErr
+	}
+	if errors.Is(operationErr, context.Canceled) || errors.Is(operationErr, context.DeadlineExceeded) {
+		return result, fmt.Errorf("%w: %w", ErrConfirmationNotExecuted, operationErr)
+	}
+	return result, nil
 }
 
 func (m *Manager) confirmBeforeConsumptionError(sessionID string, req protocol.ConfirmRequest, err error) []protocol.Event {
@@ -403,7 +428,7 @@ func (m *Manager) confirmBeforeConsumptionError(sessionID string, req protocol.C
 	return events
 }
 
-func (m *Manager) Interrupt(context.Context) ([]protocol.Event, error) {
+func (m *Manager) Interrupt(ctx context.Context) ([]protocol.Event, error) {
 	m.commitMu.Lock()
 	m.mu.Lock()
 	einoSessionID := m.einoSession.ID
@@ -419,20 +444,30 @@ func (m *Manager) Interrupt(context.Context) ([]protocol.Event, error) {
 	var events []protocol.Event
 	if turn == nil {
 		events = []protocol.Event{protocol.NewEvent(protocol.EventStatusUpdate, einoSessionID, "no active task", nil)}
+	} else if turn.finished {
+		payload := map[string]string{}
+		if turn.startCommitted {
+			payload["task_id"] = turn.id
+		}
+		events = []protocol.Event{protocol.NewEvent(protocol.EventStatusUpdate, einoSessionID, "task completion in progress", payload)}
 	} else {
 		turn.cancel()
-		events = []protocol.Event{protocol.NewEvent(protocol.EventStatusUpdate, einoSessionID, "interrupt requested", map[string]string{"task_id": turn.id})}
+		payload := map[string]string{}
+		if turn.startCommitted {
+			payload["task_id"] = turn.id
+		}
+		events = []protocol.Event{protocol.NewEvent(protocol.EventStatusUpdate, einoSessionID, "interrupt requested", payload)}
 	}
-	m.persist(events)
+	persistErr := m.persist(ctx, events)
 	dispatch := m.enqueueNotifications(nil, subscribers, events)
 	m.commitMu.Unlock()
 	if dispatch {
 		m.drainNotifications()
 	}
-	return events, nil
+	return events, persistErr
 }
 
-func (m *Manager) StopTask(_ context.Context, taskID string) ([]protocol.Event, error) {
+func (m *Manager) StopTask(ctx context.Context, taskID string) ([]protocol.Event, error) {
 	taskID = strings.TrimSpace(taskID)
 	if taskID == "" {
 		return nil, fmt.Errorf("task id is required")
@@ -451,18 +486,23 @@ func (m *Manager) StopTask(_ context.Context, taskID string) ([]protocol.Event, 
 		m.commitMu.Unlock()
 		return nil, fmt.Errorf("%w: %s", ErrTaskNotFound, taskID)
 	}
+	if turn.finished {
+		m.mu.Unlock()
+		m.commitMu.Unlock()
+		return nil, fmt.Errorf("%w: %s", ErrTaskNotFound, taskID)
+	}
 	subscribers := m.subscribersLocked()
 	m.mu.Unlock()
 
 	turn.cancel()
 	events := []protocol.Event{protocol.NewEvent(protocol.EventStatusUpdate, einoSessionID, "task stop requested", map[string]string{"task_id": taskID})}
-	m.persist(events)
+	persistErr := m.persist(ctx, events)
 	dispatch := m.enqueueNotifications(nil, subscribers, events)
 	m.commitMu.Unlock()
 	if dispatch {
 		m.drainNotifications()
 	}
-	return events, nil
+	return events, persistErr
 }
 
 func (m *Manager) WorkspaceStatus(ctx context.Context) (repository.Status, error) {
@@ -607,27 +647,19 @@ func permissionedSessionInfo(info protocol.SessionInfo) protocol.SessionInfo {
 	}
 }
 
-func (m *Manager) persistEmitAndReturn(events []protocol.Event) []protocol.Event {
-	m.commitMu.Lock()
-	m.mu.Lock()
-	subscribers := m.subscribersLocked()
-	m.mu.Unlock()
-	m.persist(events)
-	dispatch := m.enqueueNotifications(nil, subscribers, events)
-	m.commitMu.Unlock()
-	if dispatch {
-		m.drainNotifications()
-	}
-	return events
-}
-
-func (m *Manager) persist(events []protocol.Event) {
+func (m *Manager) persist(ctx context.Context, events []protocol.Event) error {
 	if m.deps.Sessions == nil {
-		return
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	for _, event := range events {
-		_ = m.deps.Sessions.Append(context.Background(), event)
+		if err := m.deps.Sessions.Append(ctx, event); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
 func (m *Manager) loadHistory(ctx context.Context, sessionID string) []protocol.Event {
