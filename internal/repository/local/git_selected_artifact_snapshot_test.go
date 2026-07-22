@@ -40,7 +40,7 @@ func TestCommitIncludesOnlySelectedArtifactBundle(t *testing.T) {
 	if _, err := (gitClient{workspace: workspace}).Commit(ctx, "source only"); err != nil {
 		t.Fatal(err)
 	}
-	if (gitClient{workspace: workspace}).Dirty(ctx) {
+	if gitClientDirty(t, gitClient{workspace: workspace}, ctx) {
 		t.Fatal("failed staged bundle should not leave the committed workspace dirty")
 	}
 	assertGitTreeContains(t, workspace, selected.BundleManifest.ProjectionID)
@@ -56,7 +56,7 @@ func TestCommitIncludesOnlySelectedArtifactBundle(t *testing.T) {
 	if _, err := (gitClient{workspace: workspace}).Commit(ctx, "successor"); err != nil {
 		t.Fatal(err)
 	}
-	if (gitClient{workspace: workspace}).Dirty(ctx) {
+	if gitClientDirty(t, gitClient{workspace: workspace}, ctx) {
 		t.Fatal("prior selected bundles should not leave the committed workspace dirty")
 	}
 	assertGitTreeContains(t, workspace, successor.BundleManifest.ProjectionID)
@@ -92,7 +92,7 @@ func TestCommitPrunesUnpublishedFirstArtifactBundleWithoutCurrentPointer(t *test
 	if _, err := store.Commit(ctx, "source update"); err != nil {
 		t.Fatal(err)
 	}
-	if (gitClient{workspace: workspace}).Dirty(ctx) {
+	if gitClientDirty(t, gitClient{workspace: workspace}, ctx) {
 		t.Fatal("unpublished first bundle left the committed workspace dirty")
 	}
 	if _, err := store.ReadCurrentArtifactManifest(ctx); !errors.Is(err, repository.ErrArtifactCurrentNotFound) {
@@ -149,7 +149,7 @@ func TestCommitPreservesLegacyArtifactsWhilePruningUnpublishedBundle(t *testing.
 		}
 	}
 	assertGitTreeOmits(t, workspace, candidate.BundleManifest.ProjectionID, "unpublished-secret-content")
-	if (gitClient{workspace: workspace}).Dirty(ctx) {
+	if gitClientDirty(t, gitClient{workspace: workspace}, ctx) {
 		t.Fatal("preserved legacy artifacts left the committed workspace dirty")
 	}
 	readManifest, err := store.ReadManifest(ctx)

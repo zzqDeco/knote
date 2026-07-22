@@ -298,9 +298,17 @@ func (s Store) Status(ctx context.Context) (repository.Status, error) {
 	if err != nil {
 		return repository.Status{}, err
 	}
+	branch, err := store.Branch(ctx)
+	if err != nil {
+		return repository.Status{}, err
+	}
+	dirty, err := store.Dirty(ctx)
+	if err != nil {
+		return repository.Status{}, fmt.Errorf("inspect workspace cleanliness: %w", err)
+	}
 	return repository.Status{
-		Branch: store.Branch(ctx),
-		Dirty:  store.Dirty(ctx),
+		Branch: branch,
+		Dirty:  dirty,
 		Raw:    raw,
 	}, nil
 }

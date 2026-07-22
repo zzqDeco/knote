@@ -1425,6 +1425,250 @@ func TestCommitOnlyIncludesKnowledgePaths(t *testing.T) {
 	}
 }
 
+func TestCommitInUnbornRepositoryPreservesUnrelatedStagedChanges(t *testing.T) {
+	ctx := context.Background()
+	workspace := initRepo(t)
+	store := New(workspace)
+	mustWrite(t, filepath.Join(workspace, ".knote", "config.yaml"), "workspace: test\n")
+	mustWrite(t, filepath.Join(workspace, "sources", "intro.md"), "knowledge\n")
+	mustWrite(t, filepath.Join(workspace, "unrelated.txt"), "keep staged\n")
+	runGit(t, workspace, "add", "unrelated.txt")
+
+	if _, err := store.Commit(ctx, "initial knowledge"); err != nil {
+		t.Fatal(err)
+	}
+	show := runGit(t, workspace, "show", "--name-only", "--format=", "HEAD")
+	if !strings.Contains(show, ".knote/config.yaml") || !strings.Contains(show, "sources/intro.md") {
+		t.Fatalf("root commit did not include knowledge paths:\n%s", show)
+	}
+	if strings.Contains(show, "unrelated.txt") {
+		t.Fatalf("root commit included unrelated staged file:\n%s", show)
+	}
+	cached := runGit(t, workspace, "diff", "--cached", "--name-status")
+	if strings.TrimSpace(cached) != "A\tunrelated.txt" {
+		t.Fatalf("unrelated file should remain staged after root commit, got %q", cached)
+	}
+}
+
+func TestCommitAtDetachedHeadPreservesUnrelatedStagedChanges(t *testing.T) {
+	ctx := context.Background()
+	workspace := initRepo(t)
+	store := New(workspace)
+	mustWrite(t, filepath.Join(workspace, ".knote", "config.yaml"), "workspace: test\n")
+	mustWrite(t, filepath.Join(workspace, "sources", "intro.md"), "initial\n")
+	runGit(t, workspace, "add", ".")
+	runGit(t, workspace, "commit", "-m", "initial")
+	runGit(t, workspace, "checkout", "--detach", "HEAD")
+
+	mustWrite(t, filepath.Join(workspace, "sources", "intro.md"), "updated\n")
+	mustWrite(t, filepath.Join(workspace, "unrelated.txt"), "keep staged\n")
+	runGit(t, workspace, "add", "unrelated.txt")
+	if _, err := store.Commit(ctx, "detached knowledge update"); err != nil {
+		t.Fatal(err)
+	}
+	show := runGit(t, workspace, "show", "--name-only", "--format=", "HEAD")
+	if !strings.Contains(show, "sources/intro.md") || strings.Contains(show, "unrelated.txt") {
+		t.Fatalf("detached commit included unexpected paths:\n%s", show)
+	}
+	cached := runGit(t, workspace, "diff", "--cached", "--name-status")
+	if strings.TrimSpace(cached) != "A\tunrelated.txt" {
+		t.Fatalf("unrelated file should remain staged after detached commit, got %q", cached)
+	}
+}
+
+func TestCommitPreservesStagedDirectoryToFileReplacement(t *testing.T) {
+	ctx := context.Background()
+	workspace := initRepo(t)
+	store := New(workspace)
+	mustWrite(t, filepath.Join(workspace, ".knote", "config.yaml"), "workspace: test\n")
+	mustWrite(t, filepath.Join(workspace, "sources", "intro.md"), "initial\n")
+	mustWrite(t, filepath.Join(workspace, "unrelated", "child.txt"), "directory entry\n")
+	runGit(t, workspace, "add", ".")
+	runGit(t, workspace, "commit", "-m", "initial")
+
+	if err := os.RemoveAll(filepath.Join(workspace, "unrelated")); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(workspace, "unrelated"), "replacement file\n")
+	runGit(t, workspace, "add", "-A", "--", "unrelated")
+	mustWrite(t, filepath.Join(workspace, "sources", "intro.md"), "updated\n")
+
+	if _, err := store.Commit(ctx, "knowledge update"); err != nil {
+		t.Fatal(err)
+	}
+	show := runGit(t, workspace, "show", "--name-only", "--format=", "HEAD")
+	if strings.Contains(show, "unrelated") {
+		t.Fatalf("knowledge commit included directory/file replacement:\n%s", show)
+	}
+	cached := runGit(t, workspace, "diff", "--cached", "--name-status")
+	if !strings.Contains(cached, "A\tunrelated") || !strings.Contains(cached, "D\tunrelated/child.txt") {
+		t.Fatalf("directory/file replacement should remain staged, got %q", cached)
+	}
+}
+
+func TestShelveUnrelatedStagedChangesRollsBackPartialBaseline(t *testing.T) {
+	stagedOne := strings.Repeat("1", 40)
+	stagedTwo := strings.Repeat("2", 40)
+	baselineOne := strings.Repeat("3", 40)
+	baselineTwo := strings.Repeat("4", 40)
+	applyErr := errors.New("baseline update interrupted")
+	var updates []string
+	client := gitClient{run: func(_ context.Context, args ...string) (string, error) {
+		command := strings.Join(args, " ")
+		switch command {
+		case "diff --cached --name-status -z":
+			return "M\x00one.txt\x00M\x00two.txt\x00", nil
+		case "ls-files --stage -- one.txt":
+			return "100644 " + stagedOne + " 0\tone.txt\n", nil
+		case "ls-files --stage -- two.txt":
+			return "100644 " + stagedTwo + " 0\ttwo.txt\n", nil
+		case "rev-parse --verify --end-of-options HEAD^{commit}":
+			return strings.Repeat("a", 40) + "\n", nil
+		case "ls-tree -z HEAD -- one.txt":
+			return "100644 blob " + baselineOne + "\tone.txt\x00", nil
+		case "ls-tree -z HEAD -- two.txt":
+			return "100644 blob " + baselineTwo + "\ttwo.txt\x00", nil
+		}
+		if len(args) > 0 && args[0] == "update-index" {
+			updates = append(updates, command)
+			if len(updates) == 2 {
+				return "", applyErr
+			}
+			return "", nil
+		}
+		return "", fmt.Errorf("unexpected Git invocation: %v", args)
+	}}
+
+	if _, err := client.shelveUnrelatedStagedChanges(context.Background()); !errors.Is(err, applyErr) {
+		t.Fatalf("shelve error = %v, want %v", err, applyErr)
+	}
+	if len(updates) != 4 {
+		t.Fatalf("update-index calls = %v, want two baseline attempts and two rollback updates", updates)
+	}
+	if !strings.Contains(updates[2], stagedOne) || !strings.Contains(updates[3], stagedTwo) {
+		t.Fatalf("rollback did not restore staged entries: %v", updates)
+	}
+}
+
+func TestCheckoutGuessesUniqueRemoteTrackingBranch(t *testing.T) {
+	ctx := context.Background()
+	workspace := initRepo(t)
+	store := New(workspace)
+	mustWrite(t, filepath.Join(workspace, ".knote", "config.yaml"), "workspace: test\n")
+	mustWrite(t, filepath.Join(workspace, "sources", "intro.md"), "initial\n")
+	runGit(t, workspace, "add", ".")
+	runGit(t, workspace, "commit", "-m", "initial")
+
+	remoteRoot := t.TempDir()
+	remote := filepath.Join(remoteRoot, "remote.git")
+	runGit(t, remoteRoot, "init", "--bare", remote)
+	runGit(t, workspace, "remote", "add", "origin", remote)
+	runGit(t, workspace, "branch", "feature")
+	runGit(t, workspace, "push", "origin", "feature")
+	runGit(t, workspace, "branch", "-D", "feature")
+
+	if err := store.Checkout(ctx, "feature", repository.CheckoutOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if branch := strings.TrimSpace(runGit(t, workspace, "branch", "--show-current")); branch != "feature" {
+		t.Fatalf("checked out branch = %q, want remote-guessed feature", branch)
+	}
+}
+
+func TestGitInputsRejectOptionsBeforeInvocation(t *testing.T) {
+	ctx := context.Background()
+	workspace := initRepo(t)
+	store := New(workspace)
+	mustWrite(t, filepath.Join(workspace, ".knote", "config.yaml"), "workspace: test\n")
+	mustWrite(t, filepath.Join(workspace, "sources", "intro.md"), "initial\n")
+	runGit(t, workspace, "add", ".")
+	runGit(t, workspace, "commit", "-m", "initial")
+
+	outputPath := filepath.Join(workspace, "unexpected.diff")
+	if _, err := store.Diff(ctx, "--output="+outputPath); err == nil || !strings.Contains(err.Error(), "must not begin") {
+		t.Fatalf("diff option-shaped revision should be rejected before Git invocation, got %v", err)
+	}
+	if _, err := os.Stat(outputPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("option-shaped revision created output file: %v", err)
+	}
+
+	mustWrite(t, filepath.Join(workspace, "sources", "intro.md"), "dirty\n")
+	if err := store.Checkout(ctx, "-f", repository.CheckoutOptions{AllowDirty: true}); err == nil || !strings.Contains(err.Error(), "must not begin") {
+		t.Fatalf("checkout option-shaped revision should be rejected before Git invocation, got %v", err)
+	}
+	contents, err := os.ReadFile(filepath.Join(workspace, "sources", "intro.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(contents) != "dirty\n" {
+		t.Fatalf("option-shaped checkout altered the worktree: %q", contents)
+	}
+
+	for _, tag := range []string{"-d", "--delete", "--force", "--list", "--contains=HEAD"} {
+		if err := store.Tag(ctx, tag); err == nil || !strings.Contains(err.Error(), "must not begin") {
+			t.Errorf("tag option %q should be rejected before Git invocation, got %v", tag, err)
+		}
+	}
+	if tags := strings.TrimSpace(runGit(t, workspace, "tag", "--list")); tags != "" {
+		t.Fatalf("option-shaped tag input changed tags: %q", tags)
+	}
+}
+
+func TestGitInputsRejectWhitespaceAndControlCharactersBeforeInvocation(t *testing.T) {
+	ctx := context.Background()
+	client := gitClient{workspace: filepath.Join(t.TempDir(), "missing")}
+	tests := []struct {
+		name string
+		run  func() error
+	}{
+		{name: "diff leading whitespace", run: func() error { _, err := client.Diff(ctx, " HEAD"); return err }},
+		{name: "diff trailing whitespace", run: func() error { _, err := client.Diff(ctx, "HEAD "); return err }},
+		{name: "checkout control", run: func() error { return client.Checkout(ctx, "HEAD\n", true) }},
+		{name: "tag control", run: func() error { return client.Tag(ctx, "v1\x00bad") }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := test.run()
+			if err == nil {
+				t.Fatal("invalid Git input should be rejected")
+			}
+			if !strings.Contains(err.Error(), "must not contain") {
+				t.Fatalf("unexpected validation error: %v", err)
+			}
+			if strings.Contains(err.Error(), "chdir") {
+				t.Fatalf("Git was invoked before input validation: %v", err)
+			}
+		})
+	}
+}
+
+func TestDirtyErrorsFailClosed(t *testing.T) {
+	errStatus := errors.New("status unavailable")
+	runner := func(_ context.Context, args ...string) (string, error) {
+		switch strings.Join(args, " ") {
+		case "rev-parse --verify --end-of-options HEAD^{commit}":
+			return strings.Repeat("a", 40) + "\n", nil
+		case "status --porcelain":
+			return "", errStatus
+		default:
+			return "", fmt.Errorf("unexpected Git invocation: %v", args)
+		}
+	}
+	client := gitClient{run: runner}
+	if _, err := client.Dirty(context.Background()); !errors.Is(err, errStatus) {
+		t.Fatalf("Dirty error = %v, want %v", err, errStatus)
+	}
+	if err := client.Tag(context.Background(), "v1.0.0"); !errors.Is(err, errStatus) {
+		t.Fatalf("Tag error = %v, want cleanliness failure", err)
+	}
+	if err := client.Checkout(context.Background(), "HEAD", false); !errors.Is(err, errStatus) {
+		t.Fatalf("Checkout error = %v, want cleanliness failure", err)
+	}
+	if err := client.Checkout(context.Background(), "HEAD", true); !errors.Is(err, errStatus) {
+		t.Fatalf("confirmed Checkout error = %v, want cleanliness failure", err)
+	}
+}
+
 func TestCommitPreservesBothSidesOfUnrelatedStagedRename(t *testing.T) {
 	ctx := context.Background()
 	workspace := initRepo(t)
@@ -1588,4 +1832,13 @@ func runGit(t *testing.T, dir string, args ...string) string {
 		t.Fatalf("git %v failed: %v\n%s", args, err, out)
 	}
 	return string(out)
+}
+
+func gitClientDirty(t *testing.T, client gitClient, ctx context.Context) bool {
+	t.Helper()
+	dirty, err := client.Dirty(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return dirty
 }
