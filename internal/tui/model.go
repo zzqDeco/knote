@@ -573,6 +573,7 @@ func closesOverlay(events []protocol.Event) bool {
 }
 
 func (m *Model) applyRuntimeResult(result runtimeResultMsg) {
+	m.reconcileFailedRuntimeTasks(result)
 	if result.commandID < m.latestRotation || result.commandID < m.latestResult {
 		return
 	}
@@ -594,16 +595,20 @@ func (m *Model) applyRuntimeResult(result runtimeResultMsg) {
 			m.restoreConfirmation(*result.confirm)
 		}
 	}
-	if !errors.Is(result.err, runtime.ErrTurnBusy) && !errors.Is(result.err, runtime.ErrTurnNotStarted) {
-		if m.failedTasks == nil {
-			m.failedTasks = map[string]runtimeTaskRef{}
-		}
-		for _, task := range result.unfinished {
-			m.failedTasks[task.task.ID] = task
-		}
-		if terminals := m.failedTaskTerminals(); len(terminals) > 0 {
-			m.applyEvents(terminals)
-		}
+}
+
+func (m *Model) reconcileFailedRuntimeTasks(result runtimeResultMsg) {
+	if result.err == nil || errors.Is(result.err, runtime.ErrTurnBusy) || errors.Is(result.err, runtime.ErrTurnNotStarted) {
+		return
+	}
+	if m.failedTasks == nil {
+		m.failedTasks = map[string]runtimeTaskRef{}
+	}
+	for _, task := range result.unfinished {
+		m.failedTasks[task.task.ID] = task
+	}
+	if terminals := m.failedTaskTerminals(); len(terminals) > 0 {
+		m.applyEvents(terminals)
 	}
 }
 

@@ -44,12 +44,15 @@ func NewSessionID() string {
 	return "sess_" + time.Now().UTC().Format("20060102T150405.000000000")
 }
 
-func appendSessionEvent(workspace string, event protocol.Event) error {
+func appendSessionEvent(ctx context.Context, workspace string, event protocol.Event) error {
 	if err := validateSessionID(event.SessionID); err != nil {
 		return err
 	}
 	sessionEventsMu.Lock()
 	defer sessionEventsMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	path := sessionPath(workspace, event.SessionID)
 	if err := secureSessionDirectory(workspace, true); err != nil {

@@ -79,6 +79,12 @@ func (m *Manager) filterPersistedEvents(
 			restrictedSlashTurn = permissionedReplay && slashTurn && restrictedPermissionedSlashReplayTurn(event)
 		}
 		if permissionedReplay && (restrictedSlashTurn || historicalDiffReplayEvent(event)) {
+			if restrictedSlashTurn && event.Type == protocol.EventTaskComplete {
+				slashTurn = false
+				restrictedSlashTurn = false
+				filtered = append(filtered, event)
+				continue
+			}
 			if event.Type == protocol.EventAssistantDone || event.Type == protocol.EventError {
 				slashTurn = false
 				restrictedSlashTurn = false

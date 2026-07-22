@@ -496,6 +496,9 @@ func (m *Manager) finishTurnResultWithStatusEvents(
 			if recoverPersistenceFailure != nil {
 				recoverPersistenceFailure()
 			}
+			if m.deps.SideEffects != nil {
+				m.deps.SideEffects.ClearTurn(turn.lifecycleSessionID, turn.id)
+			}
 			m.releaseFinishedTurn(turn, true)
 		}
 		return nil, returnErr

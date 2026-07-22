@@ -219,6 +219,58 @@ func TestSessionsAppendBatchSpansSessionsWithoutChangingPerSessionOrder(t *testi
 	}
 }
 
+func TestSessionsAppendRechecksContextAfterSerialization(t *testing.T) {
+	store := New(t.TempDir())
+	batchEntered := make(chan struct{})
+	releaseBatch := make(chan struct{})
+	store.beforeSessionBatchPublish = func(string, int) error {
+		close(batchEntered)
+		<-releaseBatch
+		return nil
+	}
+
+	batchDone := make(chan error, 1)
+	go func() {
+		batchDone <- store.AppendBatch(context.Background(), []protocol.Event{
+			protocol.NewEvent(protocol.EventUserMessage, "sess_serialized", "batch event", nil),
+		})
+	}()
+	select {
+	case <-batchEntered:
+	case <-time.After(time.Second):
+		t.Fatal("batch append did not acquire session serialization lock")
+	}
+
+	ctx := &cancelAfterFirstErrContext{firstChecked: make(chan struct{})}
+	appendDone := make(chan error, 1)
+	go func() {
+		appendDone <- store.Append(ctx, protocol.NewEvent(
+			protocol.EventAssistantDone, "sess_serialized", "late cancelled event", nil,
+		))
+	}()
+	select {
+	case <-ctx.firstChecked:
+	case <-time.After(time.Second):
+		close(releaseBatch)
+		t.Fatal("single append did not pass its initial context check")
+	}
+	close(releaseBatch)
+	if err := <-batchDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-appendDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("serialized append error = %v, want context.Canceled", err)
+	}
+
+	events, err := store.Load(context.Background(), "sess_serialized")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].Message != "batch event" {
+		t.Fatalf("cancelled append changed session: %+v", events)
+	}
+}
+
 func TestSessionsAppendBatchRollsBackPublishedFilesOnFailure(t *testing.T) {
 	ctx := context.Background()
 	workspace := t.TempDir()
@@ -259,6 +311,24 @@ func TestSessionsAppendBatchRollsBackPublishedFilesOnFailure(t *testing.T) {
 			t.Fatalf("batch staging file was not removed: %s", entry.Name())
 		}
 	}
+}
+
+type cancelAfterFirstErrContext struct {
+	firstChecked chan struct{}
+	calls        int
+}
+
+func (c *cancelAfterFirstErrContext) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (c *cancelAfterFirstErrContext) Done() <-chan struct{}       { return nil }
+func (c *cancelAfterFirstErrContext) Value(any) any               { return nil }
+
+func (c *cancelAfterFirstErrContext) Err() error {
+	c.calls++
+	if c.calls == 1 {
+		close(c.firstChecked)
+		return nil
+	}
+	return context.Canceled
 }
 
 func TestSessionAuthorizationBindIsIdempotentAndPersistent(t *testing.T) {

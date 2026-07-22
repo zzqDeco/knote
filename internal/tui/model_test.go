@@ -403,6 +403,49 @@ func TestStaleCommandResultCannotMutateRotatedInteractionState(t *testing.T) {
 	}
 }
 
+func TestStaleCommandResultReconcilesFailedTask(t *testing.T) {
+	model := newTestModel(t)
+	now := time.Now().UTC()
+	task := protocol.Task{
+		ID: "task_stale_failure", Title: "Original message", Status: protocol.TaskRunning, CreatedAt: now, UpdatedAt: now,
+	}
+	model.applyEvents([]protocol.Event{
+		protocol.NewEvent(protocol.EventTaskStarted, model.runtime.SessionID(), "Task started", task),
+	})
+	currentErr := runtime.ErrTurnBusy
+	model.err = currentErr
+	model.composer.SetValue("current input")
+	model.latestResult = 2
+
+	next, _ := model.Update(runtimeResultMsg{
+		commandID: 1,
+		kind:      runtimeCommandSend,
+		input:     "old input",
+		unfinished: []runtimeTaskRef{{
+			sessionID: model.runtime.SessionID(),
+			task:      task,
+		}},
+		err: errors.New("persist task result: storage unavailable"),
+	})
+	model = next.(Model)
+
+	if !errors.Is(model.err, currentErr) {
+		t.Fatalf("stale result changed current error: %v", model.err)
+	}
+	if got := model.composer.Value(); got != "current input" {
+		t.Fatalf("stale result changed composer = %q", got)
+	}
+	if got := currentTaskStatuses(model.events)[task.ID]; got != protocol.TaskFailed {
+		t.Fatalf("stale failed task status = %q, want %q", got, protocol.TaskFailed)
+	}
+	if got := countTUIEvents(model.events, protocol.EventTaskComplete); got != 1 {
+		t.Fatalf("task.complete events = %d, want 1", got)
+	}
+	if !strings.Contains(model.status, "tasks 0") {
+		t.Fatalf("stale failure left active task in status: %q", model.status)
+	}
+}
+
 func TestBlockedSendCommandLeavesInterruptHandlingResponsive(t *testing.T) {
 	model := newTestModel(t)
 	blocked := &blockingSendRuntime{

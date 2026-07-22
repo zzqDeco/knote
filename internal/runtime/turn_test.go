@@ -1046,6 +1046,45 @@ func TestOrdinaryTurnPersistenceErrorReleasesController(t *testing.T) {
 	}
 }
 
+func TestResultPersistenceFailureClearsUncommittedTurnConfirmations(t *testing.T) {
+	writeErr := errors.New("session disk temporarily unavailable")
+	store := &failOnceEventSessions{
+		Sessions: local.New(t.TempDir()),
+		failType: protocol.EventConfirmRequest,
+		err:      writeErr,
+	}
+	bridge := NewSideEffectBridge()
+	manager := New(Dependencies{
+		Sessions:     store,
+		EinoRunner:   pendingImmediateTurnRunner{bridge: bridge},
+		SideEffects:  bridge,
+		TurnTimeout:  time.Second,
+		NewSessionID: func() string { return "sess_recover_confirmation" },
+	})
+	if _, err := manager.Start(context.Background(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	if events, err := manager.SendMessage(context.Background(), "first confirmation fails"); !errors.Is(err, writeErr) || len(events) != 1 {
+		t.Fatalf("failed confirmation result = events:%+v err:%v", events, err)
+	}
+	bridge.mu.Lock()
+	pendingCount := len(bridge.pending)
+	queueCount := len(bridge.queue)
+	bridge.mu.Unlock()
+	if pendingCount != 0 || queueCount != 0 {
+		t.Fatalf("failed result left hidden confirmation state: pending=%d queue=%d", pendingCount, queueCount)
+	}
+
+	events, err := manager.SendMessage(context.Background(), "retry confirmation")
+	if err != nil {
+		t.Fatalf("retry after confirmation persistence failure: %v", err)
+	}
+	if !hasEvent(events, protocol.EventConfirmRequest) {
+		t.Fatalf("retry did not emit a new confirmation: %+v", events)
+	}
+}
+
 func TestResultPersistenceUsesBoundedFinalizationContext(t *testing.T) {
 	store := &blockingResultSessions{
 		Sessions:  local.New(t.TempDir()),
@@ -2206,6 +2245,10 @@ type controlledTurnRunner struct {
 
 type immediateTurnRunner struct{}
 
+type pendingImmediateTurnRunner struct {
+	bridge *SideEffectBridge
+}
+
 func (immediateTurnRunner) Ready(context.Context) error { return nil }
 
 func (immediateTurnRunner) ToolInventory(context.Context) ([]RunnerToolInfo, error) {
@@ -2214,6 +2257,23 @@ func (immediateTurnRunner) ToolInventory(context.Context) ([]RunnerToolInfo, err
 
 func (immediateTurnRunner) Run(_ context.Context, input EinoRunInput) ([]protocol.Event, error) {
 	return []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, input.SessionID, "accepted answer", nil)}, nil
+}
+
+func (pendingImmediateTurnRunner) Ready(context.Context) error { return nil }
+
+func (pendingImmediateTurnRunner) ToolInventory(context.Context) ([]RunnerToolInfo, error) {
+	return nil, nil
+}
+
+func (r pendingImmediateTurnRunner) Run(ctx context.Context, _ EinoRunInput) ([]protocol.Event, error) {
+	err := r.bridge.Request(ctx, SideEffectRequest{
+		ToolName: "knote_build",
+		Action:   "build",
+		Execute: func(context.Context, SideEffectRequest) ([]protocol.Event, error) {
+			return nil, nil
+		},
+	})
+	return nil, err
 }
 
 type lateEventTurnRunner struct{ started chan struct{} }

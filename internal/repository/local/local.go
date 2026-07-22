@@ -241,7 +241,7 @@ func (s Store) Append(ctx context.Context, event protocol.Event) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return appendSessionEvent(s.workspace, event)
+	return appendSessionEvent(ctx, s.workspace, event)
 }
 
 func (s Store) AppendBatch(ctx context.Context, events []protocol.Event) error {
