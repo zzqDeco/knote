@@ -12,29 +12,31 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/zzqDeco/knote/internal/repository"
 )
 
 type gitClient struct {
 	workspace string
+	run       func(context.Context, ...string) (string, error)
 }
 
 var knowledgePaths = []string{".knote/config.yaml", "sources", "artifacts", "evals"}
 var runtimeOnlyPaths = []string{".knote/sessions", ".knote/cache", ".knote/checkpoints", ".knote/kag-runtime", ".knote/projections", ".knote/audit"}
 
-func (c gitClient) Branch(ctx context.Context) string {
+func (c gitClient) Branch(ctx context.Context) (string, error) {
 	out, err := c.git(ctx, "branch", "--show-current")
 	if err != nil {
-		return ""
+		return "", err
 	}
-	return strings.TrimSpace(out)
+	return strings.TrimSpace(out), nil
 }
 
-func (c gitClient) Dirty(ctx context.Context) bool {
+func (c gitClient) Dirty(ctx context.Context) (bool, error) {
 	out, err := c.git(ctx, "status", "--porcelain")
 	if err != nil {
-		return false
+		return false, err
 	}
 	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
 		if strings.TrimSpace(line) == "" {
@@ -43,9 +45,9 @@ func (c gitClient) Dirty(ctx context.Context) bool {
 		if runtimeOnlyStatusLine(line) {
 			continue
 		}
-		return true
+		return true, nil
 	}
-	return false
+	return false, nil
 }
 
 func (c gitClient) Status(ctx context.Context) (string, error) {
@@ -53,8 +55,12 @@ func (c gitClient) Status(ctx context.Context) (string, error) {
 }
 
 func (c gitClient) Diff(ctx context.Context, ref string) (string, error) {
-	if strings.TrimSpace(ref) == "" {
+	if ref == "" {
 		return c.workspaceDiff(ctx)
+	}
+	resolved, err := c.resolveRevision(ctx, ref)
+	if err != nil {
+		return "", err
 	}
 	paths, err := c.committableKnowledgePaths(ctx)
 	if err != nil {
@@ -63,16 +69,20 @@ func (c gitClient) Diff(ctx context.Context, ref string) (string, error) {
 	if len(paths) == 0 {
 		return "", nil
 	}
-	return c.git(ctx, append([]string{"diff", ref, "--"}, paths...)...)
+	return c.git(ctx, append([]string{"diff", resolved, "--"}, paths...)...)
 }
 
 func (c gitClient) Versions(ctx context.Context, limit int) ([]repository.Version, error) {
 	if limit <= 0 {
 		limit = 20
 	}
-	head, err := c.git(ctx, "rev-parse", "--verify", "HEAD")
+	head, err := c.git(ctx, "rev-parse", "--verify", "--end-of-options", "HEAD^{commit}")
 	if err != nil {
-		if c.unbornHead(ctx) {
+		unborn, unbornErr := c.unbornHead(ctx)
+		if unbornErr != nil {
+			return nil, errors.Join(err, unbornErr)
+		}
+		if unborn {
 			return []repository.Version{}, nil
 		}
 		return nil, err
@@ -103,17 +113,23 @@ func (c gitClient) Versions(ctx context.Context, limit int) ([]repository.Versio
 	return versions, nil
 }
 
-func (c gitClient) unbornHead(ctx context.Context) bool {
+func (c gitClient) unbornHead(ctx context.Context) (bool, error) {
 	ref, err := c.git(ctx, "symbolic-ref", "-q", "HEAD")
-	if err != nil || strings.TrimSpace(ref) == "" {
-		return false
+	if err != nil {
+		return false, err
 	}
-	_, err = c.git(ctx, "show-ref", "--verify", "--quiet", strings.TrimSpace(ref))
+	if strings.TrimSpace(ref) == "" {
+		return false, nil
+	}
+	_, err = c.git(ctx, "show-ref", "--verify", "--quiet", "--", strings.TrimSpace(ref))
 	if err == nil {
-		return false
+		return false, nil
 	}
 	var exitErr *exec.ExitError
-	return errors.As(err, &exitErr) && exitErr.ExitCode() == 1
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+		return true, nil
+	}
+	return false, err
 }
 
 func (c gitClient) Commit(ctx context.Context, message string) (output string, resultErr error) {
@@ -216,9 +232,53 @@ func (c gitClient) shelveUnrelatedStagedChanges(ctx context.Context) ([]stagedIn
 		paths = append(paths, path)
 	}
 	if len(paths) > 0 {
-		if _, err := c.git(ctx, append([]string{"reset", "-q", "HEAD", "--"}, paths...)...); err != nil {
+		baseline, err := c.baselineIndexEntries(ctx, paths)
+		if err != nil {
 			return nil, err
 		}
+		if err := c.applyIndexEntries(ctx, baseline); err != nil {
+			if restoreErr := c.applyIndexEntries(context.Background(), entries); restoreErr != nil {
+				return nil, errors.Join(err, fmt.Errorf("restore unrelated staged changes: %w", restoreErr))
+			}
+			return nil, err
+		}
+	}
+	return entries, nil
+}
+
+func (c gitClient) baselineIndexEntries(ctx context.Context, paths []string) ([]stagedIndexEntry, error) {
+	headExists := true
+	if _, err := c.git(ctx, "rev-parse", "--verify", "--end-of-options", "HEAD^{commit}"); err != nil {
+		unborn, unbornErr := c.unbornHead(ctx)
+		if unbornErr != nil {
+			return nil, errors.Join(err, unbornErr)
+		}
+		if !unborn {
+			return nil, err
+		}
+		headExists = false
+	}
+	entries := make([]stagedIndexEntry, 0, len(paths))
+	for _, path := range paths {
+		entry := stagedIndexEntry{path: path}
+		if headExists {
+			out, err := c.git(ctx, "ls-tree", "-z", "HEAD", "--", path)
+			if err != nil {
+				return nil, err
+			}
+			if out != "" {
+				metadata, _, ok := strings.Cut(strings.TrimSuffix(out, "\x00"), "\t")
+				fields := strings.Fields(metadata)
+				if !ok || len(fields) != 3 {
+					return nil, fmt.Errorf("parse HEAD index entry for %q", path)
+				}
+				if fields[0] != "040000" {
+					entry.mode = fields[0]
+					entry.object = fields[2]
+				}
+			}
+		}
+		entries = append(entries, entry)
 	}
 	return entries, nil
 }
@@ -252,11 +312,20 @@ func pathsFromStagedNameStatus(out string) ([]string, error) {
 }
 
 func (c gitClient) restoreStagedChanges(ctx context.Context, entries []stagedIndexEntry) error {
+	return c.applyIndexEntries(ctx, entries)
+}
+
+func (c gitClient) applyIndexEntries(ctx context.Context, entries []stagedIndexEntry) error {
+	for _, entry := range entries {
+		if entry.object != "" {
+			continue
+		}
+		if _, err := c.git(ctx, "update-index", "--force-remove", "--", entry.path); err != nil {
+			return err
+		}
+	}
 	for _, entry := range entries {
 		if entry.object == "" {
-			if _, err := c.git(ctx, "update-index", "--force-remove", "--", entry.path); err != nil {
-				return err
-			}
 			continue
 		}
 		if _, err := c.git(ctx, "update-index", "--add", "--cacheinfo", entry.mode, entry.object, entry.path); err != nil {
@@ -277,28 +346,68 @@ func knowledgePath(path string) bool {
 }
 
 func (c gitClient) Tag(ctx context.Context, tag string) error {
-	if strings.TrimSpace(tag) == "" {
-		return fmt.Errorf("tag is required")
+	if err := validateGitInput("tag", tag); err != nil {
+		return err
 	}
-	if c.Dirty(ctx) {
+	dirty, err := c.Dirty(ctx)
+	if err != nil {
+		return fmt.Errorf("inspect workspace cleanliness: %w", err)
+	}
+	if dirty {
 		return fmt.Errorf("release requires a clean workspace")
 	}
-	_, err := c.git(ctx, "tag", "-a", tag, "-m", "release: "+tag)
+	_, err = c.git(ctx, "tag", "-a", "-m", "release: "+tag, "--", tag)
 	return err
 }
 
 func (c gitClient) Checkout(ctx context.Context, ref string, allowDirty bool) error {
-	if strings.TrimSpace(ref) == "" {
-		return fmt.Errorf("ref is required")
+	if err := validateGitInput("ref", ref); err != nil {
+		return err
 	}
-	if !allowDirty && c.Dirty(ctx) {
+	dirty, err := c.Dirty(ctx)
+	if err != nil {
+		return fmt.Errorf("inspect workspace cleanliness: %w", err)
+	}
+	if dirty && !allowDirty {
 		return fmt.Errorf("checkout requires confirmation because the workspace is dirty")
 	}
-	_, err := c.git(ctx, "checkout", ref)
+	_, err = c.git(ctx, "checkout", ref)
 	return err
 }
 
+func (c gitClient) resolveRevision(ctx context.Context, ref string) (string, error) {
+	if err := validateGitInput("ref", ref); err != nil {
+		return "", err
+	}
+	out, err := c.git(ctx, "rev-parse", "--verify", "--end-of-options", ref+"^{commit}")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(out), nil
+}
+
+func validateGitInput(kind, value string) error {
+	if value == "" {
+		return fmt.Errorf("%s is required", kind)
+	}
+	if strings.TrimSpace(value) != value {
+		return fmt.Errorf("%s must not contain surrounding whitespace", kind)
+	}
+	if strings.HasPrefix(value, "-") {
+		return fmt.Errorf("%s must not begin with '-'", kind)
+	}
+	for _, r := range value {
+		if unicode.IsControl(r) {
+			return fmt.Errorf("%s must not contain control characters", kind)
+		}
+	}
+	return nil
+}
+
 func (c gitClient) git(ctx context.Context, args ...string) (string, error) {
+	if c.run != nil {
+		return c.run(ctx, args...)
+	}
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = c.workspace
 	var stdout, stderr bytes.Buffer
