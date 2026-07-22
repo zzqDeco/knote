@@ -23,12 +23,13 @@ type slashResult struct {
 }
 
 type resumePreparation struct {
-	reservationID uint64
-	sessionID     string
-	loaded        []protocol.Event
-	reconciled    []protocol.Event
-	info          protocol.SessionInfo
-	binding       *authorizationBinding
+	reservationID     uint64
+	refreshAfterDrain bool
+	sessionID         string
+	loaded            []protocol.Event
+	reconciled        []protocol.Event
+	info              protocol.SessionInfo
+	binding           *authorizationBinding
 }
 
 func (r slashResult) lifecycleStatusEvents() []protocol.Event {
@@ -271,11 +272,12 @@ func (m *Manager) prepareResumeSession(ctx context.Context, currentSessionID str
 		binding = &value
 	}
 	return resumePreparation{
-		sessionID:  sessionID,
-		loaded:     loaded,
-		reconciled: reconciled,
-		info:       info,
-		binding:    binding,
+		refreshAfterDrain: sessionID == currentSessionID && activeStart.Type != "",
+		sessionID:         sessionID,
+		loaded:            loaded,
+		reconciled:        reconciled,
+		info:              info,
+		binding:           binding,
 	}, nil
 }
 

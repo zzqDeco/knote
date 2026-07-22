@@ -85,13 +85,15 @@ func (m *Manager) beginTurnWithRotationReservation(parent context.Context, title
 		parent = context.Background()
 	}
 	if err := parent.Err(); err != nil {
+		if rotation {
+			m.mu.Lock()
+			m.clearRotationLocked(reservationID)
+			m.mu.Unlock()
+			return nil, nil, fmt.Errorf("%w: prepare task start: %w", ErrTurnNotStarted, err)
+		}
 		return nil, nil, err
 	}
-	timeout := m.deps.TurnTimeout
-	if timeout <= 0 {
-		timeout = DefaultTurnTimeout
-	}
-	timedCtx, cancel := context.WithTimeout(parent, timeout)
+	timedCtx, cancel := m.turnTimeoutContext(parent)
 	keepContext := false
 	defer func() {
 		if !keepContext {
@@ -227,6 +229,17 @@ func (m *Manager) beginTurnWithRotationReservation(parent context.Context, title
 	return turn, []protocol.Event{started}, nil
 }
 
+func (m *Manager) turnTimeoutContext(parent context.Context) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	timeout := m.deps.TurnTimeout
+	if timeout <= 0 {
+		timeout = DefaultTurnTimeout
+	}
+	return context.WithTimeout(parent, timeout)
+}
+
 func (m *Manager) clearRotationLocked(reservationID uint64) {
 	if reservationID != 0 && m.rotationReservation != reservationID {
 		return
@@ -324,11 +337,11 @@ func (m *Manager) finishTurnWithCommittedOutcome(
 	operationErr error,
 	committed bool,
 ) ([]protocol.Event, error) {
-	return m.finishTurnResultWithStatusEvents(turn, events, events, events, operationErr, committed)
+	return m.finishTurnResultWithStatusEvents(turn, events, events, events, operationErr, committed, committed)
 }
 
 func (m *Manager) finishTurnResult(turn *activeTurn, persisted, emitted []protocol.Event, operationErr error) ([]protocol.Event, error) {
-	return m.finishTurnResultWithStatusEvents(turn, persisted, emitted, emitted, operationErr, false)
+	return m.finishTurnResultWithStatusEvents(turn, persisted, emitted, emitted, operationErr, false, false)
 }
 
 func (m *Manager) finishTurnResultWithStatusEvents(
@@ -338,6 +351,7 @@ func (m *Manager) finishTurnResultWithStatusEvents(
 	statusEvents []protocol.Event,
 	operationErr error,
 	committedOutcome bool,
+	failClosedOnPersistenceError bool,
 ) ([]protocol.Event, error) {
 	if turn == nil {
 		return nil, operationErr
@@ -413,6 +427,19 @@ func (m *Manager) finishTurnResultWithStatusEvents(
 		turn.cancel()
 		if returnErr == nil {
 			returnErr = fmt.Errorf("persist task result: %w", persistErr)
+		}
+		if !failClosedOnPersistenceError {
+			m.commitMu.Lock()
+			m.mu.Lock()
+			if m.activeTurn == turn {
+				m.activeTurn = nil
+			}
+			if turn.rotation {
+				m.rotating = false
+			}
+			close(turn.done)
+			m.mu.Unlock()
+			m.commitMu.Unlock()
 		}
 		return nil, returnErr
 	}

@@ -913,6 +913,42 @@ func TestCommittedSideEffectPersistenceErrorFailsClosedAcrossRestart(t *testing.
 	}
 }
 
+func TestOrdinaryTurnPersistenceErrorReleasesController(t *testing.T) {
+	writeErr := errors.New("session disk temporarily unavailable")
+	store := &failOnceEventSessions{
+		Sessions: local.New(t.TempDir()),
+		failType: protocol.EventAssistantDone,
+		err:      writeErr,
+	}
+	manager := New(Dependencies{
+		Sessions:     store,
+		EinoRunner:   immediateTurnRunner{},
+		TurnTimeout:  time.Second,
+		NewSessionID: func() string { return "sess_recover_persistence" },
+	})
+	if _, err := manager.Start(context.Background(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	if events, err := manager.SendMessage(context.Background(), "first result fails"); !errors.Is(err, writeErr) || len(events) != 1 {
+		t.Fatalf("failed result = events:%+v err:%v", events, err)
+	}
+	manager.mu.Lock()
+	active := manager.activeTurn
+	manager.mu.Unlock()
+	if active != nil {
+		t.Fatalf("ordinary persistence failure left active turn %+v", active)
+	}
+
+	events, err := manager.SendMessage(context.Background(), "retry after transient failure")
+	if err != nil {
+		t.Fatalf("retry after ordinary persistence failure: %v", err)
+	}
+	if !hasMessage(events, protocol.EventAssistantDone, "accepted answer") {
+		t.Fatalf("retry events = %+v", events)
+	}
+}
+
 func TestSessionRotationDrainUsesConfiguredDeadline(t *testing.T) {
 	runner := &stubbornTurnRunner{started: make(chan struct{}), release: make(chan struct{})}
 	manager := newTurnTestManager(t, runner, 25*time.Millisecond)
@@ -990,6 +1026,105 @@ func TestInvalidResumeDoesNotCancelActiveTurn(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("active turn did not stop")
+	}
+}
+
+func TestResumePreparationUsesConfiguredTurnTimeout(t *testing.T) {
+	underlying := local.New(t.TempDir())
+	targetSessionID := "sess_blocked_resume"
+	if err := underlying.Append(context.Background(), protocol.NewEvent(protocol.EventAssistantDone, targetSessionID, "target", nil)); err != nil {
+		t.Fatal(err)
+	}
+	store := &contextBlockingLoadSessions{
+		Sessions: underlying,
+		target:   targetSessionID,
+		started:  make(chan struct{}),
+	}
+	manager := New(Dependencies{
+		Sessions:     store,
+		EinoRunner:   immediateTurnRunner{},
+		TurnTimeout:  25 * time.Millisecond,
+		NewSessionID: func() string { return "sess_resume_timeout" },
+	})
+	if _, err := manager.Start(context.Background(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	type result struct {
+		events []protocol.Event
+		err    error
+	}
+	done := make(chan result, 1)
+	go func() {
+		events, err := manager.SendMessage(context.Background(), "/resume "+targetSessionID)
+		done <- result{events: events, err: err}
+	}()
+	select {
+	case <-store.started:
+	case <-time.After(time.Second):
+		t.Fatal("resume preparation did not reach session load")
+	}
+	select {
+	case got := <-done:
+		if !errors.Is(got.err, context.DeadlineExceeded) || !errors.Is(got.err, ErrTurnNotStarted) || len(got.events) != 0 {
+			t.Fatalf("timed-out preparation = events:%+v err:%v", got.events, got.err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("resume preparation ignored the configured turn timeout")
+	}
+	manager.mu.Lock()
+	rotating := manager.rotating
+	reservation := manager.rotationReservation
+	manager.mu.Unlock()
+	if rotating || reservation != 0 {
+		t.Fatalf("timed-out preparation retained rotation state: rotating=%t reservation=%d", rotating, reservation)
+	}
+	if _, err := manager.SendMessage(context.Background(), "accepted after resume timeout"); err != nil {
+		t.Fatalf("turn after resume timeout: %v", err)
+	}
+}
+
+func TestResumeCurrentSessionReloadsAfterActiveTurnDrains(t *testing.T) {
+	store := &loadSnapshotHookSessions{Sessions: local.New(t.TempDir())}
+	runner := &releasedResultTurnRunner{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	manager := New(Dependencies{
+		Sessions:     store,
+		EinoRunner:   runner,
+		TurnTimeout:  time.Second,
+		NewSessionID: func() string { return "sess_resume_current" },
+	})
+	if _, err := manager.Start(context.Background(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	currentSessionID := manager.SessionID()
+	activeDone := make(chan error, 1)
+	go func() {
+		_, err := manager.SendMessage(context.Background(), "complete during resume validation")
+		activeDone <- err
+	}()
+	select {
+	case <-runner.started:
+	case <-time.After(time.Second):
+		t.Fatal("active turn did not reach runner")
+	}
+	var activeErr error
+	store.setHook(func() {
+		close(runner.release)
+		activeErr = <-activeDone
+	})
+
+	events, err := manager.SendMessage(context.Background(), "/resume "+currentSessionID)
+	if err != nil {
+		t.Fatalf("resume current session: %v", err)
+	}
+	if activeErr != nil {
+		t.Fatalf("active turn completed with %v", activeErr)
+	}
+	if !hasMessage(events, protocol.EventAssistantDone, "committed before rotation") {
+		t.Fatalf("resume replay omitted result committed after validation snapshot: %+v", events)
 	}
 }
 
@@ -1659,6 +1794,11 @@ func (immediateTurnRunner) Run(_ context.Context, input EinoRunInput) ([]protoco
 
 type lateEventTurnRunner struct{ started chan struct{} }
 
+type releasedResultTurnRunner struct {
+	started chan struct{}
+	release chan struct{}
+}
+
 type stubbornTurnRunner struct {
 	started chan struct{}
 	release chan struct{}
@@ -1668,6 +1808,22 @@ func (*stubbornTurnRunner) Ready(context.Context) error { return nil }
 
 func (*stubbornTurnRunner) ToolInventory(context.Context) ([]RunnerToolInfo, error) {
 	return nil, nil
+}
+
+func (*releasedResultTurnRunner) Ready(context.Context) error { return nil }
+
+func (*releasedResultTurnRunner) ToolInventory(context.Context) ([]RunnerToolInfo, error) {
+	return nil, nil
+}
+
+func (r *releasedResultTurnRunner) Run(ctx context.Context, input EinoRunInput) ([]protocol.Event, error) {
+	close(r.started)
+	select {
+	case <-r.release:
+		return []protocol.Event{protocol.NewEvent(protocol.EventAssistantDone, input.SessionID, "committed before rotation", nil)}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 func (r *stubbornTurnRunner) Run(ctx context.Context, _ EinoRunInput) ([]protocol.Event, error) {
@@ -1881,11 +2037,68 @@ type failingEventSessions struct {
 	err      error
 }
 
+type failOnceEventSessions struct {
+	repository.Sessions
+	failType protocol.EventType
+	err      error
+	failed   atomic.Bool
+}
+
+type contextBlockingLoadSessions struct {
+	repository.Sessions
+	target  string
+	started chan struct{}
+	once    sync.Once
+}
+
+type loadSnapshotHookSessions struct {
+	repository.Sessions
+	mu   sync.Mutex
+	hook func()
+}
+
 func (s *failingEventSessions) Append(ctx context.Context, event protocol.Event) error {
 	if event.Type == s.failType {
 		return s.err
 	}
 	return s.Sessions.Append(ctx, event)
+}
+
+func (s *failOnceEventSessions) Append(ctx context.Context, event protocol.Event) error {
+	if event.Type == s.failType && s.failed.CompareAndSwap(false, true) {
+		return s.err
+	}
+	return s.Sessions.Append(ctx, event)
+}
+
+func (s *contextBlockingLoadSessions) Load(ctx context.Context, sessionID string) ([]protocol.Event, error) {
+	if sessionID != s.target {
+		return s.Sessions.Load(ctx, sessionID)
+	}
+	s.once.Do(func() { close(s.started) })
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (s *loadSnapshotHookSessions) setHook(hook func()) {
+	s.mu.Lock()
+	s.hook = hook
+	s.mu.Unlock()
+}
+
+func (s *loadSnapshotHookSessions) Load(ctx context.Context, sessionID string) ([]protocol.Event, error) {
+	events, err := s.Sessions.Load(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	hook := s.hook
+	s.hook = nil
+	s.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	return events, nil
 }
 
 func (s *blockingResultSessions) Append(ctx context.Context, event protocol.Event) error {

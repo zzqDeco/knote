@@ -269,16 +269,26 @@ func (m *Manager) SendMessage(ctx context.Context, input string) ([]protocol.Eve
 	var preparedResume *resumePreparation
 	reservedRotation := false
 	if command == "resume" && strings.TrimSpace(argument) != "" && m.deps.Capabilities.AllowsSlashCommand(command) {
+		resumeCtx, resumeCancel := m.turnTimeoutContext(ctx)
+		defer resumeCancel()
 		reservationID, currentSessionID, activeStart, err := m.reserveRotationPreparation()
 		if err != nil {
 			return nil, err
 		}
 		reservedRotation = true
-		prepared, failure := m.prepareResumeSession(ctx, currentSessionID, argument, activeStart)
+		stopTimeoutRelease := context.AfterFunc(resumeCtx, func() {
+			m.releaseRotationPreparation(reservationID)
+		})
+		prepared, failure := m.prepareResumeSession(resumeCtx, currentSessionID, argument, activeStart)
+		stopTimeoutRelease()
+		if err := resumeCtx.Err(); err != nil {
+			m.releaseRotationPreparation(reservationID)
+			return nil, fmt.Errorf("%w: prepare resume: %w", ErrTurnNotStarted, err)
+		}
 		if len(failure) > 0 {
 			m.releaseRotationPreparation(reservationID)
 			events := append([]protocol.Event{protocol.NewEvent(protocol.EventUserMessage, currentSessionID, input, nil)}, failure...)
-			if err := m.persist(ctx, events); err != nil {
+			if err := m.persist(resumeCtx, events); err != nil {
 				return nil, fmt.Errorf("persist resume validation failure: %w", err)
 			}
 			m.emit(events)
@@ -286,6 +296,7 @@ func (m *Manager) SendMessage(ctx context.Context, input string) ([]protocol.Eve
 		}
 		preparedResume = &prepared
 		preparedResume.reservationID = reservationID
+		ctx = resumeCtx
 	}
 	title := "Message"
 	if command != "" {
@@ -309,6 +320,17 @@ func (m *Manager) SendMessage(ctx context.Context, input string) ([]protocol.Eve
 		completed, returnErr := m.finishTurn(turn, nil, err)
 		return append(startedEvents, completed...), returnErr
 	}
+	if preparedResume != nil && preparedResume.refreshAfterDrain {
+		refreshed, failure := m.prepareResumeSession(turn.ctx, turn.lifecycleSessionID, preparedResume.sessionID, turn.lifecycleStart)
+		if len(failure) > 0 {
+			events := append([]protocol.Event{protocol.NewEvent(protocol.EventUserMessage, turn.lifecycleSessionID, input, nil)}, failure...)
+			completed, returnErr := m.finishTurnResult(turn, events, events, fmt.Errorf("resume session changed during rotation"))
+			return append(startedEvents, completed...), returnErr
+		}
+		refreshed.reservationID = preparedResume.reservationID
+		refreshed.refreshAfterDrain = false
+		preparedResume = &refreshed
+	}
 	m.mu.Lock()
 	einoSession := m.einoSession
 	einoRunner := m.deps.EinoRunner
@@ -319,7 +341,7 @@ func (m *Manager) SendMessage(ctx context.Context, input string) ([]protocol.Eve
 	if strings.HasPrefix(input, "/") && (!m.deps.Capabilities.AllowsSlashCommand(command) || command == "new") {
 		result := m.handleSlash(runCtx, turn, einoSession.ID, input, preparedResume)
 		completed, returnErr := m.finishTurnResultWithStatusEvents(
-			turn, result.persisted, result.events, result.lifecycleStatusEvents(), result.err, false,
+			turn, result.persisted, result.events, result.lifecycleStatusEvents(), result.err, false, false,
 		)
 		return append(startedEvents, completed...), returnErr
 	}
@@ -345,7 +367,7 @@ func (m *Manager) SendMessage(ctx context.Context, input string) ([]protocol.Eve
 	if strings.HasPrefix(input, "/") {
 		result := m.handleSlash(runCtx, turn, einoSession.ID, input, preparedResume)
 		completed, returnErr := m.finishTurnResultWithStatusEvents(
-			turn, result.persisted, result.events, result.lifecycleStatusEvents(), result.err, false,
+			turn, result.persisted, result.events, result.lifecycleStatusEvents(), result.err, false, false,
 		)
 		return append(startedEvents, completed...), returnErr
 	}
@@ -486,7 +508,7 @@ func (m *Manager) finishUnexecutedConfirmation(
 	operationErr error,
 ) ([]protocol.Event, error) {
 	events := m.confirmBeforeConsumptionError(sessionID, req, operationErr)
-	completed, finishErr := m.finishTurnWithCommittedOutcome(turn, events, operationErr, true)
+	completed, finishErr := m.finishTurnResultWithStatusEvents(turn, events, events, events, operationErr, true, false)
 	result := append(startedEvents, completed...)
 	if finishErr != nil {
 		return result, finishErr
