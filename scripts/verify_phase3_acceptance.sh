@@ -23,18 +23,8 @@ KNOTE_KAG_FAKE=1 go test -count=1 ./...
 GOTOOLCHAIN=go1.25.12 go run "github.com/openfga/cli/cmd/fga@${FGA_CLI_VERSION}" \
   model test --tests internal/authz/model/authorization.fga.yaml
 
-go test -race -count=1 \
-  ./internal/audit \
-  ./internal/authz \
-  ./internal/connector \
-  ./internal/governance \
-  ./internal/identity \
-  ./internal/knowledge/authorized \
-  ./internal/policysim \
-  ./internal/residency \
-  ./internal/runtime \
-  ./internal/runtime/eino \
-  ./cmd/knote
+scripts/test_race_packages.sh
+KNOTE_KAG_FAKE=1 scripts/run_race_tests.sh
 go vet ./...
 
 GOOS=linux GOARCH=amd64 CGO_ENABLED=0 \

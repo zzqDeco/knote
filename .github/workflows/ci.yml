@@ -16,6 +16,7 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -33,24 +34,11 @@ jobs:
       - name: Go tests
         run: KNOTE_KAG_FAKE=1 go test -count=1 ./...
 
+      - name: Race package manifest checks
+        run: scripts/test_race_packages.sh
+
       - name: Go race tests
-        run: |
-          for package in \
-            ./cmd/knote \
-            ./internal/audit \
-            ./internal/authz \
-            ./internal/catalog \
-            ./internal/connector \
-            ./internal/governance \
-            ./internal/identity \
-            ./internal/knowledge/authorized \
-            ./internal/policysim \
-            ./internal/residency \
-            ./internal/runtime \
-            ./internal/runtime/eino
-          do
-            KNOTE_KAG_FAKE=1 go test -race -count=1 "${package}"
-          done
+        run: KNOTE_KAG_FAKE=1 scripts/run_race_tests.sh
 
       - name: Go vet
         run: go vet ./...
