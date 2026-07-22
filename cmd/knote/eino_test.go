@@ -435,6 +435,7 @@ func toolNames(t *testing.T, tools []einotool.InvokableTool) []string {
 func clearEinoEnv(t *testing.T) {
 	t.Helper()
 	for _, name := range []string{
+		"KNOTE_KAG_FAKE",
 		"KNOTE_EINO_PROVIDER",
 		"KNOTE_EINO_MODEL",
 		"KNOTE_EINO_API_KEY",

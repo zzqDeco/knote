@@ -48,11 +48,12 @@ type Service interface {
 }
 
 type Options struct {
-	Workspace string
-	Repo      repository.ProjectionWorkspace
-	Versions  repository.Versions
-	Backend   Backend
-	Mode      Mode
+	Workspace     string
+	Repo          repository.ProjectionWorkspace
+	Versions      repository.Versions
+	Backend       Backend
+	Mode          Mode
+	ConfigOverlay func(repository.Config) repository.Config
 }
 
 type BuildResult struct {
@@ -79,11 +80,12 @@ type Answer struct {
 type Explanation = Answer
 
 type service struct {
-	workspace string
-	repo      repository.ProjectionWorkspace
-	versions  repository.Versions
-	backend   Backend
-	mode      Mode
+	workspace     string
+	repo          repository.ProjectionWorkspace
+	versions      repository.Versions
+	backend       Backend
+	mode          Mode
+	configOverlay func(repository.Config) repository.Config
 }
 
 func New(opts Options) Service {
@@ -92,11 +94,12 @@ func New(opts Options) Service {
 		mode = ModeReal
 	}
 	return service{
-		workspace: opts.Workspace,
-		repo:      opts.Repo,
-		versions:  opts.Versions,
-		backend:   opts.Backend,
-		mode:      mode,
+		workspace:     opts.Workspace,
+		repo:          opts.Repo,
+		versions:      opts.Versions,
+		backend:       opts.Backend,
+		mode:          mode,
+		configOverlay: opts.ConfigOverlay,
 	}
 }
 

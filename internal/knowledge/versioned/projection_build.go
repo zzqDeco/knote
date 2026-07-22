@@ -94,6 +94,9 @@ func (s service) prepareArtifactProjection(ctx context.Context) (repository.Arti
 	if err != nil {
 		return repository.ArtifactSet{}, projectionBuild{}, err
 	}
+	if s.configOverlay != nil {
+		cfg = s.configOverlay(cfg)
+	}
 	loaded := make([]loadedSource, 0, len(sources))
 	for _, source := range sources {
 		data, err := s.repo.ReadSource(ctx, source.Path)

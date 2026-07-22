@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -97,5 +98,26 @@ func TestPermissionedAuditRootDefaultsOutsideWorkspace(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(workspace, ".knote", "audit")); !os.IsNotExist(err) {
 		t.Fatalf("workspace audit path exists after default write: %v", err)
+	}
+}
+
+func TestPermissionedAuditRootAllowsMissingWorkspaceWithoutCreatingIt(t *testing.T) {
+	base := t.TempDir()
+	workspace := filepath.Join(base, "missing", "workspace")
+	configHome := t.TempDir()
+	t.Setenv(permissionedAuditPathEnv, "")
+	t.Setenv("HOME", configHome)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(configHome, "xdg"))
+	t.Setenv("APPDATA", filepath.Join(configHome, "appdata"))
+
+	root, err := permissionedAuditRoot(workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(root, configHome+string(filepath.Separator)) {
+		t.Fatalf("default audit root %q is outside user config home %q", root, configHome)
+	}
+	if _, err := os.Stat(workspace); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("resolving the audit root created the workspace: %v", err)
 	}
 }
